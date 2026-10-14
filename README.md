@@ -80,6 +80,19 @@ The icon set is generated from `scripts/gen-icon.mjs` (SVG via `sharp` →
 `node scripts/gen-icon.mjs && pnpm tauri icon src-tauri/icons/app-icon.png`
 after changing the design.
 
+## macOS app (build it yourself)
+
+```bash
+pnpm build:macos          # unsigned .app -> dist/
+pnpm build:macos:debug    # debug variant
+```
+
+No prebuilt macOS download is provided — anyone can build one from source.
+The bundle is unsigned (no Developer ID, no notarization): it runs as built
+on your machine; on another machine Gatekeeper needs a one-time
+right-click → Open. The embedded Info.plist allows plain http://ws:// hubs
+(same policy as Android's cleartext traffic).
+
 Releasing (maintainers): `pnpm release <version>` bumps all version files,
 builds the APK, commits, tags, pushes, and publishes the GitHub Release in
 one shot.

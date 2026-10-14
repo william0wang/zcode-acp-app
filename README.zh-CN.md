@@ -72,6 +72,18 @@ Release 构建使用 `.signing/` 目录下的密钥签名（已 gitignore；请�
 修改设计后重新执行
 `node scripts/gen-icon.mjs && pnpm tauri icon src-tauri/icons/app-icon.png`。
 
+## macOS 应用（自行打包）
+
+```bash
+pnpm build:macos          # 未签名 .app -> dist/
+pnpm build:macos:debug    # debug 变体
+```
+
+不提供 macOS 预构建产物——任何人都可以从源码自行打包。构建产物未签名
+（无 Developer ID / 公证）：在构建机上直接可用；拷到其他机器需绕过
+Gatekeeper（右键 → 打开）。内嵌 Info.plist 放行明文 http://ws:// hub
+（与 Android 的 cleartext 策略一致）。
+
 发版（维护者）：`pnpm release <version>` 一步完成版本号更新、APK 构建、
 提交、打 tag、推送和发布 GitHub Release。
 
