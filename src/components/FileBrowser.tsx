@@ -24,8 +24,10 @@ function joinPath(dir: string, name: string): string {
 
 // Directory listings remembered across navigation: going back up or
 // re-entering a directory repaints instantly instead of re-paying the
-// fs/list round-trip. The header's refresh button bypasses the cache; a
-// fresh listing overwrites its entry. Bounded, oldest-first eviction.
+// fs/list round-trip. Keyed by instanceId+path — a respawned bridge is a
+// NEW instance and must not inherit the dead one's cached listings. The
+// header's refresh button bypasses the cache; a fresh listing overwrites
+// its entry. Bounded, oldest-first eviction.
 const LISTING_CACHE_LIMIT = 32;
 const listingCache = new Map<string, FsListing>();
 
@@ -54,6 +56,11 @@ interface FileBrowserProps {
 export function FileBrowser({ onClose }: FileBrowserProps) {
   const { t } = useTranslation();
   const fsList = useAppStore((s) => s.fsList);
+  // Cache key ingredient: a listing belongs to the INSTANCE that served it.
+  // After a dead bridge is respawned (new instanceId), the old root's cached
+  // listing must not paint over the fresh fetch — it masked exactly the
+  // "every subdirectory fails" state that revived underneath it.
+  const instanceId = useAppStore((s) => s.instanceId);
   const [path, setPath] = useState("");
   const [listing, setListing] = useState<FsListing | null>(null);
   const [loading, setLoading] = useState(true);
@@ -75,11 +82,12 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
 
   useEffect(() => {
     let alive = true;
+    const cacheKey = `${instanceId ?? "-"}:${path}`;
     const isRefresh =
       lastLoad.current.path === path &&
       lastLoad.current.attempt !== attempt;
     lastLoad.current = { path, attempt };
-    const hit = isRefresh ? undefined : listingCache.get(path);
+    const hit = isRefresh ? undefined : listingCache.get(cacheKey);
     if (hit) {
       setListing(hit);
       setLoading(false);
@@ -98,13 +106,13 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
         setFailed(true);
         return;
       }
-      cacheListing(path, res);
+      cacheListing(cacheKey, res);
       setListing(res);
     });
     return () => {
       alive = false;
     };
-  }, [path, attempt, fsList]);
+  }, [path, attempt, fsList, instanceId]);
 
   // A new directory must start at the top, not wherever the last one scrolled.
   useEffect(() => {

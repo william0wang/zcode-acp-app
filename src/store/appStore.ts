@@ -515,6 +515,11 @@ export interface AppState extends ConfigSlice {
 
 // Module singletons: connection + timers live outside React state.
 let acp: AcpConnection | null = null;
+// Single-flight respawn of a bridge that died under a still-open session
+// (serve bridge idle-exited during phone sleep — the socket never delivered
+// a close, so nothing else noticed). The first session-bound call to hit
+// the dead instance revives it; concurrent failures share the one attempt.
+let reviveInFlight: Promise<string | null> | null = null;
 // Toast auto-clear; the id guards against a stale timer clearing a newer toast.
 const TOAST_MS = 4000;
 let toastSeq = 0;
@@ -1231,6 +1236,35 @@ export const useAppStore = create<AppState>((set, get) => {
       return;
     }
     await openConnection(cur.profile, cur.instanceId!);
+  }
+
+  /**
+   * Respawn the bridge behind the current session after the hub proved it
+   * gone ("unknown instance" / "bridge unreachable" on a session-bound
+   * call). Same path as manually re-opening the session: createInstance
+   * incubates a serve bridge for the workspace, which reconnects AND
+   * re-attaches (replay included), so the caller just retries on the NEW
+   * instanceId. The stale local instance list still carries the dead
+   * instance's workspace — the hub no longer lists it, so refreshing first
+   * would erase the one fact the respawn needs. Single-flight: concurrent
+   * failures (e.g. a listing + a file window) share one respawn.
+   */
+  async function reviveDeadInstance(): Promise<string | null> {
+    if (reviveInFlight) return reviveInFlight;
+    const s = get();
+    if (!s.profile || !s.activeSessionId) return null;
+    const workspace = s.instances.find((i) => i.id === s.instanceId)?.workspace;
+    if (!workspace) return null;
+    const sessionId = s.activeSessionId;
+    reviveInFlight = get()
+      .resumeProjectSession(workspace, sessionId)
+      .then((ok) => (ok ? get().instanceId : null))
+      .catch(() => null);
+    try {
+      return await reviveInFlight;
+    } finally {
+      reviveInFlight = null;
+    }
   }
 
   async function openConnection(profile: ConnectionProfile, instanceId: string): Promise<void> {
@@ -2408,7 +2442,18 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!client || !s.instanceId || !s.activeSessionId) return null;
       try {
         return await client.fsList(s.instanceId, s.activeSessionId, path);
-      } catch {
+      } catch (e) {
+        if (e instanceof HubApiError && e.instanceDead) {
+          const revived = await reviveDeadInstance();
+          const cur = get();
+          if (revived && cur.instanceId && cur.activeSessionId) {
+            try {
+              return await client.fsList(cur.instanceId, cur.activeSessionId, path);
+            } catch {
+              return null;
+            }
+          }
+        }
         return null;
       }
     },
@@ -2419,7 +2464,24 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!client || !s.instanceId || !s.activeSessionId) return null;
       try {
         return await client.fsFileText(s.instanceId, s.activeSessionId, path, line, limit);
-      } catch {
+      } catch (e) {
+        if (e instanceof HubApiError && e.instanceDead) {
+          const revived = await reviveDeadInstance();
+          const cur = get();
+          if (revived && cur.instanceId && cur.activeSessionId) {
+            try {
+              return await client.fsFileText(
+                cur.instanceId,
+                cur.activeSessionId,
+                path,
+                line,
+                limit,
+              );
+            } catch {
+              return null;
+            }
+          }
+        }
         return null;
       }
     },

@@ -213,6 +213,30 @@ test("a 404 right after a bridge upgrade is retried once transparently", async (
   expect(requested).toHaveLength(2);
 });
 
+test("a gone bridge (unknown instance / bridge unreachable) is flagged instanceDead", async () => {
+  // The retry-404-once path applies here too — the SECOND answer decides.
+  responses.push(new Response("unknown instance", { status: 404 }));
+  responses.push(new Response("unknown instance", { status: 404 }));
+  const err = await client().fsList("inst", "sess", "/").catch((e) => e);
+  expect(err).toBeInstanceOf(HubApiError);
+  expect(err).toMatchObject({ status: 404, instanceDead: true });
+
+  responses.push(new Response("bridge unreachable", { status: 502 }));
+  const err2 = await client()
+    .fsFileText("inst", "sess", "/f.txt", 1, 5)
+    .catch((e) => e);
+  expect(err2).toBeInstanceOf(HubApiError);
+  expect(err2).toMatchObject({ status: 502, instanceDead: true });
+});
+
+test("a genuine 404 (missing path) is not flagged instanceDead", async () => {
+  responses.push(new Response("not found", { status: 404 }));
+  responses.push(new Response("not found", { status: 404 }));
+  // Body is plain text, so the caller's res.json() throws — the pre-existing
+  // behavior for missing paths, unchanged by the instanceDead plumbing.
+  await expect(client().fsList("inst", "sess", "nope")).rejects.toThrow();
+});
+
 test("systemStats GETs the machine-level system-stats route", async () => {
   responses.push(
     Response.json({

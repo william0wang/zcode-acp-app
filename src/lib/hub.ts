@@ -40,6 +40,10 @@ export class HubApiError extends Error {
     message: string,
     readonly status?: number,
     readonly network = false,
+    // The hub no longer knows, or can no longer reach, the instance this
+    // request targeted (idle-exited bridge under a still-open session): the
+    // caller may respawn the instance instead of surfacing a plain failure.
+    readonly instanceDead = false,
   ) {
     super(message);
     this.name = "HubApiError";
@@ -71,7 +75,7 @@ export class HubClient {
     // retry". Covers connect + response headers only: every observed hang
     // mode delivers zero bytes, so headers never arrive — once they have,
     // the body follows on the same hot socket.
-    opts?: { timeoutMs?: number | null },
+    opts?: { timeoutMs?: number | null; passthrough?: number[] },
   ): Promise<Response> {
     const timeoutMs = opts?.timeoutMs !== undefined ? opts.timeoutMs : 10_000;
     const controller = new AbortController();
@@ -104,6 +108,9 @@ export class HubClient {
     }
     if (res.status === 401)
       throw new HubApiError("unauthorized: check token", 401);
+    // Callers that need to inspect a non-2xx BODY (fetchFs sniffs the hub's
+    // plain-text dead-instance answers) get the raw response back instead.
+    if (opts?.passthrough?.includes(res.status)) return res;
     if (!res.ok) {
       // The settings API answers a refused write with a REASON — "nonce is
       // stale — refresh the reset card status", "that is a built-in agent",
@@ -316,15 +323,29 @@ export class HubClient {
    * self-learning the fs route — retried once transparently.
    */
   private async fetchFs(path: string): Promise<Response> {
-    try {
-      return await this.fetch(path);
-    } catch (e) {
-      if (e instanceof HubApiError && e.status === 404) {
-        await new Promise((r) => setTimeout(r, 400));
-        return await this.fetch(path);
-      }
-      throw e;
+    // 404/502 bodies are needed here (dead-instance sniffing), so both
+    // statuses ride the passthrough instead of the generic HTTP error.
+    const opts = { passthrough: [404, 502] as number[] };
+    let res = await this.fetch(path, "GET", undefined, opts);
+    if (res.status === 404) {
+      // Bridge-upgrade race: the route briefly 404s around a respawn —
+      // retry once before believing it.
+      await new Promise((r) => setTimeout(r, 400));
+      res = await this.fetch(path, "GET", undefined, opts);
     }
+    if (res.status === 404 || res.status === 502) {
+      // The hub's instance routes answer these two exact plain-text bodies
+      // when the bridge is gone (idle-exit under a still-open session). They
+      // must not surface as a JSON-parse failure: flag them so the store can
+      // respawn the instance. Genuine 404s ("not found") pass through with
+      // the body re-wrapped.
+      const text = await res.text();
+      if (text === "unknown instance" || text === "bridge unreachable") {
+        throw new HubApiError(text, res.status, false, true);
+      }
+      return new Response(text, { status: res.status, headers: res.headers });
+    }
+    return res;
   }
 
   /** One directory level; dotfiles included (filter client-side). */
