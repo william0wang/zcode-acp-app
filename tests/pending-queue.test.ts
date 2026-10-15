@@ -16,7 +16,8 @@ interface Frame {
 }
 
 // Minimal WS double: OPEN from birth, answers initialize/session/load,
-// records session/prompt payloads for assertions.
+// records session/prompt payloads for assertions, HOLDS prompt responses
+// until settleAll() (the fake bridge replies only when told to).
 class FakeWebSocket {
   static OPEN = 1;
   static current: FakeWebSocket | null = null;
@@ -26,6 +27,7 @@ class FakeWebSocket {
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   prompts: unknown[][] = [];
+  private promptIds: number[] = [];
 
   constructor(_url: string) {
     FakeWebSocket.current = this;
@@ -39,8 +41,13 @@ class FakeWebSocket {
     } else if (frame.method === "session/load") {
       this.reply(frame.id, {});
     } else if (frame.method === "session/prompt") {
+      this.promptIds.push(frame.id as number);
       this.prompts.push(frame.params?.prompt ?? []);
     }
+  }
+
+  settleAll(): void {
+    for (const id of this.promptIds.splice(0)) this.reply(id, {});
   }
 
   private reply(id: number | undefined, result: unknown): void {
@@ -57,7 +64,9 @@ async function connectedStore() {
   useAppStore.getState().connectToHub({ hubUrl: "http://hub/", token: "t" });
   // Skip the discovery wait: a re-connect in the same module reuses the
   // running poll timer, so its next tick can be seconds out — seed the row
-  // directly instead (the fs-revive suite does the same).
+  // directly instead (the fs-revive suite does the same). pendingPrompts
+  // resets too: a previous test's leftover queue would flush into this
+  // connection's session and steal the first prompt slot.
   useAppStore.setState({
     instances: [
       {
@@ -66,6 +75,7 @@ async function connectedStore() {
         sessions: [{ sessionId: "sess_1", updatedAt: 1 }],
       },
     ],
+    pendingPrompts: {},
   });
   void useAppStore.getState().connectInstance("inst1");
   await vi.waitFor(() => expect(useAppStore.getState().connState).toBe("open"));
@@ -161,4 +171,53 @@ test("editPending returns a queued draft to the composer and keeps queue order",
   const prefill = store.getState().composerPrefill;
   expect(prefill?.text).toBe("first");
   expect(prefill?.images).toEqual([{ mimeType: "image/png", data: "aGk=" }]);
+});
+
+test("forceSendPending(index) sends THAT bubble, not the queue head", async () => {
+  const store = await connectedStore();
+
+  // A runs (response held); B and C queue behind it.
+  void store.getState().sendPrompt("A");
+  await vi.waitFor(() => expect(store.getState().isRunning).toBe(true));
+  void store.getState().sendPrompt("B");
+  void store.getState().sendPrompt("C");
+
+  // Target the THIRD bubble: C moves to the front and the running turn
+  // cancels; A's settle then flushes C out, B stays queued.
+  store.getState().forceSendPending(2);
+  FakeWebSocket.current!.settleAll();
+  await vi.waitFor(() =>
+    expect(FakeWebSocket.current?.prompts).toHaveLength(2),
+  );
+  expect(JSON.stringify(FakeWebSocket.current!.prompts[1])).toContain("C");
+  expect(
+    store.getState().pendingPrompts["sess_1"]?.map((d) => d.text),
+  ).toEqual(["B"]);
+});
+
+test("back-to-back prompts stay separate bubbles even with no assistant turn between", async () => {
+  const store = await connectedStore();
+
+  // A goes out; B queues while A's turn is held open by the fake bridge.
+  void store.getState().sendPrompt("A");
+  await vi.waitFor(() => expect(store.getState().isRunning).toBe(true));
+  void store.getState().sendPrompt("B");
+  expect(store.getState().pendingPrompts["sess_1"]).toHaveLength(1);
+
+  // A settles with ZERO assistant output (response racing the trailing
+  // chunks, or a failed turn): the flush must still open a NEW user bubble
+  // for B — not append B onto A's bubble.
+  FakeWebSocket.current!.settleAll();
+  await vi.waitFor(() =>
+    expect(FakeWebSocket.current?.prompts).toHaveLength(2),
+  );
+  // Let B's own settle land, then read the painted transcript.
+  FakeWebSocket.current!.settleAll();
+  await new Promise((r) => setTimeout(r, 50));
+
+  const users = store.getState().messages.filter((m) => m.role === "user");
+  expect(users).toHaveLength(2);
+  expect(JSON.stringify(users[0].parts)).toContain("A");
+  expect(JSON.stringify(users[1].parts)).toContain("B");
+  expect(users[0].id).not.toBe(users[1].id);
 });
