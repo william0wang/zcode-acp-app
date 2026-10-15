@@ -72,6 +72,33 @@ fn exit_app(app: tauri::AppHandle) {
   app.exit(0);
 }
 
+// Open a local file (reveal=true: show it in Finder) on the machine the app
+// runs on. The JS side only invokes this when the hub itself is loopback, so
+// a bridge-reported path names a real local file. macOS-only — it is the one
+// desktop target this app builds. The path passes as an argv element, never
+// through a shell, so it cannot inject flags.
+#[tauri::command]
+fn open_local_path(path: String, reveal: bool) -> Result<(), String> {
+  #[cfg(target_os = "macos")]
+  {
+    let mut cmd = std::process::Command::new("open");
+    if reveal {
+      cmd.arg("-R");
+    }
+    let status = cmd.arg(&path).status().map_err(|e| e.to_string())?;
+    if status.success() {
+      Ok(())
+    } else {
+      Err(format!("open exited with {}", status.code().unwrap_or(-1)))
+    }
+  }
+  #[cfg(not(target_os = "macos"))]
+  {
+    let _ = (path, reveal);
+    Err("unsupported platform".to_string())
+  }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
@@ -102,7 +129,7 @@ pub fn run() {
       }
       Ok(())
     })
-    .invoke_handler(tauri::generate_handler![download_file, exit_app])
+    .invoke_handler(tauri::generate_handler![download_file, exit_app, open_local_path])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
 }

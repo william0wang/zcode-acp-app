@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import type { FsEntry, FsListing } from "../lib/types";
 import { useBackHandler } from "../lib/backNav";
+import { inTauriShell, isLoopbackHub } from "../lib/localOpen";
 import { useAppStore } from "../store/appStore";
 import { FileViewer, fmtSize } from "./FileViewer";
 import { Spinner } from "./Spinner";
@@ -61,6 +62,7 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
   // listing must not paint over the fresh fetch — it masked exactly the
   // "every subdirectory fails" state that revived underneath it.
   const instanceId = useAppStore((s) => s.instanceId);
+  const profile = useAppStore((s) => s.profile);
   const [path, setPath] = useState("");
   const [listing, setListing] = useState<FsListing | null>(null);
   const [loading, setLoading] = useState(true);
@@ -283,6 +285,14 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
         <FileViewer
           file={viewing.entry}
           path={viewing.path}
+          // Absolute machine path, only when the hub itself is loopback: the
+          // desktop app then runs on the same machine as the bridge, so the
+          // file can be opened locally instead of streamed.
+          localPath={
+            listing && inTauriShell() && profile && isLoopbackHub(profile.hubUrl)
+              ? `${listing.root.replace(/\/+$/, "")}/${viewing.path}`
+              : undefined
+          }
           onClose={() => setViewing(null)}
           onExit={onClose}
         />

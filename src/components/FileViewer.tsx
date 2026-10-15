@@ -41,14 +41,17 @@ import {
   ArrowLeft,
   Code,
   Download,
+  ExternalLink,
   Eye,
   FileText,
+  FolderOpen,
   Link2,
   Share2,
   X,
 } from "lucide-react";
 import type { FsEntry } from "../lib/types";
 import { useBackHandler } from "../lib/backNav";
+import { openLocalPath } from "../lib/localOpen";
 import { useAppStore } from "../store/appStore";
 import { MarkdownText } from "./Markdown";
 import { Spinner } from "./Spinner";
@@ -476,6 +479,9 @@ function MarkdownView({ path }: { path: string }) {
 interface FileViewerProps {
   file: FsEntry;
   path: string;
+  /** Absolute path on the local machine — set only when the hub is
+   * loopback, enabling native open / reveal. */
+  localPath?: string;
   onClose: () => void;
   /** Exit the whole file browser back to the session — the back arrow only
    * returns to the browser at the same directory depth. */
@@ -489,7 +495,7 @@ function reasonOf(e: unknown): string {
   return s.length > 120 ? `${s.slice(0, 120)}…` : s;
 }
 
-export function FileViewer({ file, path, onClose, onExit }: FileViewerProps) {
+export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewerProps) {
   const { t } = useTranslation();
   const fsFileUrl = useAppStore((s) => s.fsFileUrl);
   const notify = useAppStore((s) => s.notify);
@@ -610,6 +616,17 @@ export function FileViewer({ file, path, onClose, onExit }: FileViewerProps) {
     a.remove();
   };
 
+  // Desktop app next to a loopback hub: hand the file to the OS instead of
+  // streaming it (reveal=true shows it in Finder instead of opening).
+  const openLocal = async (reveal: boolean) => {
+    if (!localPath) return;
+    try {
+      await openLocalPath(localPath, reveal);
+    } catch (e) {
+      notify(t("viewer.openLocalFailed", { reason: reasonOf(e) }));
+    }
+  };
+
   const downloadFile = async () => {
     if (!url || downloading) return;
     if (!canInvoke) {
@@ -659,6 +676,24 @@ export function FileViewer({ file, path, onClose, onExit }: FileViewerProps) {
           <div className="truncate text-[15px] font-medium">{file.name}</div>
           <div className="text-[11px] text-faint">{fmtSize(file.size)}</div>
         </div>
+        {localPath && (
+          <>
+            <button
+              onClick={() => void openLocal(false)}
+              aria-label={t("viewer.openLocal")}
+              className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            >
+              <ExternalLink className="size-5" />
+            </button>
+            <button
+              onClick={() => void openLocal(true)}
+              aria-label={t("viewer.revealLocal")}
+              className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            >
+              <FolderOpen className="size-5" />
+            </button>
+          </>
+        )}
         {kind === "text" && markdown && (
           <button
             onClick={() => setMdSource((v) => !v)}
