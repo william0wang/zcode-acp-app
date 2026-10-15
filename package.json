@@ -23,7 +23,6 @@
     "build:android": "bash scripts/build-android.sh",
     "build:android:debug": "bash scripts/build-android.sh --debug",
     "build:macos": "bash scripts/build-macos.sh",
-    "build:macos:debug": "bash scripts/build-macos.sh --debug",
     "deploy:web": "bash scripts/deploy-web.sh",
     "release": "bash scripts/release.sh"
   },

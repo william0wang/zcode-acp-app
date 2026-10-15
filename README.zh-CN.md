@@ -75,8 +75,7 @@ Release 构建使用 `.signing/` 目录下的密钥签名（已 gitignore；请�
 ## macOS 应用（自行打包）
 
 ```bash
-pnpm build:macos          # 未签名 .app -> dist/
-pnpm build:macos:debug    # debug 变体
+pnpm build:macos          # 未签名 .app -> dist/ZCode-acp.app
 ```
 
 不提供 macOS 预构建产物——任何人都可以从源码自行打包。构建产物未签名

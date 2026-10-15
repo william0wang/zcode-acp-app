@@ -83,8 +83,7 @@ after changing the design.
 ## macOS app (build it yourself)
 
 ```bash
-pnpm build:macos          # unsigned .app -> dist/
-pnpm build:macos:debug    # debug variant
+pnpm build:macos          # unsigned .app -> dist/ZCode-acp.app
 ```
 
 No prebuilt macOS download is provided — anyone can build one from source.
