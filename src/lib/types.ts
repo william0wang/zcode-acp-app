@@ -149,6 +149,15 @@ export interface ContextUsage {
   size: number;
 }
 
+// Last completed turn's speed readout (title bar): output tokens, wall
+// seconds, and their ratio. Seeded only by a locally-run turn's prompt
+// response; persisted in the session snapshot so switches/reconnects keep it.
+export interface TurnStats {
+  tps: number;
+  outputTokens: number;
+  seconds: number;
+}
+
 // account/usage_stats (Proposal 0002) — the combined dual-provider quota
 // behind the zcode-quota CLI: one GLM section plus one Opencode Go section.
 // GLM items pass through verbatim (counts, reset timestamps, per-model

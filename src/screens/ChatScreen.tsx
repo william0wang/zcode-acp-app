@@ -29,8 +29,20 @@ function baseName(path: string | undefined): string {
   return parts[parts.length - 1] || path;
 }
 
-function fmtK(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(n >= 10000 ? 0 : 1)}k` : String(n);
+// TUI parity (martty stats dock): `128000` -> `128K`, `1000000` -> `1.0M`.
+function fmtTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const unit = n < 1_000_000 ? 1000 : 1_000_000;
+  const scaled = n / unit;
+  const rounded =
+    scaled >= 100 ? Math.round(scaled) : Math.round(scaled * 10) / 10;
+  return `${rounded}${unit === 1000 ? "K" : "M"}`;
+}
+
+// Context gauge as the TUI prints it — `17.5%/1.0M`, a one-decimal percent
+// of the real model window, not the raw used/size counts.
+function fmtContext(used: number, size: number): string {
+  return `${Math.min(100, (used / size) * 100).toFixed(1)}%/${fmtTokens(size)}`;
 }
 
 function PlanPanel({ entries }: { entries: PlanEntry[] }) {
@@ -146,6 +158,8 @@ export function ChatScreen() {
   const workspace = baseName(instance?.workspace);
   const messages = useAppStore((s) => s.messages);
   const cacheHit = useAppStore((s) => s.cacheHit);
+  const turnStats = useAppStore((s) => s.turnStats);
+  const quotaDock = useAppStore((s) => s.quotaDock);
 
   // Discovery titles are often absent; fall back to the first user message
   // of the replayed history, then to the placeholder.
@@ -181,7 +195,7 @@ export function ChatScreen() {
 
   return (
     <div className="relative flex h-full flex-col bg-canvas text-ink">
-      <header className="relative flex items-center gap-1 border-b border-hairline px-1.5 pb-2 pt-[max(var(--safe-top),0.5rem)]">
+      <header className="@container relative flex items-center gap-1 border-b border-hairline px-1.5 pb-2 pt-[max(var(--safe-top),0.5rem)]">
         <button
           onClick={() => setDrawerOpen(true)}
           aria-label={t("chat.sessions")}
@@ -192,13 +206,35 @@ export function ChatScreen() {
         <div className="min-w-0 flex-1">
           <div className="truncate text-[15px] font-medium">{title}</div>
           {workspace && (
-            <div className="truncate text-[11px] text-faint">
-              {workspace}
-              {usage &&
-                usage.size > 0 &&
-                ` · ${fmtK(usage.used)}/${fmtK(usage.size)}`}
-              {cacheHit != null &&
-                ` · ${t("chat.cacheHit", { pct: cacheHit })}`}
+            <div className="flex items-baseline text-[11px] text-faint">
+              {/* Stats live in the title bar, TUI style: context `17.5%/1.0M`,
+                  bare cache percent, `tok/s`, then the quota dock line — the
+                  hub's preformatted string (ADR-0021), byte-identical to the
+                  TUI's bottom dock, refreshed at connect and each turn end.
+                  The dock and tps segments are header-container gated; the
+                  workspace path truncates so the numbers stay visible. */}
+              <span className="min-w-0 truncate">{workspace}</span>
+              {usage != null && usage.size > 0 && (
+                <span className="shrink-0 whitespace-nowrap">
+                  {" · "}
+                  {fmtContext(usage.used, usage.size)}
+                </span>
+              )}
+              {cacheHit != null && (
+                <span className="shrink-0 whitespace-nowrap">
+                  · {cacheHit}%
+                </span>
+              )}
+              {turnStats && (
+                <span className="hidden shrink-0 whitespace-nowrap @min-[520px]:inline">
+                  · {turnStats.tps} tok/s
+                </span>
+              )}
+              {quotaDock && (
+                <span className="ml-auto hidden shrink-0 whitespace-nowrap pl-2 @min-[640px]:inline">
+                  {quotaDock}
+                </span>
+              )}
             </div>
           )}
         </div>

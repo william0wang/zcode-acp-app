@@ -12,6 +12,7 @@ import {
   type SessionUpdate,
   type SlashCommand,
   type ToolCallPart,
+  type TurnStats,
 } from "../lib/types";
 
 // Server-side tail replay (REMOTE-CLIENTS.md "Tail replay and history
@@ -37,6 +38,11 @@ interface SessionSnapshot {
   configOptions: ConfigOption[];
   currentModeId: string | null;
   usage: ContextUsage | null;
+  // Last turn's readouts ride the snapshot too: without them a switch or
+  // wake-reconnect blanks the title-bar cache/tps segments until the next
+  // locally-run turn, while context (usage above) paints instantly.
+  cacheHit: number | null;
+  turnStats: TurnStats | null;
 }
 
 const SESSION_CACHE_LIMIT = 6;
@@ -147,18 +153,24 @@ let msgCounter = 0;
 
 // ---- session/update -> chat model ----
 
+// Fresh bottom message sharing msgCounter with replay, so live and replayed
+// ids never collide.
+export function newMessage(role: "user" | "assistant"): ChatMessage {
+  return {
+    id: `m${++msgCounter}`,
+    role,
+    parts: [],
+    createdAt: Date.now(),
+  };
+}
+
 export function ensureMessage(
   msgs: ChatMessage[],
   role: "user" | "assistant",
 ): { messages: ChatMessage[]; message: ChatMessage } {
   const last = msgs[msgs.length - 1];
   if (last && last.role === role) return { messages: msgs, message: last };
-  const message: ChatMessage = {
-    id: `m${++msgCounter}`,
-    role,
-    parts: [],
-    createdAt: Date.now(),
-  };
+  const message = newMessage(role);
   return { messages: [...msgs, message], message };
 }
 

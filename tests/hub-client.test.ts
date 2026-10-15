@@ -47,6 +47,19 @@ test("instances rejects a non-array payload", async () => {
   );
 });
 
+test("quotaDock returns the formatted line; null hides the dock", async () => {
+  responses.push(
+    Response.json({ formatted: "34% 12:59 · go 7.5% 11-03" }),
+  );
+  await expect(client().quotaDock()).resolves.toBe(
+    "34% 12:59 · go 7.5% 11-03",
+  );
+  expect(requested[0]).toBe("http://hub/api/quota/dock");
+
+  responses.push(Response.json({ formatted: null }));
+  await expect(client().quotaDock()).resolves.toBeNull();
+});
+
 test("401 keeps its status; other HTTP errors surface as 'HTTP <code>'", async () => {
   responses.push(new Response("no", { status: 401 }));
   const err = await client()

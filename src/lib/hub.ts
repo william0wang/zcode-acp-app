@@ -164,6 +164,17 @@ export class HubClient {
   }
 
   /**
+   * The one-line quota dock string (ADR-0021) — the exact line the Martty TUI
+   * renders in its resident bottom dock, preformatted hub-side (`45% 14:23 ·
+   * 12% 10-18 · go 8% 10-11`). `null` = no quota data (hide, not an error).
+   */
+  async quotaDock(): Promise<string | null> {
+    const res = await this.fetch("/api/quota/dock");
+    const data = (await res.json()) as { formatted?: unknown };
+    return typeof data.formatted === "string" ? data.formatted : null;
+  }
+
+  /**
    * Trigger the hub's staleness check (bridge 0.11.7). The hub alone decides
    * whether the on-disk code is newer and restarts onto it; `restarting`
    * just means it is about to exit and re-spawn — poll health() until it

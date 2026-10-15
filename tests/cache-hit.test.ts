@@ -121,7 +121,66 @@ test("a prompt response with cache numbers sets cacheHit (8000/10000)", async ()
   // 8000 cached read / (1000 input + 8000 read + 1000 write) = 80%.
   expect(store.getState().cacheHit).toBe(80);
 
-  // Reloading the session (switch away and back) clears the stale rate.
+  // Reloading the session (switch away and back) keeps the readout: the
+  // turn-end snapshot carries cacheHit, so the title bar does not blank
+  // until the next locally-run turn.
   await store.getState().loadSession("sess_1");
-  expect(store.getState().cacheHit).toBeNull();
+  expect(store.getState().cacheHit).toBe(80);
+});
+
+test("the same response feeds the turn speed readout (turnStats)", async () => {
+  const { useAppStore } = await import("../src/store/appStore");
+  const store = useAppStore;
+
+  await store.getState().sendPrompt("again");
+  const ts = store.getState().turnStats;
+  expect(ts).not.toBeNull();
+  expect(ts?.outputTokens).toBe(500);
+  // The fake bridge settles within one tick, so the 0.1s floor applies —
+  // tps is the floor-divided rate, seconds the floored wall time.
+  expect(ts?.seconds).toBeGreaterThanOrEqual(0.1);
+  expect(ts?.tps).toBeGreaterThan(0);
+
+  // Switching sessions keeps the readout (snapshot restore, like cacheHit).
+  await store.getState().loadSession("sess_1");
+  expect(store.getState().turnStats?.outputTokens).toBe(500);
+});
+
+test("a foreign turn's end broadcast (usage + turnMs) feeds the readouts", async () => {
+  const { useAppStore } = await import("../src/store/appStore");
+  const store = useAppStore;
+  const ws = FakeWebSocket.current!;
+
+  // A turn driven from ANOTHER client: the app only sees the turn-state
+  // broadcast, never a prompt response of its own.
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/turnState",
+    params: { sessionId: "sess_1", running: true },
+  });
+  expect(store.getState().isRunning).toBe(true);
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/turnState",
+    params: {
+      sessionId: "sess_1",
+      running: false,
+      usage: {
+        totalTokens: 10500,
+        inputTokens: 1000,
+        outputTokens: 200,
+        cachedReadTokens: 8000,
+        cachedWriteTokens: 1000,
+      },
+      turnMs: 4000,
+    },
+  });
+  // 8000 / (1000 + 8000 + 1000) = 80%; 200 tokens over 4s = 50 tok/s.
+  expect(store.getState().cacheHit).toBe(80);
+  expect(store.getState().turnStats).toEqual({
+    tps: 50,
+    outputTokens: 200,
+    seconds: 4,
+  });
+  expect(store.getState().isRunning).toBe(false);
 });

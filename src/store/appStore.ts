@@ -28,10 +28,10 @@ import {
   appendTextPart,
   bridgeSupportsPageMarker,
   EARLIER_PAGE_LIMIT,
-  ensureMessage,
   findToolCallPart,
   isEarlierPageMeta,
   isLocalMessageId,
+  newMessage,
   readReplayMeta,
   readSessionCache,
   removeSessionCache,
@@ -63,6 +63,7 @@ import {
   type SavedServer,
   type SessionUpdate,
   type SlashCommand,
+  type TurnStats,
   type ConversationRunSummary,
   type WorkflowHubGroup,
   type WorkflowRunRow,
@@ -275,12 +276,19 @@ export interface AppState extends ConfigSlice {
   // Last turn's prompt-cache hit rate (percent), from the session/prompt
   // response usage. Null until a turn reports cache numbers.
   cacheHit: number | null;
+  // Last turn's speed readout (desktop status bar): output tokens, wall
+  // seconds, and their ratio. Null until a turn reports output tokens.
+  turnStats: TurnStats | null;
   // Slash commands from available_commands_update (overwrite semantics),
   // driving the "/" completion menu in the composer.
   availableCommands: SlashCommand[];
   // Account-level quota (account/usage_stats): the combined GLM + Opencode
   // Go structure mirroring the zcode-quota CLI card, pulled after connect.
   usageStats: AccountUsageStats | null;
+  // The hub's preformatted one-line quota dock (ADR-0021) — the exact string
+  // the Martty TUI renders in its bottom dock. Null = no data; a failed
+  // refresh keeps the last line (sticky, same contract as the TUI's).
+  quotaDock: string | null;
   // Epoch ms of the last successful quota fetch — shown so the user can tell
   // whether a refresh actually landed.
   usageStatsAt: number | null;
@@ -429,6 +437,9 @@ export interface AppState extends ConfigSlice {
   loadEarlier: () => Promise<boolean>;
   setConfigOption: (configId: string, value: string) => Promise<void>;
   refreshUsageStats: () => Promise<void>;
+  // Refresh the title-bar quota dock line (hub /api/quota/dock). Sticky on
+  // failure: a fetch error keeps the last line instead of blanking it.
+  refreshQuotaDock: () => Promise<void>;
   // Session Files (ADR-0005): read-only browse/view over hub REST, scoped to
   // the active instance + session. Null = not connected / request failed.
   fsList: (path: string) => Promise<FsListing | null>;
@@ -440,8 +451,10 @@ export interface AppState extends ConfigSlice {
   fsFileUrl: (path: string) => string | null;
   sendPrompt: (text: string, images?: AttachmentDraft[]) => Promise<void>;
   runPrompt: (draft: PromptDraft) => Promise<void>;
-  // Interrupts the running turn so the queued follow-up goes out immediately.
-  forceSendPending: () => void;
+  // Interrupts the running turn so a queued follow-up goes out immediately.
+  // With an index, the targeted draft moves to the front first — that
+  // bubble's button sends THAT message, not the queue head.
+  forceSendPending: (index?: number) => void;
   discardPending: (index: number) => void;
   // Returns a queued draft to the composer for editing: it leaves the queue
   // and re-enters the input as a prefill (text + staged images).
@@ -634,9 +647,10 @@ function connectionResetPatch(): Partial<AppState> {
     configOptions: [],
     currentModeId: null,
     usage: null,
-    cacheHit: null,
+    cacheHit: null, turnStats: null,
     availableCommands: [],
     usageStats: null,
+    quotaDock: null,
     usageStatsAt: null,
     sessionStates: {},
     quotaUnavailable: false,
@@ -710,6 +724,27 @@ export const useAppStore = create<AppState>((set, get) => {
   // their queue in runPrompt's finally, so the notification path must not
   // double-flush (it only handles restored/foreign turns).
   let localPromptActive = false;
+
+  // Fold a turn's usage block (prompt response, or the turn-end broadcast a
+  // NEW bridge attaches for attach-only clients) into the title-bar readouts.
+  // Turns without cache numbers keep the previous rate; tps needs output
+  // tokens plus a wall time (absent on foreign turns from an old bridge).
+  function applyTurnUsage(sessionId: string, usage: unknown, seconds?: number): void {
+    const hit = cacheHitRate(usage);
+    const v = usage as { outputTokens?: unknown } | null;
+    const outTok = typeof v?.outputTokens === "number" ? v.outputTokens : 0;
+    const patch: Partial<AppState> = {};
+    if (hit !== null) patch.cacheHit = hit;
+    if (outTok > 0 && seconds != null && seconds > 0) {
+      patch.turnStats = {
+        tps: Math.round(outTok / seconds),
+        outputTokens: outTok,
+        seconds: Math.round(seconds * 10) / 10,
+      };
+    }
+    if (Object.keys(patch).length === 0) return;
+    set((s) => (s.activeSessionId === sessionId ? patch : {}));
+  }
 
   // Single flush point for the pending queue: after a local turn settles,
   // after a restored (bridged) turn ends, and when an attach lands. The
@@ -907,6 +942,8 @@ export const useAppStore = create<AppState>((set, get) => {
       configOptions: s.configOptions,
       currentModeId: s.currentModeId,
       usage: s.usage,
+      cacheHit: s.cacheHit,
+      turnStats: s.turnStats,
     });
   }
 
@@ -1227,7 +1264,7 @@ export const useAppStore = create<AppState>((set, get) => {
         configOptions: [],
         currentModeId: null,
         usage: null,
-        cacheHit: null,
+        cacheHit: null, turnStats: null,
         availableCommands: [],
         // usageStats stays (hub-level quota, not instance-scoped) — nothing
         // re-fetches it here, so clearing would blank the card until the
@@ -1339,7 +1376,7 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         applyUpdate(sessionId, update, meta);
       },
-      onTurnState: (sessionId, running) => {
+      onTurnState: (sessionId, running, turn) => {
         if (stale()) return;
         setActivity(
           sessionId,
@@ -1359,6 +1396,17 @@ export const useAppStore = create<AppState>((set, get) => {
         if (running) {
           set({ isRunning: true });
           return;
+        }
+        // Turn-end broadcast carries the turn's usage (new bridges): an
+        // attach-only client learns cache/tps for turns driven from another
+        // client (TUI, editor, phone) — the response path only reaches the
+        // prompt's sender.
+        if (turn?.usage != null) {
+          applyTurnUsage(
+            sessionId,
+            turn.usage,
+            turn.turnMs != null ? Math.max(turn.turnMs / 1000, 0.1) : undefined,
+          );
         }
         // End-of-turn arrives BEFORE the prompt response for locally sent
         // turns (the bridge notifies in its finally, responds on return) —
@@ -1524,9 +1572,10 @@ export const useAppStore = create<AppState>((set, get) => {
     configOptions: [],
     currentModeId: null,
     usage: null,
-    cacheHit: null,
+    cacheHit: null, turnStats: null,
     availableCommands: [],
     usageStats: null,
+    quotaDock: null,
     usageStatsAt: null,
     sessionStates: {},
     quotaUnavailable: false,
@@ -1782,7 +1831,7 @@ export const useAppStore = create<AppState>((set, get) => {
         configOptions: [],
         currentModeId: null,
         usage: null,
-        cacheHit: null,
+        cacheHit: null, turnStats: null,
         availableCommands: [],
         fsCapable: false,
         pageMarkerCapable: false,
@@ -2006,7 +2055,7 @@ export const useAppStore = create<AppState>((set, get) => {
         configOptions: [],
         currentModeId: null,
         usage: null,
-        cacheHit: null,
+        cacheHit: null, turnStats: null,
         availableCommands: [],
         // usageStats stays (hub-level quota, not instance-scoped).
         sessionStates: {},
@@ -2119,7 +2168,7 @@ export const useAppStore = create<AppState>((set, get) => {
           configOptions: [],
           currentModeId: null,
           usage: null,
-          cacheHit: null,
+          cacheHit: null, turnStats: null,
           availableCommands: [],
           loadingSession: false,
           isRunning: false,
@@ -2149,6 +2198,10 @@ export const useAppStore = create<AppState>((set, get) => {
         delete elicitations[sessionId];
         return {
           activeSessionId: sessionId,
+          // A cached snapshot paints instantly and carries the last turn's
+          // readouts (cacheHit/turnStats) with it — without them a switch or
+          // wake-reconnect blanks the title-bar segments until the next
+          // locally-run turn.
           ...(cached ?? {
             messages: [],
             planEntries: null,
@@ -2158,10 +2211,11 @@ export const useAppStore = create<AppState>((set, get) => {
             configOptions: [],
             currentModeId: null,
             usage: null,
+            cacheHit: null,
+            turnStats: null,
           }),
           permissions,
           elicitations,
-          cacheHit: null,
           availableCommands: [],
           loadingEarlier: false,
           loadingSession: true,
@@ -2425,6 +2479,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const client = hub();
       const profile = get().profile;
       if (!client || !profile) return;
+      void get().refreshQuotaDock();
       try {
         const result = await client.quota();
         if (get().profile !== profile) return; // hub changed mid-flight
@@ -2435,6 +2490,21 @@ export const useAppStore = create<AppState>((set, get) => {
         });
       } catch {
         if (get().profile === profile) set({ usageStats: null, quotaUnavailable: true });
+      }
+    },
+
+    // Title-bar quota dock line (ADR-0021). Sticky last-known on failure —
+    // a transient hub hiccup must not blank the resident line (the TUI's
+    // refresher keeps it the same way); only a successful `null` clears it.
+    refreshQuotaDock: async () => {
+      const client = hub();
+      const profile = get().profile;
+      if (!client || !profile) return;
+      try {
+        const formatted = await client.quotaDock();
+        if (get().profile === profile) set({ quotaDock: formatted });
+      } catch {
+        // keep the last line
       }
     },
 
@@ -2522,31 +2592,31 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!acp || s.connState !== "open" || !s.activeSessionId || s.loadingSession) return;
       // Live turns never echo the user's message back (only replay does), so
       // insert it optimistically; replay replaces the whole history anyway.
+      // Always a NEW message: two prompts sent back-to-back are two turns
+      // even when the first produced no assistant output before the queue
+      // flushed (response racing the trailing chunks, or a failed turn) —
+      // appending to the previous user bubble merged them into one and
+      // garbled the transcript.
       set((state) => {
-        const ensured = ensureMessage(state.messages, "user");
-        return {
-          messages: ensured.messages.map((m) => {
-            if (m.id !== ensured.message.id) return m;
-            let msg = m;
-            if (draft.text) msg = appendTextPart(msg, draft.text, "text");
-            for (const img of draft.images) {
-              // Display form is the data URL; the wire block stays base64.
-              msg = {
-                ...msg,
-                parts: [
-                  ...msg.parts,
-                  {
-                    type: "image",
-                    image: `data:${img.mimeType};base64,${img.data}`,
-                  } as ChatPart,
-                ],
-              };
-            }
-            return msg;
-          }),
-        };
+        let msg = newMessage("user");
+        if (draft.text) msg = appendTextPart(msg, draft.text, "text");
+        for (const img of draft.images) {
+          // Display form is the data URL; the wire block stays base64.
+          msg = {
+            ...msg,
+            parts: [
+              ...msg.parts,
+              {
+                type: "image",
+                image: `data:${img.mimeType};base64,${img.data}`,
+              } as ChatPart,
+            ],
+          };
+        }
+        return { messages: [...state.messages, msg] };
       });
       const sessionId = s.activeSessionId;
+      const startedAt = Date.now();
       set({ isRunning: true });
       localPromptActive = true;
       try {
@@ -2561,10 +2631,15 @@ export const useAppStore = create<AppState>((set, get) => {
             })),
           ],
         })) as { usage?: unknown } | null;
-        // Per-turn usage rides the prompt response (UNSTABLE ACP field).
-        // Turns that report no cache numbers keep the previous rate.
-        const hit = cacheHitRate(result?.usage);
-        if (hit !== null) set((s) => (s.activeSessionId === sessionId ? { cacheHit: hit } : {}));
+        // Per-turn usage rides the prompt response (UNSTABLE ACP field) AND,
+        // on new bridges, the turn-end broadcast — both fold through the
+        // same helper. Turns that report no cache numbers keep the previous
+        // rate. Wall time includes tool calls (there is no LLM-only clock).
+        applyTurnUsage(
+          sessionId,
+          result?.usage,
+          Math.max((Date.now() - startedAt) / 1000, 0.1),
+        );
       } catch (e) {
         // A dropped connection kills the in-flight prompt, but the reconnect
         // replay rebuilds the truth — stay quiet and let the banner speak.
@@ -2573,13 +2648,16 @@ export const useAppStore = create<AppState>((set, get) => {
         localPromptActive = false;
         set({ isRunning: false });
         cacheActiveSnapshot();
+        // Quota moved with the turn — refresh the dock line (TUI does the
+        // same at every turn end; hub caches 15s so retries stay cheap).
+        void get().refreshQuotaDock();
         // Auto-flush: the queue is FIFO, and each settled turn sends the next.
         // A concurrent re-attach defers to loadSession's own flush instead.
         flushPending();
       }
     },
 
-    forceSendPending: () => {
+    forceSendPending: (index) => {
       const s = get();
       const sid = s.activeSessionId;
       if (!sid) return;
@@ -2590,12 +2668,21 @@ export const useAppStore = create<AppState>((set, get) => {
       // Disconnected: runPrompt would silently swallow the draft — the
       // post-reconnect flush owns the queue until the socket is back.
       if (s.connState !== "open") return;
+      // Any bubble's button sends THAT draft, not the head: move it to the
+      // front (order of the rest is untouched) and let the settle-flush pick
+      // it up — cancelling settles the running turn, whose finally-flush then
+      // sends the reordered head.
+      const i = Math.min(Math.max(index ?? 0, 0), queue.length - 1);
+      const reordered = [
+        queue[i],
+        ...queue.filter((_, j) => j !== i),
+      ];
       if (s.isRunning) {
-        // Cancelling settles the running prompt, which auto-flushes the queue.
+        setQueue(sid, reordered);
         get().cancelTurn();
       } else {
-        setQueue(sid, queue.slice(1));
-        void get().runPrompt(queue[0]);
+        setQueue(sid, reordered.slice(1));
+        void get().runPrompt(reordered[0]);
       }
     },
 
