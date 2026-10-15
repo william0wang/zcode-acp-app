@@ -8,13 +8,18 @@ import {
   EyeOff,
   FileText,
   Folder,
+  FolderOpen,
   Link2,
   RefreshCw,
   X,
 } from "lucide-react";
 import type { FsEntry, FsListing } from "../lib/types";
 import { useBackHandler } from "../lib/backNav";
-import { inTauriShell, isLoopbackHub } from "../lib/localOpen";
+import {
+  inTauriShell,
+  isLoopbackHub,
+  openLocalPath,
+} from "../lib/localOpen";
 import { useAppStore } from "../store/appStore";
 import { FileViewer, fmtSize } from "./FileViewer";
 import { Spinner } from "./Spinner";
@@ -63,6 +68,7 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
   // "every subdirectory fails" state that revived underneath it.
   const instanceId = useAppStore((s) => s.instanceId);
   const profile = useAppStore((s) => s.profile);
+  const notify = useAppStore((s) => s.notify);
   const [path, setPath] = useState("");
   const [listing, setListing] = useState<FsListing | null>(null);
   const [loading, setLoading] = useState(true);
@@ -74,6 +80,26 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
     path: string;
   } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // Desktop app next to a loopback hub: the browsed directories exist on
+  // this machine, so one header button opens the CURRENT directory in
+  // Finder (entries are <button>s — a per-row control would nest buttons,
+  // which HTML forbids — so navigating in is the row's only action).
+  const canLocal =
+    !!listing && !!profile && isLoopbackHub(profile.hubUrl) && inTauriShell();
+  const openCurrentDir = async () => {
+    if (!listing) return;
+    const abs = `${listing.root.replace(/\/+$/, "")}/${path}`;
+    try {
+      await openLocalPath(abs, false);
+    } catch (e) {
+      notify(
+        t("viewer.openLocalFailed", {
+          reason: e instanceof Error ? e.message : String(e),
+        }),
+      );
+    }
+  };
 
   // Distinguishes "the refresh button fired for THIS directory" (bypass the
   // cache) from "navigated to a directory" (use it). Null path = first mount.
@@ -196,6 +222,15 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
             <EyeOff className="size-4.5" />
           )}
         </button>
+        {canLocal && (
+          <button
+            onClick={() => void openCurrentDir()}
+            aria-label={t("files.openLocalDir")}
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          >
+            <FolderOpen className="size-4.5" />
+          </button>
+        )}
         <button
           onClick={() => setAttempt((n) => n + 1)}
           aria-label={t("files.retry")}
