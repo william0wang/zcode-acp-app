@@ -45,6 +45,7 @@
     "taskNotice": "Task notification",
     "pending": "Pending",
     "sendNow": "Send now",
+    "editPending": "Edit",
     "discard": "Discard",
     "send": "Send",
     "attach": "Add images",
@@ -536,6 +537,9 @@
     "downloadDone": "{{name}} saved to Downloads",
     "downloadFailed": "Download failed: {{name}}",
     "downloadFailedReason": "Download failed: {{name}} ({{reason}})",
+    "openLocal": "Open on this machine",
+    "revealLocal": "Reveal in Finder",
+    "openLocalFailed": "Couldn't open locally: {{reason}}",
     "preview": "Preview",
     "source": "Source"
   }

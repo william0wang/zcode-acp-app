@@ -40,6 +40,7 @@ import {
   ImagePlus,
   Layers,
   ListChecks,
+  Pencil,
   Search,
   Square,
   Terminal,
@@ -508,6 +509,14 @@ const AssistantMessage = memo(function AssistantMessage() {
 // Whitespace class for composer word scanning (slash-completion tokens).
 const WS = /\s/;
 
+// Touch devices have a software keyboard with no Shift key, so Enter is the
+// only way to add a line: there it inserts a newline and the Send button is
+// the sole submit path; pointer-fine devices keep Enter-to-send.
+const COARSE_POINTER =
+  typeof window !== "undefined" &&
+  typeof window.matchMedia === "function" &&
+  window.matchMedia("(pointer: coarse)").matches;
+
 // Composer input row + the "/" completion menu. The command list comes from
 // the bridge's available_commands_update; the query is the word under the
 // caret, and every command matches at any caret position (a mid-draft
@@ -529,6 +538,11 @@ function Composer() {
   const [caret, setCaret] = useState(0);
   const listRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  // Self-tracked IME composition state. WKWebView (and Safari) dispatch the
+  // Enter that CONFIRMS a composition with isComposing=false — the keydown
+  // lands before compositionend — so event.isComposing alone lets the
+  // confirm key leak through as a send.
+  const composingRef = useRef(false);
   // Staged attachments (ADR 0007): compressed base64 + mime, rendered from
   // data URLs. Reset on send; ride the prompt (or the queue while running).
   const [images, setImages] = useState<AttachmentDraft[]>([]);
@@ -543,6 +557,7 @@ function Composer() {
   useEffect(() => {
     if (!composerPrefill) return;
     setText(composerPrefill.text);
+    if (composerPrefill.images?.length) setImages(composerPrefill.images);
     clearComposerPrefill();
   }, [composerPrefill, setText, clearComposerPrefill]);
 
@@ -608,22 +623,40 @@ function Composer() {
   );
 
   const onKeyDownCapture = (e: React.KeyboardEvent) => {
-    if (e.nativeEvent.isComposing) return;
+    if (e.nativeEvent.isComposing || composingRef.current) return;
     if (!open) {
-      // Enter-to-send is intercepted in the capture phase (beats the
-      // library's composer submit) so staged attachments ride along — the
-      // library's submit path only sees text and would drop them.
-      if (
-        e.key === "Enter" &&
-        !e.shiftKey &&
-        (value.trim() || images.length > 0)
-      ) {
-        e.preventDefault();
-        e.stopPropagation();
-        const text = value.trim();
-        setText("");
-        setImages([]);
-        void sendPrompt(text, images.length > 0 ? images : undefined);
+      if (e.key === "Enter" && !e.shiftKey) {
+        if (COARSE_POINTER) {
+          // Newline, not send (see COARSE_POINTER): splice "\n" in at the
+          // caret, replacing any selection; the rAF caret park runs after
+          // React commits the new value but before paint.
+          e.preventDefault();
+          e.stopPropagation();
+          const el = inputRef.current;
+          const start = el?.selectionStart ?? value.length;
+          const end = el?.selectionEnd ?? start;
+          setText(value.slice(0, start) + "\n" + value.slice(end));
+          requestAnimationFrame(() => {
+            const node = inputRef.current;
+            if (node) {
+              node.focus();
+              node.setSelectionRange(start + 1, start + 1);
+              setCaret(start + 1);
+            }
+          });
+          return;
+        }
+        // Enter-to-send is intercepted in the capture phase (beats the
+        // library's composer submit) so staged attachments ride along — the
+        // library's submit path only sees text and would drop them.
+        if (value.trim() || images.length > 0) {
+          e.preventDefault();
+          e.stopPropagation();
+          const text = value.trim();
+          setText("");
+          setImages([]);
+          void sendPrompt(text, images.length > 0 ? images : undefined);
+        }
       }
       return;
     }
@@ -768,6 +801,8 @@ function Composer() {
           rows={1}
           placeholder={t("chat.inputPlaceholder")}
           onPaste={onPaste}
+          onCompositionStart={() => (composingRef.current = true)}
+          onCompositionEnd={() => (composingRef.current = false)}
           // select covers caret moves (click, arrow keys); input covers
           // typing — Android WebView does not fire select per keystroke, and
           // a caret stuck at 0 strands the "/" menu at the draft's start
@@ -819,7 +854,9 @@ function PendingPrompts() {
   const pendingMap = useAppStore((s) => s.pendingPrompts);
   const forceSendPending = useAppStore((s) => s.forceSendPending);
   const discardPending = useAppStore((s) => s.discardPending);
+  const editPending = useAppStore((s) => s.editPending);
   const loadingSession = useAppStore((s) => s.loadingSession);
+  const connState = useAppStore((s) => s.connState);
   const lastRef = useRef<HTMLDivElement | null>(null);
   // Per-session queue (persisted across switches/restarts) — show only the
   // active session's drafts.
@@ -855,9 +892,10 @@ function PendingPrompts() {
             )}
             <span className="mt-1 flex items-center justify-end gap-3 text-[11px]">
               <span className="text-faint">{t("chat.pending")}</span>
-              {/* No force-send while replaying: there is no turn to interrupt
-                  and the queue fires on its own once the attach lands. */}
-              {!loadingSession && (
+              {/* No force-send while replaying (no turn to interrupt — the
+                  queue fires on its own once the attach lands) or while
+                  disconnected (the post-reconnect flush owns the queue). */}
+              {!loadingSession && connState === "open" && (
                 <button
                   onClick={forceSendPending}
                   className="flex items-center gap-1 font-medium text-dim active:text-ink"
@@ -866,6 +904,13 @@ function PendingPrompts() {
                   {t("chat.sendNow")}
                 </button>
               )}
+              <button
+                onClick={() => editPending(i)}
+                aria-label={t("chat.editPending")}
+                className="flex size-4 items-center justify-center text-faint"
+              >
+                <Pencil className="size-3" />
+              </button>
               <button
                 onClick={() => discardPending(i)}
                 aria-label={t("chat.discard")}

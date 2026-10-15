@@ -340,10 +340,11 @@ export interface AppState extends ConfigSlice {
     instanceId: string;
   }) => void;
   clearWorkflowRunTarget: () => void;
-  // Text the next mounted composer adopts as its draft (the workflow
-  // "create via conversation" entry). Nonce-keyed so the same text twice
-  // still reads as a new request; consumed exactly once.
-  composerPrefill: { text: string; nonce: number } | null;
+  // Text (plus staged images) the next mounted composer adopts as its draft
+  // (the workflow "create via conversation" entry, and queued drafts returned
+  // for editing via editPending). Nonce-keyed so the same text twice still
+  // reads as a new request; consumed exactly once.
+  composerPrefill: { text: string; images?: AttachmentDraft[]; nonce: number } | null;
   setComposerPrefill: (text: string) => void;
   clearComposerPrefill: () => void;
 
@@ -442,6 +443,9 @@ export interface AppState extends ConfigSlice {
   // Interrupts the running turn so the queued follow-up goes out immediately.
   forceSendPending: () => void;
   discardPending: (index: number) => void;
+  // Returns a queued draft to the composer for editing: it leaves the queue
+  // and re-enters the input as a prefill (text + staged images).
+  editPending: (index: number) => void;
   cancelTurn: () => void;
   answerPermission: (requestId: number, optionId: string) => void;
   // Resolves a pending elicitation form: content answers it (accept), null
@@ -2494,18 +2498,19 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     // Attach-only client: sessions are created in the editor, never here.
-    // ACP allows one prompt at a time: while a turn is running or history is
-    // still replaying, new text queues as pending instead — a prompt sent
-    // mid-replay never reaches the session, so it must wait for the attach.
+    // ACP allows one prompt at a time: while a turn is running, history is
+    // still replaying, or the connection is down (phone slept mid-session),
+    // new text queues as pending instead — the post-reconnect attach's
+    // loadSession flushes it. The composer is cleared before this runs, so
+    // dropping instead of queueing would lose the draft for good.
     sendPrompt: async (text, images) => {
       const s = get();
-      if (!acp || s.connState !== "open") return;
       if (!s.activeSessionId) {
         set({ notice: "notice.noSession" });
         return;
       }
       const draft: PromptDraft = { text, images: images ?? [] };
-      if (s.isRunning || s.loadingSession) {
+      if (!acp || s.connState !== "open" || s.isRunning || s.loadingSession) {
         setQueue(s.activeSessionId, [...(s.pendingPrompts[s.activeSessionId] ?? []), draft]);
         return;
       }
@@ -2582,6 +2587,9 @@ export const useAppStore = create<AppState>((set, get) => {
       if (queue.length === 0) return;
       // During replay there is no turn to interrupt; the queue fires on load.
       if (s.loadingSession) return;
+      // Disconnected: runPrompt would silently swallow the draft — the
+      // post-reconnect flush owns the queue until the socket is back.
+      if (s.connState !== "open") return;
       if (s.isRunning) {
         // Cancelling settles the running prompt, which auto-flushes the queue.
         get().cancelTurn();
@@ -2601,6 +2609,23 @@ export const useAppStore = create<AppState>((set, get) => {
         sid,
         queue.filter((_, i) => i !== index),
       );
+    },
+
+    editPending: (index) => {
+      const s = get();
+      const sid = s.activeSessionId;
+      if (!sid) return;
+      const queue = s.pendingPrompts[sid] ?? [];
+      if (index < 0 || index >= queue.length) return;
+      const draft = queue[index];
+      setQueue(
+        sid,
+        queue.filter((_, i) => i !== index),
+      );
+      prefillSeq += 1;
+      set({
+        composerPrefill: { text: draft.text, images: draft.images, nonce: prefillSeq },
+      });
     },
 
     cancelTurn: () => {

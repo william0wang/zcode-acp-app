@@ -45,6 +45,7 @@
     "taskNotice": "后台任务通知",
     "pending": "待发送",
     "sendNow": "立即发送",
+    "editPending": "编辑",
     "discard": "移除",
     "send": "发送",
     "attach": "添加图片",
@@ -534,6 +535,9 @@
     "downloadDone": "{{name}} 已保存到下载目录",
     "downloadFailed": "下载失败：{{name}}",
     "downloadFailedReason": "下载失败：{{name}}（{{reason}}）",
+    "openLocal": "在本机打开",
+    "revealLocal": "在 Finder 中显示",
+    "openLocalFailed": "本地打开失败：{{reason}}",
     "preview": "预览",
     "source": "源码"
   }
