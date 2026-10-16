@@ -15,6 +15,7 @@
 #![recursion_limit = "256"]
 
 mod approval_card;
+mod file_browser;
 mod http_transport;
 mod i18n;
 mod models_page;

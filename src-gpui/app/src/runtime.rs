@@ -58,8 +58,8 @@ use protocol::settings::{
     SettingsPlatformUsage, SettingsUsage, SpendResetCard, WriteEffect,
 };
 use protocol::hub::{
-    FsBrowseResult, HubCreateInstanceResult, HubHistoryCursor, HubHistoryPage, HubHistorySession,
-    HubInstance, HubProject,
+    FsBrowseResult, FsEntryKind, FsListing, HubCreateInstanceResult, HubHistoryCursor,
+    HubHistoryPage, HubHistorySession, HubInstance, HubProject,
 };
 use protocol::hub_client::{HubApiError, HubClient};
 use protocol::session::{LoadEarlierRequest, PromptRequest, SessionCore, WireRequest};
@@ -71,6 +71,7 @@ use protocol::ws::{TungsteniteWsFactory, WsFactory};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
+use crate::file_browser::{file_kind_of, FileKind, VIEWER_LINE_BUDGET};
 use crate::http_transport::{LocalHttpTransport, SettingsApiTransport};
 
 /// The 120ms update-coalescing batch the TS store runs (appStore.ts
@@ -284,6 +285,17 @@ pub enum UiCommand {
         nonce: String,
         reset_type: ResetCardType,
     },
+    // ---- Session Files (batch F) ----
+    /// List one directory of the ACTIVE session's root (CONTEXT.md "Session
+    /// Files"): `""` is the root itself. Every dock of the files panel sends
+    /// one (the TS FileBrowser's mount effect); breadcrumb jumps, entering a
+    /// subdirectory, and refresh land here too.
+    FilesNavigate { path: String },
+    /// Open the simplified text viewer for one file (F3). The driver resolves
+    /// name/size/kind from the current listing — the row the view clicked.
+    FilesView { path: String },
+    /// Close the viewer, back to the file list.
+    FilesCloseView,
 }
 
 /// What the driver surfaces to the window. One shape: a full snapshot —
@@ -468,6 +480,9 @@ pub struct TabView {
     /// The session's current plan/todo entries (`plan` session/update) —
     /// the collapsible strip above the chat (ChatScreen PlanPanel).
     pub plan_entries: Option<Vec<protocol::replay::PlanEntry>>,
+    /// The bridge advertised the zcode fs capability (Session Files gating,
+    /// TS `fsCapable`): per-session `/fs/list` exists on this bridge.
+    pub fs_capable: bool,
 }
 
 /// One project row of the history chooser (`GET /api/projects`).
@@ -631,6 +646,38 @@ pub struct QuotaPageView {
     pub now_ms: u64,
 }
 
+/// The Session Files browser's view (batch F, TS FileBrowser): one loaded
+/// directory of the ACTIVE session, plus the open viewer. The listing
+/// survives a panel close; a session switch resets it driver-side.
+#[derive(Debug, Clone, Default)]
+pub struct FilesPanelView {
+    /// The relative directory the listing belongs to; `""` = session root.
+    pub path: String,
+    /// `None` while loading (the TS dialog drops the previous directory so
+    /// stale rows cannot join against the new path on tap).
+    pub listing: Option<FsListing>,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// The open simplified viewer (F3); `None` = closed.
+    pub viewing: Option<FileViewerView>,
+}
+
+/// The simplified file viewer's view (F3): read-only, whole-file load.
+#[derive(Debug, Clone)]
+pub struct FileViewerView {
+    pub path: String,
+    pub name: String,
+    pub size: u64,
+    pub kind: FileKind,
+    /// The X-Zcode-First-Line the server reported for the loaded window.
+    pub first_line: Option<u64>,
+    /// The loaded text (None while loading; always None for the deferred
+    /// image/binary kinds).
+    pub text: Option<String>,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
 /// The whole workbench state the view renders.
 #[derive(Debug, Clone)]
 pub struct WorkbenchSnapshot {
@@ -676,6 +723,9 @@ pub struct WorkbenchSnapshot {
     pub active_server_id: Option<String>,
     /// The new-session chooser (TS ProjectCreateDialog); `None` = closed.
     pub new_session: Option<NewSessionView>,
+    /// The Session Files browser (batch F). Always present — the dock
+    /// panel's visibility is view-local, like every dock panel.
+    pub files: FilesPanelView,
 }
 
 impl WorkbenchSnapshot {
@@ -701,6 +751,7 @@ impl WorkbenchSnapshot {
             servers: Vec::new(),
             active_server_id: None,
             new_session: None,
+            files: FilesPanelView::default(),
         }
     }
 }
@@ -842,6 +893,17 @@ enum LoopEvent {
     QuotaHistoryRead {
         provider_id: String,
         result: Result<(), SettingsApiError>,
+    },
+    // ---- Session Files (batch F, hub REST like the browse mode) ----
+    /// `/fs/list` settled for the files panel's current directory.
+    FilesList {
+        seq: u64,
+        result: Result<FsListing, HubApiError>,
+    },
+    /// `/fs/file` settled for the open viewer's single line window.
+    FilesText {
+        seq: u64,
+        result: Result<(u64, String), HubApiError>,
     },
 }
 
@@ -987,6 +1049,9 @@ struct Tab {
     /// Consecutive failed reconnect attempts; drives the exponential backoff
     /// (mirrors appStore.ts `reconnectAttempt`) and resets on a live connect.
     reconnect_attempts: u32,
+    /// The bridge advertised the zcode fs capability on the last
+    /// `initialize` (Session Files gating, TS `fsCapable`).
+    fs_capable: bool,
 }
 
 /// The sidebar's history browser state (driver-owned — all wire I/O lives
@@ -1224,6 +1289,68 @@ impl QuotaPanel {
     }
 }
 
+/// The Session Files browser state (TS FileBrowser): driver-owned because
+/// all wire I/O lives here. A listing belongs to the (instance, session)
+/// that served it — a session switch resets the whole panel (the TS dialog
+/// is per-mount), and `seq` invalidates reads still in flight for the
+/// previous owner. No cross-directory cache: dockings re-read (the TS mount
+/// effect) and up-navigation re-fetches.
+#[derive(Default)]
+struct FilesPanel {
+    /// The (instance_id, session_id) the current state belongs to.
+    owner: Option<(String, String)>,
+    /// The relative directory being listed; `""` = session root.
+    path: String,
+    listing: Option<FsListing>,
+    loading: bool,
+    error: Option<String>,
+    viewing: Option<FileViewing>,
+    seq: u64,
+}
+
+impl FilesPanel {
+    fn reset(&mut self) {
+        // Everything but nothing — bump seq so in-flight reads from the
+        // previous owner/session are dropped on arrival.
+        *self = Self {
+            seq: self.seq + 1,
+            ..Default::default()
+        };
+    }
+
+    fn view(&self) -> FilesPanelView {
+        FilesPanelView {
+            path: self.path.clone(),
+            listing: self.listing.clone(),
+            loading: self.loading,
+            error: self.error.clone(),
+            viewing: self.viewing.as_ref().map(|v| FileViewerView {
+                path: v.path.clone(),
+                name: v.name.clone(),
+                size: v.size,
+                kind: v.kind,
+                first_line: v.first_line,
+                text: v.text.clone(),
+                loading: v.loading,
+                error: v.error.clone(),
+            }),
+        }
+    }
+}
+
+/// The open viewer's driver half (F3).
+#[derive(Debug, Clone)]
+struct FileViewing {
+    path: String,
+    name: String,
+    size: u64,
+    kind: FileKind,
+    first_line: Option<u64>,
+    text: Option<String>,
+    loading: bool,
+    error: Option<String>,
+}
+
 struct Driver {
     factory: Arc<dyn WsFactory>,
     clock: Arc<dyn Clock>,
@@ -1261,6 +1388,9 @@ struct Driver {
     /// invalidates in-flight project reads on close, the same contract the
     /// history panel's seq plays for its listings.
     new_session: NewSessionPanel,
+
+    /// The Session Files browser (batch F, see [`FilesPanel`]).
+    files: FilesPanel,
 
     /// The System Status config page (see [`SystemStatusPanel`]).
     system: SystemStatusPanel,
@@ -1323,6 +1453,7 @@ impl Driver {
             ever_had_tab: false,
             history: HistoryPanel::default(),
             new_session: NewSessionPanel::default(),
+            files: FilesPanel::default(),
             system: SystemStatusPanel {
                 supported: true,
                 ..Default::default()
@@ -1385,6 +1516,7 @@ impl Driver {
             agent_version: None,
             retry_at: None,
             reconnect_attempts: 0,
+            fs_capable: false,
         });
         self.active_tab = Some(id);
         traceln!("[driver] tab {id} opened (instance {})", self.tabs.last().unwrap().instance_id);
@@ -1577,6 +1709,191 @@ impl Driver {
                 .map(|created| (workspace_path, created));
             let _ = tx.send(LoopEvent::NewSessionCreated { result });
         });
+    }
+
+    // ---- Session Files (batch F) ----
+
+    /// The (instance, session) pair the per-session fs calls address — the
+    /// ACTIVE TAB's, exactly like the restart affordance.
+    fn active_fs_target(&self) -> Option<(String, String)> {
+        self.active_tab
+            .and_then(|id| self.tab(id))
+            .and_then(|t| Some((t.instance_id.clone(), t.core.active_session_id.clone()?)))
+    }
+
+    /// A listing belongs to the (instance, session) that served it; the
+    /// active tab showing anything else resets the browser — the TS dialog's
+    /// per-mount state (every open starts at the new session's root).
+    /// Runs on every command and loop event, so the compare borrows only.
+    fn files_reconcile(&mut self) {
+        let target = self
+            .active_tab
+            .and_then(|id| self.tab(id))
+            .and_then(|t| t.core.active_session_id.as_deref().map(|sid| (t.instance_id.as_str(), sid)));
+        let dirty = self.files.owner.is_some()
+            || self.files.loading
+            || self.files.error.is_some()
+            || self.files.listing.is_some()
+            || self.files.viewing.is_some();
+        let stale = match (&self.files.owner, target) {
+            (Some((owner_inst, owner_sess)), Some((inst, sess))) => {
+                owner_inst != inst || owner_sess != sess
+            }
+            // Had an owner, no session anymore — the state names a session
+            // the workbench no longer shows.
+            (Some(_), None) => true,
+            // The only owner-less state is the no-session error; a session
+            // existing now makes it stale.
+            (None, Some(_)) => dirty,
+            (None, None) => false,
+        };
+        if stale {
+            traceln!("[driver] files: session changed; resetting browser");
+            self.files.reset();
+        }
+    }
+
+    /// One `/fs/list` read (TS fsList): the ACTIVE session's root-relative
+    /// `path`. The previous listing drops while loading — stale rows would
+    /// join against the NEW path on tap (the TS setListing(null)).
+    fn spawn_files_list(&mut self, path: String) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some((instance_id, session_id)) = self.active_fs_target() else {
+            self.files.owner = None;
+            self.files.path = path;
+            self.files.listing = None;
+            self.files.viewing = None;
+            self.files.loading = false;
+            self.files.error =
+                Some("no active session — open one first".to_string());
+            return;
+        };
+        self.files.owner = Some((instance_id.clone(), session_id.clone()));
+        self.files.path = path.clone();
+        // Navigation supersedes the viewer (the TS overlay unmounts).
+        self.files.viewing = None;
+        self.files.loading = true;
+        self.files.error = None;
+        self.files.listing = None;
+        let seq = self.files.seq;
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.fs_list(&instance_id, &session_id, &path).await;
+            let _ = tx.send(LoopEvent::FilesList { seq, result });
+        });
+    }
+
+    /// The listing settled: success replaces it whole; a failure keeps the
+    /// error card (the previous listing is already gone per the drop above).
+    fn on_files_list(&mut self, seq: u64, result: Result<FsListing, HubApiError>) {
+        if seq != self.files.seq {
+            return; // a reset invalidated this read
+        }
+        self.files.loading = false;
+        match result {
+            Ok(listing) => {
+                self.files.listing = Some(listing);
+                self.files.error = None;
+            }
+            Err(e) => {
+                self.files.error = Some(describe_files_error(&e));
+            }
+        }
+    }
+
+    /// Open the viewer for one file of the CURRENT listing (TS setViewing):
+    /// name/size/kind resolve from the entry the view clicked; the text kind
+    /// loads immediately, the deferred kinds explain themselves without a
+    /// fetch. A path the listing no longer knows is a stale click — ignored.
+    fn spawn_files_view(&mut self, path: String) {
+        let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+        let Some(entry) = self
+            .files
+            .listing
+            .as_ref()
+            .and_then(|l| l.entries.iter().find(|e| e.name == name))
+        else {
+            return;
+        };
+        if entry.kind == FsEntryKind::Dir {
+            return; // directories navigate, never view
+        }
+        let kind = file_kind_of(&entry.name);
+        self.files.viewing = Some(FileViewing {
+            path,
+            name,
+            size: entry.size,
+            kind,
+            first_line: None,
+            text: None,
+            loading: kind == FileKind::Text,
+            error: None,
+        });
+        if kind == FileKind::Text {
+            self.spawn_files_text();
+        }
+    }
+
+    /// The viewer's single whole-file load (F3): ONE line window from line 1
+    /// at the TS viewer's MAX_LINES budget — line-window paging is a later
+    /// optimization, so there is deliberately no stitching here.
+    fn spawn_files_text(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some((instance_id, session_id)) = self.files.owner.clone() else {
+            if let Some(v) = self.files.viewing.as_mut() {
+                v.error = Some("no active session — open one first".to_string());
+            }
+            return;
+        };
+        let Some(path) = self.files.viewing.as_ref().map(|v| v.path.clone()) else {
+            return;
+        };
+        if let Some(v) = self.files.viewing.as_mut() {
+            v.loading = true;
+            v.error = None;
+        }
+        let seq = self.files.seq;
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub
+                .fs_file_text(&instance_id, &session_id, &path, 1, VIEWER_LINE_BUDGET)
+                .await;
+            let _ = tx.send(LoopEvent::FilesText { seq, result });
+        });
+    }
+
+    /// The viewer's window settled: the pair is (first_line, text) with the
+    /// server's trailing newline already stripped (protocol::hub_client).
+    fn on_files_text(&mut self, seq: u64, result: Result<(u64, String), HubApiError>) {
+        if seq != self.files.seq {
+            return;
+        }
+        let Some(v) = self.files.viewing.as_mut() else {
+            return;
+        };
+        v.loading = false;
+        match result {
+            Ok((first_line, text)) => {
+                v.first_line = Some(first_line);
+                v.text = Some(text);
+                v.error = None;
+            }
+            Err(e) => {
+                v.error = Some(format!("file: {e}"));
+            }
+        }
     }
 
     // ---- system status (config page "system") ----
@@ -2374,6 +2691,9 @@ impl Driver {
     // ---- event handling ----
 
     fn handle_loop_event(&mut self, ev: LoopEvent, now: u64) {
+        // Session switches also arrive as events (session/new, load results)
+        // — keep the files browser honest about its owner here too.
+        self.files_reconcile();
         match ev {
             LoopEvent::ConnHandle { tab, conn } => {
                 if self.tab(tab).is_some() && !self.closing.contains(&tab) {
@@ -2757,6 +3077,9 @@ impl Driver {
             LoopEvent::QuotaHistoryRead { provider_id, result } => {
                 self.on_quota_history_read(provider_id, result);
             }
+            // ---- Session Files (batch F) ----
+            LoopEvent::FilesList { seq, result } => self.on_files_list(seq, result),
+            LoopEvent::FilesText { seq, result } => self.on_files_text(seq, result),
         }
     }
 
@@ -2774,6 +3097,7 @@ impl Driver {
                     );
                     t.core.on_initialize(init.agent_version());
                     t.agent_version = init.agent_version().map(str::to_string);
+                    t.fs_capable = init.fs_capability();
                     t.core.conn_open = true;
                     t.reconnect_attempts = 0;
                     // A fresh wire knows nothing until events arrive; the
@@ -2818,6 +3142,9 @@ impl Driver {
     // ---- commands ----
 
     fn handle_cmd(&mut self, cmd: UiCommand, now: u64) -> Flow {
+        // Session Files state must never outlive the session it belongs to
+        // (tabs switch here; load/new events reconcile in the loop handler).
+        self.files_reconcile();
         match cmd {
             // Consumed by the driver's guided-setup wait loop while it is
             // up; in the steady state there is no plan to confirm — ignore.
@@ -3187,6 +3514,16 @@ impl Driver {
                     self.spawn_quota_spend(provider_id, nonce, reset_type);
                 }
             }
+            // ---- Session Files (batch F) ----
+            UiCommand::FilesNavigate { path } => {
+                self.spawn_files_list(path);
+            }
+            UiCommand::FilesView { path } => {
+                self.spawn_files_view(path);
+            }
+            UiCommand::FilesCloseView => {
+                self.files.viewing = None;
+            }
         }
         Flow::Continue
     }
@@ -3285,6 +3622,7 @@ impl Driver {
             cache_hit: tab.core.cache_hit,
             turn_stats: tab.core.turn_stats,
             plan_entries: tab.core.plan_entries.clone(),
+            fs_capable: tab.fs_capable,
         }
     }
 
@@ -3328,6 +3666,9 @@ impl Driver {
             mix(tab.core.has_more as u64, &mut sig);
             mix(tab.core.total_messages.unwrap_or(u64::MAX), &mut sig);
             mix(tab.state.fingerprint(), &mut sig);
+            // Session Files gating: the files panel's capability note and
+            // the dock-seed decision read it off the active tab.
+            mix(tab.fs_capable as u64, &mut sig);
             // Config chips: the picked values (model/mode/thought) relabel
             // the tab toolbar's buttons.
             for opt in &tab.core.config_options {
@@ -3543,6 +3884,29 @@ impl Driver {
                 .unwrap_or(u64::MAX / 2),
             &mut sig,
         );
+        // The Session Files browser (F1/F3): the reset seq (a session switch
+        // must repaint even between all-empty states), the current path,
+        // the state flags, the listing content, and the viewer.
+        mix(self.files.seq, &mut sig);
+        mix(fold_str(&self.files.path), &mut sig);
+        mix(self.files.loading as u64, &mut sig);
+        mix(self.files.error.is_some() as u64, &mut sig);
+        mix(
+            self.files
+                .listing
+                .as_ref()
+                .map(fs_listing_signature)
+                .unwrap_or(u64::MAX),
+            &mut sig,
+        );
+        mix(
+            self.files
+                .viewing
+                .as_ref()
+                .map(file_viewing_signature)
+                .unwrap_or(u64::MAX / 2),
+            &mut sig,
+        );
         sig
     }
 
@@ -3687,6 +4051,7 @@ impl Driver {
             }),
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
+            files: self.files.view(),
         }));
     }
 }
@@ -3778,6 +4143,58 @@ fn describe_history_error(e: &HubApiError) -> String {
         return "project unknown to the hub — refresh and re-pick".to_string();
     }
     format!("history: {e}")
+}
+
+/// The files panel's error story: a dead bridge is the one failure with an
+/// action behind it (the hub revives the instance on its next use, then a
+/// retry works); everything else is the plain wire error.
+fn describe_files_error(e: &HubApiError) -> String {
+    if e.instance_dead {
+        return "the bridge serving this session went away — it revives on its \
+                next use; retry afterwards"
+            .to_string();
+    }
+    format!("files: {e}")
+}
+
+/// Content signature of a listing for the fingerprint: root, truncation,
+/// and every entry's identity (name/kind/size) — a same-count reload with
+/// a changed entry must still re-emit.
+fn fs_listing_signature(listing: &FsListing) -> u64 {
+    let mut sig: u64 = 19;
+    sig = sig.wrapping_mul(31).wrapping_add(fold_str(&listing.root));
+    sig = sig.wrapping_mul(31).wrapping_add(listing.truncated as u64);
+    sig = sig.wrapping_mul(31).wrapping_add(listing.entries.len() as u64);
+    for e in &listing.entries {
+        sig = sig.wrapping_mul(31).wrapping_add(fold_str(&e.name));
+        sig = sig.wrapping_mul(31).wrapping_add(e.size);
+        sig = sig.wrapping_mul(31).wrapping_add(match e.kind {
+            FsEntryKind::File => 1,
+            FsEntryKind::Dir => 2,
+            FsEntryKind::Symlink => 3,
+        });
+    }
+    sig
+}
+
+/// Content signature of the open viewer for the fingerprint: identity,
+/// kind, the loaded window's extent, and the state flags.
+fn file_viewing_signature(v: &FileViewing) -> u64 {
+    let mut sig: u64 = 23;
+    sig = sig.wrapping_mul(31).wrapping_add(fold_str(&v.path));
+    sig = sig.wrapping_mul(31).wrapping_add(v.size);
+    sig = sig.wrapping_mul(31).wrapping_add(match v.kind {
+        FileKind::Image => 1,
+        FileKind::Text => 2,
+        FileKind::Binary => 3,
+    });
+    sig = sig.wrapping_mul(31).wrapping_add(v.first_line.unwrap_or(u64::MAX));
+    sig = sig
+        .wrapping_mul(31)
+        .wrapping_add(v.text.as_ref().map(|t| t.len() as u64).unwrap_or(u64::MAX));
+    sig = sig.wrapping_mul(31).wrapping_add(v.loading as u64);
+    sig = sig.wrapping_mul(31).wrapping_add(v.error.is_some() as u64);
+    sig
 }
 
 /// FNV-1a over a string — the usage payloads' content signature for the
@@ -4003,6 +4420,9 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         d.models.reset_data();
         d.quota.reset_data();
         d.usage.reset_data();
+        // Session Files belong to a (hub, instance, session) triple — a new
+        // lifecycle means a new machine's paths; nothing survives.
+        d.files.reset();
         d.config_notice = None;
         d.pending_restart = false;
         d.emit_if_changed();

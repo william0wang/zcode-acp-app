@@ -57,6 +57,7 @@ use protocol::image::{
 };
 
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
+use crate::file_browser::{render_file_viewer, render_files_panel, FilesPanelCtx};
 use crate::i18n::fill;
 use crate::models_page::ModelsForm;
 use crate::runtime::{
@@ -96,10 +97,11 @@ gpui_kit::actions!(
 );
 
 /// Which panel the left dock shows (ADR-0009: sessions/files/settings as
-/// dockable panels around the chat area — files stay deferred P1).
+/// dockable panels around the chat area).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DockPanel {
     Sessions,
+    Files,
     Config,
 }
 
@@ -108,6 +110,7 @@ impl DockPanel {
     fn key(self) -> &'static str {
         match self {
             DockPanel::Sessions => "sessions",
+            DockPanel::Files => "files",
             DockPanel::Config => "config",
         }
     }
@@ -187,6 +190,10 @@ pub struct Workbench {
     /// `<details>`): collapsed by default, reset on a session switch like
     /// the TS remount.
     plan_open: bool,
+    /// The files panel's dotfile toggle (F1, TS FileBrowser `showHidden`):
+    /// view-local like the TS component state — the entries always arrive
+    /// whole from the driver, filtered here.
+    files_show_hidden: bool,
     _composer_sub: Subscription,
 }
 
@@ -561,6 +568,7 @@ impl Workbench {
             quota_confirm: None,
             copied_row: None,
             plan_open: false,
+            files_show_hidden: false,
             _composer_sub: composer_sub,
         };
 
@@ -641,7 +649,31 @@ impl Workbench {
         } else {
             self.dock_open = true;
             self.dock_panel = panel;
+            // Docking the files panel seeds a listing on EVERY dock (the TS
+            // FileBrowser mount effect) — but only where the bridge
+            // advertises the capability; otherwise the panel's note
+            // explains the gap and a request would just 404.
+            if panel == DockPanel::Files
+                && self.tab.as_ref().is_some_and(|t| t.fs_capable)
+            {
+                self.runtime.send(UiCommand::FilesNavigate {
+                    path: String::new(),
+                });
+            }
         }
+        cx.notify();
+    }
+
+    /// The files panel's dotfile toggle (F1): the TS `showHidden` flip.
+    pub(crate) fn toggle_files_hidden(&mut self, cx: &mut Context<Self>) {
+        self.files_show_hidden = !self.files_show_hidden;
+        cx.notify();
+    }
+
+    /// A local-shell failure from the files panel (e.g. the Finder open) —
+    /// the same ephemeral notice slot the attachment pipeline uses.
+    pub(crate) fn files_notice(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.notice = Some(text.to_string());
         cx.notify();
     }
 
@@ -1295,6 +1327,12 @@ impl Workbench {
             cx,
         ));
         rail = rail.child(self.render_rail_button(
+            DockPanel::Files,
+            KitIconName::Folder,
+            "Files — the active session's workspace (Session Files)",
+            cx,
+        ));
+        rail = rail.child(self.render_rail_button(
             DockPanel::Config,
             IconName::Settings2,
             "Configuration — models, usage, quota, system status",
@@ -1313,6 +1351,7 @@ impl Workbench {
         }
         let panel = match self.dock_panel {
             DockPanel::Sessions => self.render_sidebar(cx),
+            DockPanel::Files => self.render_files_dock_panel(cx),
             DockPanel::Config => self.render_config_panel(cx),
         };
         div()
@@ -1514,6 +1553,7 @@ impl Workbench {
             .hover(|this| this.bg(theme.secondary.opacity(0.6)))
             .child(Icon::new(icon).size_4().text_color(color))
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .test_support()
             .on_click(move |_, _, cx| {
                 wb.update(cx, |wb, cx| wb.toggle_dock_panel(panel, cx));
             })
@@ -1796,6 +1836,25 @@ impl Workbench {
             .overflow_x_hidden()
             .child(column)
             .into_any_element()
+    }
+
+    // -- files panel ---------------------------------------------------------
+
+    /// The docked Session Files panel (F1): the driver's listing state
+    /// painted by `file_browser`, with the view-local dotfile toggle and
+    /// the loopback-gated Finder affordance (F2).
+    fn render_files_dock_panel(&self, cx: &Context<Self>) -> AnyElement {
+        render_files_panel(
+            &self.snap.files,
+            &FilesPanelCtx {
+                runtime: self.runtime.clone(),
+                wb: cx.entity(),
+                show_hidden: self.files_show_hidden,
+                hub_addr: self.snap.hub_addr.as_deref(),
+                fs_capable: self.tab.as_ref().is_some_and(|t| t.fs_capable),
+            },
+            cx,
+        )
     }
 
     // -- sessions panel ------------------------------------------------------
@@ -3625,6 +3684,12 @@ impl Render for Workbench {
                 self.snap.new_session.clone(),
                 |this, view| this.child(self.render_new_session(&view, cx)),
             )
+            // The file viewer (F3) is the topmost layer — the TS FileViewer
+            // full-screen reader; later siblings paint above, so this goes
+            // last.
+            .when_some(self.snap.files.viewing.clone(), |this, view| {
+                this.child(render_file_viewer(&view, &runtime, cx))
+            })
     }
 }
 
@@ -4117,6 +4182,7 @@ mod chip_tests {
             cache_hit: None,
             turn_stats: None,
             plan_entries: None,
+            fs_capable: true,
         });
         snap
     }
@@ -4306,6 +4372,7 @@ mod display_tests {
                 seconds: 30.1,
             }),
             plan_entries: None,
+            fs_capable: true,
         });
         let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
         cx.update_window(handle.into(), |_, window, cx| {
@@ -4453,6 +4520,7 @@ mod display_tests {
             cache_hit: None,
             turn_stats: None,
             plan_entries: None,
+            fs_capable: true,
         }
     }
 
@@ -4478,6 +4546,269 @@ mod display_tests {
             },
         )
         .expect("open test window")
+    }
+}
+
+/// Batch F (Session Files) headless UI integration tests — same paradigm as
+/// `chip_tests`: explicit imports, an inert runtime, a real Workbench in a
+/// test window, element-id assertions and real clicks. The wire half
+/// (fs_list/fs_file_text spellings) lives in the protocol tests.
+#[cfg(test)]
+mod files_tests {
+    use super::Workbench;
+    use crate::file_browser::FileKind;
+    use crate::runtime::{
+        FileViewerView, FilesPanelView, Phase, ProtocolRuntime, TabPhase, TabSummary, TabView,
+        UiCommand, WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
+        WindowBounds, WindowOptions,
+    };
+    use protocol::hub::{FsEntry, FsEntryKind, FsListing};
+
+    fn entry(name: &str, kind: FsEntryKind, size: u64) -> FsEntry {
+        FsEntry {
+            name: name.to_string(),
+            kind,
+            size,
+            mtime: Some(1),
+        }
+    }
+
+    fn listing_fixture() -> FsListing {
+        FsListing {
+            root: "/Users/me/proj".to_string(),
+            entries: vec![
+                entry("src", FsEntryKind::Dir, 0),
+                entry("README.md", FsEntryKind::File, 128),
+                entry(".env", FsEntryKind::File, 12),
+                entry("logo.png", FsEntryKind::File, 4096),
+            ],
+            truncated: false,
+        }
+    }
+
+    /// A connected workbench whose files view holds one loaded listing at
+    /// `path`; the active tab's bridge advertises the fs capability.
+    fn files_snapshot(path: &str, fs_capable: bool) -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.hub_addr = Some("http://127.0.0.1:8377".to_string());
+        snap.tabs = vec![TabSummary {
+            id: 7,
+            session_id: Some("sess_1".to_string()),
+            phase: TabPhase::Connected,
+            running: false,
+            pending: 0,
+            awaiting: false,
+        }];
+        snap.active_tab = Some(7);
+        snap.active = Some(TabView {
+            session_id: Some("sess_1".to_string()),
+            agent_version: None,
+            phase: TabPhase::Connected,
+            running: false,
+            loading_session: false,
+            messages: Vec::new(),
+            pending: Vec::new(),
+            has_more: false,
+            total_messages: None,
+            loading_earlier: false,
+            approval: None,
+            config_options: Vec::new(),
+            usage: None,
+            cache_hit: None,
+            turn_stats: None,
+            plan_entries: None,
+            fs_capable,
+        });
+        snap.files = FilesPanelView {
+            path: path.to_string(),
+            listing: Some(listing_fixture()),
+            loading: false,
+            error: None,
+            viewing: None,
+        };
+        snap
+    }
+
+    fn open_test_window(
+        cx: &mut App,
+        snap: WorkbenchSnapshot,
+    ) -> (AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
+        let runtime = ProtocolRuntime::inert();
+        let (handle, content) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: Size {
+                        width: px(800.),
+                        height: px(600.),
+                    },
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let runtime = runtime.clone();
+                cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
+            },
+        )
+        .expect("open test window");
+        (handle, content, runtime)
+    }
+
+    fn sent_files_navigate(runtime: &ProtocolRuntime, path: &str) -> bool {
+        runtime.recorded_commands().iter().any(|c| matches!(
+            c,
+            UiCommand::FilesNavigate { path: p } if p == path
+        ))
+    }
+
+    /// F1: docking the files panel seeds a listing; dotfiles stay hidden
+    /// until the toggle flips; entering a directory, refreshing, and the
+    /// breadcrumb all dispatch `FilesNavigate` with the exact target path.
+    #[gpui_kit::test]
+    fn files_panel_browses_and_toggles_hidden(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            // Dock the files panel (the default dock is sessions).
+            window.click("dock-rail-files", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("files-panel").visible(), "the panel must dock");
+            // The dock seeds one listing read at the session root.
+            assert!(
+                sent_files_navigate(&runtime, ""),
+                "docking must seed FilesNavigate at the root, got {:?}",
+                runtime.recorded_commands()
+            );
+            // F2: the Finder affordance exists next to a loopback hub with a
+            // listing (never clicked here — it shells out to `open`).
+            assert!(window.find("files-open-finder").visible());
+            // Rows render; the dotfile is filtered client-side.
+            assert!(window.find("files-entry-src").visible());
+            assert!(window.find("files-entry-README.md").visible());
+            assert!(
+                window.try_find("files-entry-.env").is_none(),
+                "dotfiles start hidden"
+            );
+            // The hidden toggle flips the filter (view-local state).
+            window.click("files-hidden-toggle", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("files-entry-.env").visible());
+            // Entering a directory navigates by the joined path.
+            window.click("files-entry-src", cx);
+            assert!(sent_files_navigate(&runtime, "src"));
+            // Refresh re-reads the CURRENT directory.
+            window.click("files-refresh", cx);
+            assert!(sent_files_navigate(&runtime, ""));
+        })
+        .unwrap();
+    }
+
+    /// F1 (deep path): the breadcrumb renders every segment and a segment
+    /// crumb navigates to its prefix.
+    #[gpui_kit::test]
+    fn files_breadcrumb_navigates_to_prefix(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, _wb, runtime) =
+            cx.update(|cx| open_test_window(cx, files_snapshot("src/ui", true)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("dock-rail-files", cx);
+            window.draw(cx).clear(cx);
+            // Root crumb is the session root's last segment; segments follow.
+            assert!(window.find("files-crumb-root").visible());
+            assert!(window.find("files-crumb-0").visible());
+            assert!(window.find("files-crumb-1").visible());
+            window.click("files-crumb-0", cx);
+            assert!(
+                sent_files_navigate(&runtime, "src"),
+                "the first segment crumb navigates to its prefix"
+            );
+            window.click("files-crumb-root", cx);
+            assert!(sent_files_navigate(&runtime, ""));
+        })
+        .unwrap();
+    }
+
+    /// F3: the simplified viewer renders the loaded whole-file text with
+    /// numbered rows and the size meta, and its close dispatches
+    /// `FilesCloseView`.
+    #[gpui_kit::test]
+    fn file_viewer_renders_text_and_closes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = files_snapshot("", true);
+        snap.files.viewing = Some(FileViewerView {
+            path: "README.md".to_string(),
+            name: "README.md".to_string(),
+            size: 128,
+            kind: FileKind::Text,
+            first_line: Some(1),
+            text: Some("line one\nline two".to_string()),
+            loading: false,
+            error: None,
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("file-viewer").visible());
+            assert!(window.find("file-viewer-meta").visible());
+            assert!(window.find("file-viewer-line-1").visible());
+            assert!(window.find("file-viewer-line-2").visible());
+            assert!(
+                window.find("file-viewer-foot").visible(),
+                "the footer states the line count"
+            );
+            window.click("file-viewer-close", cx);
+            assert!(
+                runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::FilesCloseView)),
+                "close must reach the runtime"
+            );
+        })
+        .unwrap();
+    }
+
+    /// F1 gating: a bridge without the fs capability gets the explanation
+    /// note, and docking seeds nothing (a request would just 404).
+    #[gpui_kit::test]
+    fn files_panel_notes_capability_gap_without_seeding(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, files_snapshot("", false)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("dock-rail-files", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("files-unsupported").visible());
+            assert!(
+                !runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::FilesNavigate { .. })),
+                "an incapable bridge must not be probed, got {:?}",
+                runtime.recorded_commands()
+            );
+        })
+        .unwrap();
     }
 }
 
