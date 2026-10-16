@@ -53,6 +53,8 @@
 //! - [`workflow`] — dynamic-workflow management payloads
 //! - [`system_stats`] — `/api/system-stats` machine status
 //! - [`model_value`] — configOption model-id fallback (`src/lib/modelValue.ts`)
+//! - [`workflow_args`] — launch-args declaration parsing + the typed form's
+//!   report computation (`src/lib/workflow-args.ts`, `WorkflowArgsForm.tsx`)
 //! - [`workflow_run_event_text`] — journal event rendering + slice folding
 //!   (`src/components/config/workflowRunEventText.ts`)
 //! - [`image`] — client-side attachment downsampling/re-encoding
@@ -81,6 +83,7 @@ pub mod settings_client;
 pub mod system_stats;
 pub mod toast;
 pub mod workflow;
+pub mod workflow_args;
 pub mod workflow_run_event_text;
 pub mod ws;
 

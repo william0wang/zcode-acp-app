@@ -56,7 +56,8 @@ use protocol::quota::{AccountUsageStats, QuotaItem};
 use protocol::settings::{
     AgentUpsert, Effect, HookEntryPatch, McpServerUpsert, ModelUpsert, ResetCardInventory,
     ResetCardStatus, ResetCardType, SettingsAll, SettingsPlatformUsage, SettingsUsage,
-    SpendResetCard, WriteEffect,
+    SpendResetCard, WriteEffect, WorkflowGateBlock, WorkflowGateModeSetting,
+    WorkflowGateSetResponse,
 };
 use protocol::hub::{
     FsBrowseResult, FsEntryKind, FsListing, HubCreateInstanceResult, HubHistoryCursor,
@@ -69,6 +70,12 @@ use protocol::settings_client::{HubApiError as SettingsApiError, HubHttpClient};
 use protocol::system_stats::SystemStatsResponse;
 use protocol::toast::{Toast, ToastState};
 use protocol::ws::{TungsteniteWsFactory, WsFactory};
+use protocol::workflow::{
+    AmendRunSettingsBody, AmendRunSettingsResponse, ConversationRunSummary, ConversationRunsResponse,
+    DismissRunResponse, WorkflowCreatePromptResponse, WorkflowDetailResponse,
+    WorkflowOverviewResponse, WorkflowRunEvent, WorkflowRunEventsResponse, WorkflowRunRow,
+    WorkflowRunsHistoryResponse, WorkflowScope, WorkflowStartResponse,
+};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -98,6 +105,15 @@ const NO_INSTANCE_RETRY_MS: u64 = 5_000;
 /// `POLL_MS`): a live dashboard — and the hub caches one collect for 1s, so
 /// clients must not cache.
 const SYSTEM_STATS_POLL_MS: u64 = 5_000;
+/// Workflows overview poll cadence (TS WorkflowsPage POLL_LIVE_MS /
+/// POLL_IDLE_MS): fast while anything is live anywhere (a journal row can
+/// be terminal-and-wrong — bridge-side correction happens per read), slow
+/// once everything is settled.
+const WORKFLOWS_POLL_LIVE_MS: u64 = 5_000;
+const WORKFLOWS_POLL_IDLE_MS: u64 = 30_000;
+/// Run-detail journal poll cadence while the run is unsettled (TS
+/// WorkflowRunDetail's 3s tick): live-ness is polling, not push.
+const WORKFLOW_RUN_POLL_MS: u64 = 3_000;
 
 /// Env-gated stderr trace for the driver lifecycle (ZCODE_ACP_TRACE=1) —
 /// the slice's connection story, observable without a debugger.
@@ -364,6 +380,94 @@ pub enum UiCommand {
     /// POST /settings/backups/restore (TS `restoreBackup`) — two-gesture
     /// confirmed in the view before it ever reaches here.
     RestoreBackup { file: String, path: String },
+    // ---- Workflows page + gate (batch J) ----
+    /// Open the workflows page (TS WorkflowsPage mount): the overview read
+    /// plus the gate probe while its verdict is unknown. Stays open with a
+    /// poll (5s live / 30s idle) until closed.
+    OpenWorkflows,
+    /// The page's back gesture — close it. Payloads survive (the TS store
+    /// keeps them), so a reopen paints instantly and re-reads.
+    CloseWorkflows,
+    /// The page header's refresh control (the overview read again).
+    RefreshWorkflows,
+    /// A group card: open one workflow (TS WorkflowDetail) — the detail read
+    /// plus the journal history on the group's instance.
+    OpenWorkflowDetail {
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+    },
+    /// The workflow page's back gesture — close it and re-read the overview
+    /// (badges follow whatever the run just did).
+    CloseWorkflowDetail,
+    /// POST …/start (TS `startWorkflow`): on success the page closes and the
+    /// returned `acpSessionId` opens as a tab (the TS closeConfig +
+    /// openSession pair).
+    StartWorkflow {
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+        /// The validated args object; `None` = no args.
+        args: Option<Value>,
+    },
+    /// Promote a project workflow to the global scope (TS `promoteViaChat`):
+    /// no dedicated REST — the bridge's own chat-prefill doctrine. The
+    /// driver stages the prompt into the composer and closes the page.
+    WorkflowPromoteGlobal { name: String },
+    /// GET …/workflow-create-prompt (TS `createViaChat`): stage the bridge's
+    /// prefilled "create via conversation" prompt, never auto-send it.
+    WorkflowCreateViaChat { instance_id: String },
+    /// POST …/resume (TS `resumeWorkflowRun`): on success open the run's
+    /// session and refresh whatever list the row lives in.
+    WorkflowResumeRun {
+        run_id: String,
+        session_id: String,
+        name: Option<String>,
+        instance_id: String,
+    },
+    /// POST …/stop (TS `stopWorkflowRun`): `session/cancelBackgroundTask`
+    /// via the hub — 409 = already settled.
+    WorkflowStopRun {
+        run_id: String,
+        session_id: String,
+        instance_id: String,
+    },
+    /// POST …/dismiss (TS `dismissWorkflowRun`): hide one settled journal
+    /// row; the reloads make it leave every list.
+    DismissWorkflowRun {
+        instance_id: String,
+        run_id: String,
+    },
+    /// A run row's Details (TS `runDetail`): the conversation summary plus
+    /// the journal's head on that row's address.
+    OpenWorkflowRun {
+        instance_id: String,
+        session_id: String,
+        run_id: String,
+        name: Option<String>,
+    },
+    /// The run page's "Load more" — the next journal page past the highest
+    /// sequence held (`afterSequence` cursor, `hasMore` gate).
+    WorkflowRunLoadMore,
+    /// The run page's back gesture.
+    CloseWorkflowRun,
+    /// POST …/settings (TS `amendWorkflowRun`): three-state body; a supersede
+    /// re-points the open run view to the returned run id.
+    AmendWorkflowRun {
+        instance_id: String,
+        session_id: String,
+        run_id: String,
+        body: AmendRunSettingsBody,
+    },
+    /// PUT /settings/workflow-gate (TS `setWorkflowGate`): the machine-level
+    /// switch — auto / always-on / disabled, read live by every bridge.
+    SetWorkflowGate {
+        instance_id: String,
+        mode: WorkflowGateModeSetting,
+    },
+    /// Read the gate verdict off the active tab's bridge (the switch row's
+    /// lazy seed — TS `loadWorkflowGate` on config-screen mount).
+    ProbeWorkflowGate,
 }
 
 /// What the driver surfaces to the window. One shape: a full snapshot —
@@ -812,6 +916,64 @@ pub struct ConfigSectionPageView {
     pub models: Option<ModelsPayload>,
 }
 
+/// The Workflows page (batch J): the hub's machine-level overview rendered
+/// as-is (groups + active + recent), with the two drill-downs the mobile
+/// page owns — one workflow (detail + journal history) and one run (the
+/// journal events themselves).
+#[derive(Debug, Clone)]
+pub struct WorkflowsPageView {
+    pub loading: bool,
+    pub error: Option<String>,
+    pub overview: Option<WorkflowOverviewResponse>,
+    /// The open workflow sub-page; `None` = the overview list.
+    pub detail: Option<WorkflowDetailView>,
+    /// The open run sub-page; `None` = no run open.
+    pub run: Option<WorkflowRunView>,
+    /// A workflow-level write (start / resume / dismiss) is in flight.
+    pub busy: bool,
+    /// The active tab's instance — the LAST-RESORT action address (TS
+    /// `instanceId`): rows the hub could not place fall back to it.
+    pub action_instance: Option<String>,
+}
+
+/// One open workflow sub-page (TS `WorkflowDetail`).
+#[derive(Debug, Clone)]
+pub struct WorkflowDetailView {
+    pub scope: WorkflowScope,
+    pub name: String,
+    /// The instance whose group opened this page — actions address it.
+    pub instance_id: String,
+    pub loading: bool,
+    pub detail: Option<WorkflowDetailResponse>,
+    /// `None` = never landed (loading or failed — the empty state must not
+    /// dress a failure up as "no runs recorded yet").
+    pub runs: Option<Vec<WorkflowRunRow>>,
+    /// The resumable-verdict join: acp session id → run summaries.
+    pub summaries: HashMap<String, Vec<ConversationRunSummary>>,
+}
+
+/// One open run sub-page (TS `WorkflowRunDetail`, events tab only — the
+/// artifacts/workspace tabs stay out of batch J).
+#[derive(Debug, Clone)]
+pub struct WorkflowRunView {
+    pub instance_id: String,
+    pub session_id: String,
+    /// Re-pointed on supersede (the amendment returned a NEW run id).
+    pub run_id: String,
+    pub name: Option<String>,
+    pub summary: Option<ConversationRunSummary>,
+    /// `None` = the head read has not landed.
+    pub events: Option<Vec<WorkflowRunEvent>>,
+    pub events_busy: bool,
+    pub has_more: bool,
+    /// The polls stopped believing the session is reachable — the read-only
+    /// degradation (TS `sessionDead`).
+    pub session_dead: bool,
+    /// The summary says the run is unsettled (or is still unknown).
+    pub active: bool,
+    pub amend_busy: bool,
+}
+
 /// The whole workbench state the view renders.
 #[derive(Debug, Clone)]
 pub struct WorkbenchSnapshot {
@@ -863,6 +1025,14 @@ pub struct WorkbenchSnapshot {
     /// The open ZCode-config section page (batch I); `None` = closed (a
     /// full page of its own, like every config section — ADR-0009).
     pub config_section_page: Option<ConfigSectionPageView>,
+    /// The Workflows page (batch J); `None` = closed (a full page of its
+    /// own, like every config section — ADR-0009).
+    pub workflows_page: Option<WorkflowsPageView>,
+    /// The workflow-gate verdict (batch J, per-instance probe): drives the
+    /// config panel's switch row (position label). `None` = not probed.
+    pub workflow_gate: Option<WorkflowGateBlock>,
+    /// A workflow-gate write is in flight.
+    pub workflow_gate_busy: bool,
 }
 
 impl WorkbenchSnapshot {
@@ -890,6 +1060,9 @@ impl WorkbenchSnapshot {
             new_session: None,
             files: FilesPanelView::default(),
             config_section_page: None,
+            workflows_page: None,
+            workflow_gate: None,
+            workflow_gate_busy: false,
         }
     }
 }
@@ -1080,6 +1253,68 @@ enum LoopEvent {
         reload: &'static [ConfigPageKind],
         result: Result<WriteEffect, SettingsApiError>,
     },
+    // ---- Workflows page + gate (batch J) ----
+    /// The overview read settled (the page's poll and manual refresh).
+    WorkflowOverview(Result<WorkflowOverviewResponse, SettingsApiError>),
+    /// The gate probe settled (`/settings/all`'s workflow block, per the
+    /// asking instance). `Ok(None)` = an older bridge without the block.
+    WorkflowGateProbed(Result<Option<WorkflowGateBlock>, SettingsApiError>),
+    /// PUT /settings/workflow-gate settled.
+    WorkflowGateSet(Result<WorkflowGateSetResponse, SettingsApiError>),
+    /// GET …/workflows/{scope}/{name} settled for the open detail page.
+    WorkflowDetailLoaded {
+        seq: u64,
+        result: Result<WorkflowDetailResponse, SettingsApiError>,
+    },
+    /// GET …/workflows/runs settled for the open detail page.
+    WorkflowRunsLoaded {
+        seq: u64,
+        result: Result<WorkflowRunsHistoryResponse, SettingsApiError>,
+    },
+    /// The detail page's resumable-verdict join settled: per session, the
+    /// conversation run summaries (TS `loadRunSummaries`) — silent by
+    /// design, so dead sessions simply leave their rows without a resume
+    /// button.
+    WorkflowDetailSummaries {
+        seq: u64,
+        result: Result<Vec<(String, Vec<ConversationRunSummary>)>, SettingsApiError>,
+    },
+    /// POST …/start settled.
+    WorkflowStarted {
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+        result: Result<WorkflowStartResponse, SettingsApiError>,
+    },
+    /// GET …/workflow-create-prompt settled.
+    WorkflowCreatePrompt(Result<WorkflowCreatePromptResponse, SettingsApiError>),
+    /// POST …/resume settled.
+    WorkflowRunResumed {
+        session_id: String,
+        instance_id: String,
+        result: Result<Value, SettingsApiError>,
+    },
+    /// POST …/stop settled.
+    WorkflowRunStopped(Result<Value, SettingsApiError>),
+    /// POST …/dismiss settled.
+    WorkflowRunDismissed {
+        run_id: String,
+        result: Result<DismissRunResponse, SettingsApiError>,
+    },
+    /// The run page's conversation-runs read settled.
+    WorkflowRunSummary {
+        seq: u64,
+        result: Result<ConversationRunsResponse, SettingsApiError>,
+    },
+    /// The run page's journal read settled (`initial` = the head, else the
+    /// `afterSequence` append page).
+    WorkflowRunEvents {
+        seq: u64,
+        initial: bool,
+        result: Result<WorkflowRunEventsResponse, SettingsApiError>,
+    },
+    /// POST …/settings (the amendment) settled.
+    WorkflowRunAmended(Result<AmendRunSettingsResponse, SettingsApiError>),
 }
 
 /// `AcpHandlers` forwarding into the driver loop's channel, tagged with the
@@ -1563,6 +1798,95 @@ impl ConfigSectionPanel {
     }
 }
 
+/// The Workflows page's driver state (batch J — the TS workflowSlice fields
+/// the page reads). Payloads survive a page close and re-read on the next
+/// open; a full re-bootstrap resets them alongside the connection.
+#[derive(Default)]
+struct WorkflowsPanel {
+    open: bool,
+    loading: bool,
+    error: Option<String>,
+    overview: Option<WorkflowOverviewResponse>,
+    /// The gate verdict (per-instance probe; also updated by a successful
+    /// gate write). Lives OUTSIDE `open` — the config panel's switch row
+    /// reads it while the page is closed.
+    gate: Option<WorkflowGateBlock>,
+    gate_busy: bool,
+    /// Epoch-ms when the overview poll fires next while open.
+    next_poll_at: u64,
+    /// The open workflow sub-page; `seq` invalidates in-flight reads on
+    /// close/reopen (a late answer must not land in a NEW page's state).
+    detail: Option<WorkflowDetailPanel>,
+    /// The open run sub-page; same seq contract (a supersede re-point bumps
+    /// it too — the old run's journal cursor must not append into the new).
+    run: Option<WorkflowRunPanel>,
+    /// A workflow-level write (start / resume / dismiss) is in flight.
+    busy: bool,
+    /// Monotone seq for the detail/run sub-pages' in-flight reads.
+    workflow_seq: u64,
+}
+
+/// One workflow sub-page's driver state (TS `WorkflowDetail` locals).
+struct WorkflowDetailPanel {
+    seq: u64,
+    scope: WorkflowScope,
+    name: String,
+    instance_id: String,
+    loading: bool,
+    detail: Option<WorkflowDetailResponse>,
+    runs: Option<Vec<WorkflowRunRow>>,
+    /// The resumable-verdict join: acp session id → that session's run
+    /// summaries (the resume button's source of truth).
+    summaries: HashMap<String, Vec<ConversationRunSummary>>,
+    busy: bool,
+}
+
+/// One run sub-page's driver state (TS `WorkflowRunDetail` locals, events
+/// tab only). The 3s poll appends via the `afterSequence` cursor; `fail`
+/// counts consecutive failed summary reads (two retire the poll →
+/// `session_dead`, the read-only degradation).
+#[derive(Default)]
+struct WorkflowRunPanel {
+    seq: u64,
+    instance_id: String,
+    session_id: String,
+    run_id: String,
+    name: Option<String>,
+    summary: Option<ConversationRunSummary>,
+    events: Option<Vec<WorkflowRunEvent>>,
+    events_busy: bool,
+    has_more: bool,
+    next_poll_at: u64,
+    fail: u32,
+    session_dead: bool,
+    amend_busy: bool,
+}
+
+impl WorkflowsPanel {
+    /// The connection-reset patch (the TS `connectionResetPatch`: the
+    /// workflow payloads describe ONE machine). `open` survives.
+    fn reset_data(&mut self) {
+        self.loading = false;
+        self.error = None;
+        self.overview = None;
+        self.gate = None;
+        self.gate_busy = false;
+        self.next_poll_at = 0;
+        self.detail = None;
+        self.run = None;
+        self.busy = false;
+        self.workflow_seq += 1;
+    }
+}
+
+/// Highest journal sequence held — the safe `afterSequence` cursor. NOT the
+/// last element's sequence: a clipped journal page can end on an event
+/// without one, and a degenerate cursor makes the server replay the whole
+/// journal (TS `maxSequence`).
+fn max_run_sequence(events: &[WorkflowRunEvent]) -> u64 {
+    events.iter().map(|e| e.sequence).max().unwrap_or(0)
+}
+
 struct Driver {
     factory: Arc<dyn WsFactory>,
     clock: Arc<dyn Clock>,
@@ -1620,6 +1944,8 @@ struct Driver {
     /// The five ZCode-config section pages (batch I, see
     /// [`ConfigSectionPanel`]), indexed by [`ConfigPageKind::index`]).
     sections: [ConfigSectionPanel; 5],
+    /// The Workflows page + gate (batch J, see [`WorkflowsPanel`]).
+    workflows: WorkflowsPanel,
     /// Config-screen notice (TS `notice`): `notice.*` i18n key or plain text.
     config_notice: Option<String>,
     /// A needs-restart write is pending on the connected bridge — drives the
@@ -1688,6 +2014,7 @@ impl Driver {
             },
             usage: UsagePanel::new(),
             sections: Default::default(),
+            workflows: WorkflowsPanel::default(),
             config_notice: None,
             pending_restart: false,
             toast: ToastState::new(),
@@ -2596,6 +2923,547 @@ impl Driver {
         let _ = self.ev_tx.send(RuntimeEvent::ConfigWriteResult { ok });
     }
 
+    // ---- Workflows page + gate (batch J) ----
+
+    /// The active tab's instance id — the workflows page's LAST-RESORT
+    /// action address (TS `instanceId`) and the gate probe's target.
+    fn active_instance_id(&self) -> Option<String> {
+        self.active_tab
+            .and_then(|id| self.tab(id))
+            .map(|t| t.instance_id.clone())
+    }
+
+    /// Anything flying anywhere (TS WorkflowsPage `anyRunning`): the badges'
+    /// union across the overview's last-runs and the active-run zone drives
+    /// the poll cadence.
+    fn workflows_any_active(&self) -> bool {
+        self.workflows.overview.as_ref().is_some_and(|o| {
+            o.groups.iter().any(|g| {
+                g.last_runs
+                    .values()
+                    .any(|r| r.status == "pending" || r.status == "running")
+            }) || o
+                .active_runs
+                .iter()
+                .any(|r| r.status == "pending" || r.status == "running")
+        })
+    }
+
+    /// One overview read (TS `loadWorkflowHub`): sets the spinner, schedules
+    /// the NEXT poll (the adaptive interval's tick lands here — the cadence
+    /// follows what the last answer showed), and fires.
+    fn spawn_workflow_overview(&mut self, now: u64) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        self.workflows.loading = true;
+        let live = self.workflows_any_active();
+        self.workflows.next_poll_at =
+            now + if live { WORKFLOWS_POLL_LIVE_MS } else { WORKFLOWS_POLL_IDLE_MS };
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.workflow_overview().await;
+            let _ = tx.send(LoopEvent::WorkflowOverview(result));
+        });
+    }
+
+    /// The overview settled: success replaces the snapshot (the app renders
+    /// the hub's answer as-is — no client-side merging); a failure keeps
+    /// the last snapshot, except the FIRST load, which still needs a story.
+    /// A 404 is the old-hub window (bridge < 0.60.0) — the actionable
+    /// "restart the hub" error, not a dead spinner.
+    fn on_workflow_overview(&mut self, result: Result<WorkflowOverviewResponse, SettingsApiError>) {
+        self.workflows.loading = false;
+        match result {
+            Ok(overview) => {
+                self.workflows.overview = Some(overview);
+                self.workflows.error = None;
+            }
+            Err(e) if e.status() == Some(404) => {
+                if self.workflows.overview.is_none() {
+                    self.workflows.error = Some(
+                        "this hub predates the workflow-overview route — restart the hub \
+                         (POST /api/upgrade) to pick up the newer bridge"
+                            .to_string(),
+                    );
+                }
+            }
+            Err(e) => {
+                if self.workflows.overview.is_none() {
+                    self.workflows.error = Some(e.to_string());
+                }
+            }
+        }
+    }
+
+    /// The gate probe (`/settings/all`'s workflow block on the active tab's
+    /// instance — the only honest source; the machine-level mount always
+    /// reports `{available:false}`).
+    fn spawn_workflow_gate_probe(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some(instance_id) = self.active_instance_id() else {
+            return;
+        };
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub
+                .instance_settings_all(&instance_id)
+                .await
+                .map(|all| all.workflow);
+            let _ = tx.send(LoopEvent::WorkflowGateProbed(result));
+        });
+    }
+
+    /// The probe settled: the block lands; a missing block (an older
+    /// bridge) or a failure keeps the verdict unknown (fail-closed reads
+    /// "auto" in the switch row).
+    fn on_workflow_gate_probed(
+        &mut self,
+        result: Result<Option<WorkflowGateBlock>, SettingsApiError>,
+    ) {
+        if let Ok(Some(gate)) = result {
+            self.workflows.gate = Some(gate);
+        }
+    }
+
+    /// PUT /settings/workflow-gate: the write is busy-guarded at the
+    /// command; the answer's effective verdict IS the next read.
+    fn on_workflow_gate_set(
+        &mut self,
+        result: Result<WorkflowGateSetResponse, SettingsApiError>,
+    ) {
+        self.workflows.gate_busy = false;
+        match result {
+            Ok(res) if res.ok => {
+                self.workflows.gate = Some(res.gate);
+                self.config_notice = Some("workflow switch updated".to_string());
+            }
+            Ok(_) => {
+                self.config_notice = Some("workflow gate write failed: refused".to_string());
+            }
+            Err(e) => {
+                self.config_notice = Some(format!("workflow gate write failed: {e}"));
+            }
+        }
+    }
+
+    /// Open one workflow (TS WorkflowDetail's `load`): the detail read plus
+    /// the journal history, on the group's instance.
+    fn spawn_workflow_detail_loads(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some(d) = &self.workflows.detail else {
+            return;
+        };
+        let (seq, scope, name, instance_id) =
+            (d.seq, d.scope, d.name.clone(), d.instance_id.clone());
+        self.workflows.detail.as_mut().unwrap().loading = true;
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.workflow_get(&instance_id, scope, &name).await;
+            let _ = tx.send(LoopEvent::WorkflowDetailLoaded { seq, result });
+        });
+        self.spawn_workflow_runs_load();
+    }
+
+    /// The workflow's journal history (the runs list).
+    fn spawn_workflow_runs_load(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some(d) = &self.workflows.detail else {
+            return;
+        };
+        let (seq, scope, name, instance_id) =
+            (d.seq, d.scope, d.name.clone(), d.instance_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.workflow_runs_history(&instance_id, Some(scope), Some(&name), None).await;
+            let _ = tx.send(LoopEvent::WorkflowRunsLoaded { seq, result });
+        });
+    }
+
+    /// The detail read settled (seq-guarded: a late answer from a closed or
+    /// replaced page drops).
+    fn on_workflow_detail_loaded(
+        &mut self,
+        seq: u64,
+        result: Result<WorkflowDetailResponse, SettingsApiError>,
+    ) {
+        let Some(d) = &mut self.workflows.detail else {
+            return;
+        };
+        if d.seq != seq {
+            return;
+        }
+        d.loading = false;
+        match result {
+            Ok(detail) => d.detail = Some(detail),
+            Err(_) => {
+                // A failed read keeps the old payload — the runs list below
+                // owns its own error story; the TS toast said the rest.
+            }
+        }
+    }
+
+    /// The runs read settled: only a LANDED answer updates the list (a
+    /// failure keeps `None` — never dressed up as "no runs recorded yet"),
+    /// and the resumable-verdict join re-reads for the sessions the rows
+    /// can act on (this app's launches carry no memory here — the
+    /// bridge-joined `acpSessionId` is the actionable alias, bridge 0.57).
+    fn on_workflow_runs_loaded(
+        &mut self,
+        seq: u64,
+        result: Result<WorkflowRunsHistoryResponse, SettingsApiError>,
+    ) {
+        let Some(d) = &mut self.workflows.detail else {
+            return;
+        };
+        if d.seq != seq {
+            return;
+        }
+        if let Ok(runs) = result {
+            d.runs = Some(runs.runs.clone());
+            let sessions: Vec<String> = {
+                let mut seen = std::collections::HashSet::new();
+                runs.runs
+                    .iter()
+                    .filter_map(|r| r.acp_session_id.clone())
+                    .filter(|sid| seen.insert(sid.clone()))
+                    .collect()
+            };
+            if !sessions.is_empty() {
+                let instance_id = d.instance_id.clone();
+                let hub = self.settings_client();
+                let tx = self.loop_tx.clone();
+                tokio::spawn(async move {
+                    let mut out = Vec::new();
+                    for sid in &sessions {
+                        if let Ok(res) = hub.conversation_runs(&instance_id, sid, None).await {
+                            out.push((sid.clone(), res.runs));
+                        }
+                    }
+                    let _ = tx.send(LoopEvent::WorkflowDetailSummaries {
+                        seq,
+                        result: Ok(out),
+                    });
+                });
+            }
+        }
+    }
+
+    /// The summaries join settled (seq-guarded): replace the whole map — a
+    /// session that disappeared from the rows must not keep a stale
+    /// verdict.
+    fn on_workflow_detail_summaries(
+        &mut self,
+        seq: u64,
+        result: Result<Vec<(String, Vec<ConversationRunSummary>)>, SettingsApiError>,
+    ) {
+        let Some(d) = &mut self.workflows.detail else {
+            return;
+        };
+        if d.seq != seq {
+            return;
+        }
+        if let Ok(list) = result {
+            d.summaries = list.into_iter().collect();
+        }
+    }
+
+    /// POST …/start settled: on success the page closes and the returned
+    /// `acpSessionId` opens as a tab (the TS closeConfig + openSession
+    /// pair). A failure re-opens nothing — the notice owns the story and
+    /// the form stays gone (the TS toast path).
+    fn on_workflow_started(
+        &mut self,
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+        result: Result<WorkflowStartResponse, SettingsApiError>,
+    ) {
+        self.workflows.busy = false;
+        match result {
+            Ok(res) => {
+                self.workflows.open = false;
+                self.workflows.detail = None;
+                self.open_session_by_id(res.acp_session_id, instance_id);
+            }
+            Err(e) => {
+                self.config_notice =
+                    Some(format!("start workflow \"{name}\" ({scope:?}) failed: {e}"));
+            }
+        }
+    }
+
+    /// The "create via conversation" prompt settled: stage it as the
+    /// composer draft (never auto-send), close the page, and say so when no
+    /// session is open to review it (TS `createViaChat`).
+    fn on_workflow_create_prompt(
+        &mut self,
+        result: Result<WorkflowCreatePromptResponse, SettingsApiError>,
+    ) {
+        self.workflows.busy = false;
+        match result {
+            Ok(res) => {
+                self.workflows.open = false;
+                if self.active_tab.is_none() {
+                    let now = self.clock.now_ms();
+                    self.toast.notify(
+                        now,
+                        "prompt staged — open a session to review and send it",
+                    );
+                }
+                let _ = self.ev_tx.send(RuntimeEvent::ComposerPrefill(PromptDraft {
+                    text: res.prompt,
+                    images: Vec::new(),
+                }));
+            }
+            Err(e) => {
+                self.config_notice = Some(format!("load create prompt failed: {e}"));
+            }
+        }
+    }
+
+    /// POST …/resume settled: on success open the run's session (the TS
+    /// closeConfig + openSession pair) and refresh the lists the row lives
+    /// in.
+    fn on_workflow_run_resumed(
+        &mut self,
+        session_id: String,
+        instance_id: String,
+        result: Result<Value, SettingsApiError>,
+    ) {
+        self.workflows.busy = false;
+        match result {
+            Ok(_) => {
+                self.workflows.open = false;
+                self.workflows.detail = None;
+                self.open_session_by_id(session_id, instance_id);
+            }
+            Err(e) => {
+                self.config_notice = Some(format!("resume workflow run failed: {e}"));
+            }
+        }
+    }
+
+    /// POST …/stop settled: refresh the open run view (summary + events) —
+    /// 409 (already settled) refreshes too; the row just settles.
+    fn on_workflow_run_stopped(&mut self, result: Result<Value, SettingsApiError>) {
+        self.workflows.busy = false;
+        if let Err(e) = result {
+            self.config_notice = Some(format!("stop workflow run failed: {e}"));
+        }
+        self.spawn_workflow_run_reads(true);
+    }
+
+    /// POST …/dismiss settled: the row must leave every list — reload the
+    /// overview (page-level lists) and the open detail's runs.
+    fn on_workflow_run_dismissed(
+        &mut self,
+        run_id: String,
+        result: Result<DismissRunResponse, SettingsApiError>,
+    ) {
+        self.workflows.busy = false;
+        if let Err(e) = result {
+            self.config_notice = Some(format!("dismiss run {run_id} failed: {e}"));
+        }
+        if self.workflows.open {
+            let now = self.clock.now_ms();
+            self.spawn_workflow_overview(now);
+        }
+        if self.workflows.detail.is_some() {
+            self.spawn_workflow_runs_load();
+        }
+    }
+
+    /// The run view's reads (TS `refreshSummary` + `fetchEvents`): the
+    /// conversation summary and the journal page past `after` (`None` =
+    /// the head). One summary + one events read per call.
+    fn spawn_workflow_run_reads(&mut self, initial: bool) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some(r) = &self.workflows.run else {
+            return;
+        };
+        let (seq, instance_id, session_id, run_id) =
+            (r.seq, r.instance_id.clone(), r.session_id.clone(), r.run_id.clone());
+        // The head read is also what a poll with nothing held falls back to
+        // (TS `fetchEvents(events === null, …)` — an appender with no floor
+        // must not silently store nothing).
+        let initial = initial || r.events.is_none();
+        let after = if initial {
+            None
+        } else {
+            Some(max_run_sequence(r.events.as_deref().unwrap_or(&[])))
+        };
+        self.workflows.run.as_mut().unwrap().events_busy = !initial;
+        let hub = self.settings_client();
+        let hub2 = self.settings_client();
+        let tx = self.loop_tx.clone();
+        let tx2 = self.loop_tx.clone();
+        let instance_id2 = instance_id.clone();
+        let session_id2 = session_id.clone();
+        tokio::spawn(async move {
+            let result = hub.conversation_runs(&instance_id, &session_id, None).await;
+            let _ = tx.send(LoopEvent::WorkflowRunSummary { seq, result });
+        });
+        tokio::spawn(async move {
+            let result = hub2.run_events(&instance_id2, &session_id2, &run_id, after).await;
+            let _ = tx2.send(LoopEvent::WorkflowRunEvents { seq, initial, result });
+        });
+    }
+
+    /// The summary read settled (seq-guarded): pick this run's row; two
+    /// consecutive failures retire the poll (read-only degradation).
+    fn on_workflow_run_summary(
+        &mut self,
+        seq: u64,
+        result: Result<ConversationRunsResponse, SettingsApiError>,
+    ) {
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.seq != seq {
+            return;
+        }
+        match result {
+            Ok(res) => {
+                r.fail = 0;
+                r.summary = res.runs.into_iter().find(|s| s.run_id == r.run_id);
+            }
+            Err(_) => {
+                r.fail += 1;
+                if r.fail >= 2 {
+                    r.session_dead = true;
+                }
+            }
+        }
+    }
+
+    /// The journal read settled (seq-guarded): the head replaces; an append
+    /// page is sequence-filtered regardless — a cursor the server could not
+    /// honor answers with the FULL journal, which must never re-append.
+    fn on_workflow_run_events(
+        &mut self,
+        seq: u64,
+        initial: bool,
+        result: Result<WorkflowRunEventsResponse, SettingsApiError>,
+    ) {
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.seq != seq {
+            return;
+        }
+        r.events_busy = false;
+        let Ok(res) = result else {
+            return;
+        };
+        r.has_more = res.has_more.unwrap_or(false);
+        if initial {
+            r.events = Some(res.events);
+        } else if let Some(held) = r.events.take() {
+            let floor = max_run_sequence(&held);
+            let mut merged = held;
+            merged.extend(res.events.into_iter().filter(|e| e.sequence > floor));
+            r.events = Some(merged);
+        }
+    }
+
+    /// The amendment settled: on success re-point the run view when the
+    /// amendment superseded the flying run (the NEW id continues the work —
+    /// its journal cursor starts over, so the reads reset), then reload.
+    fn on_workflow_run_amended(
+        &mut self,
+        result: Result<AmendRunSettingsResponse, SettingsApiError>,
+    ) {
+        match result {
+            Ok(res) => {
+                let mut repointed = false;
+                if let Some(r) = &mut self.workflows.run {
+                    r.amend_busy = false;
+                    repointed = res.run_id != r.run_id;
+                    r.run_id = res.run_id;
+                    if repointed {
+                        // The new run's journal is a fresh sequence space —
+                        // the old cursor must not survive (the TS
+                        // key={runId} remount).
+                        r.events = None;
+                        r.has_more = false;
+                        r.summary = None;
+                    }
+                }
+                if repointed {
+                    if let Some(r) = &mut self.workflows.run {
+                        r.seq = self.workflows.workflow_seq;
+                    }
+                    self.workflows.workflow_seq += 1;
+                }
+                self.config_notice = Some(if repointed {
+                    "run settings updated — the amendment superseded the run; the view re-pointed to the new run".to_string()
+                } else {
+                    "run settings updated".to_string()
+                });
+                self.spawn_workflow_run_reads(true);
+            }
+            Err(e) => {
+                if let Some(r) = &mut self.workflows.run {
+                    r.amend_busy = false;
+                }
+                self.config_notice = Some(format!("amend run settings failed: {e}"));
+            }
+        }
+    }
+
+    /// The OpenSession handler's body (appStore `openSession`): a tab
+    /// already holding the session activates; otherwise a new tab attaches.
+    /// Shared by the discovery rows and the workflow start/resume paths.
+    fn open_session_by_id(&mut self, session_id: String, instance_id: String) {
+        let existing = self.tabs.iter().find(|t| {
+            t.instance_id == instance_id
+                && (t.core.active_session_id.as_deref() == Some(session_id.as_str())
+                    || t.target.as_deref() == Some(session_id.as_str()))
+        });
+        match existing.map(|t| t.id) {
+            Some(id) => self.active_tab = Some(id),
+            None => {
+                let cwd = self
+                    .instances
+                    .iter()
+                    .find(|i| i.id == instance_id)
+                    .and_then(|i| i.workspace.clone())
+                    .filter(|w| !w.is_empty())
+                    .unwrap_or_else(|| "/".to_string());
+                self.open_tab(instance_id, Some(session_id), cwd);
+                self.spawn_discovery(false);
+            }
+        }
+    }
+
     // ---- usage statistics (config page "usage" / "usagePlatform") ----
 
     /// The loads a freshly-mounted Usage page runs: the capability probe
@@ -3037,6 +3905,29 @@ impl Driver {
         // POLL_MS)`) — live only while the page is open.
         if self.system.open && now >= self.system.next_poll_at {
             self.spawn_system_stats(now);
+        }
+        // The Workflows page's adaptive overview poll (TS WorkflowsPage
+        // 5s-live / 30s-idle): a journal row can be terminal-and-wrong, so
+        // the poll is NOT gated on "something already looks live".
+        if self.workflows.open && now >= self.workflows.next_poll_at {
+            self.spawn_workflow_overview(now);
+        }
+        // The run view's 3s journal poll (TS WorkflowRunDetail): live while
+        // the run is unsettled or its status is still unknown; two failed
+        // ticks retire it (session_dead) and the read-only notice stays.
+        let run_poll_due = self.workflows.run.as_ref().is_some_and(|r| {
+            let active = !r.session_dead
+                && r.summary
+                    .as_ref()
+                    .map(|s| s.status == "running" || s.status == "pending")
+                    .unwrap_or(true);
+            active && now >= r.next_poll_at && !r.events_busy
+        });
+        if run_poll_due {
+            if let Some(r) = self.workflows.run.as_mut() {
+                r.next_poll_at = now + WORKFLOW_RUN_POLL_MS;
+            }
+            self.spawn_workflow_run_reads(false);
         }
         // Reconnect due tabs (collected first — spawn_connect borrows self).
         let due: Vec<u64> = self
@@ -3697,6 +4588,42 @@ impl Driver {
                 reload,
                 result,
             } => self.on_config_write_settled(page, label, reload, result),
+            // ---- Workflows page + gate (batch J) ----
+            LoopEvent::WorkflowOverview(result) => self.on_workflow_overview(result),
+            LoopEvent::WorkflowGateProbed(result) => self.on_workflow_gate_probed(result),
+            LoopEvent::WorkflowGateSet(result) => self.on_workflow_gate_set(result),
+            LoopEvent::WorkflowDetailLoaded { seq, result } => {
+                self.on_workflow_detail_loaded(seq, result);
+            }
+            LoopEvent::WorkflowRunsLoaded { seq, result } => {
+                self.on_workflow_runs_loaded(seq, result);
+            }
+            LoopEvent::WorkflowDetailSummaries { seq, result } => {
+                self.on_workflow_detail_summaries(seq, result);
+            }
+            LoopEvent::WorkflowStarted {
+                scope,
+                name,
+                instance_id,
+                result,
+            } => self.on_workflow_started(scope, name, instance_id, result),
+            LoopEvent::WorkflowCreatePrompt(result) => self.on_workflow_create_prompt(result),
+            LoopEvent::WorkflowRunResumed {
+                session_id,
+                instance_id,
+                result,
+            } => self.on_workflow_run_resumed(session_id, instance_id, result),
+            LoopEvent::WorkflowRunStopped(result) => self.on_workflow_run_stopped(result),
+            LoopEvent::WorkflowRunDismissed { run_id, result } => {
+                self.on_workflow_run_dismissed(run_id, result);
+            }
+            LoopEvent::WorkflowRunSummary { seq, result } => {
+                self.on_workflow_run_summary(seq, result);
+            }
+            LoopEvent::WorkflowRunEvents { seq, initial, result } => {
+                self.on_workflow_run_events(seq, initial, result);
+            }
+            LoopEvent::WorkflowRunAmended(result) => self.on_workflow_run_amended(result),
         }
     }
 
@@ -3911,25 +4838,7 @@ impl Driver {
             } => {
                 // A tab already holding this session just activates
                 // (appStore openSession's same-session branch).
-                let existing = self.tabs.iter().find(|t| {
-                    t.instance_id == instance_id
-                        && (t.core.active_session_id.as_deref() == Some(session_id.as_str())
-                            || t.target.as_deref() == Some(session_id.as_str()))
-                });
-                match existing.map(|t| t.id) {
-                    Some(id) => self.active_tab = Some(id),
-                    None => {
-                        let cwd = self
-                            .instances
-                            .iter()
-                            .find(|i| i.id == instance_id)
-                            .and_then(|i| i.workspace.clone())
-                            .filter(|w| !w.is_empty())
-                            .unwrap_or_else(|| "/".to_string());
-                        self.open_tab(instance_id, Some(session_id), cwd);
-                        self.spawn_discovery(false);
-                    }
-                }
+                self.open_session_by_id(session_id, instance_id);
             }
             UiCommand::NewSessionToggle => {
                 self.new_session.open = !self.new_session.open;
@@ -4348,6 +5257,234 @@ impl Driver {
                     );
                 }
             }
+            // ---- Workflows page + gate (batch J) ----
+            UiCommand::OpenWorkflows => {
+                self.workflows.open = true;
+                // The TS mount pair: the overview read on EVERY open (the
+                // poll re-arms from its answer) plus the gate probe while
+                // its verdict is unknown.
+                let now = self.clock.now_ms();
+                self.spawn_workflow_overview(now);
+                if self.workflows.gate.is_none() {
+                    self.spawn_workflow_gate_probe();
+                }
+            }
+            UiCommand::CloseWorkflows => {
+                self.workflows.open = false;
+                self.workflows.detail = None;
+                self.workflows.run = None;
+                self.workflows.workflow_seq += 1;
+            }
+            UiCommand::RefreshWorkflows => {
+                let now = self.clock.now_ms();
+                self.spawn_workflow_overview(now);
+            }
+            UiCommand::OpenWorkflowDetail {
+                scope,
+                name,
+                instance_id,
+            } => {
+                self.workflows.workflow_seq += 1;
+                self.workflows.detail = Some(WorkflowDetailPanel {
+                    seq: self.workflows.workflow_seq,
+                    scope,
+                    name,
+                    instance_id,
+                    loading: false,
+                    detail: None,
+                    runs: None,
+                    summaries: HashMap::new(),
+                    busy: false,
+                });
+                self.spawn_workflow_detail_loads();
+            }
+            UiCommand::CloseWorkflowDetail => {
+                self.workflows.detail = None;
+                self.workflows.workflow_seq += 1;
+                // The overview re-reads on back (TS WorkflowDetail's
+                // onBack): badges follow whatever the run just did.
+                let now = self.clock.now_ms();
+                self.spawn_workflow_overview(now);
+            }
+            UiCommand::StartWorkflow {
+                scope,
+                name,
+                instance_id,
+                args,
+            } => {
+                if !self.workflows.busy {
+                    self.workflows.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub
+                            .workflow_start(&instance_id, scope, &name, args, None)
+                            .await;
+                        let _ = tx.send(LoopEvent::WorkflowStarted {
+                            scope,
+                            name,
+                            instance_id,
+                            result,
+                        });
+                    });
+                }
+            }
+            UiCommand::WorkflowPromoteGlobal { name } => {
+                // Promote-to-global rides the chat-prefill path (the
+                // desktop's launcher does exactly this — no dedicated
+                // REST); the prompt mirrors the TS app's wording.
+                let prompt = format!(
+                    "Please promote the saved workflow \"{name}\" from this project's scope to \
+                     the global scope: move the file under ~/.zcode/workflows/ keeping its \
+                     script, description, whenToUse and args declaration unchanged, then remove \
+                     the project copy. If it is inherently bound to this project and cannot be \
+                     generalized meaningfully, say why and stop without saving."
+                );
+                self.workflows.open = false;
+                self.workflows.detail = None;
+                if self.active_tab.is_none() {
+                    let now = self.clock.now_ms();
+                    self.toast.notify(
+                        now,
+                        "prompt staged — open a session to review and send it",
+                    );
+                }
+                let _ = self.ev_tx.send(RuntimeEvent::ComposerPrefill(PromptDraft {
+                    text: prompt,
+                    images: Vec::new(),
+                }));
+            }
+            UiCommand::WorkflowCreateViaChat { instance_id } => {
+                if !self.workflows.busy {
+                    self.workflows.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.workflow_create_prompt(&instance_id, None).await;
+                        let _ = tx.send(LoopEvent::WorkflowCreatePrompt(result));
+                    });
+                }
+            }
+            UiCommand::WorkflowResumeRun {
+                run_id,
+                session_id,
+                name,
+                instance_id,
+            } => {
+                if !self.workflows.busy {
+                    self.workflows.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.workflow_resume(&instance_id, &run_id, &session_id, name.as_deref()).await;
+                        let _ = tx.send(LoopEvent::WorkflowRunResumed {
+                            session_id,
+                            instance_id,
+                            result,
+                        });
+                    });
+                }
+            }
+            UiCommand::WorkflowStopRun {
+                run_id,
+                session_id,
+                instance_id,
+            } => {
+                if !self.workflows.busy {
+                    self.workflows.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.workflow_stop(&instance_id, &run_id, &session_id).await;
+                        let _ = tx.send(LoopEvent::WorkflowRunStopped(result));
+                    });
+                }
+            }
+            UiCommand::DismissWorkflowRun {
+                instance_id,
+                run_id,
+            } => {
+                if !self.workflows.busy {
+                    self.workflows.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.dismiss_workflow_run(&instance_id, &run_id).await;
+                        let _ = tx.send(LoopEvent::WorkflowRunDismissed { run_id, result });
+                    });
+                }
+            }
+            UiCommand::OpenWorkflowRun {
+                instance_id,
+                session_id,
+                run_id,
+                name,
+            } => {
+                self.workflows.workflow_seq += 1;
+                self.workflows.run = Some(WorkflowRunPanel {
+                    seq: self.workflows.workflow_seq,
+                    instance_id,
+                    session_id,
+                    run_id,
+                    name,
+                    summary: None,
+                    events: None,
+                    events_busy: false,
+                    has_more: false,
+                    next_poll_at: 0,
+                    fail: 0,
+                    session_dead: false,
+                    amend_busy: false,
+                });
+                self.spawn_workflow_run_reads(true);
+            }
+            UiCommand::WorkflowRunLoadMore => {
+                if self
+                    .workflows
+                    .run
+                    .as_ref()
+                    .is_some_and(|r| r.has_more && !r.events_busy)
+                {
+                    self.spawn_workflow_run_reads(false);
+                }
+            }
+            UiCommand::CloseWorkflowRun => {
+                self.workflows.run = None;
+                self.workflows.workflow_seq += 1;
+            }
+            UiCommand::AmendWorkflowRun {
+                instance_id,
+                session_id,
+                run_id,
+                body,
+            } => {
+                if self.workflows.run.as_ref().is_some_and(|r| !r.amend_busy) {
+                    self.workflows.run.as_mut().unwrap().amend_busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result =
+                            hub.amend_run_settings(&instance_id, &run_id, &session_id, body).await;
+                        let _ = tx.send(LoopEvent::WorkflowRunAmended(result));
+                    });
+                }
+            }
+            UiCommand::SetWorkflowGate { instance_id, mode } => {
+                if !self.workflows.gate_busy {
+                    self.workflows.gate_busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.workflow_gate_set(&instance_id, mode).await;
+                        let _ = tx.send(LoopEvent::WorkflowGateSet(result));
+                    });
+                }
+            }
+            UiCommand::ProbeWorkflowGate => {
+                if self.workflows.gate.is_none() {
+                    self.spawn_workflow_gate_probe();
+                }
+            }
         }
         Flow::Continue
     }
@@ -4756,6 +5893,101 @@ impl Driver {
                 &mut sig,
             );
         }
+        // The Workflows page + gate (batch J): open/close, the state flags,
+        // the gate verdict's identity (position + mode), and content
+        // signatures of the overview / detail / run payloads — every field
+        // the page paints.
+        let wf = &self.workflows;
+        mix(wf.open as u64, &mut sig);
+        mix(wf.loading as u64, &mut sig);
+        mix(wf.error.is_some() as u64, &mut sig);
+        mix(wf.busy as u64, &mut sig);
+        mix(wf.workflow_seq, &mut sig);
+        mix(
+            wf.overview
+                .as_ref()
+                .map(workflow_overview_signature)
+                .unwrap_or(u64::MAX),
+            &mut sig,
+        );
+        mix(
+            wf.gate
+                .as_ref()
+                .map(|g| {
+                    fold_str(&g.source)
+                        ^ fold_str(&g.mode)
+                        ^ (g.enabled as u64).rotate_left(8)
+                        ^ g.r#override.map(|o| o as u64).unwrap_or(7).rotate_left(16)
+                })
+                .unwrap_or(u64::MAX),
+            &mut sig,
+        );
+        mix(wf.gate_busy as u64, &mut sig);
+        if let Some(d) = &wf.detail {
+            mix(d.seq, &mut sig);
+            mix(fold_str(&d.name), &mut sig);
+            mix((d.scope == WorkflowScope::Global) as u64, &mut sig);
+            mix(fold_str(&d.instance_id), &mut sig);
+            mix(d.loading as u64, &mut sig);
+            mix(d.busy as u64, &mut sig);
+            mix(
+                d.detail
+                    .as_ref()
+                    .map(|x| fold_str(&serde_json::to_string(x).unwrap_or_default()))
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(
+                d.runs
+                    .as_ref()
+                    .map(|rows| {
+                        let mut s: u64 = rows.len() as u64;
+                        for r in rows {
+                            s = s.wrapping_mul(31).wrapping_add(fold_str(&r.run_id));
+                            s = s.wrapping_mul(31).wrapping_add(fold_str(&r.status));
+                            s = s.wrapping_mul(31).wrapping_add(r.updated_at.unwrap_or(0));
+                        }
+                        s
+                    })
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            for (sid, list) in &d.summaries {
+                mix(fold_str(sid), &mut sig);
+                for sum in list {
+                    mix(fold_str(&sum.run_id) ^ (sum.resumable as u64).rotate_left(20), &mut sig);
+                }
+            }
+        }
+        if let Some(r) = &wf.run {
+            mix(r.seq, &mut sig);
+            mix(fold_str(&r.run_id), &mut sig);
+            mix(fold_str(&r.session_id), &mut sig);
+            mix(r.events_busy as u64, &mut sig);
+            mix(r.has_more as u64, &mut sig);
+            mix(r.session_dead as u64, &mut sig);
+            mix(r.amend_busy as u64, &mut sig);
+            mix(
+                r.summary
+                    .as_ref()
+                    .map(|s| fold_str(&s.status) ^ s.updated_at.unwrap_or(0).rotate_left(12))
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(
+                r.events
+                    .as_ref()
+                    .map(|events| {
+                        let mut s: u64 = events.len() as u64;
+                        for e in events {
+                            s = s.wrapping_mul(31).wrapping_add(e.sequence);
+                        }
+                        s
+                    })
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+        }
         sig
     }
 
@@ -4901,6 +6133,44 @@ impl Driver {
             }),
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
+            workflows_page: self.workflows.open.then(|| WorkflowsPageView {
+                loading: self.workflows.loading,
+                error: self.workflows.error.clone(),
+                overview: self.workflows.overview.clone(),
+                detail: self.workflows.detail.as_ref().map(|d| WorkflowDetailView {
+                    scope: d.scope,
+                    name: d.name.clone(),
+                    instance_id: d.instance_id.clone(),
+                    loading: d.loading,
+                    detail: d.detail.clone(),
+                    runs: d.runs.clone(),
+                    summaries: d.summaries.clone(),
+                }),
+                run: self.workflows.run.as_ref().map(|r| {
+                    let active = !r.session_dead
+                        && r.summary
+                            .as_ref()
+                            .map(|s| s.status == "running" || s.status == "pending")
+                            .unwrap_or(true);
+                    WorkflowRunView {
+                        instance_id: r.instance_id.clone(),
+                        session_id: r.session_id.clone(),
+                        run_id: r.run_id.clone(),
+                        name: r.name.clone(),
+                        summary: r.summary.clone(),
+                        events: r.events.clone(),
+                        events_busy: r.events_busy,
+                        has_more: r.has_more,
+                        session_dead: r.session_dead,
+                        active,
+                        amend_busy: r.amend_busy,
+                    }
+                }),
+                busy: self.workflows.busy,
+                action_instance: self.active_instance_id(),
+            }),
+            workflow_gate: self.workflows.gate.clone(),
+            workflow_gate_busy: self.workflows.gate_busy,
             files: self.files.view(),
             config_section_page: ConfigPageKind::ALL
                 .iter()
@@ -5076,6 +6346,44 @@ fn fold_str(s: &str) -> u64 {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     h
+}
+
+/// Content signature of the workflow overview for the fingerprint: group
+/// identity, the per-name last-run badges, and both run zones (row
+/// identity, status, stamps — the fields the page's rows paint).
+fn workflow_overview_signature(overview: &WorkflowOverviewResponse) -> u64 {
+    let mut sig: u64 = 11;
+    let mix = |v: u64, sig: &mut u64| {
+        *sig = sig.wrapping_mul(31).wrapping_add(v);
+    };
+    let row_sig = |r: &WorkflowRunRow, sig: &mut u64| {
+        mix(fold_str(&r.run_id), sig);
+        mix(fold_str(&r.status), sig);
+        mix(r.updated_at.unwrap_or(0), sig);
+    };
+    for g in &overview.groups {
+        mix(fold_str(&g.instance_id), &mut sig);
+        mix(fold_str(&g.workspace), &mut sig);
+        mix((g.scope == WorkflowScope::Global) as u64, &mut sig);
+        mix(g.error.is_some() as u64, &mut sig);
+        mix(g.workflows.len() as u64, &mut sig);
+        for w in &g.workflows {
+            mix(fold_str(&w.name), &mut sig);
+        }
+        for (name, last) in &g.last_runs {
+            mix(fold_str(name), &mut sig);
+            row_sig(last, &mut sig);
+        }
+    }
+    mix(overview.active_runs.len() as u64, &mut sig);
+    for r in &overview.active_runs {
+        row_sig(r, &mut sig);
+    }
+    mix(overview.recent_runs.len() as u64, &mut sig);
+    for r in &overview.recent_runs {
+        row_sig(r, &mut sig);
+    }
+    sig
 }
 
 /// Content signature of the models payload for the fingerprint: everything
@@ -5292,6 +6600,7 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         for page in ConfigPageKind::ALL {
             d.sections[page.index()].reset_data();
         }
+        d.workflows.reset_data();
         // Session Files belong to a (hub, instance, session) triple — a new
         // lifecycle means a new machine's paths; nothing survives.
         d.files.reset();

@@ -26,6 +26,7 @@ mod system_status;
 mod ui_prefs;
 mod usage_page;
 mod workbench;
+mod workflows_page;
 mod zconfig_pages;
 
 use gpui_kit::component::{Theme, ThemeMode};

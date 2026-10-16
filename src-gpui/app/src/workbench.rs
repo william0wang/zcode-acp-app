@@ -67,6 +67,7 @@ use crate::runtime::{
 use crate::quota_page::SpendStage;
 use crate::system_status::render_system_status_page;
 use crate::usage_page::render_usage_page;
+use crate::workflows_page::{WorkflowAmendForm, WorkflowStartForm};
 use crate::zconfig_pages::ZConfigForm;
 
 /// Stream-reveal timing for streamed markdown chunks (the Claude-style fade
@@ -185,6 +186,15 @@ pub struct Workbench {
     pub(crate) zconfig_form: Option<ZConfigForm>,
     /// Keeps the config form inputs' change subscriptions alive.
     pub(crate) zconfig_form_subs: Vec<Subscription>,
+    /// The Workflows page's start sheet (batch J); `None` = closed.
+    /// Rendered instead of the page while open, like `zconfig_form`.
+    pub(crate) workflow_start_form: Option<WorkflowStartForm>,
+    /// The run-settings amendment sheet (batch J); `None` = closed.
+    pub(crate) workflow_amend_form: Option<WorkflowAmendForm>,
+    /// Keeps whichever workflow form's input subscriptions alive.
+    pub(crate) workflow_form_subs: Vec<Subscription>,
+    /// The WorkflowGate sheet (batch J) — view-local overlay.
+    pub(crate) workflow_gate_sheet: bool,
     /// The Hooks page's expanded event (view-local fold, TS `open`).
     pub(crate) hooks_open_event: Option<String>,
     /// The Backups page's armed restore confirm (TS `confirm`): the
@@ -608,6 +618,10 @@ impl Workbench {
             models_form_subs: Vec::new(),
             zconfig_form: None,
             zconfig_form_subs: Vec::new(),
+            workflow_start_form: None,
+            workflow_amend_form: None,
+            workflow_form_subs: Vec::new(),
+            workflow_gate_sheet: false,
             hooks_open_event: None,
             backup_confirm: None,
             quota_confirm: None,
@@ -740,6 +754,7 @@ impl Workbench {
             || self.snap.quota_page.is_some()
             || self.snap.usage_page.is_some()
             || self.snap.config_section_page.is_some()
+            || self.snap.workflows_page.is_some()
         {
             return;
         }
@@ -862,6 +877,15 @@ impl Workbench {
                     self.zconfig_form_subs.clear();
                     self.hooks_open_event = None;
                     self.backup_confirm = None;
+                }
+                // The workflows forms/gate sheet live only inside the page
+                // (the TS sheets unmount with it); a page closed under an
+                // open form drops it so a reopen starts clean.
+                if self.snap.workflows_page.is_none() {
+                    self.workflow_start_form = None;
+                    self.workflow_amend_form = None;
+                    self.workflow_form_subs.clear();
+                    self.workflow_gate_sheet = false;
                 }
                 // The spend gesture is page-local state (TS useState); a
                 // page closed under an open confirm dialog drops it.
@@ -1911,13 +1935,14 @@ impl Workbench {
         // (icon, title, description, entry command constructor). The command
         // is built inside the click closure — click listeners are `Fn`, so a
         // prebuilt command would have to be Clone for nothing. The five
-        // batch-I sections ride the same list (requirements §7).
+        // batch-I sections ride the same list (requirements §7), and the
+        // Workflows page rides it too (batch J).
         let entries: [(
             KitIconName,
             &str,
             &str,
             fn() -> UiCommand,
-        ); 9] = [
+        ); 10] = [
             (
                 KitIconName::Boxes,
                 "Models",
@@ -1982,6 +2007,12 @@ impl Workbench {
                     page: crate::runtime::ConfigPageKind::Backups,
                 },
             ),
+            (
+                KitIconName::Workflow,
+                "Workflows",
+                "Saved dynamic workflows and their runs",
+                || UiCommand::OpenWorkflows,
+            ),
         ];
         for (icon, title, description, open) in entries {
             let runtime = runtime.clone();
@@ -2024,6 +2055,64 @@ impl Workbench {
                     .on_click(move |_, _, _| runtime.send(open())),
             );
         }
+
+        // The machine-level workflow switch (J2, bridge ≥0.53): ALWAYS
+        // visible — with the remote verdict off this override is the only
+        // way in, so unlike the gated page above it must not hide. The
+        // subtitle names the switch's current position (auto until a probe
+        // or a write says otherwise — fail-closed, never "off").
+        let wb_gate = cx.entity();
+        let gate_label = crate::workflows_page::gate_position_label(
+            crate::workflows_page::gate_position(self.snap.workflow_gate.as_ref()),
+        );
+        column = column.child(
+            div()
+                .id("config-entry-Workflow switch")
+                .flex()
+                .items_start()
+                .gap_2()
+                .px_2()
+                .py_2()
+                .rounded_md()
+                .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                .cursor_pointer()
+                .child(
+                    Icon::new(KitIconName::Workflow)
+                        .size_4()
+                        .flex_none()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(theme.foreground)
+                                .child(t!("zconfig.workflowGate").into_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(theme.muted_foreground)
+                                .child(gate_label),
+                        ),
+                )
+                .on_click(move |_, _, cx| {
+                    // Opening the sheet also seeds the verdict probe (the
+                    // position label is only honest once read).
+                    wb_gate.update(cx, |this, cx| {
+                        this.workflow_gate_sheet = true;
+                        if this.snap.workflow_gate.is_none() {
+                            this.runtime.send(UiCommand::ProbeWorkflowGate);
+                        }
+                        cx.notify();
+                    });
+                }),
+        );
 
         div()
             .id("config-panel")
@@ -3924,6 +4013,7 @@ impl Render for Workbench {
                     && self.snap.quota_page.is_none()
                     && self.snap.usage_page.is_none()
                     && self.snap.config_section_page.is_none()
+                    && self.snap.workflows_page.is_none()
                 {
                     Some(self.render_dock(cx))
                 } else {
@@ -3993,6 +4083,25 @@ impl Render for Workbench {
                     })
                 },
             )
+            // The Workflows page (batch J): the same contract — the open
+            // start/amend form replaces the page while open.
+            .when_some(
+                self.snap.workflows_page.clone(),
+                |this, _page| {
+                    this.child(if self.workflow_start_form.is_some() {
+                        self.render_workflow_start_form(cx)
+                    } else if self.workflow_amend_form.is_some() {
+                        self.render_workflow_amend_form(cx)
+                    } else {
+                        crate::workflows_page::render_workflows_page(self, cx)
+                    })
+                },
+            )
+            // The WorkflowGate sheet (J2) sits above the config surfaces —
+            // the TS bottom sheet is the topmost layer while open.
+            .when(self.workflow_gate_sheet, |this| {
+                this.child(self.render_workflow_gate_sheet(cx))
+            })
             // The new-session chooser rides ON TOP of whatever surface is
             // below (the TS dialog is a fixed full-screen overlay).
             .when_some(
