@@ -538,11 +538,14 @@ fn render_entry_row(
 }
 
 /// The simplified file viewer (F3): a full-workbench overlay — read-only,
-/// whole-file load, scrolling body. Image/binary kinds explain their deferral
-/// instead of fetching (their surfaces are milestone-2 work).
+/// whole-file load, scrolling body. Text loads whole (F3); the image kind
+/// loads its raster via the hub's token-query URL (batch K) and enlarges
+/// into the lightbox on click; binary explains its deferral instead of
+/// fetching.
 pub(crate) fn render_file_viewer(
     view: &FileViewerView,
     runtime: &ProtocolRuntime,
+    wb: &gpui::WeakEntity<crate::workbench::Workbench>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -624,15 +627,49 @@ pub(crate) fn render_file_viewer(
     } else {
         match view.kind {
             FileKind::Image => {
-                body = body.child(
-                    div()
-                        .text_size(px(11.))
-                        .text_color(theme.muted_foreground)
-                        .child(
-                            "image preview is not built yet — it lands with the lightbox \
-                             milestone; the file itself opens from the files panel in Finder",
-                        ),
-                );
+                // Batch K: the whole-file fetch through the token-query URL.
+                // A transport failure (or an unrasterizable payload) already
+                // landed in `view.error` — the shared error ladder above
+                // paints it; this arm only owns the success and the brief
+                // loading window.
+                if view.loading {
+                    body = body.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child("loading preview…"),
+                    );
+                } else if let Some(src) = &view.image {
+                    let open_src = src.clone();
+                    let caption = view.path.clone();
+                    let wb = wb.clone();
+                    body = body.child(
+                        div()
+                            .id("file-viewer-image")
+                            .test_support()
+                            .flex()
+                            .justify_center()
+                            .p_2()
+                            .on_click(move |_, _, cx| {
+                                let _ = wb.update(cx, |this, cx| {
+                                    this.open_lightbox(open_src.clone(), Some(caption.clone()), cx)
+                                });
+                            })
+                            .child(
+                                gpui_kit::img(src.clone())
+                                    .max_w(px(640.))
+                                    .max_h(px(420.))
+                                    .object_fit(gpui::ObjectFit::Contain),
+                            ),
+                    );
+                } else {
+                    body = body.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child("no preview available"),
+                    );
+                }
             }
             FileKind::Binary => {
                 body = body.child(

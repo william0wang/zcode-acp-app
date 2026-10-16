@@ -520,6 +520,61 @@ impl HubClient {
         );
         self.url(&format!("/api/instances/{instance_id}/fs/file{query}"))
     }
+
+    /// The whole fs/file as raw bytes (image previews). Same URL shape as
+    /// [`Self::fs_file_url`] — the token rides the query because the fetch
+    /// cannot reuse `fetch`'s JSON body pipeline: its lossy UTF-8 body would
+    /// corrupt a raster. The default header deadline still applies.
+    pub async fn fs_file_bytes(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        path: &str,
+    ) -> Result<Vec<u8>, HubApiError> {
+        let req = HttpRequest {
+            url: self.fs_file_url(instance_id, session_id, path),
+            method: HttpMethod::Get,
+            headers: Vec::new(),
+            body: None,
+        };
+        let abort = AbortSignal::new();
+        // Same watchdog shape as `fetch`: the sleep future is created eagerly
+        // (mock clocks need the registration), the watcher fires the abort.
+        let sleep = self.clock.sleep_ms(DEFAULT_TIMEOUT_MS);
+        let watcher = {
+            let abort = abort.clone();
+            tokio::spawn(async move {
+                sleep.await;
+                abort.fire();
+            })
+        };
+        let outcome = self.http.fetch_bytes(req, abort).await;
+        watcher.abort();
+        match outcome {
+            Err(e) => {
+                let message = if e.aborted {
+                    format!("network error: no response within {DEFAULT_TIMEOUT_MS}ms (fs/file)")
+                } else {
+                    format!("network error: {}", e.message)
+                };
+                Err(HubApiError {
+                    message,
+                    status: None,
+                    network: true,
+                    instance_dead: false,
+                })
+            }
+            Ok(res) => {
+                if res.status == 401 {
+                    return Err(HubApiError::msg("unauthorized: check token", Some(401)));
+                }
+                if !(200..300).contains(&res.status) {
+                    return Err(HubApiError::msg(format!("HTTP {}", res.status), Some(res.status)));
+                }
+                Ok(res.body)
+            }
+        }
+    }
 }
 
 fn ms_of(deadline: Deadline) -> u64 {

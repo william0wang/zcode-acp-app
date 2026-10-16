@@ -12,7 +12,9 @@ use serde_json::{json, Value};
 
 use super::{HubApiError, HubClient};
 use crate::clock::{BoxFuture, MockClock};
-use crate::http::{parse_query, HttpError, HttpMethod, HttpRequest, HttpResponse, HttpTransport};
+use crate::http::{
+    parse_query, HttpBytesResponse, HttpError, HttpMethod, HttpRequest, HttpResponse, HttpTransport,
+};
 use crate::hub::HubHistoryCursor;
 
 // -- scripted fetch double ---------------------------------------------------
@@ -20,12 +22,17 @@ use crate::hub::HubHistoryCursor;
 #[derive(Default)]
 struct ScriptedHttp {
     responses: Mutex<VecDeque<Result<HttpResponse, HttpError>>>,
+    bytes_responses: Mutex<VecDeque<Result<HttpBytesResponse, HttpError>>>,
     requested: Mutex<Vec<HttpRequest>>,
 }
 
 impl ScriptedHttp {
     fn push(&self, response: Result<HttpResponse, HttpError>) {
         self.responses.lock().unwrap().push_back(response);
+    }
+
+    fn push_bytes(&self, response: Result<HttpBytesResponse, HttpError>) {
+        self.bytes_responses.lock().unwrap().push_back(response);
     }
 
     fn urls(&self) -> Vec<String> {
@@ -46,6 +53,21 @@ impl HttpTransport for ScriptedHttp {
             .unwrap()
             .pop_front()
             .expect("test bug: no scripted response left");
+        Box::pin(async move { next })
+    }
+
+    fn fetch_bytes(
+        &self,
+        req: HttpRequest,
+        _abort: crate::http::AbortSignal,
+    ) -> BoxFuture<'static, Result<HttpBytesResponse, HttpError>> {
+        self.requested.lock().unwrap().push(req);
+        let next = self
+            .bytes_responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("test bug: no scripted bytes response left");
         Box::pin(async move { next })
     }
 }
@@ -343,6 +365,61 @@ async fn fs_file_url_embeds_token_and_session_in_the_query_for_img_src() {
     assert_eq!(params.get("sessionId").map(String::as_str), Some("sess"));
     assert_eq!(params.get("path").map(String::as_str), Some("/a b.png"));
     assert_eq!(params.get("token").map(String::as_str), Some("tok"));
+}
+
+/// The image-preview fetch (batch K): same URL shape as fs_file_url — the
+/// token rides the query because a binary GET has no header story here — and
+/// the body comes back as raw bytes, untouched by the lossy text pipeline.
+#[tokio::test]
+async fn fs_file_bytes_fetches_the_token_query_url_and_returns_raw_bytes() {
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    // Bytes that are invalid UTF-8 — the lossy text body would mangle them.
+    let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0xff, 0xfe, 0x80];
+    http.push_bytes(Ok(HttpBytesResponse {
+        status: 200,
+        headers: vec![("content-type".into(), "image/png".into())],
+        body: png.clone(),
+    }));
+    let got = client(http.clone(), clock)
+        .fs_file_bytes("inst", "sess", "/a b.png")
+        .await
+        .unwrap();
+    assert_eq!(got, png);
+    let url = http.urls().remove(0);
+    let (path, query) = url.split_once('?').unwrap();
+    assert_eq!(path, "http://hub/api/instances/inst/fs/file");
+    let params = parse_query(query).into_iter().collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(params.get("sessionId").map(String::as_str), Some("sess"));
+    assert_eq!(params.get("path").map(String::as_str), Some("/a b.png"));
+    assert_eq!(params.get("token").map(String::as_str), Some("tok"));
+}
+
+#[tokio::test]
+async fn fs_file_bytes_maps_http_and_network_failures() {
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push_bytes(Ok(HttpBytesResponse {
+        status: 404,
+        headers: Vec::new(),
+        body: b"unknown instance".to_vec(),
+    }));
+    let err = client(http.clone(), clock)
+        .fs_file_bytes("inst", "sess", "/x.png")
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, Some(404));
+    assert!(!err.network);
+
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push_bytes(Err(HttpError {
+        message: "conn refused".into(),
+        aborted: false,
+    }));
+    let err = client(http, clock).fs_file_bytes("inst", "sess", "/x.png").await.unwrap_err();
+    assert!(err.network);
+    assert_eq!(err.status, None);
 }
 
 #[tokio::test]

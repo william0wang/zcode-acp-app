@@ -17,7 +17,7 @@ use std::task::{Context, Poll};
 
 use protocol::clock::BoxFuture;
 use protocol::http::{
-    AbortSignal, HttpError, HttpMethod, HttpRequest, HttpResponse, HttpTransport,
+    AbortSignal, HttpBytesResponse, HttpError, HttpMethod, HttpRequest, HttpResponse, HttpTransport,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
@@ -39,7 +39,33 @@ impl HttpTransport for LocalHttpTransport {
             tokio::select! {
                 biased;
                 _ = abort.wait() => Err(HttpError::aborted()),
-                out = perform(req) => out,
+                // JSON API bodies pass through the lossy UTF-8 decode — the
+                // protocol layer's HttpResponse contract.
+                out = perform(req) => out.map(|raw| HttpResponse {
+                    status: raw.status,
+                    headers: raw.headers,
+                    body: String::from_utf8_lossy(&raw.body).into_owned(),
+                }),
+            }
+        })
+    }
+
+    fn fetch_bytes(
+        &self,
+        req: HttpRequest,
+        abort: AbortSignal,
+    ) -> BoxFuture<'static, Result<HttpBytesResponse, HttpError>> {
+        // Same socket-per-request policy; the body stays raw bytes so image
+        // fetches never pass through the lossy UTF-8 text body.
+        Box::pin(async move {
+            tokio::select! {
+                biased;
+                _ = abort.wait() => Err(HttpError::aborted()),
+                out = perform(req) => out.map(|raw| HttpBytesResponse {
+                    status: raw.status,
+                    headers: raw.headers,
+                    body: raw.body,
+                }),
             }
         })
     }
@@ -245,7 +271,7 @@ fn tls_connector() -> Result<tokio_rustls::TlsConnector, HttpError> {
     Ok(std::sync::Arc::new(config).into())
 }
 
-async fn perform(req: HttpRequest) -> Result<HttpResponse, HttpError> {
+async fn perform(req: HttpRequest) -> Result<RawResponse, HttpError> {
     let url = parse_url(&req.url)?;
     let tcp = TcpStream::connect((url.host.as_str(), url.port))
         .await
@@ -286,10 +312,30 @@ async fn perform(req: HttpRequest) -> Result<HttpResponse, HttpError> {
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.map_err(net_err)?;
 
-    parse_response(&raw)
+    perform_parse(&raw)
 }
 
+/// One parsed response before the body is shaped for either transport arm:
+/// `fetch` lossily decodes to String (JSON API), `fetch_bytes` keeps raw.
+struct RawResponse {
+    status: u16,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+}
+
+/// Parses the raw wire response. Exposed text-shaped (lossy UTF-8) for the
+/// unit tests that assert header/content-length/chunked behavior; binary
+/// integrity is covered by the png round-trip test below.
+#[cfg(test)]
 fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
+    perform_parse(raw).map(|res| HttpResponse {
+        status: res.status,
+        headers: res.headers,
+        body: String::from_utf8_lossy(&res.body).into_owned(),
+    })
+}
+
+fn perform_parse(raw: &[u8]) -> Result<RawResponse, HttpError> {
     let header_end = find_subslice(raw, b"\r\n\r\n").ok_or_else(|| HttpError {
         message: "malformed response (no header terminator)".to_string(),
         aborted: false,
@@ -336,10 +382,10 @@ fn parse_response(raw: &[u8]) -> Result<HttpResponse, HttpError> {
         body_raw.to_vec()
     };
 
-    Ok(HttpResponse {
+    Ok(RawResponse {
         status,
         headers,
-        body: String::from_utf8_lossy(&body).into_owned(),
+        body,
     })
 }
 
@@ -419,6 +465,29 @@ mod tests {
         .unwrap();
         assert_eq!(res.status, 401);
         assert_eq!(res.body, "unautho");
+    }
+
+    /// fetch_bytes' contract: a raster body survives parsing byte-for-byte.
+    /// A PNG header contains invalid UTF-8 sequences, so the lossy text body
+    /// would mangle it (the reason the binary arm exists).
+    #[test]
+    fn raw_body_round_trips_binary_bytes_exactly() {
+        // Minimal PNG-ish payload with bytes that are NOT valid UTF-8.
+        let png: Vec<u8> = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0xfe, 0x80];
+        let mut wire = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\n\r\n",
+            png.len()
+        )
+        .into_bytes();
+        wire.extend_from_slice(&png);
+
+        let res = perform_parse(&wire).unwrap();
+        assert_eq!(res.status, 200);
+        assert_eq!(res.body, png);
+
+        // The text arm stays lossy by design (JSON API contract).
+        let text = parse_response(&wire).unwrap();
+        assert_ne!(text.body.as_bytes(), png.as_slice());
     }
 
     /// Live smoke against the real local hub (opt-in: ZCODE_ACP_SMOKE=1 with

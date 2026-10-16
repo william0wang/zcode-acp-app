@@ -227,7 +227,67 @@ pub struct Workbench {
     /// The rename sheet's single-line draft.
     rename_input: Entity<InputState>,
     _rename_sub: Subscription,
+    /// The composer's "/" completion menu (batch K, ChatView.tsx `Composer`):
+    /// view-local highlight + Escape memory. The token and matches derive
+    /// from the LIVE composer text at paint time; these fields only carry
+    /// what keystrokes cannot recompute.
+    slash_highlight: usize,
+    /// The token the highlight belongs to — a change resets it (the TS
+    /// `useEffect([token])`).
+    slash_token: Option<String>,
+    /// The Escape'd token: the menu stays closed until the query changes.
+    slash_dismissed: Option<String>,
+    /// A completion committed without a window at hand (the PressEnter
+    /// subscription); applied during render like `clear_composer`.
+    pending_slash_insert: Option<PendingSlashInsert>,
+    /// Keeps the "/" menu's keystroke interceptor alive.
+    _slash_key_sub: Subscription,
+    /// The open image lightbox (batch K): click a message image (or the file
+    /// viewer's preview) to enlarge; Esc / backdrop closes. View-local — the
+    /// raster is already in memory.
+    lightbox: Option<Lightbox>,
     _composer_sub: Subscription,
+}
+
+/// One committed slash completion waiting for a render-pass `set_value`
+/// (window-gated; the PressEnter subscription has no window).
+struct PendingSlashInsert {
+    text: String,
+    /// lsp-style (line, character) the caret parks at — right after the
+    /// inserted "/name " (the TS rAF caret park).
+    position: (u32, u32),
+}
+
+/// The enlarged image overlay's payload.
+struct Lightbox {
+    src: Arc<gpui::Image>,
+    /// Where the raster came from (a message echo or a file preview).
+    caption: Option<String>,
+}
+
+/// The composer's "/" menu key events (ChatView onKeyDownCapture's set).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SlashKey {
+    Up,
+    Down,
+    Commit,
+    Dismiss,
+}
+
+/// Everything the "/" menu paints or acts on, derived from the LIVE composer
+/// text (value + caret) — recomputed on every keystroke and every render, so
+/// no cached token can go stale.
+struct SlashMenuState {
+    /// The token under the caret, "/" included (e.g. "/td", "/$tdd").
+    token: String,
+    /// The token's byte range in the composer text.
+    start: usize,
+    end: usize,
+    /// Bridge-ordered matching commands.
+    matches: Vec<protocol::acp::SlashCommand>,
+    /// False when Escape dismissed this exact query.
+    open: bool,
+    highlight: usize,
 }
 
 /// One staged attachment: the wire draft plus the decoded raster gpui
@@ -546,7 +606,60 @@ impl Workbench {
                 shift: false,
             } = event
             {
+                // An open "/" menu swallows Enter as a commit (the TS capture
+                // handler beats the composer submit); only a closed menu sends.
+                if let Some(name) = this
+                    .slash_menu(cx)
+                    .filter(|m| m.open)
+                    .and_then(|m| m.matches.get(m.highlight).map(|c| c.name.clone()))
+                {
+                    this.stage_slash_select(&name, cx);
+                    return;
+                }
                 this.submit_composer(cx);
+            }
+        });
+        // The "/" menu's keyboard half (ChatView onKeyDownCapture): arrows
+        // navigate, Tab/Enter commit, Escape dismisses — observed BEFORE the
+        // textarea's own bindings, and consumed so the caret never moves
+        // behind the menu. App-global: the composer-focus check gates it.
+        let slash_weak = cx.entity().downgrade();
+        let slash_key_sub = cx.intercept_keystrokes(move |event, window, cx| {
+            let Some(wb) = slash_weak.upgrade() else {
+                return;
+            };
+            let focused = wb
+                .read(cx)
+                .composer
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window);
+            if !focused {
+                return;
+            }
+            // Read-side gate first: with no OPEN menu there is nothing to
+            // intercept, and the keystroke must reach the textarea's own
+            // bindings untouched (no entity writes during its dispatch).
+            let menu_open = wb.read(cx).slash_menu(cx).is_some_and(|m| m.open);
+            if !menu_open {
+                return;
+            }
+            let m = &event.keystroke.modifiers;
+            // Platform combos (cmd/ctrl/alt) stay the platform's — only the
+            // bare keys the TS handler intercepts (plus Shift+Tab, which TS
+            // also commits) drive the menu.
+            let platform_mod = m.control || m.alt || m.platform || m.function;
+            let key = match event.keystroke.key.as_str() {
+                "up" if !platform_mod => SlashKey::Up,
+                "down" if !platform_mod => SlashKey::Down,
+                "tab" if !platform_mod => SlashKey::Commit,
+                "enter" if !platform_mod && !m.shift => SlashKey::Commit,
+                "escape" if !platform_mod => SlashKey::Dismiss,
+                _ => return,
+            };
+            let handled = wb.update(cx, |this, cx| this.on_slash_key(key, cx));
+            if handled {
+                cx.stop_propagation();
             }
         });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
@@ -632,6 +745,12 @@ impl Workbench {
             rename_prefill: None,
             rename_input,
             _rename_sub: rename_sub,
+            slash_highlight: 0,
+            slash_token: None,
+            slash_dismissed: None,
+            pending_slash_insert: None,
+            _slash_key_sub: slash_key_sub,
+            lightbox: None,
             _composer_sub: composer_sub,
         };
 
@@ -770,12 +889,16 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Esc: close the topmost layer first — the rename sheet swallows it,
-    /// then the new-session sheet (the TS back-handler stack, `creating`
-    /// guard included via the command's no-op-while-busy); otherwise it is
-    /// ChatView's Cancel — `session/cancel` on the running turn.
+    /// Esc: close the topmost layer first — the lightbox swallows it (K2),
+    /// then the rename sheet, the new-session sheet (the TS back-handler
+    /// stack, `creating` guard included via the command's no-op-while-busy);
+    /// otherwise it is ChatView's Cancel — `session/cancel` on the running
+    /// turn. (The "/" menu's Escape never reaches here: the keystroke
+    /// interceptor consumes it before the global binding.)
     fn on_stop_turn(&mut self, _: &StopTurn, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.rename_target.take().is_some() {
+        if self.lightbox.take().is_some() {
+            // View-local — closing it is purely ours.
+        } else if self.rename_target.take().is_some() {
             // The rename sheet is view-local — closing it is purely ours.
         } else if self.snap.new_session.is_some() {
             self.runtime.send(UiCommand::NewSessionToggle);
@@ -1077,6 +1200,101 @@ impl Workbench {
         self.clear_composer = true;
         let images = self.take_staged();
         self.runtime.send(UiCommand::SendPrompt { text, images });
+        cx.notify();
+    }
+
+    // -- "/" completion menu (batch K, ChatView.tsx `Composer`) -------------
+
+    /// The menu derived from the LIVE composer text: the word under the
+    /// caret, the bridge's matching commands, the dismissal memory, and the
+    /// clamped highlight. `None` when there is no slash token at all.
+    fn slash_menu(&self, cx: &App) -> Option<SlashMenuState> {
+        let state = self.composer.read(cx);
+        let value = state.value();
+        let caret = state.cursor();
+        let (start, end) = slash_token_range(&value, caret)?;
+        let token = value[start..end].to_string();
+        let commands = self.tab.as_ref()?.available_commands.clone();
+        let matches = slash_matches(&token, &commands);
+        if matches.is_empty() {
+            return None;
+        }
+        let open = self.slash_dismissed.as_deref() != Some(token.as_str());
+        let highlight = self.slash_highlight.min(matches.len() - 1);
+        Some(SlashMenuState {
+            token,
+            start,
+            end,
+            matches,
+            open,
+            highlight,
+        })
+    }
+
+    /// One intercepted keystroke while the menu is open (the TS capture
+    /// handler): arrows clamp, Tab/Enter commit, Escape dismisses until the
+    /// query changes. Returns whether the key was consumed.
+    fn on_slash_key(&mut self, key: SlashKey, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.slash_menu(cx) else {
+            return false;
+        };
+        if !menu.open {
+            return false;
+        }
+        match key {
+            SlashKey::Up => self.slash_highlight = menu.highlight.saturating_sub(1),
+            SlashKey::Down => {
+                self.slash_highlight = (menu.highlight + 1).min(menu.matches.len() - 1)
+            }
+            SlashKey::Commit => {
+                let name = menu.matches[menu.highlight].name.clone();
+                self.stage_slash_select(&name, cx);
+                return true;
+            }
+            SlashKey::Dismiss => {
+                // Stay closed for THIS query; any edit reopens (TS
+                // `dismissedToken !== token`).
+                self.slash_dismissed = Some(menu.token);
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    /// Commits one command into the draft (TS `select`): the token is
+    /// replaced by "/name " (the wire name keeps a "$" prefix verbatim),
+    /// the caret parks right after it, and the inserted token joins the
+    /// dismissal memory so the menu does not instantly reopen.
+    fn stage_slash_select(&mut self, name: &str, cx: &mut Context<Self>) {
+        let Some(menu) = self.slash_menu(cx) else {
+            return;
+        };
+        let value = self.composer.read(cx).value().to_string();
+        let inserted = format!("/{name} ");
+        let mut text = String::with_capacity(value.len() + inserted.len());
+        text.push_str(&value[..menu.start]);
+        text.push_str(&inserted);
+        text.push_str(value[menu.end..].trim_start());
+        let caret = menu.start + inserted.len();
+        self.pending_slash_insert = Some(PendingSlashInsert {
+            text: text.clone(),
+            position: caret_position_of(&text, caret),
+        });
+        self.slash_dismissed = Some(format!("/{name}"));
+        self.slash_highlight = 0;
+        self.slash_token = None;
+        cx.notify();
+    }
+
+    /// Opens the image lightbox (K2): a message echo or a file preview hands
+    /// over its decoded raster.
+    pub(crate) fn open_lightbox(
+        &mut self,
+        src: Arc<gpui::Image>,
+        caption: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.lightbox = Some(Lightbox { src, caption });
         cx.notify();
     }
 
@@ -3293,6 +3511,22 @@ impl Workbench {
             );
             column = column.child(strip);
         }
+        // The "/" completion menu (K1): mounted through the deferred layer
+        // anchored to the textarea's top-left, growing upward (mobile's
+        // above-composer listbox). Input-bounds lag one frame — acceptable:
+        // the composer does not move while typing.
+        if let Some(menu) = self.slash_menu(cx).filter(|m| m.open) {
+            let anchor = self.composer.read(cx).input_bounds().origin;
+            column = column.child(
+                deferred(
+                    anchored()
+                        .anchor(Anchor::BottomLeft)
+                        .position(anchor)
+                        .child(render_slash_menu(&menu, &cx.entity().downgrade(), &theme)),
+                )
+                .with_priority(1),
+            );
+        }
         let mut controls = div().flex().items_end().gap_2();
         // The gallery pick (ChatView's ImagePlus): native file dialog.
         let wb = cx.entity();
@@ -3389,7 +3623,7 @@ impl Workbench {
                 .text_color(theme.muted_foreground)
                 .child(
                     "Enter send · Shift+Enter newline · follow-ups queue while running · \
-                     paste/drop up to 4 images",
+                     paste/drop up to 4 images · / completes commands",
                 ),
         );
 
@@ -3433,6 +3667,86 @@ fn render_image_of(draft: &AttachmentDraft) -> Option<Arc<gpui::Image>> {
     Some(Arc::new(gpui::Image::from_bytes(format, bytes)))
 }
 
+// -- "/" completion pure units (batch K, ChatView.tsx:576-635) --------------
+
+/// The whitespace-delimited word around the caret (byte range), ChatView's
+/// token scan: scan back/forward while the neighboring char is not
+/// whitespace. A caret resting exactly on a following word's start edge
+/// counts as no word (`tokenStart === caret && tokenEnd > caret` → ""). Only
+/// words starting with "/" complete — the caller decides.
+fn slash_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
+    let bytes = value.as_bytes();
+    let caret = caret.min(bytes.len());
+    // Snap the caret onto a char boundary (defensive; cursor() is a byte
+    // offset but a malformed selection could park mid-char).
+    let mut caret = caret;
+    while caret > 0 && !value.is_char_boundary(caret) {
+        caret -= 1;
+    }
+    let is_ws =
+        |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
+    let mut start = caret;
+    while start > 0 && !is_ws(bytes[start - 1]) {
+        start -= 1;
+        while start > 0 && !value.is_char_boundary(start) {
+            start -= 1;
+        }
+    }
+    let mut end = caret;
+    while end < bytes.len() && !is_ws(bytes[end]) {
+        end += 1;
+        while end < bytes.len() && !value.is_char_boundary(end) {
+            end += 1;
+        }
+    }
+    if start == caret && end > caret {
+        return None; // the caret sits on the NEXT word's start edge
+    }
+    if value[start..].starts_with('/') {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// Bridge-ordered prefix matches (TS `matches`): the query is the token
+/// after "/", lowercased; skill commands ride a "$" grouping prefix that is
+/// stripped on BOTH sides so "/td" matches "$tdd" and "/$tdd" does too.
+fn slash_matches(token: &str, commands: &[protocol::acp::SlashCommand]) -> Vec<protocol::acp::SlashCommand> {
+    let q = strip_dollar(&token[1..]).to_lowercase();
+    commands
+        .iter()
+        .filter(|c| strip_dollar(&c.name.to_lowercase()).starts_with(&q))
+        .cloned()
+        .collect()
+}
+
+/// Skill commands ride a "$" grouping prefix ("/$tdd" on the wire); the
+/// completion query strips it on BOTH sides so "/td" matches "$tdd".
+fn strip_dollar(s: &str) -> &str {
+    s.strip_prefix('$').unwrap_or(s)
+}
+
+/// lsp-style (line, character) of a byte offset — parks the caret after a
+/// committed command (the TS `setSelectionRange` park; `set_value` resets a
+/// multi-line selection to 0..0, so the park must follow it).
+fn caret_position_of(text: &str, byte_offset: usize) -> (u32, u32) {
+    let mut line = 0u32;
+    let mut character = 0u32;
+    for (i, ch) in text.char_indices() {
+        if i >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            character = 0;
+        } else {
+            character += 1;
+        }
+    }
+    (line, character)
+}
+
 /// Reads dropped/picked files off the main thread, keeping only images
 /// (TS `!f.type.startsWith("image/") continue`) — the mime comes from the
 /// bytes when the extension says nothing.
@@ -3474,13 +3788,26 @@ fn paste_inputs(item: &ClipboardItem) -> Option<Vec<StageInput>> {
 }
 
 /// One attachment echo in the chat stream: bounded raster, ring, contain.
-fn render_attachment_echo(src: &Arc<gpui::Image>, theme: &component::Theme) -> gpui::Div {
+/// Clicking opens the lightbox (K2) — the row hands its raster over.
+fn render_attachment_echo(
+    src: &Arc<gpui::Image>,
+    theme: &component::Theme,
+    wb: &WeakEntity<Workbench>,
+    id: SharedString,
+) -> AnyElement {
+    let open_src = src.clone();
+    let wb = wb.clone();
     div()
         .p_1()
         .rounded_md()
         .border_1()
         .border_color(theme.border)
         .bg(theme.background)
+        .id(id)
+        .test_support()
+        .on_click(move |_, _, cx| {
+            let _ = wb.update(cx, |this, cx| this.open_lightbox(open_src.clone(), None, cx));
+        })
         .child(
             img(src.clone())
                 .w(px(240.))
@@ -3488,6 +3815,84 @@ fn render_attachment_echo(src: &Arc<gpui::Image>, theme: &component::Theme) -> g
                 .rounded_sm()
                 .object_fit(gpui::ObjectFit::Contain),
         )
+        .into_any_element()
+}
+
+/// The "/" completion menu surface (K2, ChatView's listbox): one row per
+/// bridge-ordered match — mono "/name" plus the truncated description (and
+/// the input hint, TS `description — hint`). Mounted by the composer through
+/// `deferred(anchored(...))`, so it floats above the workbench.
+fn render_slash_menu(
+    menu: &SlashMenuState,
+    wb: &WeakEntity<Workbench>,
+    theme: &component::Theme,
+) -> AnyElement {
+    let mut list = div()
+        .id("slash-menu")
+        .test_support()
+        .flex()
+        .flex_col()
+        .w(px(420.))
+        .max_h(px(224.))
+        .overflow_y_scroll()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.title_bar);
+    for (ix, cmd) in menu.matches.iter().enumerate() {
+        let selected = ix == menu.highlight;
+        let name = cmd.name.clone();
+        let mut description = cmd.description.clone().unwrap_or_default();
+        if let Some(hint) = cmd.input.as_ref().and_then(|i| i.hint.as_deref()) {
+            if !hint.is_empty() {
+                if description.is_empty() {
+                    description = hint.to_string();
+                } else {
+                    description = format!("{description} — {hint}");
+                }
+            }
+        }
+        let row = div()
+            .id(SharedString::from(format!("slash-row-{ix}")))
+            .test_support()
+            .flex()
+            .items_baseline()
+            .gap_2()
+            .px_3()
+            .py_1()
+            .min_w_0()
+            .when(selected, |this| this.bg(theme.secondary))
+            .hover(|this| this.bg(theme.secondary))
+            .on_click({
+                let wb = wb.clone();
+                move |_, _, cx| {
+                    let _ =
+                        wb.update(cx, |this, cx| this.stage_slash_select(&name, cx));
+                }
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(if selected {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .child(format!("/{}", cmd.name)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(description),
+            );
+        list = list.child(row);
+    }
+    list.into_any_element()
 }
 
 fn short_id(id: &str, fallback: &str) -> String {
@@ -3615,7 +4020,7 @@ fn render_user_row(
         );
     }
     let mut bubble = div().flex().flex_col().gap_2().min_w_0();
-    for part in &row.parts {
+    for (part_index, part) in row.parts.iter().enumerate() {
         bubble = match part {
             PartView::Plain { text } => bubble.child(
                 div()
@@ -3630,7 +4035,13 @@ fn render_user_row(
                     .text_color(theme.muted_foreground)
                     .child("[image attachment]"),
             ),
-            PartView::Image { src } => bubble.child(render_attachment_echo(src, theme)),
+            // Click to enlarge (K2) — one stable id per row part.
+            PartView::Image { src } => bubble.child(render_attachment_echo(
+                src,
+                theme,
+                wb,
+                SharedString::from(format!("msg-image-{}-{part_index}", row.id)),
+            )),
             PartView::Markdown { state, .. } => bubble.child(
                 div()
                     .p_2()
@@ -3889,7 +4300,12 @@ fn render_assistant_row(
                     .text_color(theme.muted_foreground)
                     .child("[image attachment]"),
             ),
-            PartView::Image { src } => column.child(render_attachment_echo(src, theme)),
+            PartView::Image { src } => column.child(render_attachment_echo(
+                src,
+                theme,
+                wb,
+                SharedString::from(format!("msg-image-{}-{part_index}", row.id)),
+            )),
         };
     }
     // The trailing copy affordance (E4): the message's markdown source —
@@ -3955,6 +4371,31 @@ impl Render for Workbench {
                 composer.update(cx, |state, cx| state.set_value(&text, window, cx));
             });
             self.staged = staged;
+        }
+        // A committed "/" completion lands the same windowless way: swap the
+        // draft, then park the caret right after the inserted command (the
+        // TS rAF park — set_value alone would strand it at offset 0).
+        if let Some(insert) = self.pending_slash_insert.take() {
+            let composer = self.composer.clone();
+            window.defer(cx, move |window, cx| {
+                composer.update(cx, |state, cx| {
+                    state.set_value(insert.text, window, cx);
+                    let (line, character) = insert.position;
+                    state.set_cursor_position(
+                        gpui_kit::base::input::Position::new(line, character),
+                        window,
+                        cx,
+                    );
+                });
+            });
+        }
+        // The "/" menu's highlight resets when the query token changes (TS
+        // `useEffect([token])`); the token itself is paint-derived, so the
+        // compare happens here where &mut self exists.
+        let live_token = self.slash_menu(cx).map(|m| m.token);
+        if self.slash_token.as_deref() != live_token.as_deref() {
+            self.slash_token = live_token;
+            self.slash_highlight = 0;
         }
         // The inline approval card reconciles here: its interactive state
         // entities need a window (see reconcile_card).
@@ -4117,12 +4558,103 @@ impl Render for Workbench {
             // full-screen reader; later siblings paint above, so this goes
             // last.
             .when_some(self.snap.files.viewing.clone(), |this, view| {
-                this.child(render_file_viewer(&view, &runtime, cx))
+                this.child(render_file_viewer(
+                    &view,
+                    &runtime,
+                    &cx.entity().downgrade(),
+                    cx,
+                ))
+            })
+            // The lightbox (K2) rides the kit's DEFERRED layer — it paints
+            // above every non-deferred element regardless of tree order, so
+            // no later sibling can overpaint it (the gpui-kit no-z-index
+            // rule; same mechanism the kit's dialogs use).
+            .when(self.lightbox.is_some(), |this| {
+                this.child(self.render_lightbox(window, cx))
             })
     }
 }
 
 impl Workbench {
+    /// The image lightbox overlay (K2, ChatView's Lightbox simplified): a
+    /// near-black backdrop with the raster contained, Esc or a backdrop
+    /// click closes. Mounted through `deferred(anchored(...))` — the kit's
+    /// overlay layer, never sibling paint order.
+    fn render_lightbox(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let Some(boxed) = self.lightbox.as_ref() else {
+            return div().into_any_element();
+        };
+        let viewport = window.viewport_size();
+        // Pixel caps off the viewport (relative() here resolves against the
+        // auto-sized card, which has no definite size to be relative TO).
+        let cap_w = (viewport.width * 0.9).max(px(120.));
+        let cap_h = (viewport.height * 0.85).max(px(120.));
+        // The card swallows its own click so an inspect drag does not
+        // dismiss; anything else on the backdrop closes.
+        let card = div()
+            .id("lightbox-card")
+            .test_support()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .max_w(cap_w)
+            .max_h(cap_h)
+            .p_2()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                img(boxed.src.clone())
+                    .max_w(cap_w)
+                    .max_h(cap_h)
+                    .object_fit(gpui::ObjectFit::Contain),
+            )
+            .when_some(boxed.caption.clone(), |this, caption| {
+                this.child(
+                    div()
+                        .id("lightbox-caption")
+                        .test_support()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(caption),
+                )
+            });
+        let backdrop = div()
+            .id("lightbox-backdrop")
+            .test_support()
+            .flex()
+            .items_center()
+            .justify_center()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(viewport.width)
+            .h(viewport.height)
+            .bg(gpui::black().opacity(0.85))
+            .on_mouse_down(MouseButton::Left, {
+                let wb = wb.clone();
+                move |_, _, cx| {
+                    wb.update(cx, |this, cx| {
+                        this.lightbox = None;
+                        cx.notify();
+                    });
+                }
+            })
+            .child(card);
+        deferred(
+            anchored()
+                .anchor(Anchor::TopLeft)
+                .position(point(px(0.), px(0.)))
+                .child(backdrop),
+        )
+        .into_any_element()
+    }
     /// The rename sheet (G1, TS SessionList's action sheet in rename mode):
     /// a prefilled single-line draft; Save dispatches the UiCommand and
     /// closes (the driver owns trim/cap; the toast owns the outcome). Esc
@@ -4709,6 +5241,7 @@ mod chip_tests {
             turn_stats: None,
             plan_entries: None,
             fs_capable: true,
+            available_commands: Vec::new(),
         });
         snap
     }
@@ -4899,6 +5432,7 @@ mod display_tests {
             }),
             plan_entries: None,
             fs_capable: true,
+            available_commands: Vec::new(),
         });
         let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
         cx.update_window(handle.into(), |_, window, cx| {
@@ -5047,6 +5581,7 @@ mod display_tests {
             turn_stats: None,
             plan_entries: None,
             fs_capable: true,
+            available_commands: Vec::new(),
         }
     }
 
@@ -5149,6 +5684,7 @@ mod files_tests {
             turn_stats: None,
             plan_entries: None,
             fs_capable,
+            available_commands: Vec::new(),
         });
         snap.files = FilesPanelView {
             path: path.to_string(),
@@ -5303,6 +5839,7 @@ mod files_tests {
         });
         let mut snap = files_snapshot("", true);
         snap.files.viewing = Some(FileViewerView {
+            image: None,
             path: "README.md".to_string(),
             name: "README.md".to_string(),
             size: 128,
@@ -5636,6 +6173,7 @@ mod language_tests {
             turn_stats: None,
             plan_entries: None,
             fs_capable: true,
+            available_commands: Vec::new(),
         });
         snap
     }
@@ -5916,5 +6454,470 @@ mod display_unit_tests {
         });
         // The TS join("") has no separator.
         assert_eq!(super::row_plain_text(&row), "onetwo");
+    }
+}
+
+/// Batch K pure units: the "/" completion's caret token scan, the "$"-aware
+/// prefix matcher, and the post-commit caret park arithmetic.
+#[cfg(test)]
+mod slash_unit_tests {
+    // Explicit imports only (the file-root kit glob shadows #[test]).
+    use super::{caret_position_of, slash_matches, slash_token_range};
+    use protocol::acp::SlashCommand;
+
+    fn cmd(name: &str) -> SlashCommand {
+        SlashCommand {
+            name: name.to_string(),
+            description: None,
+            input: None,
+        }
+    }
+
+    #[test]
+    fn token_scan_takes_the_word_around_the_caret() {
+        // Mid-word caret: the whole word.
+        assert_eq!(slash_token_range("hello /wor", 10), Some((6, 10)));
+        // Any word position completes — a slash mid-draft is still a token
+        // (only the harness executes start-of-draft commands).
+        assert_eq!(slash_token_range("run /new now", 6), Some((4, 8)));
+        // A caret on the NEXT word's start edge sees no word yet ("" in TS);
+        // mid-word still completes.
+        assert_eq!(slash_token_range("hi /cmd", 3), None);
+        assert_eq!(slash_token_range("hi /cmd", 6), Some((3, 7)));
+        // Non-slash words never complete.
+        assert_eq!(slash_token_range("hello", 2), None);
+        // Bare "/" at the caret is a token (empty query lists everything).
+        assert_eq!(slash_token_range("/", 1), Some((0, 1)));
+        // The scan respects char boundaries (multibyte neighbors).
+        assert_eq!(slash_token_range("哈 /tdd", 6), Some((4, 8)));
+    }
+
+    #[test]
+    fn matcher_strips_the_dollar_on_both_sides_and_keeps_order() {
+        let commands = vec![cmd("plan"), cmd("$tdd"), cmd("Prompt")];
+        let names = |token: &str| {
+            slash_matches(token, &commands)
+                .into_iter()
+                .map(|c| c.name)
+                .collect::<Vec<_>>()
+        };
+        // Empty query: every command, bridge order.
+        assert_eq!(names("/"), vec!["plan", "$tdd", "Prompt"]);
+        // "$tdd" matches a plain "/td" (marker stripped on both sides) and
+        // the explicit "/$t" spelling alike.
+        assert_eq!(names("/td"), vec!["$tdd"]);
+        assert_eq!(names("/$t"), vec!["$tdd"]);
+        // Prefix matching is case-insensitive.
+        assert_eq!(names("/PR"), vec!["Prompt"]);
+        // No match: empty.
+        assert!(names("/zz").is_empty());
+    }
+
+    #[test]
+    fn caret_park_counts_lines_and_characters() {
+        assert_eq!(caret_position_of("/cmd rest", 5), (0, 5));
+        assert_eq!(caret_position_of("one\ntwo /cmd", 10), (1, 6));
+        // Multibyte chars count as one character.
+        assert_eq!(caret_position_of("哈\n/tdd x", 6), (1, 2));
+        // Offset at 0 parks at the origin.
+        assert_eq!(caret_position_of("abc", 0), (0, 0));
+    }
+}
+
+/// Batch K headless UI: the composer's "/" completion menu — matching,
+/// keyboard navigation (↑/Enter/Tab), Escape memory, and click commits.
+#[cfg(test)]
+mod slash_tests {
+    // Explicit imports only — the file-root kit glob shadows #[test].
+    use super::Workbench;
+    use crate::runtime::{
+        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        px, AppContext as _, Bounds, Entity, Point, Size, TestAppContext, WindowBounds, WindowOptions,
+    };
+
+    fn commands_fixture() -> Vec<protocol::acp::SlashCommand> {
+        use protocol::acp::{SlashCommand, SlashCommandInput};
+        vec![
+            SlashCommand {
+                name: "plan".to_string(),
+                description: Some("Plan mode".to_string()),
+                input: None,
+            },
+            SlashCommand {
+                name: "prompt".to_string(),
+                description: Some("Raw prompt".to_string()),
+                input: Some(SlashCommandInput {
+                    hint: Some("text".to_string()),
+                }),
+            },
+            SlashCommand {
+                name: "$tdd".to_string(),
+                description: Some("TDD skill".to_string()),
+                input: None,
+            },
+        ]
+    }
+
+    fn connected_snapshot() -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.tabs = vec![TabSummary {
+            id: 7,
+            session_id: Some("sess_1".to_string()),
+            phase: TabPhase::Connected,
+            running: false,
+            pending: 0,
+            awaiting: false,
+        }];
+        snap.active_tab = Some(7);
+        snap.active = Some(TabView {
+            session_id: Some("sess_1".to_string()),
+            agent_version: None,
+            phase: TabPhase::Connected,
+            running: false,
+            loading_session: false,
+            messages: Vec::new(),
+            pending: Vec::new(),
+            has_more: false,
+            total_messages: None,
+            loading_earlier: false,
+            approval: None,
+            config_options: Vec::new(),
+            usage: None,
+            cache_hit: None,
+            turn_stats: None,
+            plan_entries: None,
+            fs_capable: true,
+            available_commands: commands_fixture(),
+        });
+        snap
+    }
+
+    fn open(
+        cx: &mut TestAppContext,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
+        let runtime = ProtocolRuntime::inert();
+        let rt = runtime.clone();
+        let (handle, wb) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size {
+                            width: px(800.),
+                            height: px(600.),
+                        },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let rt = rt.clone();
+                    cx.new(|cx| Workbench::new(window, cx, rt, connected_snapshot()))
+                },
+            )
+            .expect("open test window")
+        });
+        (handle, wb, runtime)
+    }
+
+    /// Filtering ("$"-aware) and a click commit — the wire name keeps its
+    /// "$" prefix verbatim.
+    #[gpui_kit::test]
+    fn slash_menu_filters_and_click_commits(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb, runtime) = open(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // Bare "/": every command rows in bridge order.
+            window.input("/", cx);
+            window.render_frame(cx);
+            assert!(window.find("slash-menu").visible());
+            assert!(window.find("slash-row-0").visible());
+            assert!(window.find("slash-row-1").visible());
+            assert!(window.find("slash-row-2").visible());
+
+            // "/td": only "$tdd" matches (the marker stripped on both sides).
+            window.input("td", cx);
+            window.render_frame(cx);
+            assert!(window.find("slash-row-0").visible());
+            assert!(window.try_find("slash-row-1").is_none());
+
+            // A click commits: the draft becomes "/$tdd " (wire name kept).
+            // The insert rides a deferred set_value (App effects, not the
+            // frame) — flush outside, then read it in a fresh frame.
+            window.click("slash-row-0", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(wb.read(cx).composer.read(cx).value().as_ref(), "/$tdd ");
+            // The committed token stays dismissed — the menu does not
+            // instantly reopen over the inserted "/$tdd " (TS `select` sets
+            // dismissedToken to the inserted command).
+            assert!(
+                window.try_find("slash-menu").is_none(),
+                "the menu must not reopen for the committed token"
+            );
+            // (Enter-to-send after the commit is the batch-C composer path;
+            // the headless harness's press(enter) does not drive the kit
+            // textarea's Enter binding — verified with an isolated probe —
+            // so that half stays covered by its existing shipped behavior.)
+            let _ = runtime;
+        })
+        .unwrap();
+    }
+
+    /// ↑ moves the highlight, Tab and Enter both commit it, and Escape keeps
+    /// the menu closed only until the query changes (TS `dismissedToken`).
+    #[gpui_kit::test]
+    fn slash_menu_keys_navigate_commit_and_remember_dismissal(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb, _runtime) = open(cx);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.input("/p", cx);
+            window.render_frame(cx);
+            assert!(window.find("slash-row-0").visible());
+            assert!(window.find("slash-row-1").visible());
+
+            // ↓ moves to the second row; Tab commits it.
+            window.press("down", cx);
+            window.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(wb.read(cx).composer.read(cx).value().as_ref(), "/prompt ");
+
+            // Escape dismisses for THIS query only ("/p").
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.press("backspace", cx);
+            window.render_frame(cx);
+            window.input("/p", cx);
+            window.render_frame(cx);
+            assert!(
+                window.find("slash-menu").visible(),
+                "the menu must list before any dismissal"
+            );
+            window.press("escape", cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("slash-menu").is_none(),
+                "Escape must close the menu"
+            );
+            // Any query change reopens it — and Enter commits the top row.
+            window.input("l", cx);
+            window.render_frame(cx);
+            assert!(window.find("slash-menu").visible());
+            window.press("enter", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert_eq!(wb.read(cx).composer.read(cx).value().as_ref(), "/plan ");
+        })
+        .unwrap();
+    }
+}
+
+/// Batch K headless UI: the image lightbox — a message echo click opens it,
+/// Esc closes; a file preview's image enlarges with its path caption and a
+/// backdrop click closes.
+#[cfg(test)]
+mod lightbox_tests {
+    // Explicit imports only — the file-root kit glob shadows #[test].
+    use super::Workbench;
+    use crate::file_browser::FileKind;
+    use crate::runtime::{
+        FileViewerView, FilesPanelView, Phase, ProtocolRuntime, TabPhase, TabSummary, TabView,
+        WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        point, px, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
+        WindowBounds, WindowOptions,
+    };
+    use protocol::chat::{ChatMessage, ChatPart, ChatRole};
+
+    /// 1x1 transparent PNG — decodes through the attachment echo path.
+    const PNG_DATA_URL: &str =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    fn png_image() -> std::sync::Arc<gpui_kit::Image> {
+        let draft = protocol::image::parse_data_url(PNG_DATA_URL).expect("fixture parses");
+        super::render_image_of(&draft).expect("fixture rasterizes")
+    }
+
+    fn snapshot_with_image_message() -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.tabs = vec![TabSummary {
+            id: 7,
+            session_id: Some("sess_1".to_string()),
+            phase: TabPhase::Connected,
+            running: false,
+            pending: 0,
+            awaiting: false,
+        }];
+        snap.active_tab = Some(7);
+        snap.active = Some(TabView {
+            session_id: Some("sess_1".to_string()),
+            agent_version: None,
+            phase: TabPhase::Connected,
+            running: false,
+            loading_session: false,
+            messages: vec![ChatMessage {
+                id: "m1".to_string(),
+                role: ChatRole::User,
+                parts: vec![
+                    ChatPart::Text {
+                        text: "look".to_string(),
+                    },
+                    ChatPart::Image {
+                        image: PNG_DATA_URL.to_string(),
+                    },
+                ],
+                created_at: 1,
+                collapsed: None,
+            }],
+            pending: Vec::new(),
+            has_more: false,
+            total_messages: None,
+            loading_earlier: false,
+            approval: None,
+            config_options: Vec::new(),
+            usage: None,
+            cache_hit: None,
+            turn_stats: None,
+            plan_entries: None,
+            fs_capable: true,
+            available_commands: Vec::new(),
+        });
+        snap
+    }
+
+    fn open(
+        cx: &mut TestAppContext,
+        snap: WorkbenchSnapshot,
+    ) -> (gpui_kit::AnyWindowHandle, Entity<Workbench>) {
+        let (handle, wb) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size {
+                            width: px(800.),
+                            height: px(600.),
+                        },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let runtime = ProtocolRuntime::inert();
+                    cx.new(|cx| Workbench::new(window, cx, runtime, snap))
+                },
+            )
+            .expect("open test window")
+        });
+        (handle, wb)
+    }
+
+    #[gpui_kit::test]
+    fn message_image_click_opens_lightbox_and_escape_closes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb) = open(cx, snapshot_with_image_message());
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let echo = window.find("msg-image-m1-1");
+            assert!(echo.visible(), "the attachment echo must render");
+
+            // Click to enlarge: the deferred overlay appears above the tree.
+            window.click("msg-image-m1-1", cx);
+            window.render_frame(cx);
+            assert!(window.find("lightbox-backdrop").visible());
+
+            // Esc closes (the on_stop_turn layer stack's topmost). The
+            // headless harness drives neither press() nor dispatch_action
+            // through the workbench's on_action chain (verified with an
+            // isolated probe), so the bound handler fires directly here.
+            wb.update(cx, |this, cx| {
+                this.on_stop_turn(&super::StopTurn, window, cx)
+            });
+            window.render_frame(cx);
+            assert!(
+                window.try_find("lightbox-backdrop").is_none(),
+                "Escape must close the lightbox"
+            );
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn file_preview_enlarges_with_caption_and_backdrop_click_closes(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = snapshot_with_image_message();
+        snap.files = FilesPanelView {
+            path: String::new(),
+            listing: None,
+            loading: false,
+            error: None,
+            viewing: Some(FileViewerView {
+                path: "/shots/screen.png".to_string(),
+                name: "screen.png".to_string(),
+                size: 90,
+                kind: FileKind::Image,
+                first_line: None,
+                text: None,
+                image: Some(png_image()),
+                loading: false,
+                error: None,
+            }),
+        };
+        let (handle, _wb) = open(cx, snap);
+        cx.update_window(handle.into(), |_, window: &mut gpui_kit::Window, cx: &mut App| {
+            window.render_frame(cx);
+            assert!(window.find("file-viewer-image").visible());
+
+            // Enlarge: the path rides along as the caption.
+            window.click("file-viewer-image", cx);
+            window.render_frame(cx);
+            assert!(window.find("lightbox-backdrop").visible());
+            assert!(window.find("lightbox-caption").visible());
+
+            // A click on the backdrop (away from the centered card) closes.
+            window.click_at("lightbox-backdrop", point(px(6.), px(6.)), cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("lightbox-backdrop").is_none(),
+                "a backdrop click must close the lightbox"
+            );
+        })
+        .unwrap();
     }
 }

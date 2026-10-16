@@ -37,6 +37,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+// The gpui engine surfaces only through the kit here (the app never adds a
+// direct gpui dependency); Image/ImageFormat ride the kit's re-export.
+use gpui_kit::{Image, ImageFormat};
+
 use protocol::acp::SessionUpdate;
 use protocol::acp_client::{
     parse_session_new_result, session_load_params, session_new_params, AcpConnection,
@@ -696,6 +700,9 @@ pub struct TabView {
     /// The bridge advertised the zcode fs capability (Session Files gating,
     /// TS `fsCapable`): per-session `/fs/list` exists on this bridge.
     pub fs_capable: bool,
+    /// Slash commands from `available_commands_update` — the composer's "/"
+    /// completion menu (ChatView.tsx `commands`).
+    pub available_commands: Vec<protocol::acp::SlashCommand>,
 }
 
 /// One project row of the history chooser (`GET /api/projects`).
@@ -889,6 +896,9 @@ pub struct FileViewerView {
     /// The loaded text (None while loading; always None for the deferred
     /// image/binary kinds).
     pub text: Option<String>,
+    /// The decoded raster for the image kind (batch K): `None` while the
+    /// fetch is in flight, after a failure, or for kinds that never load.
+    pub image: Option<Arc<Image>>,
     pub loading: bool,
     pub error: Option<String>,
 }
@@ -1231,6 +1241,12 @@ enum LoopEvent {
     FilesText {
         seq: u64,
         result: Result<(u64, String), HubApiError>,
+    },
+    /// `/fs/file` (token-in-query, binary body) settled for the open image
+    /// viewer's whole-file fetch (batch K).
+    FilesImage {
+        seq: u64,
+        result: Result<Vec<u8>, HubApiError>,
     },
     // ---- ZCode config sections (batch I) ----
     /// The capability probe settled for one config-section page (the verdict
@@ -1747,6 +1763,7 @@ impl FilesPanel {
                 kind: v.kind,
                 first_line: v.first_line,
                 text: v.text.clone(),
+                image: v.image.clone(),
                 loading: v.loading,
                 error: v.error.clone(),
             }),
@@ -1763,6 +1780,8 @@ struct FileViewing {
     kind: FileKind,
     first_line: Option<u64>,
     text: Option<String>,
+    /// Decoded raster for the image kind (batch K).
+    image: Option<Arc<Image>>,
     loading: bool,
     error: Option<String>,
 }
@@ -2426,11 +2445,16 @@ impl Driver {
             kind,
             first_line: None,
             text: None,
-            loading: kind == FileKind::Text,
+            image: None,
+            loading: kind != FileKind::Binary,
             error: None,
         });
-        if kind == FileKind::Text {
-            self.spawn_files_text();
+        match kind {
+            FileKind::Text => self.spawn_files_text(),
+            // Batch K: the image preview loads whole-file via the token-query
+            // URL (fs_file_url shape); a failure leaves the placeholder.
+            FileKind::Image => self.spawn_files_image(),
+            FileKind::Binary => {}
         }
     }
 
@@ -2530,6 +2554,72 @@ impl Driver {
         }
         if let Some(next) = next_window {
             self.spawn_files_text_window(next);
+        }
+    }
+
+    /// The image viewer's whole-file fetch (batch K): one generation per
+    /// view, like the text stitcher — a navigation or a newer view bumps seq
+    /// so only THIS load's bytes land.
+    fn spawn_files_image(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        if let Some(v) = self.files.viewing.as_mut() {
+            v.loading = true;
+            v.error = None;
+            v.image = None;
+        }
+        let Some((instance_id, session_id)) = self.files.owner.clone() else {
+            if let Some(v) = self.files.viewing.as_mut() {
+                v.loading = false;
+                v.error = Some("no active session — open one first".to_string());
+            }
+            return;
+        };
+        let Some(path) = self.files.viewing.as_ref().map(|v| v.path.clone()) else {
+            return;
+        };
+        self.files.seq += 1;
+        let seq = self.files.seq;
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub
+                .fs_file_bytes(&instance_id, &session_id, &path)
+                .await;
+            let _ = tx.send(LoopEvent::FilesImage { seq, result });
+        });
+    }
+
+    /// The image fetch settled: decode into a gpui raster on success; a
+    /// transport error OR an unrasterizable payload (svg, broken bytes)
+    /// becomes the viewer's placeholder story.
+    fn on_files_image(&mut self, seq: u64, result: Result<Vec<u8>, HubApiError>) {
+        if seq != self.files.seq {
+            return;
+        }
+        let Some(v) = self.files.viewing.as_mut() else {
+            return;
+        };
+        v.loading = false;
+        match result {
+            Ok(bytes) => match decode_preview_image(&bytes) {
+                Some(image) => {
+                    v.image = Some(Arc::new(image));
+                    v.error = None;
+                }
+                None => {
+                    v.error =
+                        Some("cannot display this image format (svg and exotic rasters unsupported)"
+                            .to_string());
+                }
+            },
+            Err(e) => {
+                v.error = Some(describe_files_error(&e));
+            }
         }
     }
 
@@ -4575,6 +4665,7 @@ impl Driver {
             // ---- Session Files (batch F) ----
             LoopEvent::FilesList { seq, result } => self.on_files_list(seq, result),
             LoopEvent::FilesText { seq, result } => self.on_files_text(seq, result),
+            LoopEvent::FilesImage { seq, result } => self.on_files_image(seq, result),
             // ---- ZCode config sections (batch I) ----
             LoopEvent::ConfigSectionProbe { page, result } => {
                 self.on_config_section_probe(page, result);
@@ -5584,6 +5675,7 @@ impl Driver {
             turn_stats: tab.core.turn_stats,
             plan_entries: tab.core.plan_entries.clone(),
             fs_capable: tab.fs_capable,
+            available_commands: tab.core.available_commands.clone(),
         }
     }
 
@@ -5633,6 +5725,16 @@ impl Driver {
             // Session Files gating: the files panel's capability note and
             // the dock-seed decision read it off the active tab.
             mix(tab.fs_capable as u64, &mut sig);
+            // Slash commands (batch K): the composer's "/" menu contents —
+            // an overwrite landing must re-emit even between empty states.
+            mix(tab.core.available_commands.len() as u64, &mut sig);
+            for cmd in &tab.core.available_commands {
+                mix(cmd.name.len() as u64, &mut sig);
+                mix(
+                    cmd.description.as_ref().map(|d| d.len() as u64).unwrap_or(u64::MAX),
+                    &mut sig,
+                );
+            }
             // Config chips: the picked values (model/mode/thought) relabel
             // the tab toolbar's buttons.
             for opt in &tab.core.config_options {
@@ -6331,9 +6433,28 @@ fn file_viewing_signature(v: &FileViewing) -> u64 {
     sig = sig
         .wrapping_mul(31)
         .wrapping_add(v.text.as_ref().map(|t| t.len() as u64).unwrap_or(u64::MAX));
+    // The decoded raster's identity (batch K): the placeholder → image swap
+    // must re-emit even with every other field unchanged.
+    sig = sig
+        .wrapping_mul(31)
+        .wrapping_add(v.image.as_ref().map(|i| i.id).unwrap_or(u64::MAX));
     sig = sig.wrapping_mul(31).wrapping_add(v.loading as u64);
     sig = sig.wrapping_mul(31).wrapping_add(v.error.is_some() as u64);
     sig
+}
+
+/// Sniffs the fetched bytes and wraps them for `img()` — the file viewer's
+/// decode step (batch K). Vector formats and unknown payloads return None
+/// (the viewer shows its placeholder instead); gpui decodes lazily at paint.
+fn decode_preview_image(bytes: &[u8]) -> Option<Image> {
+    let mime = protocol::image::sniff_mime(bytes)?;
+    // from_mime_type maps mimes gpui cannot rasterize too (svg) — exclude
+    // the vector form explicitly, mirroring the attachment echo's rule.
+    if mime == "image/svg+xml" {
+        return None;
+    }
+    let format = ImageFormat::from_mime_type(mime)?;
+    Some(Image::from_bytes(format, bytes.to_vec()))
 }
 
 /// FNV-1a over a string — the usage payloads' content signature for the

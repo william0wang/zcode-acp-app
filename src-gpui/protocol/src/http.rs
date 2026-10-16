@@ -54,6 +54,16 @@ pub struct HttpResponse {
     pub body: String,
 }
 
+/// One binary-safe response: same shape as [`HttpResponse`] but the body is
+/// raw bytes. Image fetches need it — the text body is lossily UTF-8-decoded
+/// and rasters would not survive the round trip.
+#[derive(Debug, Clone)]
+pub struct HttpBytesResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
 impl HttpResponse {
     pub fn json(&self) -> Result<Value, serde_json::Error> {
         serde_json::from_str(&self.body)
@@ -114,6 +124,22 @@ pub trait HttpTransport: Send + Sync {
         req: HttpRequest,
         abort: AbortSignal,
     ) -> BoxFuture<'static, Result<HttpResponse, HttpError>>;
+
+    /// The binary-body variant. Only image/link fetches need it; the JSON
+    /// doubles of the test suites keep implementing `fetch` alone and inherit
+    /// a plain "unsupported" error here.
+    fn fetch_bytes(
+        &self,
+        _req: HttpRequest,
+        _abort: AbortSignal,
+    ) -> BoxFuture<'static, Result<HttpBytesResponse, HttpError>> {
+        Box::pin(async {
+            Err(HttpError {
+                message: "binary fetch unsupported by this transport".into(),
+                aborted: false,
+            })
+        })
+    }
 }
 
 /// `encodeURIComponent` equivalent: RFC 3986 unreserved characters pass
