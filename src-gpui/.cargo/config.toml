@@ -1,0 +1,5 @@
+# The #[gpui_kit::test] proc macro nests deeply enough to overflow rustc's
+# default thread stack (see .zcode/scratch/gpui-kit-notes.md). Setting it here
+# puts every cargo invocation — build, test, agents, CI — on the same page.
+[env]
+RUST_MIN_STACK = "16777216"
