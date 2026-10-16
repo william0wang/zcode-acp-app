@@ -30,12 +30,37 @@ use crate::runtime::{FileViewerView, FilesPanelView, ProtocolRuntime, UiCommand}
 use crate::workbench::Workbench;
 use protocol::hub::{FsEntry, FsEntryKind};
 
-/// The single line-window budget of the simplified viewer (the TS viewer's
-/// MAX_LINES cap): one request loads up to this many lines from line 1.
+/// The whole-viewer line budget (the TS viewer's MAX_LINES cap). The load
+/// stitches server windows until this many lines or the file ends.
 pub(crate) const VIEWER_LINE_BUDGET: u64 = 10_000;
+/// The bridge silently clamps a `/fs/file` line window to its own
+/// MAX_LINE_LIMIT (zcode-acp-server src/remote/file-endpoint.ts) — asking
+/// for more returns exactly this many lines, never an error, so the budget
+/// above is filled by consecutive windows of at most this size.
+pub(crate) const SERVER_LINE_WINDOW: u64 = 5_000;
 /// A display row longer than this is chopped (the TS TextViewer's
 /// MAX_LINE_CHARS): a single mega-line must not lay out unbounded.
 const MAX_LINE_CHARS: usize = 2_000;
+
+/// The window to request for a load starting at `start` (1-based): the
+/// server cap, or whatever is left of the whole-viewer budget.
+pub(crate) fn viewer_window(start: u64) -> u64 {
+    let budget_left = VIEWER_LINE_BUDGET.saturating_sub(start - 1);
+    budget_left.min(SERVER_LINE_WINDOW)
+}
+
+/// After a window starting at `first_line` returned `received` lines, the
+/// start of the next window — `None` when the file ended or the budget is
+/// full. A full window cannot tell "file ends here" from "window cut it",
+/// so an exactly-window-sized file costs one extra probe that comes back
+/// empty (the TS viewer's windows probe the same way).
+pub(crate) fn viewer_next_window(first_line: u64, received: u64) -> Option<u64> {
+    if received == 0 || received < viewer_window(first_line) {
+        return None;
+    }
+    let next = first_line.checked_add(received)?;
+    (next <= VIEWER_LINE_BUDGET).then_some(next)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
@@ -625,7 +650,7 @@ pub(crate) fn render_file_viewer(
                             div()
                                 .id(SharedString::from(format!(
                                     "file-viewer-line-{}",
-                                    first + i as u64
+                                    first.saturating_add(i as u64)
                                 )))
                                 .test_support()
                                 .flex()
@@ -638,7 +663,7 @@ pub(crate) fn render_file_viewer(
                                         .text_right()
                                         .text_size(px(10.))
                                         .text_color(theme.muted_foreground)
-                                        .child(format!("{}", first + i as u64)),
+                                        .child(format!("{}", first.saturating_add(i as u64))),
                                 )
                                 .child(
                                     div()
@@ -662,7 +687,7 @@ pub(crate) fn render_file_viewer(
         if let Some(text) = &view.text {
             let lines = text.split('\n').count() as u64;
             footer_text = Some(if lines >= VIEWER_LINE_BUDGET {
-                format!("first {VIEWER_LINE_BUDGET} lines — window paging lands later")
+                format!("first {VIEWER_LINE_BUDGET} lines — file truncated")
             } else {
                 format!("{lines} lines")
             });
@@ -723,7 +748,7 @@ mod tests {
     // built-in #[test] with gpui's macro (see gpui-kit-notes.md).
     use super::{
         absolute_dir, display_line, file_kind_of, fmt_size, is_loopback_hub, join_dir, root_name,
-        FileKind,
+        viewer_next_window, viewer_window, FileKind, SERVER_LINE_WINDOW, VIEWER_LINE_BUDGET,
     };
 
     #[test]
@@ -772,5 +797,29 @@ mod tests {
         let mega = "x".repeat(3_000);
         let shown = display_line(&mega);
         assert_eq!(shown.chars().count(), 2_002); // 2000 chars + " …"
+    }
+
+    #[test]
+    fn viewer_windows_never_exceed_the_server_cap() {
+        assert_eq!(viewer_window(1), SERVER_LINE_WINDOW);
+        // The tail window shrinks to the budget remainder, never past it.
+        assert_eq!(viewer_window(9_001), 1_000);
+        assert_eq!(viewer_window(VIEWER_LINE_BUDGET), 1);
+    }
+
+    #[test]
+    fn stitch_probes_only_while_a_full_window_left_budget() {
+        // Full first window: the 10k budget needs the second half.
+        assert_eq!(viewer_next_window(1, SERVER_LINE_WINDOW), Some(5_001));
+        // Full second window: the budget is exhausted.
+        assert_eq!(
+            viewer_next_window(5_001, SERVER_LINE_WINDOW),
+            None
+        );
+        // A partial window means the file ended mid-window.
+        assert_eq!(viewer_next_window(1, SERVER_LINE_WINDOW - 1), None);
+        // An exactly-cap-sized file costs one empty probe, which ends the
+        // stitch (received == 0), not another request.
+        assert_eq!(viewer_next_window(5_001, 0), None);
     }
 }

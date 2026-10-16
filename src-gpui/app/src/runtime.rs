@@ -71,7 +71,7 @@ use protocol::ws::{TungsteniteWsFactory, WsFactory};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use crate::file_browser::{file_kind_of, FileKind, VIEWER_LINE_BUDGET};
+use crate::file_browser::{file_kind_of, viewer_next_window, viewer_window, FileKind};
 use crate::http_transport::{LocalHttpTransport, SettingsApiTransport};
 
 /// The 120ms update-coalescing batch the TS store runs (appStore.ts
@@ -1843,8 +1843,9 @@ impl Driver {
     }
 
     /// One `/fs/list` read (TS fsList): the ACTIVE session's root-relative
-    /// `path`. The previous listing drops while loading — stale rows would
-    /// join against the NEW path on tap (the TS setListing(null)).
+    /// `path`. Every read bumps `seq`, so a late response from a superseded
+    /// navigation (the transport is socket-per-request; completion order is
+    /// unbounded) is dropped instead of painting rows under the NEW path.
     fn spawn_files_list(&mut self, path: String) {
         if !matches!(
             self.phase,
@@ -1869,6 +1870,7 @@ impl Driver {
         self.files.loading = true;
         self.files.error = None;
         self.files.listing = None;
+        self.files.seq += 1;
         let seq = self.files.seq;
         let hub = self.hub_client();
         let tx = self.loop_tx.clone();
@@ -1929,9 +1931,11 @@ impl Driver {
         }
     }
 
-    /// The viewer's single whole-file load (F3): ONE line window from line 1
-    /// at the TS viewer's MAX_LINES budget — line-window paging is a later
-    /// optimization, so there is deliberately no stitching here.
+    /// The viewer's whole-file load (F3): stitch consecutive server line
+    /// windows from line 1 until the TS viewer's MAX_LINES budget is full
+    /// or the file ends. The bridge clamps each window silently
+    /// (SERVER_LINE_WINDOW), so one shot at the full budget would quietly
+    /// stop at the cap.
     fn spawn_files_text(&mut self) {
         if !matches!(
             self.phase,
@@ -1939,6 +1943,20 @@ impl Driver {
         ) {
             return;
         }
+        if let Some(v) = self.files.viewing.as_mut() {
+            v.loading = true;
+            v.error = None;
+            v.first_line = None;
+            v.text = None;
+        }
+        // One generation per view: a navigation or a newer view bumps seq,
+        // so only windows of THIS load append.
+        self.files.seq += 1;
+        self.spawn_files_text_window(1);
+    }
+
+    /// Request one window of the current viewer load, starting at `start`.
+    fn spawn_files_text_window(&mut self, start: u64) {
         let Some((instance_id, session_id)) = self.files.owner.clone() else {
             if let Some(v) = self.files.viewing.as_mut() {
                 v.error = Some("no active session — open one first".to_string());
@@ -1948,23 +1966,27 @@ impl Driver {
         let Some(path) = self.files.viewing.as_ref().map(|v| v.path.clone()) else {
             return;
         };
-        if let Some(v) = self.files.viewing.as_mut() {
-            v.loading = true;
-            v.error = None;
-        }
         let seq = self.files.seq;
         let hub = self.hub_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
             let result = hub
-                .fs_file_text(&instance_id, &session_id, &path, 1, VIEWER_LINE_BUDGET)
+                .fs_file_text(
+                    &instance_id,
+                    &session_id,
+                    &path,
+                    start,
+                    viewer_window(start),
+                )
                 .await;
             let _ = tx.send(LoopEvent::FilesText { seq, result });
         });
     }
 
-    /// The viewer's window settled: the pair is (first_line, text) with the
-    /// server's trailing newline already stripped (protocol::hub_client).
+    /// A viewer window settled: append it to the accumulated text and keep
+    /// loading while another full window fits the budget. The pair is
+    /// (first_line, text) with the server's trailing newline already
+    /// stripped (protocol::hub_client), so stitching re-adds the join.
     fn on_files_text(&mut self, seq: u64, result: Result<(u64, String), HubApiError>) {
         if seq != self.files.seq {
             return;
@@ -1972,16 +1994,39 @@ impl Driver {
         let Some(v) = self.files.viewing.as_mut() else {
             return;
         };
-        v.loading = false;
+        let mut next_window: Option<u64> = None;
         match result {
             Ok((first_line, text)) => {
-                v.first_line = Some(first_line);
-                v.text = Some(text);
+                if v.first_line.is_none() {
+                    v.first_line = Some(first_line);
+                }
+                let received = if text.is_empty() {
+                    0
+                } else {
+                    text.split('\n').count() as u64
+                };
+                if received > 0 {
+                    match v.text.as_mut() {
+                        Some(prev) => {
+                            prev.push('\n');
+                            prev.push_str(&text);
+                        }
+                        None => v.text = Some(text),
+                    }
+                }
                 v.error = None;
+                match viewer_next_window(first_line, received) {
+                    Some(next) => next_window = Some(next),
+                    None => v.loading = false,
+                }
             }
             Err(e) => {
+                v.loading = false;
                 v.error = Some(format!("file: {e}"));
             }
+        }
+        if let Some(next) = next_window {
+            self.spawn_files_text_window(next);
         }
     }
 

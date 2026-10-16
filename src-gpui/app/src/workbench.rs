@@ -4929,6 +4929,14 @@ mod files_tests {
         ))
     }
 
+    fn files_navigate_count(runtime: &ProtocolRuntime, path: &str) -> usize {
+        runtime
+            .recorded_commands()
+            .iter()
+            .filter(|c| matches!(c, UiCommand::FilesNavigate { path: p } if p == path))
+            .count()
+    }
+
     /// F1: docking the files panel seeds a listing; dotfiles stay hidden
     /// until the toggle flips; entering a directory, refreshing, and the
     /// breadcrumb all dispatch `FilesNavigate` with the exact target path.
@@ -4967,10 +4975,26 @@ mod files_tests {
             assert!(window.find("files-entry-.env").visible());
             // Entering a directory navigates by the joined path.
             window.click("files-entry-src", cx);
-            assert!(sent_files_navigate(&runtime, "src"));
-            // Refresh re-reads the CURRENT directory.
+            assert_eq!(
+                files_navigate_count(&runtime, "src"),
+                1,
+                "the row click must be the only src navigation, got {:?}",
+                runtime.recorded_commands()
+            );
+            // Refresh re-reads the CURRENT directory: the dock seed plus
+            // this click — counting, so the assertion fails if the button
+            // stops dispatching (the seed alone used to satisfy `.any()`).
             window.click("files-refresh", cx);
-            assert!(sent_files_navigate(&runtime, ""));
+            assert_eq!(
+                files_navigate_count(&runtime, ""),
+                2,
+                "refresh must re-send FilesNavigate for the current path, got {:?}",
+                runtime.recorded_commands()
+            );
+            assert!(matches!(
+                runtime.recorded_commands().last(),
+                Some(UiCommand::FilesNavigate { path }) if path == ""
+            ));
         })
         .unwrap();
     }
