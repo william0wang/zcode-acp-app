@@ -1,0 +1,82 @@
+{
+  "ok": true,
+  "groups": [
+    {
+      "instanceId": "94d0c8e2-6f2a-4a3b-9c1d-5e7f0a1b2c3d",
+      "scope": "global",
+      "workspace": "",
+      "workflows": [
+        { "name": "release-check", "description": "Verify the release checklist", "scope": "global" },
+        { "name": "repo-triage", "scope": "global" }
+      ],
+      "invalid": [{ "path": "/Users/william/.zcode/workflows/bad.md", "reason": "frontmatter parse failed" }],
+      "lastRuns": {
+        "release-check": {
+          "runId": "run-0192-77ab",
+          "name": "release-check",
+          "status": "completed",
+          "updatedAt": 1760520600000,
+          "spentTokens": 184000,
+          "parentSessionId": "b41d2f90-1234-4aaa-9bbb-00000000000a",
+          "acpSessionId": "f0eee6a1-1111-4bbb-8ccc-000000000001",
+          "cwd": "/Users/william/Develop/tools/zcode-acp-server"
+        }
+      },
+      "error": null
+    },
+    {
+      "instanceId": "serve-7c9b1d3e",
+      "scope": "project",
+      "workspace": "/Users/william/Develop/tools/zcode-acp-app",
+      "workflows": [{ "name": "port-protocol-types", "scope": "project" }],
+      "invalid": [],
+      "lastRuns": {},
+      "error": null
+    },
+    {
+      "instanceId": "editor-dead-0001",
+      "scope": "project",
+      "workspace": "/Users/william/Develop/ai-hot-app",
+      "workflows": [],
+      "invalid": [],
+      "lastRuns": {},
+      "error": "no bridge of this workspace answered"
+    }
+  ],
+  "activeRuns": [
+    {
+      "runId": "run-0192-77cd",
+      "name": "port-protocol-types",
+      "status": "running",
+      "updatedAt": 1760527100000,
+      "parentSessionId": "b41d2f90-1234-4aaa-9bbb-00000000000a",
+      "acpSessionId": "f0eee6a1-1111-4bbb-8ccc-000000000001",
+      "cwd": "/Users/william/Develop/tools/zcode-acp-app",
+      "ownerInstanceId": "serve-7c9b1d3e"
+    }
+  ],
+  "recentRuns": [
+    {
+      "runId": "run-0192-77ab",
+      "name": "release-check",
+      "status": "completed",
+      "stopReason": "completed",
+      "updatedAt": 1760520600000,
+      "spentTokens": 184000,
+      "parentSessionId": "b41d2f90-1234-4aaa-9bbb-00000000000a",
+      "acpSessionId": "f0eee6a1-1111-4bbb-8ccc-000000000001",
+      "cwd": "/Users/william/Develop/tools/zcode-acp-server",
+      "artifacts": [{ "id": "art-0001", "kind": "markdown", "title": "Checklist report" }],
+      "ownerInstanceId": "94d0c8e2-6f2a-4a3b-9c1d-5e7f0a1b2c3d"
+    },
+    {
+      "runId": "run-0192-7700",
+      "name": "repo-triage",
+      "status": "stopped",
+      "stopReason": "user",
+      "updatedAt": 1760444000000,
+      "resumedFrom": "run-0192-76ff",
+      "cwd": "/Users/william/Develop/tools/zcode-acp-server"
+    }
+  ]
+}

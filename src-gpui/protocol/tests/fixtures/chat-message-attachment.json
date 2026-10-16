@@ -1,0 +1,13 @@
+{
+  "id": "msg-0003",
+  "role": "user",
+  "parts": [
+    {
+      "type": "image",
+      "image": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+    },
+    { "type": "text", "text": "This is the failing row." }
+  ],
+  "createdAt": 1760526200000,
+  "collapsed": true
+}

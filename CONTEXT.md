@@ -18,6 +18,43 @@ manager (switch / edit / delete); the legacy single-profile key migrates on
 first load.
 _Avoid_: server config, account
 
+**Hub Bootstrap**:
+The desktop client's way of ensuring a Hub exists — nothing more. When the
+app wants to connect and no Hub is listening, it spawns the installed
+`zcode-acp-server` hub daemon detached, joining the same EADDRINUSE singleton
+race any bridge runs, then connects to whichever daemon won the port. The Hub
+is always a background task: idle-exit, respawn, and upgrade cycles belong to
+the server's own machinery (bridge heartbeats re-spawn it), never to the app.
+Closing the app never stops the Hub. Requires the server installed; the app
+skips when present and guides installation when absent — never replaces or
+bundles it.
+_Avoid_: embedded server, hub host, sidecar
+
+**Desktop Workbench**:
+The desktop-only client (a separate product line, not a port of the mobile
+UI): a dock-style window — sessions/files/settings as dockable panels around
+a chat area, multiple sessions in tabs. The mobile and web clients remain the
+universal UI and stay in low-intensity maintenance.
+_Avoid_: desktop mode, desktop skin
+
+**Parity**:
+The desktop client's coverage rule against the mobile app: every mobile
+capability must be reachable on the desktop — that completeness comes first,
+and reshaping the interaction to desktop conventions comes second. The
+mobile app is the capability reference, never the layout reference: a
+missing capability is a gap by definition; a different layout is not.
+_Avoid_: UI port, pixel parity, mobile skin
+
+**Desktop Presence**:
+The Hub's awareness that the desktop client is connected (identified via its
+clientInfo at initialize). While a desktop client is present, every NEW
+session — created from the app, mobile, or web alike — incubates in the
+headless serve form: no martty terminal window opens, because the desktop
+app is the presenting surface for all sessions. With no desktop client
+connected, session creation keeps the visible-terminal semantics (server
+ADR-0016) unchanged, and sessions that already have a window keep it.
+_Avoid_: app takeover, session manager
+
 **Active Session**:
 The single session currently loaded in the chat view. Switching sessions is a
 `session/load` on the same connection.

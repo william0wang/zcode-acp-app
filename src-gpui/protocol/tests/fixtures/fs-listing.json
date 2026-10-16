@@ -1,0 +1,12 @@
+{
+  "root": "/Users/william/Develop/tools/zcode-acp-app",
+  "entries": [
+    { "name": "src", "kind": "dir", "size": 96, "mtime": 1760510400000 },
+    { "name": "tests", "kind": "dir", "size": 64, "mtime": 1760509200000 },
+    { "name": ".zcode", "kind": "dir", "size": 32, "mtime": 1760508000000 },
+    { "name": "package.json", "kind": "file", "size": 1204, "mtime": 1760428800000 },
+    { "name": "pnpm-lock.yaml", "kind": "file", "size": 214558, "mtime": 1760428800000 },
+    { "name": "current", "kind": "symlink", "size": 0, "mtime": 0 }
+  ],
+  "truncated": false
+}

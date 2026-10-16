@@ -1,0 +1,30 @@
+{
+  "ok": true,
+  "runs": [
+    {
+      "runId": "run-0192-77cd",
+      "toolCallId": "toolu_01ABC",
+      "label": "port-protocol-types",
+      "updatedAt": 1760527100000,
+      "status": "running",
+      "resumable": false
+    },
+    {
+      "runId": "run-0192-7700",
+      "label": "repo-triage",
+      "updatedAt": 1760444000000,
+      "status": "cancelled",
+      "stopReason": "user",
+      "resumedFrom": "run-0192-76ff",
+      "resumable": true
+    },
+    {
+      "runId": "run-0192-76ff",
+      "updatedAt": 1760358000000,
+      "status": "failed",
+      "failureCode": "provider_error",
+      "failureMessage": "upstream 502 after 3 retries",
+      "resumable": false
+    }
+  ]
+}

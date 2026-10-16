@@ -1,0 +1,1 @@
+{ "type": "string", "description": "quick or full pass", "required": false, "default": "quick" }

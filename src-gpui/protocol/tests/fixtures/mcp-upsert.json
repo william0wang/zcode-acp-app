@@ -1,0 +1,7 @@
+{
+  "type": "stdio",
+  "command": "/Users/william/.local/bin/bifrost",
+  "args": ["serve", "--port", "7777"],
+  "env": { "BIFROST_HOME": "/Users/william/.bifrost" },
+  "enabled": true
+}

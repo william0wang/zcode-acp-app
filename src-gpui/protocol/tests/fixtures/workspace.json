@@ -1,0 +1,32 @@
+{
+  "ok": true,
+  "nodes": [
+    {
+      "siteId": "port",
+      "ordinal": 1,
+      "op": "world.read",
+      "args": { "path": "src/lib/types.ts" },
+      "status": "ok",
+      "summary": { "resultBytes": 28611 },
+      "createdAt": 1760526000000,
+      "updatedAt": 1760526005000
+    },
+    {
+      "siteId": "port",
+      "ordinal": 2,
+      "op": "world.run",
+      "args": { "command": "cargo test -p protocol" },
+      "status": "ok",
+      "summary": {
+        "resultBytes": 1844,
+        "resultCount": 38,
+        "exitCode": 0,
+        "stdoutBytes": 1502,
+        "stderrBytes": 342
+      },
+      "createdAt": 1760526010000,
+      "updatedAt": 1760526120000
+    }
+  ],
+  "truncated": false
+}

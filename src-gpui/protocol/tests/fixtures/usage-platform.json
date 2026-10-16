@@ -1,0 +1,88 @@
+{
+  "kind": "success",
+  "range": "7d",
+  "generatedAt": 1760527231456,
+  "activity": {
+    "summary": {
+      "totalTokens": 9821000,
+      "peakDailyTokens": 1120000,
+      "peakDailyTokensDate": "2026-09-28",
+      "totalUsageDurationMs": 44520000,
+      "currentStreakDays": 12,
+      "longestStreakDays": 41
+    },
+    "heatmap": {
+      "startDate": "2025-10-16",
+      "endDate": "2026-10-15",
+      "maxTokens": 1120000,
+      "weeks": [
+        {
+          "days": [
+            null,
+            { "date": "2025-10-16", "level": 1, "tokens": 21000 },
+            { "date": "2025-10-17", "level": 0, "tokens": 0 },
+            null,
+            null,
+            null,
+            null
+          ]
+        },
+        {
+          "days": [
+            { "date": "2026-10-11", "level": 3, "tokens": 655000 },
+            { "date": "2026-10-12", "level": 4, "tokens": 1102000 },
+            { "date": "2026-10-13", "level": 2, "tokens": 320000 },
+            { "date": "2026-10-14", "level": 1, "tokens": 88000 },
+            { "date": "2026-10-15", "level": 2, "tokens": 410000 },
+            null,
+            null
+          ]
+        }
+      ]
+    }
+  },
+  "detail": {
+    "model": {
+      "cacheHitRate": 72.4,
+      "cacheHitRateTrend": 3.1,
+      "totalCredits": 128.55,
+      "totalCreditsTrend": -4.2,
+      "averageDailyCredits": 18.36,
+      "averageDailyCreditsTrend": 1.0
+    },
+    "tool": {
+      "cacheHitRate": null,
+      "cacheHitRateTrend": null,
+      "totalCredits": 12.05,
+      "totalCreditsTrend": null,
+      "averageDailyCredits": 1.72,
+      "averageDailyCreditsTrend": 0.4
+    }
+  },
+  "models": [
+    {
+      "name": "GLM-5.3",
+      "totalTokens": 8411000,
+      "totalCredits": 110.2,
+      "cachedInputTokens": 3510000,
+      "uncachedInputTokens": 790000,
+      "outputTokens": 1320000,
+      "sortOrder": 1
+    },
+    {
+      "name": "GLM-5-Air",
+      "totalTokens": 1410000,
+      "totalCredits": 18.35,
+      "sortOrder": 2
+    }
+  ],
+  "tools": [
+    { "name": "Read", "totalUsageCount": 5230, "totalCredits": 4.1 },
+    { "name": "Grep", "totalUsageCount": 3120, "totalCredits": 1.9 }
+  ],
+  "series": {
+    "granularity": "day",
+    "xTime": ["2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12"],
+    "totals": [190000, 244000, 655000, 1102000]
+  }
+}

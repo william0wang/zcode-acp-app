@@ -1,0 +1,65 @@
+# Cargo workspace for the zcode-acp-remote desktop client ("Desktop
+# Workbench", see docs/adr/0009-desktop-client-as-gpui-product-line.md).
+# Layering contract (docs/.zcode desktop-client-requirements.md §5):
+#   protocol — pure logic, no UI dependencies
+#   app      — thin gpui window layer on gpui-kit; beyond gpui-kit/protocol
+#              it carries only the workspace pins tokio + serde_json (the
+#              real HttpTransport the protocol crate leaves to its caller,
+#              the driver runtime, and request-envelope construction) plus
+#              the shared-catalog i18n pair rust-i18n + sys-locale (both
+#              already in the tree via gpui-kit's own dependencies)
+
+[workspace]
+resolver = "2"
+members = ["app", "protocol"]
+
+[workspace.package]
+# Follows the repo's main version; the desktop line ships from 0.33.0.
+version = "0.33.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+protocol = { path = "protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "fs", "net", "time", "sync"] }
+# rustls-tls-native-roots: wss:// for remote Connection Profiles — the system
+# trust store, so tunnels with public or locally trusted CAs work like they
+# do in the TS client.
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
+# futures-util drives tokio-tungstenite's Stream/Sink halves (the WS pump);
+# not a UI dependency — required to use the already-listed tokio-tungstenite.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+thiserror = "2"
+anyhow = "1"
+# Attachment pipeline (protocol::image — src/lib/image.ts port): pure-Rust
+# codecs, no UI. Trimmed features: the server's inline formats plus
+# decodable-but-reencoded drops; matches the `image` 0.25 gpui already pins.
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "webp",
+  "bmp",
+  "tiff",
+  "ico",
+] }
+# ACP image-block base64 payload (same 0.22 line gpui's deps already use).
+base64 = "0.22"
+# i18n over the shared mobile/web catalogs (requirements §2: same JSON, no
+# fork). Already in-tree: gpui-component itself localizes through rust-i18n,
+# so this pin adds no new external crate, and the locale global is shared —
+# our set_locale also drives the kit's own component strings.
+rust-i18n = "4"
+# System locale for the i18n startup pick; already in-tree via cosmic-text.
+sys-locale = "0.3"
+# gpui distribution is pinned by gpui-kit itself (docs/adr/0009 §decision,
+# requirements §7); the app never adds a direct gpui dependency.
+gpui-kit = "0.7"
+# https:// for the hub REST API on remote profiles: the hand-rolled
+# socket-per-request transport wraps its TcpStream with tokio-rustls and the
+# system trust store (same policy as the WS side above).
+tokio-rustls = "0.26"
+rustls = "0.23"
+rustls-pki-types = "1"
+rustls-native-certs = "0.8"

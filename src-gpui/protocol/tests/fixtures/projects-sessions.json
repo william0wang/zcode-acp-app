@@ -1,0 +1,27 @@
+{
+  "workspacePath": "/Users/william/Develop/tools/zcode-acp-server",
+  "instance": { "id": "serve-7c9b1d3e", "origin": "serve" },
+  "sessions": [
+    {
+      "sessionId": "b41d2f90-1234-4aaa-9bbb-00000000000a",
+      "title": "Hub heartbeat pruning",
+      "cwd": "/Users/william/Develop/tools/zcode-acp-server",
+      "updatedAt": "2026-10-14T09:12:33.000Z",
+      "live": false,
+      "running": false,
+      "workflowActivity": {
+        "active": 1,
+        "last": { "status": "running", "updatedAt": 1760527000000, "name": "release-check" }
+      }
+    },
+    {
+      "sessionId": "b41d2f90-5678-4aaa-9bbb-00000000000b",
+      "title": "Terminal launch fallback",
+      "cwd": "/Users/william/Develop/tools/zcode-acp-server",
+      "updatedAt": "2026-10-13T18:02:01.000Z",
+      "live": false,
+      "running": false
+    }
+  ],
+  "nextCursor": { "before": 1760431353000, "beforeId": "b41d2f90-5678-4aaa-9bbb-00000000000b" }
+}

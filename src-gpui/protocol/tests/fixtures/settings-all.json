@@ -1,0 +1,61 @@
+{
+  "ok": true,
+  "models": {
+    "available": [
+      { "providerId": "builtin:bigmodel-coding-plan", "modelId": "GLM-5.3", "enabled": true }
+    ],
+    "providers": [
+      { "providerId": "builtin:bigmodel-coding-plan", "providerName": "GLM Coding Plan", "enabled": true, "modelIds": ["GLM-5.3"] }
+    ],
+    "modelRules": [
+      {
+        "providerId": "builtin:bigmodel-coding-plan",
+        "modelId": "GLM-5.3",
+        "enabled": true,
+        "contextWindow": 200000,
+        "reasoningLevels": ["low", "high", "max"]
+      }
+    ]
+  },
+  "skills": [
+    { "name": "ask-matt", "source": "user", "enabled": true, "path": "/Users/william/.zcode/skills/ask-matt" }
+  ],
+  "mcp": {
+    "servers": [
+      { "name": "bifrost", "type": "stdio", "command": "/Users/william/.local/bin/bifrost", "args": ["serve"], "enabled": true }
+    ]
+  },
+  "hooks": { "enabled": true, "events": { "PreToolUse": { "matchers": [{ "hooks": [{ "command": "codesearch-hooks", "enabled": true }] }] } } },
+  "agents": [
+    { "name": "协议类型工程师", "description": "Ports type definitions", "enabled": true }
+  ],
+  "usage": {
+    "available": false,
+    "range": "7d",
+    "summary": {
+      "totalTokens": 0,
+      "inputTokens": 0,
+      "outputTokens": 0,
+      "reasoningTokens": 0,
+      "cacheReadTokens": 0,
+      "requestCount": 0,
+      "sessionCount": 0,
+      "turnCount": 0,
+      "toolCallCount": 0,
+      "models": 0,
+      "activeDays": 0
+    },
+    "models": [],
+    "daily": []
+  },
+  "resetCards": {
+    "providers": ["account:bigmodel-individual-coding-plan"],
+    "credentials": true
+  },
+  "workflow": {
+    "enabled": true,
+    "mode": "onDemand",
+    "source": "override",
+    "override": "onDemand"
+  }
+}

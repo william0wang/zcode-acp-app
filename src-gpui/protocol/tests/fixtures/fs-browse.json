@@ -1,0 +1,12 @@
+{
+  "path": "/Users/william/Develop",
+  "parent": "/Users/william",
+  "creatable": true,
+  "entries": [
+    { "name": ".config" },
+    { "name": "NoBackup" },
+    { "name": "ai-hot-app" },
+    { "name": "tools" }
+  ],
+  "truncated": false
+}

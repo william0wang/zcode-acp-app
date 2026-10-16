@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "workflows": [
+    { "name": "release-check", "description": "Verify the release checklist", "scope": "global" },
+    { "name": "repo-triage", "scope": "global" }
+  ],
+  "invalid": [{ "path": "/Users/william/.zcode/workflows/bad.md", "reason": "frontmatter parse failed" }],
+  "dir": "/Users/william/Develop/tools/zcode-acp-server/.zcode/workflows"
+}

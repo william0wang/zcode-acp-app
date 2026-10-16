@@ -1,0 +1,54 @@
+[
+  {
+    "sessionUpdate": "user_message_chunk",
+    "sessionId": "f0eee6a1-1111-4bbb-8ccc-000000000001",
+    "content": { "type": "text", "text": "Port types.ts to Rust." }
+  },
+  {
+    "sessionUpdate": "agent_message_chunk",
+    "sessionId": "f0eee6a1-1111-4bbb-8ccc-000000000001",
+    "content": [
+      { "type": "text", "text": "Surveying " },
+      { "type": "content", "content": { "type": "text", "text": "hub-server.ts" } }
+    ]
+  },
+  {
+    "sessionUpdate": "usage_update",
+    "used": 74201,
+    "size": 200000
+  },
+  {
+    "sessionUpdate": "available_commands_update",
+    "availableCommands": [
+      { "name": "model", "description": "Show or switch the current model" },
+      { "name": "quota", "description": "Show the quota card", "input": { "hint": "provider id" } }
+    ]
+  },
+  {
+    "sessionUpdate": "config_option_update",
+    "configOptions": [
+      {
+        "id": "model",
+        "name": "Model",
+        "category": "model",
+        "currentValue": "builtin:bigmodel-coding-plan\\GLM-5.3",
+        "options": [
+          { "value": "builtin:bigmodel-coding-plan\\GLM-5.3", "name": "GLM-5.3" },
+          { "value": "builtin:bigmodel-coding-plan\\GLM-5-Air", "name": "GLM-5-Air" }
+        ]
+      },
+      {
+        "id": "mode",
+        "currentValue": "build",
+        "options": [
+          { "value": "build", "name": "Build" },
+          { "value": "plan", "name": "Plan" }
+        ]
+      }
+    ]
+  },
+  {
+    "sessionUpdate": "future_update_kind",
+    "anything": { "rides": ["along"] }
+  }
+]

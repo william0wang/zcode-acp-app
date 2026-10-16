@@ -1,0 +1,7 @@
+{
+  "providerId": "builtin:bigmodel-coding-plan",
+  "modelId": "GLM-5.3",
+  "enabled": true,
+  "contextWindow": 200000,
+  "reasoningLevels": ["low", "high", "max"]
+}

@@ -1,0 +1,13 @@
+{
+  "ok": true,
+  "name": "release-check",
+  "path": "/Users/william/.zcode/workflows/release-check.md",
+  "scope": "global",
+  "meta": {
+    "description": "Verify the release checklist",
+    "args": {
+      "mode": { "type": "string", "description": "quick or full pass", "required": false, "default": "quick" }
+    }
+  },
+  "script": "// dynamic-workflow script\nexport default async function* run({ read, ask }) {\n  yield* await read(\"CHANGELOG.md\");\n}\n"
+}

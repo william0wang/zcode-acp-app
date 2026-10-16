@@ -1,0 +1,68 @@
+{
+  "collectedAt": 1760527231942,
+  "host": {
+    "hostname": "william-mbp.local",
+    "osVersion": "15.8 (24H23)",
+    "model": "Mac14,9",
+    "chip": "Apple M2 Pro"
+  },
+  "uptimeS": 812345,
+  "cpu": {
+    "cores": 10,
+    "usagePct": null,
+    "loadAvg": [2.42, 2.75, 2.58]
+  },
+  "memory": {
+    "totalBytes": 17179869184,
+    "availableBytes": 6039425024,
+    "usedBytes": 11140444160,
+    "swapTotalBytes": 3221225472,
+    "swapUsedBytes": 536870912
+  },
+  "storage": {
+    "root": {
+      "totalBytes": 994662584320,
+      "usedBytes": 471303245824,
+      "availableBytes": 523359338496
+    },
+    "home": null
+  },
+  "battery": {
+    "present": true,
+    "percent": 76,
+    "powerSource": "ac",
+    "status": "charging",
+    "remainingMin": null
+  },
+  "power": {
+    "preventSleep": true,
+    "sleepHolders": ["Amphetamine"],
+    "cpuSpeedLimitPct": 100
+  },
+  "network": {
+    "addresses": ["192.168.1.42"],
+    "ssid": "william-5g",
+    "rxBytesPerS": null,
+    "txBytesPerS": null
+  },
+  "processes": {
+    "hub": { "pid": 40188, "rssBytes": 91226112, "cpuPct": null },
+    "bridges": [
+      {
+        "id": "94d0c8e2-6f2a-4a3b-9c1d-5e7f0a1b2c3d",
+        "workspace": "/Users/william/Develop/tools/zcode-acp-server",
+        "pid": 40211,
+        "rssBytes": 213807104,
+        "cpuPct": 1.7
+      },
+      {
+        "id": "serve-7c9b1d3e",
+        "workspace": "/Users/william/Develop/tools/zcode-acp-app",
+        "pid": null,
+        "rssBytes": null,
+        "cpuPct": null
+      }
+    ]
+  },
+  "hub": { "version": "0.72.0", "uptimeS": 76543, "instances": 2 }
+}

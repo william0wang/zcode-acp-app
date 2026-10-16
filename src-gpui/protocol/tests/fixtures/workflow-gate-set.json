@@ -1,0 +1,9 @@
+{
+  "ok": true,
+  "gate": {
+    "enabled": true,
+    "mode": "onDemand",
+    "source": "override",
+    "override": "onDemand"
+  }
+}

@@ -1,0 +1,28 @@
+[package]
+name = "protocol"
+description = "Pure-logic protocol layer: hub WebSocket client, Settings API client, ACP message types, replay/pagination, reconnect state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Hard rule: this crate must stay UI-free — no gpui or windowing deps, only
+# pure-logic crates (serde / serde_json / tokio / tokio-tungstenite /
+# thiserror / anyhow plus the pure-Rust codecs below).
+[dependencies]
+serde.workspace = true
+# preserve_order: JS-object insertion order for Map payloads — the ACP journal
+# events and settings blobs are produced by JSON.stringify server-side, and
+# previews (item_summary) must serialize keys in wire order like the TS app.
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+# Attachment pipeline (src/lib/image.ts): pure-Rust codecs, no UI. The
+# feature set covers the inline formats the server accepts (png/jpeg/webp/
+# gif/bmp/svg — gif/svg ride as raw bytes) plus decodable-but-reencoded
+# drops (tiff/ico); same `image` version gpui already pins.
+image = { workspace = true }
+# base64 payload of the ACP image block (TS FileReader.readAsDataURL).
+base64 = { workspace = true }

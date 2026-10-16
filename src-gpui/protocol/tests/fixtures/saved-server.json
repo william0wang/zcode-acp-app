@@ -1,0 +1,6 @@
+{
+  "id": "srv-01",
+  "name": "Dev machine",
+  "hubUrl": "http://127.0.0.1:8377",
+  "token": "dev-token-0123456789abcdef"
+}

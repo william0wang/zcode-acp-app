@@ -1,0 +1,5 @@
+{
+  "name": "quota",
+  "description": "Show the quota card",
+  "input": { "hint": "provider id" }
+}

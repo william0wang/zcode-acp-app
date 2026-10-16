@@ -1,0 +1,11 @@
+{
+  "id": "art-0003",
+  "kind": "board",
+  "title": "Port board",
+  "itemCount": 12,
+  "columns": [
+    { "key": "todo", "label": "To port" },
+    { "key": "done", "label": "Ported" }
+  ],
+  "versions": [{ "version": 1, "items": 9 }]
+}

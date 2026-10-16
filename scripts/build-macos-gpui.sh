@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Build the Desktop Workbench (src-gpui) macOS app bundle into dist/.
+# Usage: scripts/build-macos-gpui.sh
+# Unsigned (no Developer ID, no notarization), same as build-macos.sh: runs
+# as built on the build machine; elsewhere Gatekeeper needs a one-time
+# right-click -> Open. Bundles the .app only: dmg wrapping adds nothing over
+# the .app and breaks in headless/sandboxed shells.
+# Product name: ZCode-acp.app, no desktop suffix — the gpui workbench IS the
+# desktop product line now (requirements .zcode/docs/desktop-parity-requirements.md).
+# The Tauri line still builds dist/ZCode-acp.app too (build-macos.sh wipes
+# dist/*.app first), so the two builds replace one another by design.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+BIN="src-gpui/target/release/app"
+# Stable name (no version suffix): each build overwrites the previous one,
+# so the app replaces cleanly in /Applications / dock / Launchpad.
+OUT="dist/ZCode-acp.app"
+# Follows the repo's main version (src-gpui workspace.package.version).
+VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' src-gpui/Cargo.toml | head -1)"
+
+echo "==> building Desktop Workbench (release)"
+cargo build --manifest-path src-gpui/Cargo.toml --release
+
+[[ -x "${BIN}" ]] || { echo "error: no workbench binary produced" >&2; exit 1; }
+rm -rf "${OUT}"
+mkdir -p "${OUT}/Contents/MacOS" "${OUT}/Contents/Resources"
+# ditto, not cp: preserves bundle permissions/metadata the app needs.
+# The cargo binary is plain `app`; the bundle renames it to the product name.
+ditto "${BIN}" "${OUT}/Contents/MacOS/zcode-acp"
+ditto src-tauri/icons/icon.icns "${OUT}/Contents/Resources/AppIcon.icns"
+cat > "${OUT}/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>ZCode ACP</string>
+	<key>CFBundleDisplayName</key>
+	<string>ZCode ACP</string>
+	<key>CFBundleExecutable</key>
+	<string>zcode-acp</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.zcode.acp</string>
+	<key>CFBundleVersion</key>
+	<string>${VERSION}</string>
+	<key>CFBundleShortVersionString</key>
+	<string>${VERSION}</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
+PLIST
+echo "==> ${OUT} (${VERSION})"
+du -sh "${OUT}" | awk '{print $1, $2}'

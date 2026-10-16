@@ -1,0 +1,6 @@
+{
+  "id": "msg-0001",
+  "role": "user",
+  "parts": [{ "type": "text", "text": "Port types.ts to Rust, server wins on divergence." }],
+  "createdAt": 1760526000000
+}

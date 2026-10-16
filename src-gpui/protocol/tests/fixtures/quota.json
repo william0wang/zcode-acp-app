@@ -1,0 +1,75 @@
+{
+  "glm": {
+    "kind": "success",
+    "level": "MAX",
+    "items": [
+      {
+        "key": "token_5h",
+        "label": "5h",
+        "usedPercent": 43.2,
+        "leftPercent": 56.8,
+        "usedCount": 128400,
+        "totalCount": 297222,
+        "nextResetTime": 1760530800000,
+        "detail": [
+          { "modelCode": "GLM-5.3", "usage": 98221 },
+          { "modelCode": "GLM-5-Air", "usage": 30179 }
+        ]
+      },
+      {
+        "key": "mcp",
+        "label": "MCP",
+        "usedPercent": 12.5,
+        "leftPercent": 87.5,
+        "totalCount": 800
+      }
+    ]
+  },
+  "opencode": {
+    "kind": "success",
+    "windows": [
+      { "key": "rolling", "label": "5h", "usagePercent": 66.7, "resetsAt": 1760534400000 },
+      { "key": "weekly", "label": "Week", "usagePercent": 31.0, "resetsAt": 1760793600000 }
+    ]
+  },
+  "ollama": {
+    "kind": "success",
+    "windows": [
+      { "key": "session", "label": "5h", "usagePercent": 4.1, "resetsAt": 1760529000000 },
+      { "key": "weekly", "label": "Week", "usagePercent": 18.9, "resetsAt": 1760880000000 },
+      { "key": "monthly", "label": "Month", "usagePercent": 22.4 }
+    ],
+    "usage": {
+      "plan": "ollama-plus",
+      "usageUsd": 3.41,
+      "creditUsd": 20.0,
+      "requestCount": 87,
+      "inputTokens": 412000,
+      "cachedInputTokens": 190500,
+      "outputTokens": 58020,
+      "window": "30d"
+    }
+  },
+  "cliproxy": {
+    "kind": "success",
+    "accounts": [
+      {
+        "label": "gemini-01",
+        "models": [
+          {
+            "name": "gemini-3-pro",
+            "windows": [
+              { "window": "5h", "usedPercent": 51.2, "resetsAt": 1760530800000 },
+              { "window": "week", "usedPercent": 9.8 }
+            ]
+          }
+        ]
+      }
+    ],
+    "combined": [
+      { "window": "5h", "usedPercent": 51.2, "resetsAt": 1760530800000 },
+      { "window": "week", "usedPercent": 9.8 }
+    ],
+    "otherAccounts": 2
+  }
+}

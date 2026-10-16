@@ -1,0 +1,10 @@
+{
+  "id": "art-0001",
+  "kind": "markdown",
+  "title": "Checklist report",
+  "versions": [
+    { "version": 1, "bytes": 420, "createdAt": 1760520500000 },
+    { "version": 2, "bytes": 680, "createdAt": 1760520600000 }
+  ],
+  "primary": true
+}

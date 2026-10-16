@@ -1,0 +1,12 @@
+{
+  "path": "/",
+  "parent": null,
+  "creatable": false,
+  "entries": [
+    { "name": "Applications" },
+    { "name": "Library" },
+    { "name": "System" },
+    { "name": "Users" }
+  ],
+  "truncated": false
+}

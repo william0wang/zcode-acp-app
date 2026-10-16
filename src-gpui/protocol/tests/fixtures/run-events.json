@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "events": [
+    {
+      "sequence": 12,
+      "type": "node-queued",
+      "payload": { "instance": { "siteId": "scan", "ordinal": 1 }, "instructionsHead": "scan the tree" }
+    },
+    {
+      "sequence": 13,
+      "type": "node-settled",
+      "payload": {
+        "instance": { "siteId": "scan", "ordinal": 1 },
+        "outcome": "failed",
+        "error": { "code": "EIO", "message": "disk went away" }
+      }
+    },
+    {
+      "sequence": 14,
+      "type": "usage-updated",
+      "payload": { "spentTokens": 2500 },
+      "truncated": true
+    }
+  ],
+  "hasMore": true
+}

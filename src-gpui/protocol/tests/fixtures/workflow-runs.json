@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "runs": [
+    {
+      "runId": "run-0192-77cd",
+      "name": "port-protocol-types",
+      "status": "running",
+      "createdAt": 1760526000000,
+      "updatedAt": 1760527100000,
+      "spentTokens": 91000,
+      "parentSessionId": "b41d2f90-1234-4aaa-9bbb-00000000000a",
+      "acpSessionId": "f0eee6a1-1111-4bbb-8ccc-000000000001",
+      "toolCallId": "toolu_01ABC",
+      "args": { "focus": "types.ts" },
+      "cwd": "/Users/william/Develop/tools/zcode-acp-app",
+      "artifacts": [{ "id": "art-0002", "kind": "file", "title": "protocol/src/lib.rs" }]
+    },
+    {
+      "runId": "run-0192-7700",
+      "name": "repo-triage",
+      "status": "stopped",
+      "stopReason": "user",
+      "updatedAt": 1760444000000,
+      "resumedFrom": "run-0192-76ff"
+    }
+  ],
+  "truncated": true
+}

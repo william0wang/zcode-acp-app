@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "resetCards": {
+    "availableFiveHour": [
+      { "expireAt": 1799059200000 },
+      { "expireAt": 1801737600000 }
+    ],
+    "availableWeek": [{ "expireAt": 1801737600000 }],
+    "latestFiveHour": { "usedAt": 1760325600000 },
+    "latestWeek": null,
+    "hasUnreadHistory": true,
+    "nonce": "9b6f0c22-7f61-4f6e-bd8f-1f0f21f0e101"
+  }
+}

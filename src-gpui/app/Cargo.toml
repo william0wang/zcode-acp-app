@@ -1,0 +1,34 @@
+[package]
+name = "app"
+description = "Desktop Workbench gpui window layer: entities mirror appStore slices, views bind to protocol events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+gpui-kit.workspace = true
+protocol.workspace = true
+# The protocol crate deliberately ships no real HTTP stack (its `hub_client`
+# module doc names the app layer as the supplier), so the app owns the
+# transport plus the tokio driver thread that runs the protocol futures.
+# Same workspace pins as protocol — no new external crates.
+tokio.workspace = true
+serde_json.workspace = true
+# The shared mobile/web catalogs (requirements §2) — src/i18n is loaded at
+# compile time straight from the TS app's directory, no forked copy. Both
+# pins already sit in the workspace tree via gpui-kit's own dependencies.
+rust-i18n.workspace = true
+sys-locale.workspace = true
+# https:// on remote Connection Profiles: tokio-rustls wraps the transport's
+# TcpStream; rustls-native-certs loads the system trust store (the same
+# policy the WS side gets from tokio-tungstenite's feature).
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rustls-native-certs.workspace = true
+
+[dev-dependencies]
+# UI integration tests (gpui-kit TESTING.md / website test guide): test-support
+# under dev-dependencies only — features unify for tests, production builds
+# never enable observation.
+gpui-kit = { workspace = true, features = ["test-support"] }

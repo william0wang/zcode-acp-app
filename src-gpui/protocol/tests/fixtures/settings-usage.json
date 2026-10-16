@@ -1,0 +1,51 @@
+{
+  "available": true,
+  "range": "30d",
+  "summary": {
+    "totalTokens": 4821000,
+    "inputTokens": 2440000,
+    "outputTokens": 1810000,
+    "reasoningTokens": 571000,
+    "cacheReadTokens": 2020000,
+    "requestCount": 1204,
+    "sessionCount": 63,
+    "turnCount": 918,
+    "toolCallCount": 5277,
+    "models": 3,
+    "activeDays": 24
+  },
+  "models": [
+    {
+      "modelId": "GLM-5.3",
+      "totalTokens": 4102000,
+      "inputTokens": 2077000,
+      "outputTokens": 1551000,
+      "reasoningTokens": 474000,
+      "cacheReadTokens": 1719000,
+      "cacheCreationTokens": 124000,
+      "requestCount": 1010,
+      "share": 0.8511
+    },
+    {
+      "modelId": null,
+      "totalTokens": 719000,
+      "inputTokens": 363000,
+      "outputTokens": 259000,
+      "reasoningTokens": 97000,
+      "cacheReadTokens": 301000,
+      "cacheCreationTokens": 21000,
+      "requestCount": 194,
+      "share": 0.1489
+    }
+  ],
+  "daily": [
+    {
+      "date": "2026-10-14",
+      "models": [
+        { "modelId": "GLM-5.3", "totalTokens": 412000 },
+        { "modelId": null, "totalTokens": 61000 }
+      ]
+    },
+    { "date": "2026-10-15", "models": [{ "modelId": "GLM-5.3", "totalTokens": 88000 }] }
+  ]
+}

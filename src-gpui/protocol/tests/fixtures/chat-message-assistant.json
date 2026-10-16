@@ -1,0 +1,26 @@
+{
+  "id": "msg-0002",
+  "role": "assistant",
+  "parts": [
+    { "type": "thought", "text": "Survey the server sources before writing types." },
+    {
+      "type": "tool-call",
+      "toolCallId": "toolu_01ABC",
+      "toolName": "Bash: cargo test -p protocol",
+      "detail": "cargo test --manifest-path src-gpui/Cargo.toml -p protocol",
+      "status": "completed",
+      "kind": "execute",
+      "rawName": "Bash",
+      "diffs": [
+        {
+          "type": "diff",
+          "path": "src-gpui/protocol/src/lib.rs",
+          "oldText": null,
+          "newText": "pub mod hub;\npub mod workflow;\n"
+        }
+      ]
+    },
+    { "type": "text", "text": "All 38 tests pass." }
+  ],
+  "createdAt": 1760526120000
+}

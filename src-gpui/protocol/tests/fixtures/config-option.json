@@ -1,0 +1,10 @@
+{
+  "id": "model",
+  "name": "Model",
+  "category": "model",
+  "currentValue": "builtin:bigmodel-coding-plan\\GLM-5.3",
+  "options": [
+    { "value": "builtin:bigmodel-coding-plan\\GLM-5.3", "name": "GLM-5.3" },
+    { "value": "builtin:bigmodel-coding-plan\\GLM-5-Air", "name": "GLM-5-Air" }
+  ]
+}
