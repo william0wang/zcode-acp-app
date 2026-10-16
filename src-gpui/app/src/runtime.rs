@@ -54,8 +54,9 @@ use protocol::config_store::{
 };
 use protocol::quota::{AccountUsageStats, QuotaItem};
 use protocol::settings::{
-    Effect, ModelUpsert, ResetCardInventory, ResetCardStatus, ResetCardType, SettingsAll,
-    SettingsPlatformUsage, SettingsUsage, SpendResetCard, WriteEffect,
+    AgentUpsert, Effect, HookEntryPatch, McpServerUpsert, ModelUpsert, ResetCardInventory,
+    ResetCardStatus, ResetCardType, SettingsAll, SettingsPlatformUsage, SettingsUsage,
+    SpendResetCard, WriteEffect,
 };
 use protocol::hub::{
     FsBrowseResult, FsEntryKind, FsListing, HubCreateInstanceResult, HubHistoryCursor,
@@ -319,6 +320,50 @@ pub enum UiCommand {
     FilesView { path: String },
     /// Close the viewer, back to the file list.
     FilesCloseView,
+    // ---- ZCode config sections (batch I: skills / mcp / hooks / agents /
+    // backups) ----
+    /// Open one config-section page. Every open re-runs the TS mount pair:
+    /// the capability probe (while the verdict is unknown) and the section
+    /// read; the Agents page additionally seeds the models read its picker
+    /// needs (TS AgentsPage's `loadConfigSection("models")` effect).
+    OpenConfigPage { page: ConfigPageKind },
+    /// The page's back gesture — close it. Payloads survive (the TS store
+    /// keeps them), so a reopen paints instantly and re-reads.
+    CloseConfigPage { page: ConfigPageKind },
+    /// The page header's refresh control (the section read again).
+    RefreshConfigPage { page: ConfigPageKind },
+    /// POST /settings/skills/enable (TS `setSkillEnabled`) — immediate.
+    SetSkillEnabled { path: String, enable: bool },
+    /// POST /settings/skills/copy-to-user (TS `copySkillToUser`).
+    CopySkillToUser { path: String },
+    /// PUT /settings/mcp/{name} (TS `upsertMcp`): add or edit one server;
+    /// the body carries only its transport's fields (config_decode's
+    /// `mcp_upsert_body`). `adding` names the failure label only.
+    UpsertMcpServer {
+        adding: bool,
+        name: String,
+        body: McpServerUpsert,
+    },
+    /// POST /settings/hooks/enabled (TS `setHooksEnabled`) — the whole
+    /// tree's switch.
+    SetHooksEnabled { enabled: bool },
+    /// PUT /settings/hooks/{event}/{matcherIndex} + body `hookIndex`
+    /// (TS `updateHookEntry`) — edit ONE existing entry; no add, no remove.
+    UpdateHookEntry {
+        event: String,
+        matcher_index: usize,
+        hook_index: usize,
+        patch: HookEntryPatch,
+    },
+    /// POST /settings/agents/{name}/enable (TS `setAgentEnabled`).
+    SetAgentEnabled { name: String, enable: bool },
+    /// PUT /settings/agents/{name} (TS `upsertAgent`): a personal agent's
+    /// frontmatter patch; the model/thought-level keys travel only when the
+    /// user actually picked (the modelTouched gate, TS PersonalAgentForm).
+    UpsertAgent { name: String, body: AgentUpsert },
+    /// POST /settings/backups/restore (TS `restoreBackup`) — two-gesture
+    /// confirmed in the view before it ever reaches here.
+    RestoreBackup { file: String, path: String },
 }
 
 /// What the driver surfaces to the window. One shape: a full snapshot —
@@ -330,10 +375,51 @@ pub enum RuntimeEvent {
     /// One model upsert settled: `ok` closes the add/edit form; a failure
     /// keeps it open with the notice banner carrying the reason.
     ModelWriteResult { ok: bool },
+    /// One config-section write settled (batch I). `ok` closes the open
+    /// MCP/hook/agent form — the same TS `if (ok) onClose()` contract;
+    /// switches and restores have no form and simply ignore it.
+    ConfigWriteResult { ok: bool },
     /// A queued draft returned to the composer (ChatView `editPending`):
     /// prefill the text and re-stage the images. One-shot — never part of
     /// the snapshot, so it cannot re-fire on a fingerprint change.
     ComposerPrefill(protocol::chat::PromptDraft),
+}
+
+/// The five ZCode-config section pages (batch I, requirements §7): one
+/// shared panel shape — every one is a section read plus writes through the
+/// applyConfigWrite path (effect class surfaced, section reloaded).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigPageKind {
+    Skills,
+    Mcp,
+    Hooks,
+    Agents,
+    Backups,
+}
+
+impl ConfigPageKind {
+    pub const ALL: [Self; 5] = [Self::Skills, Self::Mcp, Self::Hooks, Self::Agents, Self::Backups];
+
+    fn index(self) -> usize {
+        match self {
+            Self::Skills => 0,
+            Self::Mcp => 1,
+            Self::Hooks => 2,
+            Self::Agents => 3,
+            Self::Backups => 4,
+        }
+    }
+
+    /// The section's i18n title (the page header).
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Skills => "zconfig.skills",
+            Self::Mcp => "zconfig.mcp",
+            Self::Hooks => "zconfig.hooks",
+            Self::Agents => "zconfig.agents",
+            Self::Backups => "zconfig.backups",
+        }
+    }
 }
 
 /// Hub-level connection/bootstrap phase for the status bar (per-tab
@@ -703,6 +789,29 @@ pub struct FileViewerView {
     pub error: Option<String>,
 }
 
+/// One open ZCode-config section page (batch I): the section payload stays
+/// a raw `Value` — every screen decodes through `protocol::config_decode`
+/// at paint time (the module the TS rule says the screens must call, never
+/// fork). Rendered only while the page is open.
+#[derive(Debug, Clone)]
+pub struct ConfigSectionPageView {
+    pub kind: ConfigPageKind,
+    /// `None` = not probed; `Some(false)` = an older hub — the capability
+    /// card, not an error.
+    pub supported: Option<bool>,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// GET /settings/{section}, permissive-wire doctrine.
+    pub payload: Option<Value>,
+    /// A write from this page is in flight (the form's busy / switch
+    /// disable).
+    pub busy: bool,
+    /// Agents only: the model picker's data (the models section payload),
+    /// seeded on open because the agents section does not carry it. `None`
+    /// for every other kind.
+    pub models: Option<ModelsPayload>,
+}
+
 /// The whole workbench state the view renders.
 #[derive(Debug, Clone)]
 pub struct WorkbenchSnapshot {
@@ -751,6 +860,9 @@ pub struct WorkbenchSnapshot {
     /// The Session Files browser (batch F). Always present — the dock
     /// panel's visibility is view-local, like every dock panel.
     pub files: FilesPanelView,
+    /// The open ZCode-config section page (batch I); `None` = closed (a
+    /// full page of its own, like every config section — ADR-0009).
+    pub config_section_page: Option<ConfigSectionPageView>,
 }
 
 impl WorkbenchSnapshot {
@@ -777,6 +889,7 @@ impl WorkbenchSnapshot {
             active_server_id: None,
             new_session: None,
             files: FilesPanelView::default(),
+            config_section_page: None,
         }
     }
 }
@@ -945,6 +1058,27 @@ enum LoopEvent {
     FilesText {
         seq: u64,
         result: Result<(u64, String), HubApiError>,
+    },
+    // ---- ZCode config sections (batch I) ----
+    /// The capability probe settled for one config-section page (the verdict
+    /// half of the TS mount pair).
+    ConfigSectionProbe {
+        page: ConfigPageKind,
+        result: Result<(), SettingsApiError>,
+    },
+    /// One section read settled (TS `loadConfigSection(section)`).
+    ConfigSectionLoaded {
+        page: ConfigPageKind,
+        result: Result<Value, SettingsApiError>,
+    },
+    /// One config-section write settled (the applyConfigWrite outcome):
+    /// `label` names the failure, `reload` the sections the write's success
+    /// must re-read.
+    ConfigWriteSettled {
+        page: ConfigPageKind,
+        label: &'static str,
+        reload: &'static [ConfigPageKind],
+        result: Result<WriteEffect, SettingsApiError>,
     },
 }
 
@@ -1398,6 +1532,37 @@ struct FileViewing {
     error: Option<String>,
 }
 
+/// One ZCode-config section page's driver state (batch I — the TS configSlice
+/// fields the five screens read: `config{Section}`, `configSupported`,
+/// `configLoading`, `configError` + the write busy). The payload survives a
+/// page close (the TS store keeps it) and re-reads on the next open; a full
+/// re-bootstrap resets it alongside the connection (the TS
+/// `connectionResetPatch`: configuration state describes ONE machine).
+#[derive(Default)]
+struct ConfigSectionPanel {
+    open: bool,
+    /// `None` = not probed; `Some(false)` = an older hub (bridge < 0.47.0).
+    supported: Option<bool>,
+    loading: bool,
+    error: Option<String>,
+    payload: Option<Value>,
+    /// A write from this page is in flight.
+    busy: bool,
+}
+
+impl ConfigSectionPanel {
+    /// The connection-reset patch — same doctrine as
+    /// [`ModelsPanel::reset_data`]. `open` survives; the steady-state entry
+    /// re-seeds the reads.
+    fn reset_data(&mut self) {
+        self.supported = None;
+        self.loading = false;
+        self.error = None;
+        self.payload = None;
+        self.busy = false;
+    }
+}
+
 struct Driver {
     factory: Arc<dyn WsFactory>,
     clock: Arc<dyn Clock>,
@@ -1452,6 +1617,9 @@ struct Driver {
     quota: QuotaPanel,
     /// The Usage config page (see [`UsagePanel`]).
     usage: UsagePanel,
+    /// The five ZCode-config section pages (batch I, see
+    /// [`ConfigSectionPanel`]), indexed by [`ConfigPageKind::index`]).
+    sections: [ConfigSectionPanel; 5],
     /// Config-screen notice (TS `notice`): `notice.*` i18n key or plain text.
     config_notice: Option<String>,
     /// A needs-restart write is pending on the connected bridge — drives the
@@ -1519,6 +1687,7 @@ impl Driver {
                 ..Default::default()
             },
             usage: UsagePanel::new(),
+            sections: Default::default(),
             config_notice: None,
             pending_restart: false,
             toast: ToastState::new(),
@@ -2261,6 +2430,170 @@ impl Driver {
             }
         };
         let _ = self.ev_tx.send(RuntimeEvent::ModelWriteResult { ok });
+    }
+
+    // ---- ZCode config sections (batch I: skills / mcp / hooks / agents /
+    // backups) ----
+
+    /// The capability probe for one section page (the verdict half of its
+    /// TS mount pair). No-op before a hub is dialable.
+    fn spawn_config_section_probe(&mut self, page: ConfigPageKind) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.settings_all().await.map(|_| ());
+            let _ = tx.send(LoopEvent::ConfigSectionProbe { page, result });
+        });
+    }
+
+    /// One section read (TS `loadConfigSection(section)`): runs on every
+    /// page open and after every write from the section.
+    fn spawn_config_section_load(&mut self, page: ConfigPageKind) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let panel = &mut self.sections[page.index()];
+        panel.loading = true;
+        panel.error = None;
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = match page {
+                ConfigPageKind::Skills => hub.settings_skills().await,
+                ConfigPageKind::Mcp => hub.settings_mcp().await,
+                ConfigPageKind::Hooks => hub.settings_hooks().await,
+                ConfigPageKind::Agents => hub.settings_agents().await,
+                ConfigPageKind::Backups => hub.settings_backups().await,
+            };
+            let _ = tx.send(LoopEvent::ConfigSectionLoaded { page, result });
+        });
+    }
+
+    /// The section probe settled — same verdict handling as
+    /// [`Self::on_config_probe`], scoped to the asking page.
+    fn on_config_section_probe(
+        &mut self,
+        page: ConfigPageKind,
+        result: Result<(), SettingsApiError>,
+    ) {
+        let panel = &mut self.sections[page.index()];
+        match result {
+            Ok(()) => panel.supported = Some(true),
+            Err(SettingsApiError::Http { status: 404, .. }) => {
+                // Bridge < 0.47.0: the capability card, and the section read
+                // behind it cannot work either.
+                panel.supported = Some(false);
+                panel.loading = false;
+            }
+            Err(_) => {
+                // A real failure belongs to the section read's error story;
+                // the verdict stays unknown so a later probe can still run.
+            }
+        }
+    }
+
+    /// The section read settled (the `on_models_loaded` doctrine): Ok keeps
+    /// the raw `Value` (the screens decode through config_decode at paint
+    /// time), a 404 retires the page's capability verdict, anything else is
+    /// the error card.
+    fn on_config_section_loaded(
+        &mut self,
+        page: ConfigPageKind,
+        result: Result<Value, SettingsApiError>,
+    ) {
+        let panel = &mut self.sections[page.index()];
+        panel.loading = false;
+        match result {
+            Ok(v) => {
+                panel.payload = Some(v);
+                panel.error = None;
+            }
+            Err(SettingsApiError::Http { status: 404, .. }) => {
+                panel.supported = Some(false);
+            }
+            Err(e) => {
+                panel.error = Some(e.to_string());
+            }
+        }
+    }
+
+    /// One write through the applyConfigWrite path (label, write, reload):
+    /// the future is boxed by the spawn because each route returns its own
+    /// concrete future type.
+    fn spawn_config_write<F>(
+        &mut self,
+        page: ConfigPageKind,
+        label: &'static str,
+        reload: &'static [ConfigPageKind],
+        fut: F,
+    ) where
+        F: std::future::Future<Output = Result<WriteEffect, SettingsApiError>> + Send + 'static,
+    {
+        self.sections[page.index()].busy = true;
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = fut.await;
+            let _ = tx.send(LoopEvent::ConfigWriteSettled {
+                page,
+                label,
+                reload,
+                result,
+            });
+        });
+    }
+
+    /// The write settled — the applyConfigWrite outcome port (the
+    /// `on_model_upsert` doctrine): ok reloads the sections the write
+    /// touched, a needs-restart effect ARMS the restart affordance with its
+    /// notice, a refusal surfaces its BODY, and the form-close result goes
+    /// to the view.
+    fn on_config_write_settled(
+        &mut self,
+        page: ConfigPageKind,
+        label: &'static str,
+        reload: &[ConfigPageKind],
+        result: Result<WriteEffect, SettingsApiError>,
+    ) {
+        self.sections[page.index()].busy = false;
+        let ok = match result {
+            Ok(w) if w.ok => {
+                if w.effect == Some(Effect::NeedsRestart) {
+                    self.pending_restart = true;
+                    self.config_notice = Some(NOTICE_NEEDS_RESTART.to_string());
+                }
+                for r in reload {
+                    self.spawn_config_section_load(*r);
+                }
+                // A restore rewrites the WHOLE config document, so the
+                // models page's snapshot is stale too (TS BackupsPage
+                // reloads models alongside the four sections).
+                if page == ConfigPageKind::Backups {
+                    self.spawn_models_load();
+                }
+                true
+            }
+            Ok(w) => {
+                self.config_notice = Some(format!(
+                    "{label} failed: {}",
+                    w.error.unwrap_or_else(|| "refused".to_string())
+                ));
+                false
+            }
+            Err(e) => {
+                self.config_notice = Some(format!("{label} failed: {e}"));
+                false
+            }
+        };
+        let _ = self.ev_tx.send(RuntimeEvent::ConfigWriteResult { ok });
     }
 
     // ---- usage statistics (config page "usage" / "usagePlatform") ----
@@ -3351,6 +3684,19 @@ impl Driver {
             // ---- Session Files (batch F) ----
             LoopEvent::FilesList { seq, result } => self.on_files_list(seq, result),
             LoopEvent::FilesText { seq, result } => self.on_files_text(seq, result),
+            // ---- ZCode config sections (batch I) ----
+            LoopEvent::ConfigSectionProbe { page, result } => {
+                self.on_config_section_probe(page, result);
+            }
+            LoopEvent::ConfigSectionLoaded { page, result } => {
+                self.on_config_section_loaded(page, result);
+            }
+            LoopEvent::ConfigWriteSettled {
+                page,
+                label,
+                reload,
+                result,
+            } => self.on_config_write_settled(page, label, reload, result),
         }
     }
 
@@ -3869,6 +4215,139 @@ impl Driver {
             UiCommand::FilesCloseView => {
                 self.files.viewing = None;
             }
+            // ---- ZCode config sections (batch I) ----
+            UiCommand::OpenConfigPage { page } => {
+                self.sections[page.index()].open = true;
+                // The TS mount pair, on EVERY open (not only the first): a
+                // reopened page refreshes over its surviving payload.
+                if self.sections[page.index()].supported.is_none() {
+                    self.spawn_config_section_probe(page);
+                }
+                self.spawn_config_section_load(page);
+                // The Agents page's picker reads the models section (TS
+                // AgentsPage's `loadConfigSection("models")` effect); the
+                // entry screen's snapshot may not have carried it.
+                if page == ConfigPageKind::Agents && self.models.models.is_none() {
+                    self.spawn_models_load();
+                }
+            }
+            UiCommand::CloseConfigPage { page } => {
+                self.sections[page.index()].open = false;
+            }
+            UiCommand::RefreshConfigPage { page } => {
+                self.spawn_config_section_load(page);
+            }
+            UiCommand::SetSkillEnabled { path, enable } => {
+                // One write at a time per page (the switches disable while
+                // busy; this is the same guard on the driver side).
+                if !self.sections[ConfigPageKind::Skills.index()].busy {
+                    let hub = self.settings_client();
+                    let label: &'static str =
+                        if enable { "enable skill" } else { "disable skill" };
+                    self.spawn_config_write(
+                        ConfigPageKind::Skills,
+                        label,
+                        &[ConfigPageKind::Skills],
+                        async move { hub.set_skill_enabled(&path, enable).await },
+                    );
+                }
+            }
+            UiCommand::CopySkillToUser { path } => {
+                if !self.sections[ConfigPageKind::Skills.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Skills,
+                        "copy skill",
+                        &[ConfigPageKind::Skills],
+                        async move { hub.copy_skill_to_user(&path).await },
+                    );
+                }
+            }
+            UiCommand::UpsertMcpServer { adding, name, body } => {
+                if !self.sections[ConfigPageKind::Mcp.index()].busy {
+                    let hub = self.settings_client();
+                    let label: &'static str =
+                        if adding { "add MCP server" } else { "update MCP server" };
+                    self.spawn_config_write(
+                        ConfigPageKind::Mcp,
+                        label,
+                        &[ConfigPageKind::Mcp],
+                        async move { hub.upsert_mcp_server(&name, body).await },
+                    );
+                }
+            }
+            UiCommand::SetHooksEnabled { enabled } => {
+                if !self.sections[ConfigPageKind::Hooks.index()].busy {
+                    let hub = self.settings_client();
+                    let label: &'static str =
+                        if enabled { "enable hooks" } else { "disable hooks" };
+                    self.spawn_config_write(
+                        ConfigPageKind::Hooks,
+                        label,
+                        &[ConfigPageKind::Hooks],
+                        async move { hub.set_hooks_enabled(enabled).await },
+                    );
+                }
+            }
+            UiCommand::UpdateHookEntry {
+                event,
+                matcher_index,
+                hook_index,
+                patch,
+            } => {
+                if !self.sections[ConfigPageKind::Hooks.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Hooks,
+                        "update hook",
+                        &[ConfigPageKind::Hooks],
+                        async move {
+                            hub.update_hook(&event, matcher_index, hook_index, patch)
+                                .await
+                        },
+                    );
+                }
+            }
+            UiCommand::SetAgentEnabled { name, enable } => {
+                if !self.sections[ConfigPageKind::Agents.index()].busy {
+                    let hub = self.settings_client();
+                    let label: &'static str =
+                        if enable { "enable subagent" } else { "disable subagent" };
+                    self.spawn_config_write(
+                        ConfigPageKind::Agents,
+                        label,
+                        &[ConfigPageKind::Agents],
+                        async move { hub.set_agent_enabled(&name, enable).await },
+                    );
+                }
+            }
+            UiCommand::UpsertAgent { name, body } => {
+                if !self.sections[ConfigPageKind::Agents.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Agents,
+                        "update subagent",
+                        &[ConfigPageKind::Agents],
+                        async move { hub.upsert_agent(&name, body).await },
+                    );
+                }
+            }
+            UiCommand::RestoreBackup { file, path } => {
+                if !self.sections[ConfigPageKind::Backups.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Backups,
+                        "restore backup",
+                        &[
+                            ConfigPageKind::Skills,
+                            ConfigPageKind::Mcp,
+                            ConfigPageKind::Hooks,
+                            ConfigPageKind::Agents,
+                        ],
+                        async move { hub.restore_backup(&file, &path).await },
+                    );
+                }
+            }
         }
         Flow::Continue
     }
@@ -4256,6 +4735,27 @@ impl Driver {
                 .unwrap_or(u64::MAX / 2),
             &mut sig,
         );
+        // The five ZCode-config section pages (batch I): open/close, the
+        // state flags, and a content signature of each payload.
+        for page in ConfigPageKind::ALL {
+            let panel = &self.sections[page.index()];
+            mix(panel.open as u64, &mut sig);
+            mix(
+                panel.supported.map(|s| s as u64).unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(panel.loading as u64, &mut sig);
+            mix(panel.busy as u64, &mut sig);
+            mix(panel.error.is_some() as u64, &mut sig);
+            mix(
+                panel
+                    .payload
+                    .as_ref()
+                    .map(|p| fold_str(&p.to_string()))
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+        }
         sig
     }
 
@@ -4402,6 +4902,25 @@ impl Driver {
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
             files: self.files.view(),
+            config_section_page: ConfigPageKind::ALL
+                .iter()
+                .find(|page| self.sections[page.index()].open)
+                .map(|page| {
+                    let panel = &self.sections[page.index()];
+                    ConfigSectionPageView {
+                        kind: *page,
+                        supported: panel.supported,
+                        loading: panel.loading,
+                        error: panel.error.clone(),
+                        payload: panel.payload.clone(),
+                        busy: panel.busy,
+                        // The Agents page's picker decodes the models
+                        // payload; every other page leaves it None.
+                        models: (*page == ConfigPageKind::Agents)
+                            .then(|| self.models.models.clone())
+                            .flatten(),
+                    }
+                }),
         }));
     }
 }
@@ -4770,6 +5289,9 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         d.models.reset_data();
         d.quota.reset_data();
         d.usage.reset_data();
+        for page in ConfigPageKind::ALL {
+            d.sections[page.index()].reset_data();
+        }
         // Session Files belong to a (hub, instance, session) triple — a new
         // lifecycle means a new machine's paths; nothing survives.
         d.files.reset();

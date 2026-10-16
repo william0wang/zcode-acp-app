@@ -67,6 +67,7 @@ use crate::runtime::{
 use crate::quota_page::SpendStage;
 use crate::system_status::render_system_status_page;
 use crate::usage_page::render_usage_page;
+use crate::zconfig_pages::ZConfigForm;
 
 /// Stream-reveal timing for streamed markdown chunks (the Claude-style fade
 /// TextView ships; numbers from the gpui-component defaults).
@@ -178,6 +179,17 @@ pub struct Workbench {
     pub(crate) models_form: Option<ModelsForm>,
     /// Keeps the form inputs' change subscriptions alive.
     pub(crate) models_form_subs: Vec<Subscription>,
+    /// The open ZCode-config section form (batch I: MCP / hook / agent);
+    /// `None` = closed. Rendered instead of the section page while open,
+    /// like `models_form`.
+    pub(crate) zconfig_form: Option<ZConfigForm>,
+    /// Keeps the config form inputs' change subscriptions alive.
+    pub(crate) zconfig_form_subs: Vec<Subscription>,
+    /// The Hooks page's expanded event (view-local fold, TS `open`).
+    pub(crate) hooks_open_event: Option<String>,
+    /// The Backups page's armed restore confirm (TS `confirm`): the
+    /// (file, path) the second gesture would restore.
+    pub(crate) backup_confirm: Option<(String, String)>,
     /// The quota page's spend gesture (TS `confirm` useState): which window,
     /// and whether the below-threshold warning has been answered. Lives only
     /// inside the page — a page closed under an open gesture drops it so a
@@ -594,6 +606,10 @@ impl Workbench {
             add_server_token,
             models_form: None,
             models_form_subs: Vec::new(),
+            zconfig_form: None,
+            zconfig_form_subs: Vec::new(),
+            hooks_open_event: None,
+            backup_confirm: None,
             quota_confirm: None,
             copied_row: None,
             plan_open: false,
@@ -723,6 +739,7 @@ impl Workbench {
             || self.snap.models_page.is_some()
             || self.snap.quota_page.is_some()
             || self.snap.usage_page.is_some()
+            || self.snap.config_section_page.is_some()
         {
             return;
         }
@@ -837,6 +854,15 @@ impl Workbench {
                     self.models_form = None;
                     self.models_form_subs.clear();
                 }
+                if self.snap.config_section_page.is_none() {
+                    // Same contract for the section form, plus the two
+                    // page-local gestures (the hooks fold, the armed
+                    // restore confirm).
+                    self.zconfig_form = None;
+                    self.zconfig_form_subs.clear();
+                    self.hooks_open_event = None;
+                    self.backup_confirm = None;
+                }
                 // The spend gesture is page-local state (TS useState); a
                 // page closed under an open confirm dialog drops it.
                 if self.snap.quota_page.is_none() {
@@ -851,6 +877,15 @@ impl Workbench {
                 if ok && self.models_form.is_some() {
                     self.models_form = None;
                     self.models_form_subs.clear();
+                }
+                cx.notify();
+            }
+            RuntimeEvent::ConfigWriteResult { ok } => {
+                // The same contract for the section forms (batch I): a
+                // switch or restore has no form and simply ignores this.
+                if ok && self.zconfig_form.is_some() {
+                    self.zconfig_form = None;
+                    self.zconfig_form_subs.clear();
                 }
                 cx.notify();
             }
@@ -1875,13 +1910,14 @@ impl Workbench {
 
         // (icon, title, description, entry command constructor). The command
         // is built inside the click closure — click listeners are `Fn`, so a
-        // prebuilt command would have to be Clone for nothing.
+        // prebuilt command would have to be Clone for nothing. The five
+        // batch-I sections ride the same list (requirements §7).
         let entries: [(
             KitIconName,
             &str,
             &str,
             fn() -> UiCommand,
-        ); 4] = [
+        ); 9] = [
             (
                 KitIconName::Boxes,
                 "Models",
@@ -1905,6 +1941,46 @@ impl Workbench {
                 "System status",
                 "Machine health: battery, CPU, memory, storage",
                 || UiCommand::OpenSystemStatus,
+            ),
+            (
+                KitIconName::Puzzle,
+                "Skills",
+                "Discovered skills and their enable state",
+                || UiCommand::OpenConfigPage {
+                    page: crate::runtime::ConfigPageKind::Skills,
+                },
+            ),
+            (
+                KitIconName::PlugZap,
+                "MCP servers",
+                "Configured MCP servers (stdio and remote)",
+                || UiCommand::OpenConfigPage {
+                    page: crate::runtime::ConfigPageKind::Mcp,
+                },
+            ),
+            (
+                KitIconName::Webhook,
+                "Hooks",
+                "Per-event commands the agent runs",
+                || UiCommand::OpenConfigPage {
+                    page: crate::runtime::ConfigPageKind::Hooks,
+                },
+            ),
+            (
+                KitIconName::Bot,
+                "Agents",
+                "Subagents: built-ins and personal agents",
+                || UiCommand::OpenConfigPage {
+                    page: crate::runtime::ConfigPageKind::Agents,
+                },
+            ),
+            (
+                KitIconName::ArchiveRestore,
+                "Backups",
+                "Restore an earlier version of a config file",
+                || UiCommand::OpenConfigPage {
+                    page: crate::runtime::ConfigPageKind::Backups,
+                },
             ),
         ];
         for (icon, title, description, open) in entries {
@@ -3847,6 +3923,7 @@ impl Render for Workbench {
                     && self.snap.models_page.is_none()
                     && self.snap.quota_page.is_none()
                     && self.snap.usage_page.is_none()
+                    && self.snap.config_section_page.is_none()
                 {
                     Some(self.render_dock(cx))
                 } else {
@@ -3902,6 +3979,18 @@ impl Render for Workbench {
                         &runtime,
                         &theme,
                     ))
+                },
+            )
+            // The ZCode-config section pages (batch I): the open form
+            // replaces the page while open, exactly like the Models form.
+            .when_some(
+                self.snap.config_section_page.clone(),
+                |this, _page| {
+                    this.child(if self.zconfig_form.is_some() {
+                        self.render_zconfig_form(cx)
+                    } else {
+                        crate::zconfig_pages::render_config_section_page(self, cx)
+                    })
                 },
             )
             // The new-session chooser rides ON TOP of whatever surface is

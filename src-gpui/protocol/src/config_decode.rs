@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::settings::{McpServerUpsert, ResetCardType};
+use crate::settings::{HookEntryPatch, McpServerUpsert, ResetCardType};
 use crate::settings_client::encode_uri_component;
 
 // ─── models (ModelsPage.ts) ─────────────────────────────────────────────────
@@ -592,6 +592,211 @@ pub fn is_user_tree_scope(scope: Option<&str>) -> bool {
 /// the API refuses both with a 400 the user cannot act on).
 pub fn is_agent_read_only(read_only: Option<bool>) -> bool {
     read_only == Some(true)
+}
+
+/// One discovered skill (the skills section's `skills[]`). All fields
+/// optional — the route's payload is permissive; a missing `path` falls
+/// back to the name as the row's identity (TS `s.path ?? s.name ?? ""`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl SkillRow {
+    /// The row's identity: the file path when the bridge sent one, the name
+    /// otherwise (both go into the enable/copy bodies).
+    pub fn id(&self) -> &str {
+        self.path.as_deref().or(self.name.as_deref()).unwrap_or("")
+    }
+
+    /// Absent means on: the config spells `enabled: false` only when a skill
+    /// is switched off.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled != Some(false)
+    }
+}
+
+/// The discovered-skill list out of `{ok, skills:[…]}`. A missing section
+/// is an empty list, never an error.
+pub fn skill_rows(payload: Option<&Value>) -> Vec<SkillRow> {
+    payload
+        .and_then(|v| v.get("skills"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| serde_json::from_value(row.clone()).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One agent entry (the agents section's `agents[]`): the frontmatter fields
+/// a personal agent's form edits, the server's `readOnly` verdict, and the
+/// resolved model override a built-in carries. All optional — the route's
+/// payload is permissive.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentRow {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frontmatter: Option<AgentFrontmatter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Built-in agents cannot be edited or disabled — the server's word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+    /// The resolved model override (a built-in's), when one is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_selection: Option<AgentModelSelection>,
+}
+
+/// The frontmatter fields the write route patches (a personal agent's own
+/// file); kept raw — the model stays in the file's spelling, decoded by the
+/// form through [`decode_subagent_model`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentFrontmatter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<String>,
+}
+
+/// The resolved override a built-in carries (server `modelSelection`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentModelSelection {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thought_level: Option<String>,
+}
+
+impl AgentRow {
+    pub fn is_enabled(&self) -> bool {
+        self.enabled != Some(false)
+    }
+}
+
+/// The agent list out of `{ok, agents:[…]}`. A missing section is an empty
+/// list, never an error.
+pub fn agent_rows(payload: Option<&Value>) -> Vec<AgentRow> {
+    payload
+        .and_then(|v| v.get("agents"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| serde_json::from_value(row.clone()).unwrap_or_default())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+// ─── backups (BackupsPage.tsx) ──────────────────────────────────────────────
+
+/// One timestamped backup copy of a config file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupRow {
+    pub path: String,
+    pub created_at: String,
+}
+
+/// The two backup lists out of `{ok, backups:{providerConfig, cliConfig}}`.
+/// A missing section is an empty list, never an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct BackupLists {
+    pub provider_config: Vec<BackupRow>,
+    pub cli_config: Vec<BackupRow>,
+}
+
+pub fn backup_lists(payload: Option<&Value>) -> BackupLists {
+    let Some(backups) = payload.and_then(|v| v.get("backups")) else {
+        return BackupLists::default();
+    };
+    let side = |key: &str| -> Vec<BackupRow> {
+        backups
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| serde_json::from_value(row.clone()).unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    BackupLists {
+        provider_config: side("providerConfig"),
+        cli_config: side("cliConfig"),
+    }
+}
+
+/// The server's name rule for a personal agent (agents-config.ts):
+/// 3–50 of `[a-zA-Z0-9-]`. Mirrored so an invalid name disables Save
+/// instead of erroring after the round trip.
+pub fn is_valid_agent_name(name: &str) -> bool {
+    (3..=50).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+/// TS `timeoutOk` (HookForm): blank keeps the current timeout; anything
+/// else must be a positive finite number — the route throws on `0` or a
+/// non-numeric string.
+pub fn hook_timeout_ok(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match trimmed.parse::<f64>() {
+        Ok(n) => n.is_finite() && n > 0.0,
+        Err(_) => false,
+    }
+}
+
+/// The hook edit form's patch (TS `submit`): the trimmed command always
+/// travels; the timeout only when the field is non-blank, written back in
+/// the unit the entry already spells — an entry with no timeout takes the
+/// unit its type implies (`process` → `timeoutMs`, `command` → `timeout`
+/// seconds), so editing never adds a second timeout field beside the first.
+/// Call only with a non-blank command and a [`hook_timeout_ok`] value.
+pub fn hook_edit_patch(row: &HookRow, command: &str, timeout_seconds: &str) -> HookEntryPatch {
+    let ms_spelled = row.raw_timeout_ms.is_some()
+        || (row.raw_timeout_ms.is_none()
+            && row.raw_timeout_sec.is_none()
+            && row.hook_type.as_deref() != Some("command"));
+    let seconds = timeout_seconds.trim();
+    let mut patch = HookEntryPatch {
+        command: Some(command.trim().to_string()),
+        ..Default::default()
+    };
+    if !seconds.is_empty() {
+        let n: f64 = seconds.parse().unwrap_or_default();
+        if ms_spelled {
+            // Scale BEFORE the u64 cast: 2.5s is 2500ms, not (2)*1000.
+            patch.timeout_ms = Some((n * 1000.0) as u64);
+        } else {
+            patch.timeout = Some(n as u64);
+        }
+    }
+    patch
 }
 
 // ─── plan quota (QuotaPage.tsx) ─────────────────────────────────────────────
@@ -1329,6 +1534,173 @@ mod tests {
         assert_eq!(wire[0]["frontmatter"]["description"], "General agent");
         assert_eq!(wire[1]["modelSelection"]["modelId"], "glm-4.6");
         assert_eq!(wire[1]["modelSelection"]["thoughtLevel"], "high");
+    }
+
+    // --- the skills/agents row decodes (the real ones the screens call) ---------
+
+    #[test]
+    fn skill_rows_decode_the_real_route_shape_permissively() {
+        let wire = json!({
+            "ok": true,
+            "skills": [
+                { "name": "mine", "path": "/h/.zcode/skills/mine/SKILL.md",
+                  "description": "Mine", "scope": "user", "enabled": true },
+                { "name": "ws", "path": "/w/.zcode/skills/ws/SKILL.md", "scope": "project" },
+                { "name": "anon" },
+                "garbage"
+            ]
+        });
+        let rows = skill_rows(Some(&wire));
+        assert_eq!(rows.len(), 4);
+        // Absent `enabled` means on; the identity is the path, falling back
+        // to the name when the bridge sent none.
+        assert!(rows[0].is_enabled());
+        assert!(rows[1].is_enabled());
+        assert_eq!(rows[0].id(), "/h/.zcode/skills/mine/SKILL.md");
+        assert_eq!(rows[2].id(), "anon");
+        assert_eq!(rows[2].scope, None);
+        // The garbage row decodes as all-defaults, never a failure.
+        assert_eq!(rows[3], SkillRow::default());
+        assert!(skill_rows(None).is_empty());
+        assert!(skill_rows(Some(&json!({ "ok": true }))).is_empty());
+    }
+
+    #[test]
+    fn agent_rows_decode_frontmatter_and_the_read_only_verdict() {
+        let wire = json!({
+            "ok": true,
+            "agents": [
+                {
+                    "name": "general-purpose",
+                    "frontmatter": { "name": "general-purpose", "description": "General agent" },
+                    "enabled": true,
+                    "readOnly": true
+                },
+                {
+                    "name": "mine",
+                    "frontmatter": {
+                        "description": "My agent", "color": "blue",
+                        "model": "account:bigmodel-individual-coding-plan/glm-4.6",
+                        "thoughtLevel": "high"
+                    },
+                    "readOnly": false
+                },
+                { "name": "off", "enabled": false }
+            ]
+        });
+        let rows = agent_rows(Some(&wire));
+        assert_eq!(rows.len(), 3);
+        assert!(is_agent_read_only(rows[0].read_only));
+        assert!(!is_agent_read_only(rows[1].read_only));
+        let fm = rows[1].frontmatter.as_ref().unwrap();
+        assert_eq!(fm.description.as_deref(), Some("My agent"));
+        assert_eq!(fm.color.as_deref(), Some("blue"));
+        assert_eq!(
+            fm.model.as_deref(),
+            Some("account:bigmodel-individual-coding-plan/glm-4.6")
+        );
+        // Absent `enabled` means on; explicit false is off.
+        assert!(rows[0].is_enabled());
+        assert!(rows[1].is_enabled());
+        assert!(!rows[2].is_enabled());
+        assert!(agent_rows(None).is_empty());
+    }
+
+    #[test]
+    fn is_valid_agent_name_mirrors_the_server_rule() {
+        assert!(is_valid_agent_name("abc"));
+        assert!(is_valid_agent_name("my-agent-2"));
+        assert!(is_valid_agent_name(&"a".repeat(50)));
+        assert!(!is_valid_agent_name("ab"));
+        assert!(!is_valid_agent_name(&"a".repeat(51)));
+        assert!(!is_valid_agent_name("has space"));
+        assert!(!is_valid_agent_name("dot.name"));
+        assert!(!is_valid_agent_name(""));
+    }
+
+    // --- backups ------------------------------------------------------------------
+
+    #[test]
+    fn backup_lists_decode_both_files_independently() {
+        let wire = json!({
+            "ok": true,
+            "backups": {
+                "providerConfig": [
+                    { "path": "/h/.zcode/providers.json.bak-1", "createdAt": "2026-10-01T00:00:00.000Z" }
+                ],
+                "cliConfig": [
+                    { "path": "/h/.zcode/config.json.bak-1", "createdAt": "2026-10-02T00:00:00.000Z" },
+                    { "path": "/h/.zcode/config.json.bak-2", "createdAt": "2026-10-03T00:00:00.000Z" }
+                ]
+            }
+        });
+        let lists = backup_lists(Some(&wire));
+        assert_eq!(lists.provider_config.len(), 1);
+        assert_eq!(lists.cli_config.len(), 2);
+        assert_eq!(lists.cli_config[1].path, "/h/.zcode/config.json.bak-2");
+        // Missing sections (and payloads) are empty lists, never errors.
+        let empty = backup_lists(Some(&json!({ "ok": true })));
+        assert!(empty.provider_config.is_empty() && empty.cli_config.is_empty());
+        assert!(backup_lists(None).provider_config.is_empty());
+    }
+
+    // --- the hook edit patch --------------------------------------------------------
+
+    #[test]
+    fn hook_timeout_ok_accepts_blank_or_a_positive_number() {
+        assert!(hook_timeout_ok(""));
+        assert!(hook_timeout_ok("  "));
+        assert!(hook_timeout_ok("60"));
+        assert!(hook_timeout_ok("0.5"));
+        assert!(!hook_timeout_ok("0"));
+        assert!(!hook_timeout_ok("-1"));
+        assert!(!hook_timeout_ok("abc"));
+        assert!(!hook_timeout_ok("1e999"));
+    }
+
+    #[test]
+    fn hook_edit_patch_writes_back_in_the_entrys_own_timeout_unit() {
+        // ms-spelled entry: a new timeout lands in timeoutMs.
+        let ms_row = HookRow {
+            key: "k".into(),
+            event: "PostToolUse".into(),
+            matcher_index: 0,
+            hook_index: 0,
+            matcher: "Bash".into(),
+            hook_type: Some("process".into()),
+            command: "old".into(),
+            enabled: true,
+            raw_timeout_ms: Some(5_000),
+            raw_timeout_sec: None,
+        };
+        let patch = hook_edit_patch(&ms_row, " echo hi ", "2.5");
+        assert_eq!(patch.command.as_deref(), Some("echo hi"));
+        assert_eq!(patch.timeout_ms, Some(2_500));
+        assert_eq!(patch.timeout, None);
+
+        // seconds-spelled entry: the same edit lands in timeout.
+        let sec_row = HookRow { raw_timeout_ms: None, raw_timeout_sec: Some(5), ..ms_row.clone() };
+        let patch = hook_edit_patch(&sec_row, "echo", "2");
+        assert_eq!(patch.timeout, Some(2));
+        assert_eq!(patch.timeout_ms, None);
+
+        // No timeout yet: the entry's TYPE picks the unit — command → seconds,
+        // anything else (process, absent) → ms.
+        let mut fresh = HookRow {
+            raw_timeout_ms: None,
+            raw_timeout_sec: None,
+            hook_type: Some("command".into()),
+            ..ms_row.clone()
+        };
+        assert_eq!(hook_edit_patch(&fresh, "echo", "10").timeout, Some(10));
+        fresh.hook_type = None;
+        assert_eq!(hook_edit_patch(&fresh, "echo", "10").timeout_ms, Some(10_000));
+
+        // A blank timeout field means unchanged: neither field travels.
+        let blank = hook_edit_patch(&sec_row, "echo", "  ");
+        assert_eq!(blank.timeout, None);
+        assert_eq!(blank.timeout_ms, None);
+        assert_eq!(blank.command.as_deref(), Some("echo"));
     }
 
     // --- reset cards: the provider list is all four ids, not the account's -------
