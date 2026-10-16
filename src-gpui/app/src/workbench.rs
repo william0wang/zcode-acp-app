@@ -36,7 +36,7 @@ use gpui::{
     ImageFormat, PathPromptOptions, SharedString, Subscription, Window, div, img, px,
 };
 use gpui_kit::component;
-use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{
     Input, InputEvent, InputState, Textarea, TextareaState,
 };
@@ -45,7 +45,7 @@ use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerStat
 use gpui_kit::component::text::{TextView, TextViewMotion, TextViewState};
 use gpui_kit::component::{
     h_resizable, resizable_panel, ActiveTheme as _, Disableable as _, Icon, IconName,
-    ResizableState, Sizable as _, WindowExt as _,
+    ResizableState, Selectable as _, Sizable as _, WindowExt as _,
 };
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::component::tooltip::Tooltip;
@@ -1795,6 +1795,63 @@ impl Workbench {
         column.into_any_element()
     }
 
+    // -- language (batch H3) ---------------------------------------------------
+
+    /// Apply the settings panel's language pick: flip the process-global
+    /// rust-i18n locale, persist the choice (the TS `saveLang` key's
+    /// counterpart), and repaint — every chrome string resolves through
+    /// `t!()` at paint time, so one notify switches the whole window (and
+    /// gpui-kit's own component strings, which ride the same global).
+    fn switch_locale(&mut self, locale: &'static str, cx: &mut Context<Self>) {
+        if &*rust_i18n::locale() == locale {
+            return;
+        }
+        rust_i18n::set_locale(locale);
+        crate::ui_prefs::store_locale(locale);
+        cx.notify();
+    }
+
+    /// The settings panel's language segment (SidePanel.tsx:167-187): two
+    /// native-named options in one kit ButtonGroup, the active one selected.
+    /// The catalogs carry exactly `en` + `zh-CN` (i18n.rs collapsed any zh*
+    /// system locale already), so the segment never needs a third option.
+    fn render_language_section(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let zh = rust_i18n::locale().starts_with("zh");
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_w_0()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("panel.language").into_owned()),
+            )
+            .child(
+                ButtonGroup::new("lang-segment")
+                    .small()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Button::new("lang-en").label("English").selected(!zh))
+                    .child(Button::new("lang-zh").label("中文").selected(zh))
+                    .on_click(move |clicks, _, cx| {
+                        // Single-select group: the click's index is the pick.
+                        if let Some(&ix) = clicks.first() {
+                            let locale = if ix == 0 {
+                                crate::ui_prefs::LOCALE_EN
+                            } else {
+                                crate::ui_prefs::LOCALE_ZH
+                            };
+                            wb.update(cx, |wb, cx| wb.switch_locale(locale, cx));
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_config_panel(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
@@ -1809,6 +1866,12 @@ impl Workbench {
         );
 
         column = column.child(self.render_servers_section(cx));
+
+        // The language segment (batch H3, SidePanel.tsx:167-187): two
+        // native-named options in one rounded track, the active one raised.
+        // Both the header and the flip's effect resolve through t!() at
+        // paint time, so the pick re-renders the whole chrome at once.
+        column = column.child(self.render_language_section(cx));
 
         // (icon, title, description, entry command constructor). The command
         // is built inside the click closure — click listeners are `Fn`, so a
@@ -4091,6 +4154,8 @@ impl Workbench {
                     if rows.is_empty() {
                         list = list.child(
                             div()
+                                .id("ns-no-match")
+                                .test_support()
                                 .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(format!("no project matches \"{q}\"")),
@@ -4107,6 +4172,7 @@ impl Workbench {
                             .to_string();
                         let mut row = div()
                             .id(SharedString::from(format!("ns-project-{workspace_path}")))
+                            .test_support()
                             .flex()
                             .items_center()
                             .gap_2()
@@ -5320,6 +5386,251 @@ mod session_action_tests {
                 )),
                 "the menu trigger click must not resume the row"
             );
+        })
+        .unwrap();
+    }
+}
+
+/// Batch H3 (language switch) headless UI integration tests — same paradigm
+/// as `chip_tests`. The locale is PROCESS-GLOBAL state: these tests hold
+/// `i18n::locale_test_lock` (shared with the i18n catalog tests) so a flip
+/// can never race a bare `t!()` assertion, and they redirect the prefs file
+/// into a scratch XDG_CONFIG_HOME — a test must never write the user's real
+/// config directory.
+#[cfg(test)]
+mod language_tests {
+    use super::Workbench;
+    use crate::runtime::{
+        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        px, AppContext as _, Bounds, Point, Size, TestAppContext, WindowBounds, WindowOptions,
+    };
+
+    fn tabbed_snapshot() -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.tabs = vec![TabSummary {
+            id: 7,
+            session_id: Some("sess_1".to_string()),
+            phase: TabPhase::Connected,
+            running: false,
+            pending: 0,
+            awaiting: false,
+        }];
+        snap.active_tab = Some(7);
+        snap.active = Some(TabView {
+            session_id: Some("sess_1".to_string()),
+            agent_version: None,
+            phase: TabPhase::Connected,
+            running: false,
+            loading_session: false,
+            messages: Vec::new(),
+            pending: Vec::new(),
+            has_more: false,
+            total_messages: None,
+            loading_earlier: false,
+            approval: None,
+            config_options: Vec::new(),
+            usage: None,
+            cache_hit: None,
+            turn_stats: None,
+            plan_entries: None,
+            fs_capable: true,
+        });
+        snap
+    }
+
+    /// The settings panel's language segment: both options render, and the
+    /// pick re-renders the chrome IMMEDIATELY — the composer's Send control
+    /// (`t!("chat.send")`) relabels on the very next frame, both ways.
+    #[gpui_kit::test]
+    fn language_segment_switches_chrome(cx: &mut TestAppContext) {
+        let _locale = crate::i18n::locale_test_lock();
+        // Redirect the persisted prefs into a scratch dir (store_locale
+        // writes the config dir otherwise; no other test reads it).
+        let scratch = std::env::temp_dir().join(format!("zcode-lang-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &scratch);
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+            // A known starting locale regardless of the machine's catalogs.
+            rust_i18n::set_locale("en");
+        });
+        let runtime = ProtocolRuntime::inert();
+        let (handle, _wb) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size {
+                            width: px(800.),
+                            height: px(600.),
+                        },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let runtime = runtime.clone();
+                    cx.new(|cx| Workbench::new(window, cx, runtime.clone(), tabbed_snapshot()))
+                },
+            )
+            .expect("open test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            // Dock the config panel (the settings home of the segment).
+            window.click("dock-rail-config", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("lang-en").visible() && window.find("lang-zh").visible(),
+                "both language options must render in the settings panel"
+            );
+            // English chrome before the switch.
+            assert_eq!(window.find("send").label().as_deref(), Some("Send"));
+            // Pick 中文: the same frame's chrome relabels — no restart, no
+            // remount (the mobile panel's instant i18next changeLanguage).
+            window.click("lang-zh", cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(window.find("send").label().as_deref(), Some("发送"));
+            // And back: the segment is a toggle, not a one-way door.
+            window.click("lang-en", cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(window.find("send").label().as_deref(), Some("Send"));
+            // The pick persisted (the scratch prefs file, H3's saveLang).
+            let saved = std::fs::read_to_string(
+                scratch.join("zcode-acp-remote").join("ui-prefs.json"),
+            )
+            .expect("prefs file written");
+            assert!(saved.contains("\"en\""), "saved locale: {saved}");
+        })
+        .unwrap();
+
+        // Restore the process-global state for the tests that follow.
+        rust_i18n::set_locale("en");
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}
+
+/// Batch H4 — the new-session chooser's project filter (B2/D2): the known-
+/// projects list narrows case-insensitively against the workspace path, and
+/// an over-narrow query shows the no-match hint instead of an empty panel.
+#[cfg(test)]
+mod new_session_tests {
+    use super::Workbench;
+    use crate::runtime::{
+        HistoryProjectRow, NewSessionView, Phase, ProtocolRuntime, WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        px, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext, WindowBounds,
+        WindowOptions,
+    };
+
+    fn project(workspace_path: &str, sessions: u64) -> HistoryProjectRow {
+        HistoryProjectRow {
+            workspace_path: workspace_path.to_string(),
+            sessions,
+            last_active: 1,
+        }
+    }
+
+    fn chooser_snapshot() -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.new_session = Some(NewSessionView {
+            projects: Some(vec![
+                project("/Users/william/Develop/tools/zcode-acp-app", 2),
+                project("/Users/william/Develop/tools/martty", 1),
+            ]),
+            error: None,
+            browse: None,
+            creating: None,
+        });
+        snap
+    }
+
+    /// Type into the filter the way the subscription path would (set the
+    /// input's value, then notify — a keystroke fires InputEvent and the
+    /// workbench re-renders; set_value itself emits nothing by design).
+    fn set_filter(
+        wb: &Entity<Workbench>,
+        text: &str,
+        window: &mut gpui_kit::Window,
+        cx: &mut App,
+    ) {
+        wb.update(cx, |wb, cx| {
+            wb.new_session_filter
+                .update(cx, |state, cx| state.set_value(text, window, cx));
+            cx.notify();
+        });
+    }
+
+    #[gpui_kit::test]
+    fn project_filter_narrows_and_shows_no_match(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let (handle, wb) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size {
+                            width: px(800.),
+                            height: px(600.),
+                        },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let runtime = runtime.clone();
+                    cx.new(|cx| Workbench::new(window, cx, runtime.clone(), chooser_snapshot()))
+                },
+            )
+            .expect("open test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // Unfiltered: both known projects list.
+            assert!(window.find("ns-project-/Users/william/Develop/tools/zcode-acp-app").visible());
+            assert!(window.find("ns-project-/Users/william/Develop/tools/martty").visible());
+            assert!(window.try_find("ns-no-match").is_none());
+
+            // A case-insensitive path substring narrows to its hit.
+            set_filter(&wb, "ZCODE", window, cx);
+            window.render_frame(cx);
+            assert!(window.find("ns-project-/Users/william/Develop/tools/zcode-acp-app").visible());
+            assert!(
+                window.try_find("ns-project-/Users/william/Develop/tools/martty").is_none(),
+                "a non-matching project must not list under the filter"
+            );
+            assert!(window.try_find("ns-no-match").is_none());
+
+            // An over-narrow query: no rows, the no-match hint instead.
+            set_filter(&wb, "does-not-exist", window, cx);
+            window.render_frame(cx);
+            assert!(window.try_find("ns-project-/Users/william/Develop/tools/zcode-acp-app").is_none());
+            assert!(window.find("ns-no-match").visible());
+
+            // Clearing the filter restores the full list (TS dialog's
+            // empty-query-means-all rule).
+            set_filter(&wb, "", window, cx);
+            window.render_frame(cx);
+            assert!(window.find("ns-project-/Users/william/Develop/tools/zcode-acp-app").visible());
+            assert!(window.find("ns-project-/Users/william/Develop/tools/martty").visible());
         })
         .unwrap();
     }

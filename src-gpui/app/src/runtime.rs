@@ -45,7 +45,7 @@ use protocol::acp_client::{
 };
 use protocol::approval::{ApprovalCore, ElicitAnswers, IncomingAsk, PendingAsk};
 use protocol::bootstrap::{assess_local_hub, dial_host, ensure_hub, BootstrapEnv, EnsureOptions};
-use protocol::chat::ChatMessage;
+use protocol::chat::{ChatMessage, PromptDraft};
 use protocol::clock::{Clock, TokioClock};
 use protocol::config_decode::ModelsPayload;
 use protocol::config_store::{
@@ -73,6 +73,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use crate::file_browser::{file_kind_of, viewer_next_window, viewer_window, FileKind};
 use crate::http_transport::{LocalHttpTransport, SettingsApiTransport};
+use crate::pending_store::{merge_pending_queues, pending_path, PendingStore};
 
 /// The 120ms update-coalescing batch the TS store runs (appStore.ts
 /// `updateQueue`); the driver's tick is its timer.
@@ -1411,6 +1412,11 @@ struct Driver {
     /// Saved Connection Profiles (CONTEXT.md): an active remote entry dials
     /// its hub directly; the local hub is the implicit no-book default.
     book: protocol::profiles::ServerBook,
+    /// The persisted pending-prompt queues (batch H1): session id → drafts,
+    /// restored into a tab's core when it attaches that session and folded
+    /// back on every queue change (the TS localStorage map's port —
+    /// `pending_prompts` in `SessionCore` stays the in-memory truth).
+    pending: PendingStore,
 
     instances: Vec<HubInstance>,
     /// Discovery failure note (sidebar hint) — the hub REST call failing.
@@ -1488,6 +1494,7 @@ impl Driver {
                 &protocol::profiles::servers_path(),
             )
             .unwrap_or_default(),
+            pending: PendingStore::load(&pending_path()),
             instances: Vec::new(),
             discovery_note: None,
             next_discovery_at: 0,
@@ -2822,6 +2829,26 @@ impl Driver {
         }
     }
 
+    /// Batch H1 persistence sync (the TS `setQueue` → `savePending` seam):
+    /// fold every tab's live queues into the persisted map — live queues
+    /// overwrite, an attached session with no queue drops its entry, and
+    /// sessions no tab holds keep their drafts until the next attach. Runs
+    /// after every driver-loop turn; queue mutations only happen inside
+    /// command/loop handlers, so one diff per turn catches them all, and a
+    /// quit (which never drains queues) leaves the store current.
+    fn sync_pending(&mut self) {
+        let live: Vec<(Option<&str>, &HashMap<String, Vec<PromptDraft>>)> = self
+            .tabs
+            .iter()
+            .map(|t| (t.core.active_session_id.as_deref(), &t.core.pending_prompts))
+            .collect();
+        if let Some(next) = merge_pending_queues(self.pending.snapshot(), &live) {
+            if let Err(e) = self.pending.adopt(next) {
+                traceln!("[driver] pending queue save failed: {e}");
+            }
+        }
+    }
+
     // ---- event handling ----
 
     fn handle_loop_event(&mut self, ev: LoopEvent, now: u64) {
@@ -3332,6 +3359,23 @@ impl Driver {
     fn on_connect_result(&mut self, tab: u64, result: Result<AcpInitializeResult, String>, now: u64) {
         // Collect the spawn inputs before the mutable tab borrow.
         let mut fresh_session: Option<(AcpConnection, String)> = None;
+        // Batch H1 restore-on-attach: this tab is about to attach a session
+        // that may have persisted pending drafts. Read the seed before the
+        // mutable borrow; seed ONLY when the core holds no live queue for
+        // the session (a reconnect keeps its in-memory queue — re-seeding
+        // would duplicate every draft).
+        let attach_sid = self.tab(tab).and_then(|t| {
+            t.core.active_session_id.clone().or_else(|| t.target.clone())
+        });
+        let seed: Option<(String, Vec<PromptDraft>)> = attach_sid
+            .filter(|sid| {
+                self.tab(tab)
+                    .map(|t| !t.core.pending_prompts.contains_key(sid))
+                    .unwrap_or(false)
+            })
+            .and_then(|sid| {
+                self.pending.queue(&sid).map(|q| (sid, q.to_vec()))
+            });
         if let Some(t) = self.tab_mut(tab) {
             match result {
                 Ok(init) => {
@@ -3352,7 +3396,21 @@ impl Driver {
                     // Attach: an already-active session (reconnect) replays;
                     // otherwise the tab's target, else a fresh session/new.
                     match t.core.active_session_id.clone().or_else(|| t.target.clone()) {
-                        Some(sid) => t.core.load_session(&sid),
+                        Some(sid) => {
+                            // The restored drafts ride the queue; the load's
+                            // settle flushes them exactly like drafts queued
+                            // before a reconnect (SessionCore::flush_pending).
+                            if let Some((seed_sid, queue)) = &seed {
+                                t.core
+                                    .pending_prompts
+                                    .insert(seed_sid.clone(), queue.clone());
+                                traceln!(
+                                    "[driver] tab {tab} restored {} persisted pending draft(s) for {seed_sid}",
+                                    queue.len()
+                                );
+                            }
+                            t.core.load_session(&sid);
+                        }
                         None => {
                             let conn =
                                 t.conn.clone().expect("ConnHandle precedes ConnectResult");
@@ -3400,6 +3458,9 @@ impl Driver {
                 if let Err(e) = self.book.save(&protocol::profiles::servers_path()) {
                     traceln!("[driver] server book save failed: {e}");
                 }
+                // The queued drafts belong to the previous hub's sessions
+                // (TS switchServer/disconnectHub `savePending({})`).
+                self.pending.reset();
                 return Flow::Restart;
             }
             UiCommand::AddServer {
@@ -3418,6 +3479,9 @@ impl Driver {
                 if let Err(e) = self.book.save(&protocol::profiles::servers_path()) {
                     traceln!("[driver] server book save failed: {e}");
                 }
+                // Saving activates — the app dials a different hub next
+                // round, so its drafts start clean (same TS rule).
+                self.pending.reset();
                 return Flow::Restart;
             }
             UiCommand::RemoveServer { id } => {
@@ -3427,6 +3491,9 @@ impl Driver {
                     traceln!("[driver] server book save failed: {e}");
                 }
                 if was_active {
+                    // Falls back to the local hub — a hub change all the
+                    // same (TS deleteServer's `savePending({})`).
+                    self.pending.reset();
                     return Flow::Restart;
                 }
             }
@@ -4882,6 +4949,7 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
                 }
             }
             d.pump_all();
+            d.sync_pending();
             d.emit_if_changed();
         }
     }
@@ -4945,3 +5013,106 @@ async fn wait_for_retry(
 // documented in workbench.rs (per-tab identity caches keyed by tab id).
 #[allow(dead_code)]
 type _TabViewMap = HashMap<u64, ()>;
+
+#[cfg(test)]
+mod tests {
+    // Plain #[test] with explicit imports — this file has no kit glob, but
+    // the sibling test modules' explicit-import shape is the convention.
+    use super::pick_target;
+    use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
+
+    fn session(session_id: &str, updated_at: Option<u64>) -> HubSessionInfo {
+        HubSessionInfo {
+            session_id: session_id.to_string(),
+            title: None,
+            updated_at,
+            status: None,
+        }
+    }
+
+    fn instance(id: &str, workspace: Option<&str>, sessions: Vec<HubSessionInfo>) -> HubInstance {
+        HubInstance {
+            id: id.to_string(),
+            port: Some(4900),
+            pid: Some(42),
+            started_at: Some(1),
+            workspace: workspace.map(str::to_string),
+            origin: InstanceOrigin::Editor,
+            sessions,
+            extra: Default::default(),
+        }
+    }
+
+    /// Batch H2's attach rule (appStore.ts:1847-1855): the cold-start
+    /// auto-tab attaches the MOST RECENTLY UPDATED session across
+    /// discovery's instances — not the first instance's first session.
+    #[test]
+    fn cold_start_attaches_most_recently_updated_session() {
+        let instances = vec![
+            instance(
+                "inst-old",
+                Some("/w/first"),
+                vec![session("s_old", Some(1_000))],
+            ),
+            instance(
+                "inst-new",
+                Some("/w/second"),
+                vec![
+                    session("s_quiet", None),
+                    session("s_latest", Some(9_000)),
+                ],
+            ),
+        ];
+        let (inst, attach, cwd) = pick_target(&instances).expect("a target exists");
+        assert_eq!(inst, "inst-new");
+        assert_eq!(attach.as_deref(), Some("s_latest"));
+        assert_eq!(cwd, "/w/second");
+    }
+
+    /// Sessions without timestamps rank as 0 — a timestamped session beats
+    /// them, and ties keep the first walked (strictly-greater comparison).
+    #[test]
+    fn untimestamped_sessions_rank_below_dated_ones() {
+        let instances = vec![instance(
+            "inst-a",
+            Some("/w/a"),
+            vec![session("s_undated", None), session("s_dated", Some(10))],
+        )];
+        let (_, attach, _) = pick_target(&instances).expect("a target exists");
+        assert_eq!(attach.as_deref(), Some("s_dated"));
+    }
+
+    /// The "no history" half of the H2 semantics: with no sessions anywhere
+    /// the rule falls back to a fresh `session/new` on the first instance
+    /// (the supervisor's M1 behavior — the desktop's "keep the current
+    /// state" is this fresh-tab path, not an error).
+    #[test]
+    fn sessionless_instances_fall_back_to_fresh_session() {
+        let instances = vec![
+            instance("inst-a", Some("/w/a"), vec![]),
+            instance("inst-b", Some("/w/b"), vec![]),
+        ];
+        let (inst, attach, cwd) = pick_target(&instances).expect("a target exists");
+        assert_eq!(inst, "inst-a");
+        assert_eq!(attach, None, "no history means session/new, no attach");
+        assert_eq!(cwd, "/w/a");
+    }
+
+    /// An instance with no workspace falls back to "/" for the fresh
+    /// session's cwd (session/load's cwd is backend-authoritative anyway).
+    #[test]
+    fn missing_workspace_falls_back_to_root() {
+        let instances = vec![instance("inst-a", None, vec![])];
+        let (_, attach, cwd) = pick_target(&instances).expect("a target exists");
+        assert_eq!(attach, None);
+        assert_eq!(cwd, "/");
+    }
+
+    /// No instance at all (cold hub, nothing discovered): no tab — the
+    /// driver keeps its empty-workbench note instead (on_discovery's
+    /// discovery_note branch).
+    #[test]
+    fn no_instances_yields_no_target() {
+        assert!(pick_target(&[]).is_none());
+    }
+}

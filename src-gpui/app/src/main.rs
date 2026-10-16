@@ -19,9 +19,11 @@ mod file_browser;
 mod http_transport;
 mod i18n;
 mod models_page;
+mod pending_store;
 mod quota_page;
 mod runtime;
 mod system_status;
+mod ui_prefs;
 mod usage_page;
 mod workbench;
 
@@ -83,9 +85,12 @@ fn main() {
         .with_quit_mode(QuitMode::LastWindowClosed)
         .run(|cx| {
             gpui_kit::init(cx);
-            // Locale follows the system; the shared rust-i18n global also
-            // drives gpui-kit's own component strings.
-            rust_i18n::set_locale(i18n::detect_locale());
+            // Locale: the persisted settings-panel pick (batch H3) wins;
+            // with no stored preference the system decides (the shared
+            // rust-i18n global also drives gpui-kit's own strings).
+            rust_i18n::set_locale(
+                ui_prefs::load_locale().unwrap_or_else(i18n::detect_locale),
+            );
             // Dark theme only in P0 (requirements §2), polished onto the
             // product's quiet-dark palette (see apply_quiet_dark).
             Theme::change(ThemeMode::Dark, None, cx);

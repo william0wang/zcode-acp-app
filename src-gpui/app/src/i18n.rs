@@ -42,6 +42,18 @@ pub(crate) fn fill(text: &str, args: &[(&str, &str)]) -> String {
     out
 }
 
+/// Serializes tests that touch the PROCESS-GLOBAL rust-i18n locale against
+/// tests that read it. The crate's unit tests share one process (parallel
+/// threads); the language-switch UI test flips the global for a moment, and
+/// without this lock that window races the `t!("chat.send")` assertions
+/// below. Every test that calls bare `t!()` (no explicit `locale =`) takes
+/// this lock, as does the switch test itself.
+#[cfg(test)]
+pub(crate) fn locale_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     // Explicit imports, NOT `use super::*` — matches the sibling test
@@ -51,6 +63,9 @@ mod tests {
 
     #[test]
     fn nested_keys_resolve_in_both_catalogs() {
+        // Bare t!() reads the process-global locale — hold the locale lock
+        // against the language-switch UI test's flips (locale_test_lock).
+        let _g = super::locale_test_lock();
         assert_eq!(t!("chat.send"), "Send");
         assert_eq!(t!("chat.send", locale = "zh-CN"), "发送");
         assert_eq!(t!("permission.hint"), "The first answer across all clients wins");
@@ -99,6 +114,8 @@ mod tests {
 
     #[test]
     fn runtime_keys_translate_or_fall_back_to_the_input() {
+        // Bare t!() reads the process-global locale (see locale_test_lock).
+        let _g = super::locale_test_lock();
         // The notice banners' shape: a `notice.*` key resolves, plain text
         // passes through verbatim.
         assert_eq!(

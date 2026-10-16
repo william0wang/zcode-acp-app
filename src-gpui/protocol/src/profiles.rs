@@ -67,9 +67,11 @@ impl ServerBook {
     }
 }
 
-/// The book's file location: `$XDG_CONFIG_HOME/zcode-acp-remote/servers.json`
-/// or `~/.config/zcode-acp-remote/servers.json`.
-pub fn servers_path() -> PathBuf {
+/// The app's config directory — the one directory every desktop-side
+/// persisted file lives in (`$XDG_CONFIG_HOME/zcode-acp-remote` or
+/// `~/.config/zcode-acp-remote`): the server book here, plus the app
+/// layer's pending-queue and UI-preference files beside it.
+pub fn config_dir() -> PathBuf {
     let base = std::env::var("XDG_CONFIG_HOME")
         .ok()
         .filter(|v| !v.is_empty())
@@ -81,7 +83,12 @@ pub fn servers_path() -> PathBuf {
                 .map(|home| PathBuf::from(home).join(".config"))
         })
         .expect("neither XDG_CONFIG_HOME nor HOME is set");
-    base.join("zcode-acp-remote").join("servers.json")
+    base.join("zcode-acp-remote")
+}
+
+/// The book's file location: `servers.json` inside [`config_dir`].
+pub fn servers_path() -> PathBuf {
+    config_dir().join("servers.json")
 }
 
 #[cfg(test)]
