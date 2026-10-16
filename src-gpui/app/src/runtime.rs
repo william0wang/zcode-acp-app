@@ -457,6 +457,17 @@ pub struct TabView {
     /// The bridge's configOptions (model / mode / thought) — the tab
     /// toolbar's chips and their dropdown lists.
     pub config_options: Vec<protocol::acp::ConfigOption>,
+    /// Last-reported context window usage (`usage_update`) — the status
+    /// bar's readout and progress hairline (ChatScreen.tsx `usage`).
+    pub usage: Option<protocol::acp::ContextUsage>,
+    /// Last turn's prompt-cache hit rate in percent (SessionCore
+    /// `apply_turn_usage`) — the `cache {n}%` segment.
+    pub cache_hit: Option<u32>,
+    /// Last completed turn's speed readout — the `tok/s` segment.
+    pub turn_stats: Option<protocol::chat::TurnStats>,
+    /// The session's current plan/todo entries (`plan` session/update) —
+    /// the collapsible strip above the chat (ChatScreen PlanPanel).
+    pub plan_entries: Option<Vec<protocol::replay::PlanEntry>>,
 }
 
 /// One project row of the history chooser (`GET /api/projects`).
@@ -3270,6 +3281,10 @@ impl Driver {
                 .as_deref()
                 .and_then(|sid| tab.approvals.pending_for_session(sid)),
             config_options: tab.core.config_options.clone(),
+            usage: tab.core.usage,
+            cache_hit: tab.core.cache_hit,
+            turn_stats: tab.core.turn_stats,
+            plan_entries: tab.core.plan_entries.clone(),
         }
     }
 
@@ -3326,6 +3341,42 @@ impl Driver {
                     &mut sig,
                 );
             }
+            // Title-bar readouts (E1): usage/cache/tps repaint the status
+            // bar segments and the progress hairline.
+            mix(
+                tab.core
+                    .usage
+                    .map(|u| u.used.wrapping_mul(31).wrapping_add(u.size))
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(tab.core.cache_hit.map(u64::from).unwrap_or(u64::MAX), &mut sig);
+            mix(
+                tab.core
+                    .turn_stats
+                    .map(|s| s.tps.to_bits() ^ s.output_tokens.rotate_left(17) ^ s.seconds.to_bits())
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            // The plan/todo strip (E3): entry count plus each entry's
+            // content/status — a same-count status flip must still re-emit.
+            mix(
+                tab.core
+                    .plan_entries
+                    .as_ref()
+                    .map(|entries| {
+                        let mut s: u64 = entries.len() as u64;
+                        for e in entries {
+                            s = s.wrapping_mul(31).wrapping_add(fold_str(&e.content));
+                            s = s.wrapping_mul(31).wrapping_add(
+                                e.status.as_ref().map(|st| st.len() as u64).unwrap_or(u64::MAX),
+                            );
+                        }
+                        s
+                    })
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
             // The pending approval card: request id + channel tag (the card
             // content itself is immutable once stored).
             if let Some(ask) = tab

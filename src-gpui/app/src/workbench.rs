@@ -47,6 +47,7 @@ use gpui_kit::component::{
     h_resizable, resizable_panel, ActiveTheme as _, Disableable as _, Icon, IconName,
     ResizableState, Sizable as _, WindowExt as _,
 };
+use gpui_kit::TestSupportExt as _;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{assets::IconName as KitIconName, *};
 use rust_i18n::t;
@@ -179,6 +180,13 @@ pub struct Workbench {
     /// inside the page — a page closed under an open gesture drops it so a
     /// reopen starts clean.
     pub(crate) quota_confirm: Option<SpendStage>,
+    /// The message row whose copy button just fired (the TS ActionBar's
+    /// copied checkmark, E4): cleared by a short timer.
+    copied_row: Option<String>,
+    /// The plan/todo strip's manual fold (E3, ChatScreen PlanPanel's
+    /// `<details>`): collapsed by default, reset on a session switch like
+    /// the TS remount.
+    plan_open: bool,
     _composer_sub: Subscription,
 }
 
@@ -219,11 +227,19 @@ enum PartView {
     /// reinterpreted as formatting).
     Plain { text: String },
     /// Compact tool-call row for workbench density: status glyph, name, and
-    /// the head of the detail line.
+    /// the head of the detail line. `detail` is the FULL body behind the
+    /// expand (E2 — ChatView.tsx `<details>` ToolCard); `fold_kind` marks a
+    /// replay harness fold (`context-handoff` / `tool-transcript`), whose
+    /// summary row stays clean (label only; a handoff shows the localized
+    /// label, not the wire title); `expanded` is the manual fold state,
+    /// collapsed by default like the TS `<details>`.
     ToolCall {
         label: SharedString,
         status: String,
         detail_head: String,
+        detail: String,
+        fold_kind: Option<String>,
+        expanded: bool,
     },
     /// Prompt-attachment echo: the raster decoded once from the part's data
     /// URL. SVG (and anything gpui cannot rasterize) stays on the stub.
@@ -278,6 +294,9 @@ fn new_part_view(part: &ChatPart, role: ChatRole, cx: &mut Context<Workbench>) -
             label: tc.tool_name.clone().into(),
             status: tc.status.clone(),
             detail_head: tool_detail_head(&tc.detail),
+            detail: tc.detail.clone(),
+            fold_kind: tc.fold_kind.clone(),
+            expanded: false,
         },
     }
 }
@@ -290,6 +309,109 @@ fn tool_detail_head(detail: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// TUI parity (martty stats dock, ChatScreen.tsx `fmtTokens`): `128000` ->
+/// `128K`, `1500000` -> `1.5M`.
+fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let (unit, suffix) = if n < 1_000_000 {
+        (1_000u64, "K")
+    } else {
+        (1_000_000u64, "M")
+    };
+    let scaled = n as f64 / unit as f64;
+    if scaled >= 100.0 {
+        format!("{}{}", scaled.round(), suffix)
+    } else {
+        format!("{scaled:.1}{suffix}")
+    }
+}
+
+/// Context gauge as the TUI prints it (ChatScreen.tsx `fmtContext`) —
+/// `17.5%/1.0M`, a one-decimal percent of the model window, clamped at 100.
+fn fmt_context(used: u64, size: u64) -> String {
+    let pct = if size == 0 {
+        100.0
+    } else {
+        ((used as f64 / size as f64) * 100.0).min(100.0)
+    };
+    format!("{pct:.1}%/{}", fmt_tokens(size))
+}
+
+/// A row's concatenated plain text (user speech) — the task-notification
+/// parser's input, like the TS `parts.map(...).join("")`.
+fn row_plain_text(row: &RowModel) -> String {
+    let mut out = String::new();
+    for part in &row.parts {
+        if let PartView::Plain { text } = part {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
+/// The `<status>`/`<summary>` value inside a task-notification block (the TS
+/// regex `[^<]*?` — content with a nested tag does not match; empty on
+/// miss).
+fn tag_value(text: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    text.find(&open)
+        .and_then(|start| {
+            let inner = &text[start + open.len()..];
+            inner.find(&close).map(|end| &inner[..end])
+        })
+        .filter(|content| !content.contains('<'))
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Harness task lifecycle notices arrive as user-role XML blocks; they are
+/// system plumbing, not user speech — rendered as a centered system chip
+/// (ChatView.tsx `parseTaskNotification`). Only a message that is EXACTLY
+/// one notification block qualifies (the `^…$` anchor).
+fn parse_task_notification(text: &str) -> Option<(String, String)> {
+    const OPEN: &str = "<task-notification>";
+    const CLOSE: &str = "</task-notification>";
+    let t = text.trim();
+    let body = t.strip_prefix(OPEN)?;
+    body.strip_suffix(CLOSE)?;
+    Some((tag_value(t, "status"), tag_value(t, "summary")))
+}
+
+/// The row's trailing copy affordance (E4 — ChatView.tsx:437
+/// `ActionBarPrimitive.Copy`): writes the row's source text to the platform
+/// clipboard; the icon flips to a checkmark for a beat after the click (the
+/// TS `data-copied` swap).
+fn copy_button(
+    row: &RowModel,
+    text: String,
+    copied: bool,
+    wb: &WeakEntity<Workbench>,
+) -> Button {
+    let row_id = row.id.clone();
+    Button::new(SharedString::from(format!("copy-{}", row.id)))
+        .ghost()
+        .xsmall()
+        .icon(if copied {
+            KitIconName::Check
+        } else {
+            KitIconName::Copy
+        })
+        .tooltip(t!("chat.copy"))
+        .on_click({
+            let wb = wb.clone();
+            move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                if let Some(wb) = wb.upgrade() {
+                    wb.update(cx, |wb, cx| wb.mark_copied(&row_id, cx));
+                }
+            }
+        })
 }
 
 /// Updates a part view in place. Returns true when its rendered content
@@ -336,16 +458,26 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
                 label,
                 status,
                 detail_head,
+                detail,
+                fold_kind,
+                ..
             },
             ChatPart::ToolCall(tc),
         ) => {
             let head = tool_detail_head(&tc.detail);
-            if *status == tc.status && *detail_head == head && label.as_ref() == tc.tool_name {
+            if *status == tc.status
+                && *detail_head == head
+                && label.as_ref() == tc.tool_name
+                && *detail == tc.detail
+                && *fold_kind == tc.fold_kind
+            {
                 return false;
             }
             *label = tc.tool_name.clone().into();
             *status = tc.status.clone();
             *detail_head = head;
+            *detail = tc.detail.clone();
+            *fold_kind = tc.fold_kind.clone();
             true
         }
         _ => false,
@@ -427,6 +559,8 @@ impl Workbench {
             models_form: None,
             models_form_subs: Vec::new(),
             quota_confirm: None,
+            copied_row: None,
+            plan_open: false,
             _composer_sub: composer_sub,
         };
 
@@ -657,6 +791,9 @@ impl Workbench {
         if session_changed {
             self.rows.clear();
             self.rows_session = session_id;
+            // The plan strip folds back on a session switch (the TS screen
+            // remounts, so its uncontrolled `<details>` resets).
+            self.plan_open = false;
             self.scroller.update(cx, |state, cx| state.reset(0, cx));
         }
 
@@ -898,6 +1035,48 @@ impl Workbench {
         }
     }
 
+    /// One tool card's expand toggle (E2 — the TS `<details>` summary click):
+    /// flips the part's manual fold.
+    fn set_tool_expanded(
+        &mut self,
+        row_id: &str,
+        part_index: usize,
+        expanded_now: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row) = self.rows.iter_mut().find(|r| r.id == row_id) else {
+            return;
+        };
+        if let Some(PartView::ToolCall { expanded, .. }) = row.parts.get_mut(part_index) {
+            *expanded = !expanded_now;
+            cx.notify();
+        }
+    }
+
+    /// A row copy landed (E4 — ActionBarPrimitive.Copy): hold the row's
+    /// checkmark for a beat, then clear it. The clipboard write itself
+    /// happens at the click site (`App::write_to_clipboard`).
+    fn mark_copied(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        self.copied_row = Some(row_id.to_string());
+        cx.notify();
+        let row_id = row_id.to_string();
+        let clear = cx
+            .background_executor()
+            .timer(Duration::from_millis(1400));
+        cx.spawn(async move |this, cx| {
+            clear.await;
+            if let Some(entity) = this.upgrade() {
+                let _ = cx.update_entity(&entity, |wb, cx| {
+                    if wb.copied_row.as_deref() == Some(&row_id) {
+                        wb.copied_row = None;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
     // -- sections ----------------------------------------------------------
 
     fn render_status_bar(&self, cx: &Context<Self>) -> AnyElement {
@@ -918,6 +1097,7 @@ impl Workbench {
             .h_9()
             .px_3()
             .flex_none()
+            .relative()
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.title_bar)
@@ -982,9 +1162,49 @@ impl Workbench {
             );
         }
 
-        // Right cluster: running-session count (the quit guard's number),
-        // the active tab's turn state, and its bridge agent.
+        // Right cluster: the active tab's title-bar stats (E1 — ChatScreen's
+        // header line: context `17.5%/1.0M`, bare cache percent, `tok/s`),
+        // running-session count (the quit guard's number), the turn state,
+        // and its bridge agent.
         let mut right = div().flex().items_center().gap_3().ml_auto().flex_none();
+        if let Some(tab) = self.tab.as_ref() {
+            if let Some(usage) = tab.usage.filter(|u| u.size > 0) {
+                right = right.child(
+                    div()
+                        .id("stat-context")
+                        .flex_none()
+                        .text_size(px(11.))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(format!("ctx {}", fmt_context(usage.used, usage.size)))
+                        .test_support(),
+                );
+            }
+            if let Some(hit) = tab.cache_hit {
+                right = right.child(
+                    div()
+                        .id("stat-cache")
+                        .flex_none()
+                        .text_size(px(11.))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(format!("cache {hit}%"))
+                        .test_support(),
+                );
+            }
+            if let Some(stats) = tab.turn_stats {
+                right = right.child(
+                    div()
+                        .id("stat-tps")
+                        .flex_none()
+                        .text_size(px(11.))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{} tok/s", stats.tps))
+                        .test_support(),
+                );
+            }
+        }
         if self.snap.running_session_count > 0 {
             right = right.child(
                 div()
@@ -1020,7 +1240,30 @@ impl Workbench {
                     .child(format!("bridge {agent}")),
             );
         }
-        bar.child(right).into_any_element()
+        bar = bar.child(right);
+        // Context progress hairline (ChatScreen's header-bottom gauge): the
+        // fill sits on the bar's bottom edge, clamped at 100%. Inside the
+        // bar's own bounds, so no later sibling can overpaint it.
+        if let Some(usage) = self
+            .tab
+            .as_ref()
+            .and_then(|t| t.usage)
+            .filter(|u| u.size > 0)
+        {
+            let pct = (((usage.used as f32 / usage.size as f32) * 100.0).min(100.0) / 100.0) as f32;
+            bar = bar.child(
+                div()
+                    .id("context-progress")
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .h(px(2.))
+                    .w(relative(pct))
+                    .bg(theme.accent)
+                    .test_support(),
+            );
+        }
+        bar.into_any_element()
     }
 
     // -- dock ----------------------------------------------------------------
@@ -1122,6 +1365,16 @@ impl Workbench {
             .flex_1()
             .min_w_0()
             .child(self.render_tab_strip(cx))
+            // The plan/todo strip (E3 — ChatScreen's PlanPanel above the
+            // chat): only with entries from the active session's `plan`
+            // update.
+            .when_some(
+                self.tab
+                    .as_ref()
+                    .and_then(|t| t.plan_entries.clone())
+                    .filter(|entries| !entries.is_empty()),
+                |this, entries| this.child(self.render_plan_bar(&entries, cx)),
+            )
             .child(self.render_chat(cx))
             // The ephemeral toast strip (notify-toast semantics: approval
             // requested in a non-active session, attachment notices…).
@@ -2114,6 +2367,114 @@ impl Workbench {
             .into_any_element()
     }
 
+    /// The plan/todo strip (E3 — ChatScreen.tsx `PlanPanel`): a collapsed
+    /// `Plan · done/total` summary above the chat that expands to the entry
+    /// list — ✓ completed (struck out), › active, ○ pending.
+    fn render_plan_bar(
+        &self,
+        entries: &[protocol::replay::PlanEntry],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let open = self.plan_open;
+        let done = entries
+            .iter()
+            .filter(|e| e.status.as_deref() == Some("completed"))
+            .count();
+        let mut bar = div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.title_bar);
+        bar = bar.child(
+            div()
+                .id("plan-toggle")
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .py_1_5()
+                .cursor_pointer()
+                .hover(|h| h.bg(theme.secondary))
+                .on_click(move |_, _, cx| {
+                    wb.update(cx, |wb, cx| {
+                        wb.plan_open = !wb.plan_open;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .small()
+                        .flex_none()
+                        .when(!open, |icon| {
+                            icon.rotate(radians(-std::f32::consts::FRAC_PI_2))
+                        })
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{} · {}/{}", t!("chat.plan"), done, entries.len())),
+                )
+                .test_support(),
+        );
+        if open {
+            bar = bar.child(
+                div()
+                    .id("plan-entries")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .pb_2()
+                    .max_h(px(240.))
+                    .overflow_y_scroll()
+                    .children(entries.iter().enumerate().map(|(i, e)| {
+                        let status = e.status.as_deref();
+                        let (glyph, color) = match status {
+                            Some("completed") => ("✓", theme.accent),
+                            Some("active") => ("›", theme.foreground),
+                            _ => ("○", theme.muted_foreground),
+                        };
+                        div()
+                            .id(SharedString::from(format!("plan-entry-{i}")))
+                            .flex()
+                            .items_start()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(11.))
+                                    .text_color(color)
+                                    .child(glyph),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(px(12.))
+                                    .when(status == Some("completed"), |this| {
+                                        this.line_through()
+                                            .text_color(theme.muted_foreground)
+                                    })
+                                    .when(status != Some("completed"), |this| {
+                                        this.text_color(theme.muted_foreground)
+                                    })
+                                    .child(e.content.clone()),
+                            )
+                            .test_support()
+                    })),
+            );
+        }
+        bar.into_any_element()
+    }
+
     fn render_tab(&self, tab: &TabSummary, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let active = self.snap.active_tab == Some(tab.id);
@@ -2305,6 +2666,7 @@ impl Workbench {
         let runtime = self.runtime.clone();
         let weak = cx.weak_entity();
         let running = self.tab.as_ref().is_some_and(|t| t.running);
+        let copied = self.copied_row.clone();
         let weak_rows = weak.clone();
         let scroller = self.scroller.clone();
         let fade = theme.background;
@@ -2313,7 +2675,7 @@ impl Workbench {
                 MessageScroller::new("chat", scroller, move |index, _window, cx| {
                     let is_last_row = index + 1 == rows.len();
                     if let Some(row) = rows.get(index) {
-                        render_row(row, is_last_row, running, &weak_rows, cx)
+                        render_row(row, is_last_row, running, copied.as_deref(), &weak_rows, cx)
                     } else if let Some(card) = card.as_ref() {
                         // The trailing approval card row (inline in the stream —
                         // requirements §2).
@@ -2723,14 +3085,15 @@ fn render_row(
     row: &RowModel,
     is_last_row: bool,
     running: bool,
+    copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     match row.role {
-        ChatRole::User => render_user_row(row, theme).into_any_element(),
+        ChatRole::User => render_user_row(row, copied, wb, theme).into_any_element(),
         ChatRole::Assistant => {
-            render_assistant_row(row, is_last_row, running, wb, theme).into_any_element()
+            render_assistant_row(row, is_last_row, running, copied, wb, theme).into_any_element()
         }
     }
 }
@@ -2744,7 +3107,53 @@ fn gutter(label: &str, color: gpui::Hsla) -> gpui::Div {
         .child(label.to_string())
 }
 
-fn render_user_row(row: &RowModel, theme: &component::Theme) -> gpui::Div {
+fn render_user_row(
+    row: &RowModel,
+    copied: Option<&str>,
+    wb: &WeakEntity<Workbench>,
+    theme: &component::Theme,
+) -> gpui::Div {
+    // Harness task lifecycle notices are system plumbing, not user speech
+    // (E5 — ChatView.tsx `parseTaskNotification`): a centered chip with the
+    // summary and status, no bubble, no copy affordance.
+    if let Some((status, summary)) = parse_task_notification(&row_plain_text(row)) {
+        let mut chip = div()
+            .id(SharedString::from(format!("notice-{}", row.id)))
+            .flex()
+            .items_center()
+            .gap_1()
+            .min_w_0()
+            .max_w(relative(0.8))
+            .justify_center()
+            .px_2()
+            .py_1()
+            .rounded_full()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.title_bar)
+            .text_size(px(11.))
+            .text_color(theme.muted_foreground)
+            .child(
+                Icon::new(KitIconName::Bell)
+                    .small()
+                    .flex_none()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(summary.is_empty().then(|| t!("chat.taskNotice").into_owned()).unwrap_or(summary)),
+            );
+        if !status.is_empty() {
+            chip = chip.child(
+                div()
+                    .flex_none()
+                    .child(format!("· {}", status.to_uppercase())),
+            );
+        }
+        return div().flex().min_w_0().justify_center().child(chip.test_support());
+    }
     if row.collapsed {
         // Replay harness fold (`_meta.zcode.collapsed`): the wall of context
         // text collapses to a chip, like ChatView's collapsed ids.
@@ -2790,6 +3199,7 @@ fn render_user_row(row: &RowModel, theme: &component::Theme) -> gpui::Div {
             PartView::ToolCall { .. } => bubble,
         };
     }
+    let text = row_plain_text(row);
     div()
         .flex()
         .gap_3()
@@ -2804,12 +3214,16 @@ fn render_user_row(row: &RowModel, theme: &component::Theme) -> gpui::Div {
                 .bg(theme.secondary)
                 .child(bubble),
         )
+        .when(!text.trim().is_empty(), |this| {
+            this.child(copy_button(row, text, copied == Some(row.id.as_str()), wb))
+        })
 }
 
 fn render_assistant_row(
     row: &RowModel,
     is_last_row: bool,
     running: bool,
+    copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
     theme: &component::Theme,
 ) -> gpui::Div {
@@ -2905,7 +3319,17 @@ fn render_assistant_row(
                 label,
                 status,
                 detail_head,
+                detail,
+                fold_kind,
+                expanded,
             } => {
+                // ToolCard (E2 — ChatView.tsx:226 `<details>`): the summary
+                // row (glyph, name, detail head) is the toggle; the body is
+                // the FULL detail in a capped, scrollable window. Replay
+                // folds (`context-handoff` / `tool-transcript`) keep the
+                // summary clean — a handoff shows the localized label (the
+                // wire title is English-only plumbing), the body text
+                // behind the expand.
                 let done = status == "completed";
                 let glyph = if done { "✓" } else { "…" };
                 let color = if done {
@@ -2913,30 +3337,109 @@ fn render_assistant_row(
                 } else {
                     theme.accent
                 };
-                let mut line = div()
+                let display: SharedString =
+                    match fold_kind.as_deref() {
+                        Some("context-handoff") => t!("chat.contextHandoff").into_owned().into(),
+                        _ => label.clone(),
+                    };
+                let open_now = *expanded;
+                let row_id = row.id.clone();
+                let mut card = div()
                     .flex()
-                    .items_baseline()
-                    .gap_2()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_size(px(11.))
-                    .child(div().flex_none().text_color(color).child(glyph))
-                    .child(
+                    .flex_col()
+                    .my_1()
+                    .min_w_0()
+                    .rounded_lg()
+                    .bg(theme.secondary)
+                    .overflow_hidden();
+                card = card.child(
+                    div()
+                        .id(SharedString::from(format!("tool-{}-{}", row.id, part_index)))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .hover(|h| h.bg(theme.title_bar))
+                        .on_click({
+                            let wb = wb.clone();
+                            move |_, _window, cx| {
+                                if let Some(wb) = wb.upgrade() {
+                                    wb.update(cx, |wb, cx| {
+                                        wb.set_tool_expanded(&row_id, part_index, open_now, cx)
+                                    });
+                                }
+                            }
+                        })
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(px(11.))
+                                .text_color(color)
+                                .child(glyph),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .child(display),
+                        )
+                        .when(fold_kind.is_none() && !detail_head.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .truncate()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(detail_head.clone()),
+                            )
+                        })
+                        .child(
+                            div().ml_auto().flex_none().child(
+                                Icon::new(IconName::ChevronDown)
+                                    .small()
+                                    .flex_none()
+                                    .when(!*expanded, |icon| {
+                                        icon.rotate(radians(-std::f32::consts::FRAC_PI_2))
+                                    })
+                                    .text_color(theme.muted_foreground),
+                            ),
+                        )
+                        .test_support(),
+                );
+                if *expanded {
+                    card = card.child(
                         div()
-                            .flex_none()
-                            .text_color(theme.foreground)
-                            .child(label.clone()),
-                    );
-                if !detail_head.is_empty() {
-                    line = line.child(
-                        div()
+                            .id(SharedString::from(format!(
+                                "tool-detail-{}-{}",
+                                row.id, part_index
+                            )))
+                            .max_h(px(256.))
+                            .overflow_y_scroll()
                             .min_w_0()
-                            .flex_1()
-                            .truncate()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .px_2()
+                            .py_1_5()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(px(11.))
+                            .line_height(relative(1.45))
                             .text_color(theme.muted_foreground)
-                            .child(detail_head.clone()),
+                            .child(if detail.is_empty() {
+                                "…".to_string()
+                            } else {
+                                detail.clone()
+                            })
+                            .test_support(),
                     );
                 }
-                column.child(line)
+                column.child(card)
             }
             PartView::ImageStub => column.child(
                 div()
@@ -2947,11 +3450,30 @@ fn render_assistant_row(
             PartView::Image { src } => column.child(render_attachment_echo(src, theme)),
         };
     }
+    // The trailing copy affordance (E4): the message's markdown source —
+    // text parts only, thoughts and tool cards stay out (the TS ActionBar
+    // copies the text blocks).
+    let text = row
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            PartView::Markdown {
+                thought: false,
+                last_text,
+                ..
+            } => Some(last_text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     div()
         .flex()
         .gap_3()
         .child(gutter("Agent", theme.accent))
         .child(div().flex_1().min_w_0().child(column))
+        .when(!text.trim().is_empty(), |this| {
+            this.child(copy_button(row, text, copied == Some(row.id.as_str()), wb))
+        })
 }
 
 impl Render for Workbench {
@@ -3591,6 +4113,10 @@ mod chip_tests {
             loading_earlier: false,
             approval: None,
             config_options: fixture_options(),
+            usage: None,
+            cache_hit: None,
+            turn_stats: None,
+            plan_entries: None,
         });
         snap
     }
@@ -3663,5 +4189,379 @@ mod chip_tests {
             );
         })
         .unwrap();
+    }
+}
+
+/// Batch E (display details) headless UI integration tests — same paradigm
+/// as `chip_tests`: explicit imports, an inert runtime, a real Workbench in
+/// a test window, element-id assertions and real clicks.
+#[cfg(test)]
+mod display_tests {
+    use super::Workbench;
+    use crate::runtime::{
+        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
+        WindowBounds, WindowOptions,
+    };
+
+    fn base_snapshot() -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.tabs = vec![TabSummary {
+            id: 7,
+            session_id: Some("sess_1".to_string()),
+            phase: TabPhase::Connected,
+            running: false,
+            pending: 0,
+            awaiting: false,
+        }];
+        snap.active_tab = Some(7);
+        snap
+    }
+
+    fn messages_fixture() -> Vec<protocol::chat::ChatMessage> {
+        use protocol::chat::{ChatMessage, ChatPart, ChatRole, ToolCallPart};
+        vec![
+            ChatMessage {
+                id: "u1".to_string(),
+                role: ChatRole::User,
+                parts: vec![ChatPart::Text {
+                    text: "hello desktop".to_string(),
+                }],
+                created_at: 1,
+                collapsed: None,
+            },
+            ChatMessage {
+                id: "a1".to_string(),
+                role: ChatRole::Assistant,
+                parts: vec![
+                    ChatPart::ToolCall(ToolCallPart {
+                        tool_call_id: "t1".to_string(),
+                        tool_name: "Bash: npm test".to_string(),
+                        detail: "first line of output\nsecond line of output\nthird line"
+                            .to_string(),
+                        status: "completed".to_string(),
+                        kind: Some("execute".to_string()),
+                        raw_name: Some("Bash".to_string()),
+                        fold_kind: None,
+                        diffs: None,
+                    }),
+                    ChatPart::Text {
+                        text: "all green".to_string(),
+                    },
+                ],
+                created_at: 2,
+                collapsed: None,
+            },
+            // A harness task-notification user message (E5): renders as the
+            // centered system chip, not a bubble.
+            ChatMessage {
+                id: "n1".to_string(),
+                role: ChatRole::User,
+                parts: vec![ChatPart::Text {
+                    text: "<task-notification>\n  <status>completed</status>\n  \
+                           <summary>nightly build ok</summary>\n</task-notification>"
+                        .to_string(),
+                }],
+                created_at: 3,
+                collapsed: None,
+            },
+        ]
+    }
+
+    /// E1: the status bar carries the active tab's context/cache/tps
+    /// readouts and the context progress hairline (ChatScreen's header
+    /// line, `17.5%/1.0M` formatting included).
+    #[gpui_kit::test]
+    fn title_stats_render_in_status_bar(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        snap.active = Some(TabView {
+            session_id: Some("sess_1".to_string()),
+            agent_version: None,
+            phase: TabPhase::Connected,
+            running: false,
+            loading_session: false,
+            messages: Vec::new(),
+            pending: Vec::new(),
+            has_more: false,
+            total_messages: None,
+            loading_earlier: false,
+            approval: None,
+            config_options: Vec::new(),
+            usage: Some(protocol::acp::ContextUsage {
+                used: 175_000,
+                size: 1_000_000,
+            }),
+            cache_hit: Some(82),
+            turn_stats: Some(protocol::chat::TurnStats {
+                tps: 41.0,
+                output_tokens: 1_234,
+                seconds: 30.1,
+            }),
+            plan_entries: None,
+        });
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("stat-context").visible());
+            assert!(window.find("stat-cache").visible());
+            assert!(window.find("stat-tps").visible());
+            let progress = window.find("context-progress");
+            assert!(progress.visible());
+            // 17.5% of the 800px status bar ≈ 140px (clamped fill).
+            let width = progress.bounds().size.width;
+            assert!(
+                (width - px(140.)).abs() < px(8.),
+                "progress fill should be ~140px, got {width:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// E2: a tool-call row expands its full detail (max-h scroll window) on
+    /// click and collapses again — the TS `<details>` ToolCard.
+    #[gpui_kit::test]
+    fn tool_call_expands_detail(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        let mut tab = tab_view();
+        tab.messages = messages_fixture();
+        snap.active = Some(tab);
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let row = window.find("tool-a1-0");
+            assert!(row.visible(), "the tool summary row must render");
+            assert!(
+                window.try_find("tool-detail-a1-0").is_none(),
+                "detail starts collapsed"
+            );
+            window.click("tool-a1-0", cx);
+            assert!(
+                window.find("tool-detail-a1-0").visible(),
+                "the click must expand the detail body"
+            );
+            window.click("tool-a1-0", cx);
+            assert!(
+                window.try_find("tool-detail-a1-0").is_none(),
+                "a second click collapses it again"
+            );
+        })
+        .unwrap();
+    }
+
+    /// E3: the plan/todo strip renders collapsed with its done/total summary
+    /// and expands to the entry list on click.
+    #[gpui_kit::test]
+    fn plan_bar_collapses_and_lists_entries(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        let mut tab = tab_view();
+        tab.plan_entries = Some(vec![
+            protocol::replay::PlanEntry {
+                content: "scan the code".to_string(),
+                status: Some("completed".to_string()),
+            },
+            protocol::replay::PlanEntry {
+                content: "write the fix".to_string(),
+                status: Some("active".to_string()),
+            },
+        ]);
+        snap.active = Some(tab);
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("plan-toggle").visible());
+            assert!(
+                window.try_find("plan-entry-0").is_none(),
+                "entries start collapsed"
+            );
+            window.click("plan-toggle", cx);
+            assert!(window.find("plan-entry-0").visible());
+            assert!(window.find("plan-entry-1").visible());
+        })
+        .unwrap();
+    }
+
+    /// E4 + E5: the copy affordance writes the row's source text to the
+    /// platform clipboard (user plain text, assistant markdown source), and
+    /// a task-notification renders as the centered chip with no bubble copy
+    /// button.
+    #[gpui_kit::test]
+    fn copy_buttons_write_clipboard_and_notice_chip_has_none(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        let mut tab = tab_view();
+        tab.messages = messages_fixture();
+        snap.active = Some(tab);
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("copy-u1").visible());
+            assert!(window.find("copy-a1").visible());
+            // The notice row is a chip, and chips have no copy affordance.
+            assert!(window.find("notice-n1").visible());
+            assert!(window.try_find("copy-n1").is_none());
+            window.click("copy-u1", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("hello desktop".to_string())
+        );
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("copy-a1", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some("all green".to_string())
+        );
+    }
+
+    fn tab_view() -> TabView {
+        TabView {
+            session_id: Some("sess_1".to_string()),
+            agent_version: None,
+            phase: TabPhase::Connected,
+            running: false,
+            loading_session: false,
+            messages: Vec::new(),
+            pending: Vec::new(),
+            has_more: false,
+            total_messages: None,
+            loading_earlier: false,
+            approval: None,
+            config_options: Vec::new(),
+            usage: None,
+            cache_hit: None,
+            turn_stats: None,
+            plan_entries: None,
+        }
+    }
+
+    fn open_test_window(
+        cx: &mut App,
+        snap: WorkbenchSnapshot,
+    ) -> (AnyWindowHandle, Entity<Workbench>) {
+        let runtime = ProtocolRuntime::inert();
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: Size {
+                        width: px(800.),
+                        height: px(600.),
+                    },
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
+            },
+        )
+        .expect("open test window")
+    }
+}
+
+/// Pure-logic units of batch E: the TUI-parity formatters and the
+/// task-notification parser.
+#[cfg(test)]
+mod display_unit_tests {
+    // Explicit imports only (the file-root kit glob shadows #[test]).
+    use super::{fmt_context, fmt_tokens, parse_task_notification, PartView, RowModel};
+    use protocol::chat::ChatRole;
+
+    fn plain_row(text: &str) -> RowModel {
+        RowModel {
+            id: "m1".to_string(),
+            role: ChatRole::User,
+            collapsed: false,
+            parts: vec![PartView::Plain {
+                text: text.to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn token_formatting_matches_the_tui_dock() {
+        // ChatScreen.tsx fmtTokens: >=100 of the unit rounds to an integer
+        // (`128000` -> `128K`), below keeps one decimal (`1.0M`).
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_000), "1.0K");
+        assert_eq!(fmt_tokens(12_800), "12.8K");
+        assert_eq!(fmt_tokens(128_000), "128K");
+        assert_eq!(fmt_tokens(1_000_000), "1.0M");
+        assert_eq!(fmt_tokens(1_500_000), "1.5M");
+        assert_eq!(fmt_tokens(128_000_000), "128M");
+    }
+
+    #[test]
+    fn context_gauge_clamps_and_formats() {
+        assert_eq!(fmt_context(175_000, 1_000_000), "17.5%/1.0M");
+        assert_eq!(fmt_context(1_200_000, 1_000_000), "100.0%/1.0M");
+        // size 0 never paints on the TS side; the formatter stays total.
+        assert_eq!(fmt_context(0, 0), "100.0%/0");
+    }
+
+    #[test]
+    fn task_notification_parses_status_and_summary() {
+        let (status, summary) = parse_task_notification(
+            "<task-notification>\n <status> completed </status>\n <summary>build ok</summary>\n</task-notification>",
+        )
+        .expect("a full block parses");
+        assert_eq!(status, "completed");
+        assert_eq!(summary, "build ok");
+        // Missing tags yield empty strings, not None.
+        let (status, summary) =
+            parse_task_notification("<task-notification>plain</task-notification>").unwrap();
+        assert_eq!((status.as_str(), summary.as_str()), ("", ""));
+    }
+
+    #[test]
+    fn non_notification_text_is_not_a_notice() {
+        assert!(parse_task_notification("just a question").is_none());
+        assert!(parse_task_notification(
+            "prefix <task-notification><status>x</status></task-notification>"
+        )
+        .is_none());
+        assert!(parse_task_notification(
+            "<task-notification><status>x</status></task-notification> suffix"
+        )
+        .is_none());
+        // A nested tag inside <status> breaks the TS `[^<]*?` match.
+        let (status, _) = parse_task_notification(
+            "<task-notification><status>a<b</status><summary>s</summary></task-notification>",
+        )
+        .unwrap();
+        assert_eq!(status, "");
+    }
+
+    #[test]
+    fn row_plain_text_concatenates_only_text_parts() {
+        let mut row = plain_row("one");
+        row.parts.push(PartView::ImageStub);
+        row.parts.push(PartView::Plain {
+            text: "two".to_string(),
+        });
+        // The TS join("") has no separator.
+        assert_eq!(super::row_plain_text(&row), "onetwo");
     }
 }
