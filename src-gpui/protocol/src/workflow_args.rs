@@ -48,13 +48,16 @@ pub fn parse_args_input(text: &str) -> ArgsInput {
     }
 }
 
-/// Extract the declared-args map from a workflow's meta (upstream
+/// Extract the declared-args list from a workflow's meta (upstream
 /// `zcodeSavedWorkflowArgsDeclarationSchema`). `None` when the workflow
 /// declares no args — the launcher then falls back to the free-form JSON
-/// textarea. Insertion order is preserved by the serde_json Map on the wire.
-pub fn args_declaration(meta: Option<&Value>) -> Option<BTreeMap<String, WorkflowArgDeclaration>> {
+/// textarea. Declaration order is preserved (serde_json `preserve_order`:
+/// the TS form renders `Object.entries` in the same order).
+pub fn args_declaration(
+    meta: Option<&Value>,
+) -> Option<Vec<(String, WorkflowArgDeclaration)>> {
     let raw = meta?.get("args")?.as_object()?;
-    let mut out = BTreeMap::new();
+    let mut out = Vec::new();
     for (k, v) in raw {
         let Some(fields) = v.as_object() else {
             continue;
@@ -70,7 +73,7 @@ pub fn args_declaration(meta: Option<&Value>) -> Option<BTreeMap<String, Workflo
             required: fields.get("required").and_then(Value::as_bool),
             default: fields.get("default").cloned(),
         };
-        out.insert(k.clone(), decl);
+        out.push((k.clone(), decl));
     }
     (!out.is_empty()).then_some(out)
 }
@@ -79,7 +82,7 @@ pub fn args_declaration(meta: Option<&Value>) -> Option<BTreeMap<String, Workflo
 /// booleans prefill their declared `default: true` so the first report
 /// carries them; everything else starts empty.
 pub fn args_initial_values(
-    decls: &BTreeMap<String, WorkflowArgDeclaration>,
+    decls: &[(String, WorkflowArgDeclaration)],
 ) -> BTreeMap<String, Value> {
     let mut initial = BTreeMap::new();
     for (name, decl) in decls {
@@ -97,7 +100,7 @@ pub fn args_initial_values(
 /// that disables the submit. Unset optional fields are simply absent —
 /// the backend applies declared defaults itself.
 pub fn typed_args_report(
-    decls: &BTreeMap<String, WorkflowArgDeclaration>,
+    decls: &[(String, WorkflowArgDeclaration)],
     values: &BTreeMap<String, Value>,
     json_texts: &BTreeMap<String, String>,
 ) -> ArgsInput {
@@ -202,15 +205,36 @@ mod tests {
         })
     }
 
+    fn decl_of<'a>(
+        decls: &'a [(String, WorkflowArgDeclaration)],
+        name: &str,
+    ) -> &'a WorkflowArgDeclaration {
+        &decls
+            .iter()
+            .find(|(k, _)| k == name)
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .1
+    }
+
     #[test]
     fn declaration_extracts_object_entries_only() {
         let meta = decls_json();
         let decls = args_declaration(Some(&meta)).expect("declaration");
         assert_eq!(decls.len(), 4, "the non-object entry is skipped");
-        assert_eq!(decls["target"].r#type.as_deref(), Some("string"));
-        assert_eq!(decls["target"].required, Some(true));
-        assert_eq!(decls["limit"].default, Some(serde_json::json!(5)));
-        assert!(!decls.contains_key("broken"));
+        assert_eq!(decl_of(&decls, "target").r#type.as_deref(), Some("string"));
+        assert_eq!(decl_of(&decls, "target").required, Some(true));
+        assert_eq!(decl_of(&decls, "limit").default, Some(serde_json::json!(5)));
+        assert!(decls.iter().all(|(k, _)| k != "broken"));
+    }
+
+    #[test]
+    fn declaration_keeps_wire_order_for_the_form() {
+        // The TS form renders Object.entries in declaration order; the
+        // desktop fields follow the same sequence (preserve_order keeps it
+        // through the parse).
+        let decls = args_declaration(Some(&decls_json())).unwrap();
+        let names: Vec<&str> = decls.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(names, ["target", "limit", "verbose", "filter"]);
     }
 
     #[test]

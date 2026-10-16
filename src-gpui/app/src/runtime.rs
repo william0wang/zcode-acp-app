@@ -1043,6 +1043,12 @@ pub struct WorkbenchSnapshot {
     pub workflow_gate: Option<WorkflowGateBlock>,
     /// A workflow-gate write is in flight.
     pub workflow_gate_busy: bool,
+    /// The active tab's bridge instance — the write target the gate sheet
+    /// addresses. Snapshot-level on purpose: the sheet's entry lives in the
+    /// CONFIG panel, which only renders with the workflows page CLOSED, so
+    /// the page's own `action_instance` is `None` on every real open (the
+    /// TS store writes the active session's instance, page-independent).
+    pub active_instance: Option<String>,
 }
 
 impl WorkbenchSnapshot {
@@ -1073,6 +1079,7 @@ impl WorkbenchSnapshot {
             workflows_page: None,
             workflow_gate: None,
             workflow_gate_busy: false,
+            active_instance: None,
         }
     }
 }
@@ -5800,6 +5807,12 @@ impl Driver {
         }
         mix(self.toast.current().map(|t| t.id).unwrap_or(u64::MAX), &mut sig);
         mix(self.active_tab.unwrap_or(0), &mut sig);
+        // The gate sheet's write target and its need-instance warning repaint
+        // when the active tab (and with it the active instance) changes.
+        mix(
+            self.active_instance_id().map(|i| i.len() as u64).unwrap_or(u64::MAX),
+            &mut sig,
+        );
         let h = &self.history;
         mix(h.open as u64, &mut sig);
         mix(h.seq, &mut sig);
@@ -6273,6 +6286,7 @@ impl Driver {
             }),
             workflow_gate: self.workflows.gate.clone(),
             workflow_gate_busy: self.workflows.gate_busy,
+            active_instance: self.active_instance_id(),
             files: self.files.view(),
             config_section_page: ConfigPageKind::ALL
                 .iter()
@@ -6849,9 +6863,23 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         d.next_discovery_at = 0; // fire on the first tick
         // A config page the user left open through the re-bootstrap re-seeds
         // itself against the new hub (its data did not survive the switch).
-        if d.models.open {
+        // The Agents page's picker reads the models payload, so EITHER page
+        // being open re-seeds that read.
+        if d.models.open || d.sections[ConfigPageKind::Agents.index()].open {
             d.spawn_config_probe();
             d.spawn_models_load();
+        }
+        // The five config-section pages (batch I) re-seed the same way: a
+        // page left open through the switch lost its payload (reset_data),
+        // and without these reads it would paint the empty-state card for
+        // the new hub until a manual refresh.
+        for page in ConfigPageKind::ALL {
+            if d.sections[page.index()].open {
+                if d.sections[page.index()].supported.is_none() {
+                    d.spawn_config_section_probe(page);
+                }
+                d.spawn_config_section_load(page);
+            }
         }
         // The quota page re-seeds itself against the new hub the same way
         // (its payloads — and the provider session with its nonce — did not

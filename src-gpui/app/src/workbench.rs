@@ -1001,14 +1001,16 @@ impl Workbench {
                     self.hooks_open_event = None;
                     self.backup_confirm = None;
                 }
-                // The workflows forms/gate sheet live only inside the page
-                // (the TS sheets unmount with it); a page closed under an
-                // open form drops it so a reopen starts clean.
+                // The workflows forms live only inside the page (the TS
+                // sheets unmount with it); a page closed under an open form
+                // drops it so a reopen starts clean. The GATE sheet is
+                // deliberately not touched: its entry lives in the config
+                // panel (rendered only with the page CLOSED), so "page is
+                // None" is its NORMAL state, not a close signal.
                 if self.snap.workflows_page.is_none() {
                     self.workflow_start_form = None;
                     self.workflow_amend_form = None;
                     self.workflow_form_subs.clear();
-                    self.workflow_gate_sheet = false;
                 }
                 // The spend gesture is page-local state (TS useState); a
                 // page closed under an open confirm dialog drops it.
@@ -4653,6 +4655,10 @@ impl Workbench {
                 .position(point(px(0.), px(0.)))
                 .child(backdrop),
         )
+        // Priority 2: above the slash menu's 1, so the modal backdrop both
+        // covers the menu and wins its hit-tests (deferred draws sort by
+        // priority ascending — the no-z-index rule's overlay discipline).
+        .with_priority(2)
         .into_any_element()
     }
     /// The rename sheet (G1, TS SessionList's action sheet in rename mode):

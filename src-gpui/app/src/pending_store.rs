@@ -62,7 +62,10 @@ impl PendingStore {
     /// Persist to `path` (pretty JSON + trailing newline, parent dirs
     /// created), removing the file when the map is empty — the TS
     /// `removeItem`-on-empty behavior, so a fully drained queue leaves no
-    /// stale file behind.
+    /// stale file behind. The write is temp-file + rename: a crash
+    /// mid-write must not truncate the file the drafts live in (an
+    /// in-place partial write would read back as empty and lose EVERY
+    /// session's queue, the exact data this store exists to protect).
     pub(crate) fn save(&self, path: &Path) -> Result<(), String> {
         if self.map.is_empty() {
             return match std::fs::remove_file(path) {
@@ -79,7 +82,18 @@ impl PendingStore {
             "{}\n",
             serde_json::to_string_pretty(&self.map).map_err(|e| e.to_string())?
         );
-        std::fs::write(path, body).map_err(|e| e.to_string())
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, body) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.to_string());
+        }
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.to_string())
+            }
+        }
     }
 
     /// This session's persisted queue, if any (the attach-time seed source).

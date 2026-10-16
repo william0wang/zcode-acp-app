@@ -40,12 +40,12 @@ use protocol::config_decode::{
     agent_rows, backup_lists, decode_subagent_model, encode_subagent_model, find_model_option,
     flatten_hooks, hook_edit_patch, hook_timeout_ok, hooks_enabled, is_agent_read_only,
     is_user_tree_scope, mcp_servers, mcp_upsert_body, model_options, skill_rows, timeout_ms_of,
-    AgentRow, HookRow, McpFormFields, McpServerRow, SkillRow,
+    AgentRow, HookRow, McpFormFields, McpServerRow, ModelOption, SkillRow,
 };
 use protocol::settings::{AgentUpsert, HookEntryPatch};
 use rust_i18n::t;
 
-use crate::i18n::fill;
+use crate::i18n::{fill, t_count};
 use crate::runtime::{ConfigPageKind, ConfigSectionPageView, UiCommand};
 use crate::workbench::Workbench;
 
@@ -122,10 +122,6 @@ pub(crate) struct AgentFormState {
     /// same model.
     model_touched: bool,
     thought_level: Option<String>,
-    /// The encoded value the file's model decodes to (mappable files only).
-    stored_encoded: Option<String>,
-    /// Whether the file's model maps onto a picker option at all.
-    stored_known: bool,
     /// The file's raw model spelling (the unmappable read-only display).
     stored_raw: Option<String>,
     /// The file's own thought level — kept when an unrelated edit saves.
@@ -158,6 +154,16 @@ fn kv_to_lines(map: &BTreeMap<String, String>) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The picker option the agent form's file-stored model maps onto, against
+/// the CURRENT options list. Free function so the paint branch and
+/// `agent_level_choices` share ONE live derivation — never frozen into the
+/// form state, so a form opened before the models read settles upgrades
+/// itself when the payload lands.
+fn agent_stored_match(options: &[ModelOption], form: &AgentFormState) -> Option<ModelOption> {
+    decode_subagent_model(form.stored_raw.as_deref())
+        .and_then(|s| find_model_option(options, &s.provider_id, &s.model_id).cloned())
 }
 
 // ---------------------------------------------------------------------------
@@ -805,7 +811,7 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                                 .text_size(px(10.))
                                 .text_color(theme.muted_foreground)
                                 .child(fill(
-                                    &t!("zconfig.hooksEntryCount"),
+                                    &t_count("zconfig.hooksEntryCount", entries.len() as u64),
                                     &[("count", &entries.len().to_string())],
                                 )),
                         ),
@@ -1425,7 +1431,10 @@ impl Workbench {
         let matched = stored
             .as_ref()
             .and_then(|s| find_model_option(&options, &s.provider_id, &s.model_id));
-        let stored_known = matched.is_some();
+        // Seed the picker only when the payload has landed AND the file's
+        // model maps onto an option — otherwise leave it unseeded; the
+        // paint-time derivation (agent_stored_match) upgrades the form once
+        // the models read settles instead of freezing a read-only verdict.
         let stored_encoded = stored
             .zip(matched)
             .map(|(s, _)| encode_subagent_model(&s.provider_id, &s.model_id));
@@ -1452,8 +1461,6 @@ impl Workbench {
             model: stored_encoded.clone(),
             model_touched: false,
             thought_level: fm.thought_level.clone().filter(|l| !l.is_empty()),
-            stored_encoded,
-            stored_known,
             stored_raw: fm.model.clone(),
             stored_level: fm.thought_level.clone(),
         }));
@@ -1614,22 +1621,31 @@ impl Workbench {
             .as_ref()
             .and_then(|page| page.models.clone());
         let options = model_options(models.as_ref());
-        let active = form.model.as_ref().and_then(|encoded| {
-            options
-                .iter()
-                .find(|o| &encode_subagent_model(&o.provider_id, &o.model_id) == encoded)
-        });
+        let stored_match = agent_stored_match(&options, form);
+        let active = form
+            .model
+            .as_ref()
+            .and_then(|encoded| {
+                options
+                    .iter()
+                    .find(|o| &encode_subagent_model(&o.provider_id, &o.model_id) == encoded)
+            })
+            .or(stored_match.as_ref());
         let mut choices: Vec<String> = active
             .map(|o| o.reasoning_levels.clone())
             .unwrap_or_default();
-        let active_encoded =
-            active.map(|o| encode_subagent_model(&o.provider_id, &o.model_id));
-        let on_stored =
-            form.stored_encoded.is_some() && active_encoded.as_deref() == form.stored_encoded.as_deref();
-        if on_stored {
-            if let Some(level) = form.stored_level.clone() {
-                if !level.is_empty() && !choices.contains(&level) {
-                    choices.push(level);
+        // The file's own level rides on the STORED model's vocabulary —
+        // selected either by an explicit pick or by nothing being picked at
+        // all (the unseeded case while the payload lands).
+        if let Some(stored) = stored_match.as_ref() {
+            let active_is_stored = active
+                .map(|o| o.provider_id == stored.provider_id && o.model_id == stored.model_id)
+                .unwrap_or(true);
+            if active_is_stored {
+                if let Some(level) = form.stored_level.clone() {
+                    if !level.is_empty() && !choices.contains(&level) {
+                        choices.push(level);
+                    }
                 }
             }
         }
@@ -1983,7 +1999,19 @@ impl Workbench {
         // option (hand-written in the file) is shown read-only, and the
         // submit leaves it alone — substituting a different model on the
         // user's behalf is worse than keeping the value they wrote.
-        if form.stored_raw.is_some() && !form.stored_known {
+        // Known-ness is derived LIVE from the section page's models payload:
+        // the form can open before that read settles (a remote hub), and a
+        // frozen open-time verdict would keep the picker read-only after
+        // the data landed.
+        let page_models = self
+            .snap
+            .config_section_page
+            .as_ref()
+            .and_then(|page| page.models.clone());
+        let models_present = page_models.is_some();
+        let options = model_options(page_models.as_ref());
+        let stored_match = agent_stored_match(&options, form);
+        if form.stored_raw.is_some() && models_present && stored_match.is_none() {
             body = body
                 .child(field_label(&t!("zconfig.agentModel"), None, theme))
                 .child(
@@ -2000,13 +2028,21 @@ impl Workbench {
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.agentModelUnavailable").into_owned()),
                 );
+        } else if form.stored_raw.is_some() && !models_present {
+            // Payload still loading: show the raw spelling read-only, but
+            // no "unavailable" verdict — it may well map once the read
+            // lands (the branch above re-derives every paint).
+            body = body
+                .child(field_label(&t!("zconfig.agentModel"), None, theme))
+                .child(
+                    div()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(form.stored_raw.clone().unwrap_or_default()),
+                );
         } else {
-            let models = self
-                .snap
-                .config_section_page
-                .as_ref()
-                .and_then(|page| page.models.clone());
-            let options = model_options(models.as_ref());
             let current = form
                 .model
                 .as_ref()
@@ -2015,6 +2051,10 @@ impl Workbench {
                         .iter()
                         .find(|o| &encode_subagent_model(&o.provider_id, &o.model_id) == encoded)
                 })
+                // An unseeded picker (opened before the payload landed)
+                // still shows the file's model when it maps — the display
+                // is live even though the pick is not.
+                .or(stored_match.as_ref())
                 .map(|o| o.label.clone())
                 .unwrap_or_else(|| t!("zconfig.agentModelInherit").into_owned());
             // The builder runs on every open, so hand each run fresh copies.

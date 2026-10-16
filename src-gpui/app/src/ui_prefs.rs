@@ -45,9 +45,16 @@ pub(crate) fn store_locale(locale: &str) {
         let _ = std::fs::create_dir_all(dir);
     }
     if let Ok(body) = serde_json::to_string_pretty(&serde_json::json!({ "locale": locale })) {
-        // A failed preference write never blocks the switch — the pick still
-        // applies to this run, it just does not survive a restart.
-        let _ = std::fs::write(&path, format!("{body}\n"));
+        // Temp-file + rename: a crash mid-write must not leave a truncated
+        // prefs file (a corrupt read silently falls back to system
+        // detection). A failed write never blocks the switch — the pick
+        // still applies to this run, it just does not survive a restart.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, format!("{body}\n")).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        } else {
+            let _ = std::fs::remove_file(&tmp);
+        }
     }
 }
 

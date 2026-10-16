@@ -13,6 +13,8 @@
 //! Chinese system locale maps onto `zh-CN` and everything else onto `en`
 //! (plus rust-i18n's `en` fallback for missed keys).
 
+use rust_i18n::t;
+
 /// Maps a system locale onto one of the two catalog locales. macOS reports
 /// e.g. `zh-Hans-CN`; the catalog's only Chinese is `zh-CN`, so the whole
 /// `zh` family collapses onto it rather than relying on rust-i18n's
@@ -40,6 +42,43 @@ pub(crate) fn fill(text: &str, args: &[(&str, &str)]) -> String {
         out = out.replace(&format!("{{{{{name}}}}}"), value);
     }
     out
+}
+
+/// An i18next-style plural lookup (the `count` counterpart of [`fill`]'s
+/// seam): the shared catalogs pluralize with `_one`/`_other` suffixes that
+/// rust-i18n's exact-key resolution never tries, and locales without plural
+/// forms (zh) carry only the bare key. Try the count-appropriate suffix,
+/// then the bare spelling, then the `en` fallback — the `{{count}}`
+/// placeholder still goes through [`fill`] afterwards.
+pub(crate) fn t_count(key: &str, count: u64) -> String {
+    t_count_in(&rust_i18n::locale().to_string(), key, count)
+}
+
+/// [`t_count`] against an explicit locale (tests; the language switch flips
+/// the process-global the wrapper reads).
+pub(crate) fn t_count_in(locale: &str, key: &str, count: u64) -> String {
+    let suffix = if count == 1 { "_one" } else { "_other" };
+    let suffixed = format!("{key}{suffix}");
+    // The catalogs' plural convention: `en` carries the `_one`/`_other`
+    // variants, zh (no plural forms) carries the bare key. The ACTIVE
+    // locale's own spelling must win — i18next resolves [key_suffix, key]
+    // per language before crossing to the fallback language, and asking
+    // rust-i18n for the suffixed key in zh would answer with the `en`
+    // suffixed value straight away.
+    if locale.eq_ignore_ascii_case("en") {
+        let hit = t!(suffixed.as_str(), locale = "en");
+        if hit != suffixed.as_str() {
+            return hit.into_owned();
+        }
+        return t!(key, locale = "en").into_owned();
+    }
+    let bare = t!(key, locale = locale);
+    if bare != key {
+        return bare.into_owned();
+    }
+    // No bare key in the active locale (or its fallbacks): the suffixed
+    // spelling, with rust-i18n's own en fallback answering if it can.
+    t!(suffixed.as_str(), locale = locale).into_owned()
 }
 
 /// Serializes tests that touch the PROCESS-GLOBAL rust-i18n locale against
@@ -98,6 +137,38 @@ mod tests {
         // An absent placeholder stays literal; an extra arg is a no-op.
         assert_eq!(fill("Below {{pct}}%", &[("pct", "90")]), "Below 90%");
         assert_eq!(fill("plain text", &[("pct", "90")]), "plain text");
+    }
+
+    #[test]
+    fn plural_count_keys_resolve_per_locale() {
+        use super::{fill, t_count_in};
+        // en pluralizes through the suffixed keys (count == 1 → _one).
+        assert_eq!(
+            t_count_in("en", "zconfig.hooksEntryCount", 1),
+            "{{count}} entry"
+        );
+        assert_eq!(
+            t_count_in("en", "zconfig.hooksEntryCount", 2),
+            "{{count}} entries"
+        );
+        // zh has no plural forms — the bare key answers for any count.
+        assert_eq!(
+            t_count_in("zh-CN", "zconfig.hooksEntryCount", 2),
+            "{{count}} 条"
+        );
+        // The resolved template still interpolates through fill.
+        assert_eq!(
+            fill(
+                &t_count_in("en", "zconfig.hooksEntryCount", 2),
+                &[("count", "3")]
+            ),
+            "3 entries"
+        );
+        // A key no catalog carries leaks verbatim (the t! miss contract).
+        assert_eq!(
+            t_count_in("en", "zconfig.noSuchKeyAnywhere", 2),
+            "zconfig.noSuchKeyAnywhere"
+        );
     }
 
     #[test]

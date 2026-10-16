@@ -1452,10 +1452,13 @@ pub(crate) struct WorkflowStartForm {
 
 impl WorkflowStartForm {
     /// The declaration this form was built from (None = free-form).
-    fn decls(&self) -> Option<BTreeMap<String, WorkflowArgDeclaration>> {
+    fn decls(&self) -> Option<Vec<(String, WorkflowArgDeclaration)>> {
         if self.fields.is_empty() {
             return None;
         }
+        // The fields Vec already carries the declaration order (open built
+        // it from the ordered args list) — keep it, the report's args object
+        // follows the same order on the wire.
         Some(
             self.fields
                 .iter()
@@ -1794,8 +1797,12 @@ impl Workbench {
             run_id,
             body,
         });
-        // The write outcome owns the close: a refusal keeps the sheet open
-        // with the notice banner carrying the reason.
+        // TS closes the sheet on submit BEFORE the await
+        // (WorkflowRunDetail.tsx): the page's notice banner — which the open
+        // form was REPLACING — then carries the outcome (a refusal explains
+        // itself there; keeping the form open on failure hid that banner).
+        self.workflow_amend_form = None;
+        self.workflow_form_subs.clear();
         cx.notify();
     }
 
@@ -2230,12 +2237,13 @@ impl Workbench {
     }
 
     /// The instance a gate write addresses: the active tab's bridge (the
-    /// per-instance settings mount is the only writable one).
+    /// per-instance settings mount is the only writable one). Read from the
+    /// SNAPSHOT-level field, not the page's `action_instance` — the sheet's
+    /// only entry lives in the config panel, which renders with the
+    /// workflows page closed, so the page-scoped field is `None` on every
+    /// real open (the TS store writes the active session's instance).
     fn gate_target_instance(&self) -> Option<String> {
-        self.snap
-            .workflows_page
-            .as_ref()
-            .and_then(|p| p.action_instance.clone())
+        self.snap.active_instance.clone()
     }
 }
 
@@ -2582,7 +2590,10 @@ mod workflows_tests {
 
     /// The gate sheet (J2): three positions render, the current one is
     /// marked, and picking "on" writes `PUT /settings/workflow-gate` with
-    /// alwaysOn on the active tab's bridge.
+    /// alwaysOn on the active tab's bridge. Opened the PRODUCTION way — the
+    /// config panel row, with the workflows page CLOSED (the dock and the
+    /// page are exclusive surfaces) — so the write target must come from
+    /// the snapshot-level `active_instance`, not the page's own state.
     #[gpui_kit::test]
     fn workflow_gate_sheet_picks_position(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2592,7 +2603,7 @@ mod workflows_tests {
         let runtime = ProtocolRuntime::inert();
         let mut snap = WorkbenchSnapshot::initial();
         snap.phase = Phase::Connected;
-        snap.workflows_page = Some(page_view(None));
+        snap.active_instance = Some("inst-a".to_string());
         // A probed verdict with no override: the AUTO position is active.
         snap.workflow_gate = Some(WorkflowGateBlock {
             enabled: false,
