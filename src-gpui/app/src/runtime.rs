@@ -204,6 +204,28 @@ pub enum UiCommand {
     HistoryLoadMore,
     /// Manual sidebar refresh (probe=1 — an honest list).
     RefreshSessions,
+    // ---- session row actions (batch G-light) ----
+    /// A sidebar session row's Rename (appStore `renameSession`): the hub's
+    /// HTTP rename — the bridge pins the title and broadcasts
+    /// session_info_update so attached editors update live. The driver
+    /// applies the TS action's trim + 80-char cap before sending.
+    RenameSession {
+        instance_id: String,
+        session_id: String,
+        title: String,
+    },
+    /// A sidebar session row's End session (appStore `closeRemoteSession`):
+    /// retire the conversation from remote discovery (ADR-0006 — close, not
+    /// delete). Refused with 409 while a turn is running.
+    CloseSession {
+        instance_id: String,
+        session_id: String,
+    },
+    /// A history row's Delete from history (ADR-0031 tombstone): hides the
+    /// conversation from every listing; nothing is purged. The driver
+    /// resolves the serving instance from the selected history page — the
+    /// same `page.instance.id` the TS dialog keeps for its deletes.
+    DeleteHistorySession { session_id: String },
     /// The approval card's answer to a `session/request_permission` ask
     /// (Permission Race: the first answer wins).
     AnswerPermission {
@@ -515,6 +537,8 @@ pub struct HistorySelected {
     pub error: Option<String>,
     /// The row whose resume POST is in flight.
     pub resuming: Option<String>,
+    /// The row whose tombstone DELETE is in flight (batch G-light).
+    pub deleting: Option<String>,
 }
 
 /// The sidebar's Session History browser (ProjectHistoryDialog port).
@@ -836,6 +860,22 @@ enum LoopEvent {
         session_id: String,
         result: Result<HubCreateInstanceResult, HubApiError>,
     },
+    // ---- session row actions (batch G-light, hub REST, no tab) ----
+    SessionRenamed {
+        instance_id: String,
+        session_id: String,
+        title: String,
+        result: Result<(), HubApiError>,
+    },
+    SessionClosed {
+        instance_id: String,
+        session_id: String,
+        result: Result<(), HubApiError>,
+    },
+    HistorySessionDeleted {
+        session_id: String,
+        result: Result<(), HubApiError>,
+    },
     // ---- new-session chooser (no tab) ----
     NewSessionProjects {
         seq: u64,
@@ -1069,12 +1109,18 @@ struct HistoryPanel {
 #[derive(Default)]
 struct HistorySelectedInner {
     workspace_path: String,
+    /// The instance that served the FIRST page (`page.instance.id`) — the
+    /// delete target for every row of the view (the TS dialog captures the
+    /// same id; load-more pages never re-capture it).
+    instance_id: String,
     rows: Vec<HubHistorySession>,
     next_cursor: Option<HubHistoryCursor>,
     loading_page: bool,
     loading_more: bool,
     error: Option<String>,
     resuming: Option<String>,
+    /// The row whose tombstone DELETE is in flight (TS dialog `deleting`).
+    deleting: Option<String>,
 }
 
 /// The new-session chooser state (TS ProjectCreateDialog): driver-owned
@@ -1667,6 +1713,49 @@ impl Driver {
                 session_id,
                 result,
             });
+        });
+    }
+
+    // ---- session row actions (batch G-light) ----
+
+    /// appStore `renameSession`: the hub's HTTP rename. Default 10s deadline
+    /// like every TS hub call.
+    fn spawn_session_rename(&mut self, instance_id: String, session_id: String, title: String) {
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.rename_session(&instance_id, &session_id, &title).await;
+            let _ = tx.send(LoopEvent::SessionRenamed {
+                instance_id,
+                session_id,
+                title,
+                result,
+            });
+        });
+    }
+
+    /// appStore `closeRemoteSession`: retire one conversation from discovery.
+    fn spawn_session_close(&mut self, instance_id: String, session_id: String) {
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.close_session(&instance_id, &session_id).await;
+            let _ = tx.send(LoopEvent::SessionClosed {
+                instance_id,
+                session_id,
+                result,
+            });
+        });
+    }
+
+    /// The history row's tombstone delete, addressed to the instance that
+    /// served the listing (TS `removeRow` → `deleteSession`).
+    fn spawn_history_delete(&mut self, instance_id: String, session_id: String) {
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.delete_session(&instance_id, &session_id).await;
+            let _ = tx.send(LoopEvent::HistorySessionDeleted { session_id, result });
         });
     }
 
@@ -2924,9 +3013,13 @@ impl Driver {
                 let Some(sel) = self.history.selected.as_mut() else { return };
                 match result {
                     Ok(page) => {
+                        // The FIRST page names the serving instance — the
+                        // delete target for every row of the view (load-more
+                        // pages never re-capture it, TS dialog parity).
                         if more {
                             sel.rows.extend(page.sessions);
                         } else {
+                            sel.instance_id = page.instance.id;
                             sel.rows = page.sessions;
                         }
                         sel.next_cursor = page.next_cursor;
@@ -2970,6 +3063,112 @@ impl Driver {
                         if let Some(err) = resuming {
                             *err = Some(describe_history_error(&e));
                         }
+                    }
+                }
+            }
+            // ---- session row actions (batch G-light) ----
+            LoopEvent::SessionRenamed {
+                instance_id,
+                session_id,
+                title,
+                result,
+            } => match result {
+                Ok(()) => {
+                    // Optimistic local rewrite (appStore renameSession's
+                    // instances patch); the bridge's session_info_update
+                    // broadcast lands over the tabs' sockets as well.
+                    for inst in &mut self.instances {
+                        if inst.id == instance_id {
+                            for sess in &mut inst.sessions {
+                                if sess.session_id == session_id {
+                                    sess.title = Some(title.clone());
+                                }
+                            }
+                        }
+                    }
+                    self.toast.notify(now, "Session renamed");
+                }
+                Err(e) => {
+                    self.toast.notify(now, &format!("rename session failed: {e}"));
+                }
+            },
+            LoopEvent::SessionClosed {
+                instance_id,
+                session_id,
+                result,
+            } => match result {
+                Ok(()) => {
+                    // Drop the row locally (the heartbeat list aligns within
+                    // ~10s) and close any tab holding the conversation — the
+                    // TS store returns to the list screen when it ended the
+                    // open one; the tab list is this client's list screen.
+                    for inst in &mut self.instances {
+                        if inst.id == instance_id {
+                            inst.sessions.retain(|s| s.session_id != session_id);
+                        }
+                    }
+                    let holders: Vec<u64> = self
+                        .tabs
+                        .iter()
+                        .filter(|t| {
+                            t.core.active_session_id.as_deref() == Some(session_id.as_str())
+                                || t.target.as_deref() == Some(session_id.as_str())
+                        })
+                        .map(|t| t.id)
+                        .collect();
+                    for id in holders {
+                        self.close_tab(id);
+                    }
+                    self.toast.notify(
+                        now,
+                        "Session ended — it reappears if the editor still holds it open",
+                    );
+                }
+                Err(e) => {
+                    let msg = if e.status == Some(409) {
+                        // A turn is in flight — stop it first (ADR-0006).
+                        "the session is running — stop the turn before ending it".to_string()
+                    } else {
+                        format!("close session failed: {e}")
+                    };
+                    self.toast.notify(now, &msg);
+                }
+            },
+            LoopEvent::HistorySessionDeleted { session_id, result } => {
+                // Clear the in-flight marker first (one mutable pass; the
+                // error slot is written again below on failure).
+                if let Some(sel) = self.history.selected.as_mut() {
+                    sel.deleting = None;
+                }
+                match result {
+                    Ok(()) => {
+                        // The tombstone hides the conversation from EVERY
+                        // listing: drop it from the open page AND the
+                        // sidebar's discovery rows, so it never resurrects
+                        // for a refresh cycle (bytes are kept — a new session
+                        // in the project records a fresh row).
+                        if let Some(sel) = self.history.selected.as_mut() {
+                            sel.error = None;
+                            sel.rows.retain(|r| r.session_id != session_id);
+                        }
+                        for inst in &mut self.instances {
+                            inst.sessions.retain(|s| s.session_id != session_id);
+                        }
+                        self.toast.notify(now, "Deleted from history — nothing was purged");
+                    }
+                    Err(e) => {
+                        let msg = if e.status == Some(409) {
+                            // Live or a turn in flight (ADR-0031): ending the
+                            // live copy is the end action's job.
+                            "the session is still live — end it before deleting its history"
+                                .to_string()
+                        } else {
+                            format!("delete session failed: {e}")
+                        };
+                        if let Some(sel) = self.history.selected.as_mut() {
+                            sel.error = Some(msg.clone());
+                        }
+                        self.toast.notify(now, &msg);
                     }
                 }
             }
@@ -3358,6 +3557,40 @@ impl Driver {
             UiCommand::RefreshSessions => {
                 self.spawn_discovery(true);
             }
+            UiCommand::RenameSession {
+                instance_id,
+                session_id,
+                title,
+            } => {
+                // appStore renameSession: trim, cap at 80, no-op when empty.
+                // The cap counts chars (TS slices UTF-16 code units); both
+                // spell "a title line", never a wire-format constraint.
+                let title = title.trim().chars().take(80).collect::<String>();
+                if title.is_empty() {
+                    return Flow::Continue;
+                }
+                self.spawn_session_rename(instance_id, session_id, title);
+            }
+            UiCommand::CloseSession {
+                instance_id,
+                session_id,
+            } => {
+                self.spawn_session_close(instance_id, session_id);
+            }
+            UiCommand::DeleteHistorySession { session_id } => {
+                let Some(sel) = self.history.selected.as_mut() else {
+                    return Flow::Continue;
+                };
+                // One delete at a time, and only once the first page named
+                // the serving instance (the TS `instanceId` guard).
+                if sel.deleting.is_some() || sel.instance_id.is_empty() {
+                    return Flow::Continue;
+                }
+                sel.deleting = Some(session_id.clone());
+                sel.error = None;
+                let instance = sel.instance_id.clone();
+                self.spawn_history_delete(instance, session_id);
+            }
             UiCommand::AnswerPermission {
                 request_id,
                 option_id,
@@ -3639,6 +3872,9 @@ impl Driver {
         mix(self.instances.len() as u64, &mut sig);
         for row in self.session_rows(&self.running_sessions(), &self.awaiting_sessions()) {
             mix(row.session_id.len() as u64, &mut sig);
+            // Titles repaint on rename (batch G-light) — length only, the
+            // cheap idiom used everywhere else in this signature.
+            mix(row.title.clone().map(|t| t.len() as u64).unwrap_or(u64::MAX), &mut sig);
             mix(row.updated_at.unwrap_or(0), &mut sig);
             mix(row.running as u64, &mut sig);
             mix(row.awaiting as u64, &mut sig);
@@ -3745,6 +3981,7 @@ impl Driver {
             mix(sel.loading_more as u64, &mut sig);
             mix(sel.error.is_some() as u64, &mut sig);
             mix(sel.resuming.is_some() as u64, &mut sig);
+            mix(sel.deleting.is_some() as u64, &mut sig);
             mix(sel.next_cursor.is_some() as u64, &mut sig);
         }
         // The new-session chooser: open/close plus the fields the sheet
@@ -3970,6 +4207,7 @@ impl Driver {
                 loading_more: sel.loading_more,
                 error: sel.error.clone(),
                 resuming: sel.resuming.clone(),
+                deleting: sel.deleting.clone(),
             }),
         };
         let new_session = self.new_session.open.then(|| NewSessionView {

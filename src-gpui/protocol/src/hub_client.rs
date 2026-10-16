@@ -331,6 +331,41 @@ impl HubClient {
         Ok(())
     }
 
+    /// Retires a session from remote discovery (ADR-0006 — the "end session"
+    /// action). Close, not delete: backend store and editor storage are
+    /// untouched; an editor-side-still-open conversation self-heals back into
+    /// discovery on its next use. Refused with 409 while a turn is running.
+    /// Id encoding matches delete_session (instance ids are hub-numeric).
+    pub async fn close_session(&self, instance_id: &str, session_id: &str) -> Result<(), HubApiError> {
+        let path = format!(
+            "/api/instances/{instance_id}/sessions/{}/close",
+            encode_query_component(session_id)
+        );
+        self.fetch(&path, HttpMethod::Post, None, &FetchOpts::default())
+            .await?;
+        Ok(())
+    }
+
+    /// Renames a session (bridge 0.11.9). The title is set once automatically
+    /// from the first prompt; this is the only later modifier — the bridge
+    /// pins it (title_overridden) and broadcasts session_info_update so
+    /// attached editors update live.
+    pub async fn rename_session(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        title: &str,
+    ) -> Result<(), HubApiError> {
+        let path = format!(
+            "/api/instances/{instance_id}/sessions/{}/rename",
+            encode_query_component(session_id)
+        );
+        let body = serde_json::json!({ "title": title });
+        self.fetch(&path, HttpMethod::Post, Some(&body), &FetchOpts::default())
+            .await?;
+        Ok(())
+    }
+
     /// Soft-deletes a session from every listing (bridge >=0.53). The
     /// session id is encoded, the instance id rides raw — hub instance ids
     /// are hub-numeric (same shape as close/rename).

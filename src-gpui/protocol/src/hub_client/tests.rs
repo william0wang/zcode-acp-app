@@ -242,6 +242,39 @@ async fn fs_browse_surfaces_a_404_with_its_status() {
 }
 
 #[tokio::test]
+async fn close_session_posts_the_retire_route() {
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push(res_text(200, "ok", &[]));
+    client(http.clone(), clock).close_session("inst 1", "sess/a").await.unwrap();
+    let calls = http.requested.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].url, "http://hub/api/instances/inst 1/sessions/sess%2Fa/close");
+    assert_eq!(calls[0].method, HttpMethod::Post);
+    // A retire carries no body — the route is addressed by path alone.
+    assert_eq!(calls[0].body, None);
+}
+
+#[tokio::test]
+async fn rename_session_posts_the_title_body() {
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push(res_text(200, "ok", &[]));
+    client(http.clone(), clock)
+        .rename_session("inst 1", "sess/a", "my title")
+        .await
+        .unwrap();
+    let calls = http.requested.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].url, "http://hub/api/instances/inst 1/sessions/sess%2Fa/rename");
+    assert_eq!(calls[0].method, HttpMethod::Post);
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[0].body.clone().unwrap()).unwrap(),
+        json!({ "title": "my title" })
+    );
+}
+
+#[tokio::test]
 async fn delete_session_posts_the_per_instance_tombstone_route() {
     let http = Arc::new(ScriptedHttp::default());
     let clock = Arc::new(MockClock::new());

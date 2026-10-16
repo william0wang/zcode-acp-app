@@ -194,6 +194,17 @@ pub struct Workbench {
     /// view-local like the TS component state — the entries always arrive
     /// whole from the driver, filtered here.
     files_show_hidden: bool,
+    /// The rename sheet (G1, TS SessionList's action sheet → rename mode):
+    /// the sidebar row it was opened for, `(instance_id, session_id)`.
+    /// `None` = closed. View-local — the wire call travels a UiCommand.
+    rename_target: Option<(String, String)>,
+    /// The sheet's prefill (the TS `draftTitle = title ?? ""`), applied
+    /// during render — `set_value` is window-gated and the menu's click
+    /// closure has no window.
+    rename_prefill: Option<String>,
+    /// The rename sheet's single-line draft.
+    rename_input: Entity<InputState>,
+    _rename_sub: Subscription,
     _composer_sub: Subscription,
 }
 
@@ -532,6 +543,24 @@ impl Workbench {
             cx.new(|cx| InputState::new(window, cx).placeholder("https://hub.example:8377"));
         let add_server_token =
             cx.new(|cx| InputState::new(window, cx).placeholder("Bearer token"));
+        // The rename sheet's draft (G1) — Enter saves when non-empty (the TS
+        // sheet's disabled-Save guard), every keystroke re-renders the button.
+        let rename_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
+        let rename_sub = cx.subscribe(&rename_input, |this, _, event: &InputEvent, cx| {
+            match event {
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => {
+                    let can_save = !this.rename_input.read(cx).value().trim().is_empty();
+                    if can_save && this.rename_target.is_some() {
+                        this.submit_rename(cx);
+                    }
+                }
+                _ => cx.notify(),
+            }
+        });
         let dock_sizes = cx.new(|_| ResizableState::default());
         // The composer is the primary surface — start focused.
         let focus = composer.read(cx).focus_handle(cx).clone();
@@ -569,6 +598,10 @@ impl Workbench {
             copied_row: None,
             plan_open: false,
             files_show_hidden: false,
+            rename_target: None,
+            rename_prefill: None,
+            rename_input,
+            _rename_sub: rename_sub,
             _composer_sub: composer_sub,
         };
 
@@ -705,15 +738,45 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Esc: close the topmost layer first — the new-session sheet swallows
-    /// it (the TS back-handler stack, `creating` guard included via the
-    /// command's no-op-while-busy); otherwise it is ChatView's Cancel —
-    /// `session/cancel` on the running turn.
+    /// Esc: close the topmost layer first — the rename sheet swallows it,
+    /// then the new-session sheet (the TS back-handler stack, `creating`
+    /// guard included via the command's no-op-while-busy); otherwise it is
+    /// ChatView's Cancel — `session/cancel` on the running turn.
     fn on_stop_turn(&mut self, _: &StopTurn, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.snap.new_session.is_some() {
+        if self.rename_target.take().is_some() {
+            // The rename sheet is view-local — closing it is purely ours.
+        } else if self.snap.new_session.is_some() {
             self.runtime.send(UiCommand::NewSessionToggle);
         } else if self.tab.as_ref().is_some_and(|t| t.running) {
             self.runtime.send(UiCommand::CancelTurn);
+        }
+        cx.notify();
+    }
+
+    /// Open the rename sheet for a sidebar row (G1). The prefill lands
+    /// during render (the caller — a menu click — has no window).
+    fn open_rename(
+        &mut self,
+        instance_id: String,
+        session_id: String,
+        title: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.rename_target = Some((instance_id, session_id));
+        self.rename_prefill = Some(title.filter(|t| !t.is_empty()).unwrap_or_default());
+        cx.notify();
+    }
+
+    /// The rename sheet's Save (TS `submitRename`): dispatch and close — the
+    /// driver owns the trim/cap/no-op guard, the toast owns the outcome.
+    fn submit_rename(&mut self, cx: &mut Context<Self>) {
+        if let Some((instance_id, session_id)) = self.rename_target.take() {
+            let title = self.rename_input.read(cx).value().to_string();
+            self.runtime.send(UiCommand::RenameSession {
+                instance_id,
+                session_id,
+                title,
+            });
         }
         cx.notify();
     }
@@ -2004,8 +2067,64 @@ impl Workbench {
         };
         let instance_id = sess.instance_id.clone();
         let session_id = sess.session_id.clone();
+        // The row's "…" actions (G-light): the TS long-press sheet as a
+        // desktop dropdown — Rename and End session (mobile's sheet pair for
+        // discovery rows; the tombstone delete lives on history rows).
+        let wb = cx.entity();
+        let menu_instance = sess.instance_id.clone();
+        let menu_session = sess.session_id.clone();
+        let menu_prefill = sess.title.clone();
+        let menu_runtime = self.runtime.clone();
+        let actions = div()
+            .id(SharedString::from(format!(
+                "session-menu-wrap-{}",
+                sess.session_id
+            )))
+            .flex_none()
+            // The trigger's click must not ALSO open the session (the row's
+            // own on_click sits above in the bubble path).
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(SharedString::from(format!("session-menu-{}", sess.session_id)))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Ellipsis)
+                    .tooltip("Session actions")
+                    .dropdown_menu(move |menu, _, _| {
+                        let mut m = menu;
+                        // The builder runs on every open — fresh captures.
+                        let (wb, inst, sid, prefill) = (
+                            wb.clone(),
+                            menu_instance.clone(),
+                            menu_session.clone(),
+                            menu_prefill.clone(),
+                        );
+                        m = m.item(
+                            PopupMenuItem::new("Rename…").on_click(move |_, _, cx| {
+                                wb.update(cx, |wb, cx| {
+                                    wb.open_rename(inst.clone(), sid.clone(), prefill.clone(), cx)
+                                });
+                            }),
+                        );
+                        let (runtime, inst, sid) = (
+                            menu_runtime.clone(),
+                            menu_instance.clone(),
+                            menu_session.clone(),
+                        );
+                        m = m.item(
+                            PopupMenuItem::new("End session").on_click(move |_, _, _| {
+                                runtime.send(UiCommand::CloseSession {
+                                    instance_id: inst.clone(),
+                                    session_id: sid.clone(),
+                                });
+                            }),
+                        );
+                        m
+                    }),
+            );
         div()
             .id(SharedString::from(format!("session-row-{}", sess.session_id)))
+            .test_support()
             .flex()
             .items_center()
             .gap_2()
@@ -2033,6 +2152,7 @@ impl Workbench {
                         .child("open"),
                 )
             })
+            .child(actions)
             .on_click(move |_, _, _| {
                 runtime.send(UiCommand::OpenSession {
                     instance_id: instance_id.clone(),
@@ -2239,18 +2359,50 @@ impl Workbench {
             .clone()
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| short_id(&row.session_id, "session"));
-        let resuming = self
-            .snap
-            .history
-            .selected
-            .as_ref()
+        let selected = self.snap.history.selected.as_ref();
+        let resuming = selected
             .and_then(|s| s.resuming.as_ref())
+            .map(|r| r == &row.session_id)
+            .unwrap_or(false);
+        let deleting = selected
+            .and_then(|s| s.deleting.as_ref())
             .map(|r| r == &row.session_id)
             .unwrap_or(false);
         let workspace = workspace_path.to_string();
         let session_id = row.session_id.clone();
+        // The row's "…" action (G3): the tombstone delete — the history
+        // surface's own row action on mobile too (readOnly + onDelete).
+        let menu_runtime = self.runtime.clone();
+        let menu_session = row.session_id.clone();
+        let actions = div()
+            .id(SharedString::from(format!(
+                "history-menu-wrap-{}",
+                row.session_id
+            )))
+            .flex_none()
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                Button::new(SharedString::from(format!("history-menu-{}", row.session_id)))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Ellipsis)
+                    .tooltip("Session actions")
+                    .dropdown_menu(move |menu, _, _| {
+                        let mut m = menu;
+                        let (runtime, sid) = (menu_runtime.clone(), menu_session.clone());
+                        m = m.item(
+                            PopupMenuItem::new("Delete from history").on_click(move |_, _, _| {
+                                runtime.send(UiCommand::DeleteHistorySession {
+                                    session_id: sid.clone(),
+                                });
+                            }),
+                        );
+                        m
+                    }),
+            );
         div()
             .id(SharedString::from(format!("history-row-{}", row.session_id)))
+            .test_support()
             .flex()
             .items_center()
             .gap_2()
@@ -2279,12 +2431,15 @@ impl Workbench {
                     })
                     .child(if resuming {
                         "resuming…".to_string()
+                    } else if deleting {
+                        "deleting…".to_string()
                     } else if row.live {
                         "live".to_string()
                     } else {
                         row.updated_at.clone().unwrap_or_default()
                     }),
             )
+            .child(actions)
             .on_click(move |_, _, _| {
                 runtime.send(UiCommand::OpenHistorySession {
                     workspace_path: workspace.clone(),
@@ -3544,6 +3699,14 @@ impl Render for Workbench {
                 composer.update(cx, |state, cx| state.set_value("", window, cx));
             });
         }
+        // The rename sheet's prefill (open_rename deferred it here — the
+        // menu click that opened the sheet had no window for set_value).
+        if let Some(text) = self.rename_prefill.take() {
+            let input = self.rename_input.clone();
+            window.defer(cx, move |window, cx| {
+                input.update(cx, |state, cx| state.set_value(&text, window, cx));
+            });
+        }
         if let Some(draft) = self.composer_prefill.take() {
             // editPending's prefill (ChatView `prefill`): text re-enters the
             // composer; drafts re-stage with decoded rasters so the strip
@@ -3684,6 +3847,11 @@ impl Render for Workbench {
                 self.snap.new_session.clone(),
                 |this, view| this.child(self.render_new_session(&view, cx)),
             )
+            // The rename sheet (G1) sits above the chooser — the TS action
+            // sheet is the topmost layer while open.
+            .when(self.rename_target.is_some(), |this| {
+                this.child(self.render_rename_sheet(cx))
+            })
             // The file viewer (F3) is the topmost layer — the TS FileViewer
             // full-screen reader; later siblings paint above, so this goes
             // last.
@@ -3694,6 +3862,100 @@ impl Render for Workbench {
 }
 
 impl Workbench {
+    /// The rename sheet (G1, TS SessionList's action sheet in rename mode):
+    /// a prefilled single-line draft; Save dispatches the UiCommand and
+    /// closes (the driver owns trim/cap; the toast owns the outcome). Esc
+    /// and the backdrop close without sending.
+    fn render_rename_sheet(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let can_save = !self.rename_input.read(cx).value().trim().is_empty();
+        let card = div()
+            .id("rename-card")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .max_w(px(420.))
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.title_bar)
+            // The card swallows backdrop clicks (the sheet's own close).
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme.foreground)
+                    .child("Rename session"),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child("The title shows here, in the editor, and in the ZCode app."),
+            )
+            .child(Input::new(&self.rename_input).small())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .justify_end()
+                    .child(
+                        Button::new("rename-cancel")
+                            .secondary()
+                            .small()
+                            .label("Cancel")
+                            .on_click({
+                                let wb = wb.clone();
+                                move |_, _, cx| {
+                                    wb.update(cx, |wb, cx| {
+                                        wb.rename_target = None;
+                                        cx.notify();
+                                    })
+                                }
+                            }),
+                    )
+                    .child(
+                        Button::new("rename-save")
+                            .primary()
+                            .small()
+                            .label("Save")
+                            .disabled(!can_save)
+                            .on_click({
+                                let wb = wb.clone();
+                                move |_, _, cx| {
+                                    wb.update(cx, |wb, cx| wb.submit_rename(cx))
+                                }
+                            }),
+                    ),
+            );
+        div()
+            .id("rename-sheet")
+            .test_support()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p_6()
+            .bg(theme.background.opacity(0.65))
+            .on_click({
+                let wb = wb.clone();
+                move |_, _, cx| {
+                    wb.update(cx, |wb, cx| {
+                        wb.rename_target = None;
+                        cx.notify();
+                    })
+                }
+            })
+            .child(card)
+            .into_any_element()
+    }
+
     /// The new-session chooser (TS ProjectCreateDialog): a modal overlay —
     /// the hub's known projects, with a browse mode walking the machine's
     /// directories. Picking incubates a serve bridge for that workspace and
@@ -4806,6 +5068,233 @@ mod files_tests {
                     .any(|c| matches!(c, UiCommand::FilesNavigate { .. })),
                 "an incapable bridge must not be probed, got {:?}",
                 runtime.recorded_commands()
+            );
+        })
+        .unwrap();
+    }
+}
+
+/// Batch G-light (session row actions) headless UI integration tests — same
+/// paradigm as `chip_tests`: explicit imports, an inert runtime, a real
+/// Workbench in a test window, element-id assertions and real clicks. The
+/// wire half (rename/close/delete spellings) lives in the protocol tests.
+#[cfg(test)]
+mod session_action_tests {
+    use super::Workbench;
+    use crate::runtime::{
+        HistoryRow, HistorySelected, Phase, ProtocolRuntime, SessionRow, UiCommand,
+        WorkbenchSnapshot,
+    };
+    use gpui_kit::test::TestWindowExt;
+    use gpui_kit::{
+        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
+        WindowBounds, WindowOptions,
+    };
+
+    fn session_row(session_id: &str, title: Option<&str>) -> SessionRow {
+        SessionRow {
+            instance_id: "inst-1".to_string(),
+            workspace: "/w/proj".to_string(),
+            session_id: session_id.to_string(),
+            title: title.map(str::to_string),
+            updated_at: Some(1),
+            running: false,
+            awaiting: false,
+            open_tab: None,
+        }
+    }
+
+    fn sessions_snapshot() -> WorkbenchSnapshot {
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.hub_addr = Some("http://127.0.0.1:8377".to_string());
+        snap.sessions = vec![session_row("sess_1", Some("First chat"))];
+        snap
+    }
+
+    fn history_snapshot() -> WorkbenchSnapshot {
+        let mut snap = sessions_snapshot();
+        snap.history.open = true;
+        snap.history.selected = Some(HistorySelected {
+            workspace_path: "/w/proj".to_string(),
+            rows: vec![HistoryRow {
+                session_id: "hist_1".to_string(),
+                title: Some("Old conversation".to_string()),
+                updated_at: Some("2026-10-01T10:00:00Z".to_string()),
+                live: false,
+            }],
+            next_cursor: None,
+            loading_page: false,
+            loading_more: false,
+            error: None,
+            resuming: None,
+            deleting: None,
+        });
+        snap
+    }
+
+    fn open_test_window(
+        cx: &mut App,
+        snap: WorkbenchSnapshot,
+    ) -> (AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
+        let runtime = ProtocolRuntime::inert();
+        let (handle, content) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: Size {
+                        width: px(800.),
+                        height: px(600.),
+                    },
+                })),
+                ..Default::default()
+            },
+            cx,
+            |window, cx| {
+                let runtime = runtime.clone();
+                cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
+            },
+        )
+        .expect("open test window");
+        (handle, content, runtime)
+    }
+
+    fn sent_close(runtime: &ProtocolRuntime, session_id: &str) -> bool {
+        runtime.recorded_commands().iter().any(|c| matches!(
+            c,
+            UiCommand::CloseSession { instance_id, session_id: sid }
+                if instance_id == "inst-1" && sid == session_id
+        ))
+    }
+
+    /// G1 + G2 (the End half): the sidebar session row's "…" menu carries
+    /// Rename and End session in that order; End dispatches the exact
+    /// `CloseSession` command, and the trigger click never opens the session.
+    /// One menu interaction per window — a dismissal rides a deferred
+    /// DismissEvent, so re-opening immediately after a pick toggles the
+    /// still-open state closed (TESTING.md's wait-for note).
+    #[gpui_kit::test]
+    fn session_row_menu_ends_session(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, sessions_snapshot()));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("session-row-sess_1").visible());
+            assert!(window.find("session-menu-sess_1").visible());
+            // Opening the actions menu must not ALSO open the session (the
+            // row's own click sits above in the bubble path).
+            window.click("session-menu-sess_1", cx);
+            {
+                let mut menu = window.within("popup-menu");
+                assert_eq!(menu.find(0usize).label().as_deref(), Some("Rename…"));
+                assert_eq!(menu.find(1usize).label().as_deref(), Some("End session"));
+                menu.click(1usize, cx);
+            }
+            window.draw(cx).clear(cx);
+            assert!(
+                sent_close(&runtime, "sess_1"),
+                "End session must reach the runtime, got {:?}",
+                runtime.recorded_commands()
+            );
+            assert!(
+                !runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::OpenSession { .. }
+                )),
+                "the menu trigger click must not open the session"
+            );
+        })
+        .unwrap();
+    }
+
+    /// G1 (the Rename half): picking Rename opens the sheet with the row's
+    /// title prefilled, and Save dispatches `RenameSession` with that
+    /// prefill, closing the sheet.
+    #[gpui_kit::test]
+    fn session_row_rename_sheet_prefills_and_saves(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, sessions_snapshot()));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("session-menu-sess_1", cx);
+            {
+                let mut menu = window.within("popup-menu");
+                menu.click(0usize, cx);
+            }
+            window.draw(cx).clear(cx);
+            assert!(window.find("rename-sheet").visible(), "the sheet must open");
+        })
+        .unwrap();
+        // The prefill rides a deferred set_value (App effects, not the
+        // frame) — flush, then one frame shows the value and enables Save.
+        cx.run_until_parked();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("rename-save", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("rename-sheet").is_none(),
+                "Save closes the sheet"
+            );
+            assert!(
+                runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::RenameSession { instance_id, session_id, title }
+                        if instance_id == "inst-1"
+                            && session_id == "sess_1"
+                            && title == "First chat"
+                )),
+                "Save must dispatch the prefilled rename, got {:?}",
+                runtime.recorded_commands()
+            );
+        })
+        .unwrap();
+    }
+
+    /// G3: the history row's "…" menu carries the tombstone delete, and
+    /// picking it dispatches `DeleteHistorySession` for that row — never a
+    /// resume (the row's own click still owns that).
+    #[gpui_kit::test]
+    fn history_row_menu_deletes_tombstone(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, history_snapshot()));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("history-row-hist_1").visible());
+            assert!(window.find("history-menu-hist_1").visible());
+            window.click("history-menu-hist_1", cx);
+            {
+                let mut menu = window.within("popup-menu");
+                assert_eq!(
+                    menu.find(0usize).label().as_deref(),
+                    Some("Delete from history")
+                );
+                menu.click(0usize, cx);
+            }
+            window.draw(cx).clear(cx);
+            assert!(
+                runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::DeleteHistorySession { session_id } if session_id == "hist_1"
+                )),
+                "the tombstone delete must reach the runtime, got {:?}",
+                runtime.recorded_commands()
+            );
+            assert!(
+                !runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::OpenHistorySession { .. }
+                )),
+                "the menu trigger click must not resume the row"
             );
         })
         .unwrap();
