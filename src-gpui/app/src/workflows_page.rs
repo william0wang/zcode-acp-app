@@ -478,6 +478,7 @@ fn render_overview_body(wb: &Workbench, page: &WorkflowsPageView, cx: &Context<W
                 page.action_instance.as_deref(),
                 page.busy,
                 page.launches.get(&r.run_id),
+                page.session_runs.get(&r.run_id).map(|s| s.as_str()),
                 wb,
                 cx,
             ));
@@ -499,6 +500,9 @@ fn render_overview_body(wb: &Workbench, page: &WorkflowsPageView, cx: &Context<W
                 page.action_instance.as_deref(),
                 page.busy,
                 page.launches.get(&r.run_id),
+                // TS RecentRunsBlock has no conversationRuns join — the
+                // third ladder is the ACTIVE zone's stop affordance only.
+                None,
                 wb,
                 cx,
             ));
@@ -554,10 +558,12 @@ fn render_overview_body(wb: &Workbench, page: &WorkflowsPageView, cx: &Context<W
 /// One row of the active/recent zones: label, stamp, badge, and the
 /// Detail/Stop (active) or Detail/dismiss (recent) controls. The session
 /// ladder is the TS one: launch memory → the row's bridge-joined
-/// `acpSessionId` (absent = read-only row); the instance ladder adds the
-/// hub's owner annotation ahead of launch memory, with the connected tab's
-/// instance last. Recent rows additionally carry the stamp · tokens ·
-/// artifact-count chips line (TS RecentRunsBlock).
+/// `acpSessionId` → (active zone only) the conversationRuns join
+/// `session_run` — a run that flies in the CURRENT session is actionable
+/// even when neither memory nor the bridge could place it; the instance
+/// ladder adds the hub's owner annotation ahead of launch memory, with the
+/// connected tab's instance last. Recent rows additionally carry the
+/// stamp · tokens · artifact-count chips line (TS RecentRunsBlock).
 fn render_run_zone_row(
     r: &WorkflowRunRow,
     index: usize,
@@ -565,6 +571,7 @@ fn render_run_zone_row(
     action_instance: Option<&str>,
     busy: bool,
     launch: Option<&WorkflowLaunchRef>,
+    session_run: Option<&str>,
     wb: &Workbench,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -580,7 +587,8 @@ fn render_run_zone_row(
         .or_else(|| action_instance.map(str::to_string));
     let row_session: Option<String> = launch
         .map(|l| l.acp_session_id.clone())
-        .or_else(|| r.acp_session_id.clone());
+        .or_else(|| r.acp_session_id.clone())
+        .or_else(|| session_run.map(str::to_string));
     let key = format!("{zone}-{index}");
     let slug_run = slug_run_id(&r.run_id);
 
@@ -1168,6 +1176,34 @@ fn render_detail_body(
             );
         }
         Some(runs) => {
+            // Clear finished (TS `clearFinished`): one dismiss-batch POST
+            // for every settled row — visible only while at least one
+            // exists (an all-active history hides it, an empty one has no
+            // block to clear).
+            let finished: Vec<String> = runs
+                .iter()
+                .filter(|r| !run_is_active(&r.status))
+                .map(|r| r.run_id.clone())
+                .collect();
+            if !finished.is_empty() {
+                let runtime = wb.runtime.clone();
+                let instance_id = detail.instance_id.clone();
+                runs_block = runs_block.child(
+                    Button::new("wf-clear-finished")
+                        .ghost()
+                        .xsmall()
+                        .w_full()
+                        .text_left()
+                        .label(t!("zconfig.workflowClearFinished").into_owned())
+                        .disabled(page.busy)
+                        .on_click(move |_, _, _| {
+                            runtime.send(UiCommand::DismissWorkflowRuns {
+                                instance_id: instance_id.clone(),
+                                run_ids: finished.clone(),
+                            });
+                        }),
+                );
+            }
             for r in runs {
                 runs_block = runs_block.child(render_detail_run_row(
                     r,
@@ -4814,6 +4850,7 @@ mod workflows_tests {
             busy: false,
             action_instance: Some("inst-a".to_string()),
             launches: std::collections::HashMap::new(),
+            session_runs: std::collections::HashMap::new(),
         }
     }
 
@@ -5762,6 +5799,128 @@ mod workflows_tests {
                             && instance_id == "inst-launch"
                 )),
                 "detail must ride the launch memory's address, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The third session ladder (TS ActiveRunsBlock's `sessionRuns`): an
+    /// active run neither launch memory nor the bridge join could place
+    /// still gets Detail/Stop when the CURRENT session's conversationRuns
+    /// poll reported it — and the join is the ACTIVE zone's alone: a
+    /// sessionless recent row stays read-only (TS RecentRunsBlock).
+    #[gpui_kit::test]
+    fn session_runs_join_makes_active_rows_actionable(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut overview = overview_fixture();
+        let mut active = run_row("run-9x", "deploy", "running", None);
+        active.owner_instance_id = None;
+        let mut recent = run_row("run-8x", "deploy", "completed", None);
+        recent.owner_instance_id = None;
+        overview.active_runs = vec![active];
+        overview.recent_runs = vec![recent];
+        let mut view = page_view(Some(overview));
+        view.session_runs = [("run-9x".to_string(), "s-cur".to_string())]
+            .into_iter()
+            .collect();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // The active row resolves through the join; the instance falls
+            // back to the connected tab's (the join's session lives there).
+            assert!(window.find("wf-active-0-detail").visible());
+            assert!(window.find("wf-active-0-stop-run-9x").visible());
+            click_recorded(
+                window,
+                gpui_kit::SharedString::from("wf-active-0-stop-run-9x"),
+                &runtime,
+                cx,
+            );
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::WorkflowStopRun { run_id, session_id, instance_id }
+                        if run_id == "run-9x"
+                            && session_id == "s-cur"
+                            && instance_id.as_deref() == Some("inst-a")
+                )),
+                "stop must ride the sessionRuns join's address, got {sent:?}"
+            );
+            window.render_frame(cx);
+            // The recent row has no join and no session of its own: the
+            // detail affordance stays hidden (read-only visibility row).
+            assert!(
+                window.try_find("wf-recent-0-detail").is_none(),
+                "the third ladder must not leak into the recent zone"
+            );
+            assert!(window.find("wf-recent-0-dismiss-run-8x").visible());
+        })
+        .unwrap();
+    }
+
+    /// Clear finished (TS `clearFinished`): the control shows only while a
+    /// settled row exists, and one click dismiss-batches exactly the
+    /// settled ids — still-flying rows never ride along.
+    #[gpui_kit::test]
+    fn clear_finished_dismisses_only_settled_rows(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut detail = detail_view(BTreeMap::new());
+        if let Some(runs) = detail.runs.as_mut() {
+            runs.push(run_row("run-4", "deploy", "running", Some("s4")));
+        }
+        let mut view = page_view(None);
+        view.detail = Some(detail);
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("wf-clear-finished").visible());
+            click_recorded(window, "wf-clear-finished".into(), &runtime, cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::DismissWorkflowRuns { instance_id, run_ids }
+                        if instance_id == "inst-a"
+                            && run_ids.as_slice() == ["run-3".to_string()]
+                )),
+                "clear finished must batch exactly the settled ids, got {sent:?}"
+            );
+        })
+        .unwrap();
+
+        // All-active history: nothing to clear, the control hides.
+        let runtime2 = ProtocolRuntime::inert();
+        let mut detail = detail_view(BTreeMap::new());
+        if let Some(runs) = detail.runs.as_mut() {
+            runs.clear();
+            runs.push(run_row("run-5", "deploy", "running", Some("s5")));
+        }
+        let mut view = page_view(None);
+        view.detail = Some(detail);
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime2, snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window.try_find("wf-clear-finished").is_none(),
+                "an all-active history has nothing to clear"
             );
         })
         .unwrap();

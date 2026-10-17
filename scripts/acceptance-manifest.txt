@@ -42,6 +42,7 @@ workflow-run-detail :: Run detail tabs, artifacts viewer, workspace, raw payload
 run-detail-journal :: Run journal redesign (newest-first phases, step folds, drain) :: rust:workflow_run_events_render_and_paginate,rust:workflow_run_event_text,rust:newest_first
 workflow-actions :: Meta edit, move to project, two-step delete, script fold :: rust:workflow_detail_move_and_two_step_delete,rust:workflow_detail_script_folds,rust:workflow_meta_form_merges_rest,rust:merge_workflow_meta_shapes
 launch-memory :: Workflow launch memory (LRU rows, actionable zones) :: rust:launch_memory_makes_zone_rows_actionable,rust:workflow_launches
+workflow-tail :: Clear-finished batch dismiss, sessionRuns third ladder, gate re-probe on instance switch :: rust:clear_finished_dismisses_only_settled_rows,rust:session_runs_join_makes_active_rows_actionable,rust:session_runs_map_replaces_not_merges
 workflow-protocol :: Workflow protocol (start/resume/journal/amend wire, args) :: rust:workflow_args,rust:workflow_start_round_trip,rust:workflow_list_round_trip,rust:workflow_gate_set_round_trip,rust:workflow_detail_round_trip,rust:workflow_overview_round_trip,rust:workflow_arg_declaration_round_trip,rust:workflow_create_prompt_round_trip
 
 # ---- desktop: protocol core ----

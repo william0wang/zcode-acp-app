@@ -76,7 +76,8 @@ use protocol::toast::{Toast, ToastState};
 use protocol::ws::{TungsteniteWsFactory, WsFactory};
 use protocol::workflow::{
     AmendRunSettingsBody, AmendRunSettingsResponse, ConversationRunSummary, ConversationRunsResponse,
-    DismissRunResponse, RunArtifactsResponse, WorkflowArtifact, WorkflowArtifactItemsResponse,
+    DismissRunResponse, DismissRunsResponse, RunArtifactsResponse, WorkflowArtifact,
+    WorkflowArtifactItemsResponse,
     WorkflowArtifactReadResponse, WorkflowCreatePromptResponse, WorkflowDetailResponse,
     WorkflowNodeResultResponse, WorkflowOverviewResponse, WorkflowRunEvent,
     WorkflowRunEventsResponse, WorkflowRunRow, WorkflowRunsHistoryResponse, WorkflowScope,
@@ -129,6 +130,9 @@ const WORKFLOW_RUN_POLL_MS: u64 = 3_000;
 /// WorkflowDetail's 5s tick, `skipDetail` mode: meta is static between
 /// runs, only history + summaries refresh).
 const WORKFLOW_DETAIL_POLL_MS: u64 = 5_000;
+/// The active-session conversationRuns poll cadence (TS ActiveRunsBlock's
+/// 5s interval): the third session-resolution ladder's map refresh.
+const WORKFLOW_SESSION_RUNS_POLL_MS: u64 = 5_000;
 
 /// Env-gated stderr trace for the driver lifecycle (ZCODE_ACP_TRACE=1) —
 /// the slice's connection story, observable without a debugger.
@@ -480,6 +484,13 @@ pub enum UiCommand {
     DismissWorkflowRun {
         instance_id: String,
         run_id: String,
+    },
+    /// POST …/dismiss-batch (TS `clearFinished`): hide every settled row of
+    /// the open workflow's history at once; still-flying ids are skipped
+    /// hub-side.
+    DismissWorkflowRuns {
+        instance_id: String,
+        run_ids: Vec<String>,
     },
     /// A run row's Details (TS `runDetail`): the conversation summary plus
     /// the journal's head on that row's address.
@@ -1009,6 +1020,12 @@ pub struct WorkflowsPageView {
     /// start minted. Rows without an `acpSessionId` resolve through this
     /// table into actionable rows; a stale entry just fails its open.
     pub launches: HashMap<String, WorkflowLaunchRef>,
+    /// The third session ladder's join (TS ActiveRunsBlock `sessionRuns`):
+    /// run id → the CURRENT attached session, filled by the 5s poll while
+    /// live rows are on screen. Active-zone rows the first two rungs
+    /// missed resolve through this map; entries are run-id-exact, so a
+    /// stale one can only act on a run that WAS in this session.
+    pub session_runs: HashMap<String, String>,
 }
 
 /// One launch-memory resolution carried to the view (the two fields the
@@ -1465,6 +1482,14 @@ enum LoopEvent {
     WorkflowRunDismissed {
         run_id: String,
         result: Result<DismissRunResponse, SettingsApiError>,
+    },
+    /// POST …/dismiss-batch settled (the detail page's clear-finished).
+    WorkflowRunsDismissed(Result<DismissRunsResponse, SettingsApiError>),
+    /// The third ladder's conversationRuns read settled (the pair is the
+    /// epoch — an answer from a previous instance/session drops).
+    WorkflowSessionRuns {
+        pair: (String, String),
+        result: Result<ConversationRunsResponse, SettingsApiError>,
     },
     /// The run page's conversation-runs read settled.
     WorkflowRunSummary {
@@ -2016,14 +2041,27 @@ struct WorkflowsPanel {
     /// reads it while the page is closed.
     gate: Option<WorkflowGateBlock>,
     gate_busy: bool,
-    /// The lazy gate-probe seed (batch M): true until the first attempt
-    /// fires — the gated config entry and the session manage row need the
-    /// verdict to appear at all (TS probes on the panel/screen mount; the
-    /// desktop surfaces are always mounted, so the first live instance
-    /// triggers the one-shot).
-    gate_probe_pending: bool,
+    /// The instance the last gate probe addressed (`None` = nothing probed
+    /// yet — the first live instance triggers one). While the verdict is
+    /// unknown, a CHANGE of the active instance re-probes (TS
+    /// ZCodeConfigScreen's `instanceId` effect dep); a probe that failed for
+    /// THIS instance waits for the next config-dock / page open instead of
+    /// being hammered on a timer.
+    gate_probe_instance: Option<String>,
     /// Epoch-ms when the overview poll fires next while open.
     next_poll_at: u64,
+    /// The third session-resolution ladder (TS ActiveRunsBlock's
+    /// `sessionRuns`): run id → the CURRENT attached session, filled by the
+    /// 5s conversationRuns poll. Only consulted for ACTIVE-zone rows the
+    /// first two rungs (launch memory, the bridge-joined alias) missed.
+    session_runs: HashMap<String, String>,
+    /// The (instance, session) pair the map and its in-flight poll are
+    /// scoped to — TS's epoch ref: an answer from a previous instance or
+    /// session must not land, and a pair switch drops the map first.
+    session_runs_pair: Option<(String, String)>,
+    /// Epoch-ms when the sessionRuns poll fires next (armed only while the
+    /// page is open, live rows are on screen, and a session is attached).
+    next_session_runs_poll_at: u64,
     /// The open workflow sub-page; `seq` invalidates in-flight reads on
     /// close/reopen (a late answer must not land in a NEW page's state).
     detail: Option<WorkflowDetailPanel>,
@@ -2150,8 +2188,11 @@ impl WorkflowsPanel {
         self.overview = None;
         self.gate = None;
         self.gate_busy = false;
-        self.gate_probe_pending = true;
+        self.gate_probe_instance = None;
         self.next_poll_at = 0;
+        self.session_runs.clear();
+        self.session_runs_pair = None;
+        self.next_session_runs_poll_at = 0;
         self.detail = None;
         self.run = None;
         self.busy = false;
@@ -2161,6 +2202,19 @@ impl WorkflowsPanel {
 
 /// Journal pages drained per run-events call (TS `DRAIN_PAGES`).
 const RUN_EVENT_DRAIN_PAGES: usize = 8;
+
+/// The third ladder's map fold (TS `new Map(conv.runs.map((r) => [r.runId,
+/// sid]))`): every run the CURRENT session reports, keyed by run id. A
+/// REPLACE, not a merge — a run that left the session must leave the map
+/// too, or its stale entry could pin a phantom session onto a later row.
+fn fold_session_runs(
+    runs: &[ConversationRunSummary],
+    session_id: &str,
+) -> HashMap<String, String> {
+    runs.iter()
+        .map(|r| (r.run_id.clone(), session_id.to_string()))
+        .collect()
+}
 
 /// Highest journal sequence held — the safe `afterSequence` cursor. NOT the
 /// last element's sequence: a clipped journal page can end on an event
@@ -2317,12 +2371,7 @@ impl Driver {
             },
             usage: UsagePanel::new(),
             sections: Default::default(),
-            // The gate's lazy one-shot probe arms with the driver (the TS
-            // panel mounts probe while the verdict is unknown).
-            workflows: WorkflowsPanel {
-                gate_probe_pending: true,
-                ..Default::default()
-            },
+            workflows: WorkflowsPanel::default(),
             config_notice: None,
             pending_restart: false,
             toast: ToastState::new(),
@@ -3315,6 +3364,19 @@ impl Driver {
             .map(|t| t.instance_id.clone())
     }
 
+    /// The active tab's (instance, session) pair — the third session
+    /// ladder's poll scope. `None` while no tab holds an attached session
+    /// (there is nothing to ask conversationRuns about).
+    fn active_session_pair(&self) -> Option<(String, String)> {
+        self.active_tab
+            .and_then(|id| self.tab(id))
+            .and_then(|t| t
+                .core
+                .active_session_id
+                .clone()
+                .map(|sid| (t.instance_id.clone(), sid)))
+    }
+
     /// The launch-memory joins for the run rows the open page paints
     /// (batch M, TS `lookupLaunch` per row): run id → the session/instance
     /// this app's own start minted. Scoped to the visible rows so the
@@ -3442,6 +3504,7 @@ impl Driver {
         let Some(instance_id) = self.active_instance_id() else {
             return;
         };
+        self.workflows.gate_probe_instance = Some(instance_id.clone());
         let hub = self.settings_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
@@ -3451,6 +3514,44 @@ impl Driver {
                 .map(|all| all.workflow);
             let _ = tx.send(LoopEvent::WorkflowGateProbed(result));
         });
+    }
+
+    /// The third session-resolution ladder's read (TS ActiveRunsBlock's
+    /// `load`): the attached session's conversationRuns, polled 5s while
+    /// live rows are on screen. Silent by design — a transient failure just
+    /// keeps the previous map (stale keys are run-id-exact, so a kept entry
+    /// can only act on a run that was in this session).
+    fn spawn_workflow_session_runs(&mut self, pair: (String, String)) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let (instance_id, session_id) = &pair;
+            let result = hub.conversation_runs(instance_id, session_id, None).await;
+            let _ = tx.send(LoopEvent::WorkflowSessionRuns { pair, result });
+        });
+    }
+
+    /// The sessionRuns read settled: guarded by the pair (an in-flight read
+    /// from a previous instance/session drops); success REPLACES the map
+    /// (run ids are exact, a vanished run must leave it), failure keeps it.
+    fn on_workflow_session_runs(
+        &mut self,
+        pair: (String, String),
+        result: Result<ConversationRunsResponse, SettingsApiError>,
+    ) {
+        if self.workflows.session_runs_pair.as_ref() != Some(&pair) {
+            return;
+        }
+        if let Ok(res) = result {
+            let (_, session_id) = &pair;
+            self.workflows.session_runs = fold_session_runs(&res.runs, session_id);
+        }
     }
 
     /// The probe settled: the block lands; a missing block (an older
@@ -3808,6 +3909,19 @@ impl Driver {
         if self.workflows.open {
             let now = self.clock.now_ms();
             self.spawn_workflow_overview(now);
+        }
+        if self.workflows.detail.is_some() {
+            self.spawn_workflow_runs_load();
+        }
+    }
+
+    /// POST …/dismiss-batch settled (the clear-finished): the hidden rows
+    /// must leave the open detail's runs (TS `load()`); the page-level
+    /// lists catch up on the next overview poll, as in TS.
+    fn on_workflow_runs_dismissed(&mut self, result: Result<DismissRunsResponse, SettingsApiError>) {
+        self.workflows.busy = false;
+        if let Err(e) = result {
+            self.config_notice = Some(format!("clear finished runs failed: {e}"));
         }
         if self.workflows.detail.is_some() {
             self.spawn_workflow_runs_load();
@@ -4863,23 +4977,61 @@ impl Driver {
         if self.workflows.open && now >= self.workflows.next_poll_at {
             self.spawn_workflow_overview(now);
         }
-        // The gate's lazy one-shot probe (batch M): the gated config entry
-        // and the session manage row need the verdict to render at all —
-        // TS probes on the panel/screen mount; the desktop surfaces mount
-        // with the window, so the first live instance triggers the seed.
-        // The pending flag clears only when the probe actually fires (the
-        // spawn's own phase/instance guards would otherwise eat it while
-        // bootstrapping).
+        // The gate probe's retry rule (batch M's seed generalized to TS
+        // ZCodeConfigScreen's `instanceId` effect dep): the gated config
+        // entry and the session manage row need the verdict to render at
+        // all, so while it is unknown a CHANGE of the active instance
+        // re-probes — the first live instance included (`gate_probe_instance`
+        // starts None). A probe that failed for THIS instance is not
+        // hammered on a timer; the next config-dock / workflows-page open
+        // retries it.
         if self.workflows.gate.is_none()
-            && self.workflows.gate_probe_pending
             && matches!(
                 self.phase,
                 Phase::Discovering | Phase::Connected | Phase::Reconnecting
             )
-            && self.active_instance_id().is_some()
+            && self.active_instance_id() != self.workflows.gate_probe_instance
         {
-            self.workflows.gate_probe_pending = false;
             self.spawn_workflow_gate_probe();
+        }
+        // The third session-resolution ladder (TS ActiveRunsBlock): the
+        // attached session's conversationRuns, polled 5s while the page
+        // shows live rows — a run neither launch memory nor the bridge join
+        // could place is still actionable if it flies in the CURRENT
+        // session. Any dropped condition (page closed, a detail/run
+        // sub-page replaces the overview where the block lives, zone
+        // empty, no session) clears the map, and a pair switch drops it
+        // FIRST so an in-flight answer from the old pair cannot land (TS's
+        // epoch ref).
+        let live_rows = self
+            .workflows
+            .overview
+            .as_ref()
+            .is_some_and(|o| !o.active_runs.is_empty());
+        let session_pair = self.active_session_pair();
+        match session_pair.filter(|_| {
+            self.workflows.open
+                && self.workflows.detail.is_none()
+                && self.workflows.run.is_none()
+                && live_rows
+        }) {
+            Some(pair) => {
+                if self.workflows.session_runs_pair.as_ref() != Some(&pair) {
+                    self.workflows.session_runs.clear();
+                    self.workflows.session_runs_pair = Some(pair.clone());
+                    self.workflows.next_session_runs_poll_at = 0;
+                }
+                if now >= self.workflows.next_session_runs_poll_at {
+                    self.workflows.next_session_runs_poll_at = now + WORKFLOW_SESSION_RUNS_POLL_MS;
+                    self.spawn_workflow_session_runs(pair);
+                }
+            }
+            None => {
+                if self.workflows.session_runs_pair.is_some() {
+                    self.workflows.session_runs.clear();
+                    self.workflows.session_runs_pair = None;
+                }
+            }
         }
         // One workflow's runs-history poll (TS WorkflowDetail's 5s tick,
         // `skipDetail` mode): armed only while its newest run flies — meta
@@ -5613,6 +5765,12 @@ impl Driver {
             LoopEvent::WorkflowRunStopped(result) => self.on_workflow_run_stopped(result),
             LoopEvent::WorkflowRunDismissed { run_id, result } => {
                 self.on_workflow_run_dismissed(run_id, result);
+            }
+            LoopEvent::WorkflowRunsDismissed(result) => {
+                self.on_workflow_runs_dismissed(result);
+            }
+            LoopEvent::WorkflowSessionRuns { pair, result } => {
+                self.on_workflow_session_runs(pair, result);
             }
             LoopEvent::WorkflowRunSummary { seq, result } => {
                 self.on_workflow_run_summary(seq, result);
@@ -6543,6 +6701,20 @@ impl Driver {
                     });
                 }
             }
+            UiCommand::DismissWorkflowRuns {
+                instance_id,
+                run_ids,
+            } => {
+                if !self.workflows.busy {
+                    self.workflows.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.dismiss_workflow_runs(&instance_id, &run_ids).await;
+                        let _ = tx.send(LoopEvent::WorkflowRunsDismissed(result));
+                    });
+                }
+            }
             UiCommand::OpenWorkflowRun {
                 instance_id,
                 session_id,
@@ -7131,6 +7303,18 @@ impl Driver {
             }
             mix(s, &mut sig);
         }
+        // The third ladder's map: a fresh conversationRuns answer must
+        // repaint the active rows it just made actionable. Same
+        // XOR-commutative fold as the launch joins (HashMap order is
+        // arbitrary).
+        {
+            mix(self.workflows.session_runs.len() as u64, &mut sig);
+            let mut s: u64 = 0;
+            for (run_id, sid) in &self.workflows.session_runs {
+                s ^= fold_str(run_id) ^ fold_str(sid).rotate_left(8);
+            }
+            mix(s, &mut sig);
+        }
         if let Some(d) = &wf.detail {
             mix(d.seq, &mut sig);
             mix(fold_str(&d.name), &mut sig);
@@ -7457,6 +7641,7 @@ impl Driver {
                 busy: self.workflows.busy,
                 action_instance: self.active_instance_id(),
                 launches: self.workflow_launch_joins(),
+                session_runs: self.workflows.session_runs.clone(),
             }),
             workflow_gate: self.workflows.gate.clone(),
             workflow_gate_busy: self.workflows.gate_busy,
@@ -8168,7 +8353,7 @@ type _TabViewMap = HashMap<u64, ()>;
 mod tests {
     // Plain #[test] with explicit imports — this file has no kit glob, but
     // the sibling test modules' explicit-import shape is the convention.
-    use super::{max_run_sequence, merge_run_events, pick_target};
+    use super::{fold_session_runs, max_run_sequence, merge_run_events, pick_target};
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
     use protocol::workflow::WorkflowRunEvent;
 
@@ -8292,5 +8477,36 @@ mod tests {
     #[test]
     fn no_instances_yields_no_target() {
         assert!(pick_target(&[]).is_none());
+    }
+
+    /// The third ladder's map fold (TS `new Map(conv.runs.map(...))`): a
+    /// REPLACE keyed by run id, never a merge — a run that left the session
+    /// must leave the map too, or its stale entry could pin a phantom
+    /// session onto a later row.
+    #[test]
+    fn session_runs_map_replaces_not_merges() {
+        use protocol::workflow::ConversationRunSummary;
+        let summary = |run_id: &str| ConversationRunSummary {
+            run_id: run_id.to_string(),
+            tool_call_id: None,
+            label: None,
+            updated_at: None,
+            status: "running".to_string(),
+            stop_reason: None,
+            resumed_from: None,
+            superseded_by: None,
+            failure_code: None,
+            failure_message: None,
+            resumable: false,
+        };
+        let first = fold_session_runs(&[summary("a"), summary("b")], "s1");
+        assert_eq!(first.get("a").map(String::as_str), Some("s1"));
+        assert_eq!(first.get("b").map(String::as_str), Some("s1"));
+        let second = fold_session_runs(&[summary("b")], "s1");
+        assert_eq!(
+            second.len(),
+            1,
+            "a run that left the session must leave the map"
+        );
     }
 }
