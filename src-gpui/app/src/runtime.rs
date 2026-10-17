@@ -2461,20 +2461,23 @@ impl Driver {
                     self.phase = Phase::Connected;
                 }
                 // M1 parity auto-attach: while NO tab has ever existed, the
-                // most recently updated session (any instance) opens one; a
-                // session-less instance gets a fresh `session/new`.
+                // most recently updated session (any instance) opens one.
+                // Instances without sessions never mint a tab — the landing
+                // note shows instead (the TS picker's empty state).
                 if self.tabs.is_empty() && !self.ever_had_tab {
-                    if let Some((instance_id, attach, cwd)) = pick_target(&self.instances) {
+                    if let Some((instance_id, session_id, cwd)) = pick_target(&self.instances) {
                         traceln!(
                             "[driver] auto-tab on {} (attach {})",
                             instance_id,
-                            attach.as_deref().unwrap_or("<session/new>")
+                            session_id
                         );
-                        self.open_tab(instance_id, attach, cwd);
+                        self.open_tab(instance_id, Some(session_id), cwd);
                     } else {
-                        self.discovery_note =
-                            Some("no bridge instance on the hub yet — start a session from the \
-                                  editor or pick one from history below".to_string());
+                        self.discovery_note = Some(
+                            "no open session on the hub yet — start one from the editor, the \
+                              + button, or pick one from history below"
+                                .to_string(),
+                        );
                     }
                 }
             }
@@ -7839,10 +7842,11 @@ fn quota_cards_signature(cards: &ResetCardInventory) -> u64 {
 // ---------------------------------------------------------------------------
 
 /// The M1 attach rule, mirroring the supervisor's auto-attach: the most
-/// recently updated session across instances; a session-less instance gets a
-/// fresh `session/new` in its workspace. Returns
-/// `(instance id, attach session id, cwd)`.
-fn pick_target(instances: &[HubInstance]) -> Option<(String, Option<String>, String)> {
+/// recently updated session across instances. Attach ONLY — an instance
+/// without sessions must not mint a fresh `session/new` on cold start (the
+/// TS picker's empty state; the user starts one via + or history).
+/// Returns `(instance id, session id, cwd)`.
+fn pick_target(instances: &[HubInstance]) -> Option<(String, String, String)> {
     let mut best: Option<(&HubInstance, u64, String)> = None;
     for inst in instances {
         for sess in &inst.sessions {
@@ -7856,12 +7860,7 @@ fn pick_target(instances: &[HubInstance]) -> Option<(String, Option<String>, Str
             }
         }
     }
-    if let Some((inst, _, sid)) = best {
-        return Some((inst.id.clone(), Some(sid), workspace_or_root(inst)));
-    }
-    instances
-        .first()
-        .map(|inst| (inst.id.clone(), None, workspace_or_root(inst)))
+    best.map(|(inst, _, sid)| (inst.id.clone(), sid, workspace_or_root(inst)))
 }
 
 fn workspace_or_root(inst: &HubInstance) -> String {
@@ -8245,7 +8244,7 @@ mod tests {
         ];
         let (inst, attach, cwd) = pick_target(&instances).expect("a target exists");
         assert_eq!(inst, "inst-new");
-        assert_eq!(attach.as_deref(), Some("s_latest"));
+        assert_eq!(attach, "s_latest");
         assert_eq!(cwd, "/w/second");
     }
 
@@ -8259,32 +8258,31 @@ mod tests {
             vec![session("s_undated", None), session("s_dated", Some(10))],
         )];
         let (_, attach, _) = pick_target(&instances).expect("a target exists");
-        assert_eq!(attach.as_deref(), Some("s_dated"));
+        assert_eq!(attach, "s_dated");
     }
 
-    /// The "no history" half of the H2 semantics: with no sessions anywhere
-    /// the rule falls back to a fresh `session/new` on the first instance
-    /// (the supervisor's M1 behavior — the desktop's "keep the current
-    /// state" is this fresh-tab path, not an error).
+    /// The "no history" half: instances whose sessions are all gone do NOT
+    /// mint a fresh `session/new` — the driver keeps its landing note (the
+    /// TS picker's empty state; the user decides what to open).
     #[test]
-    fn sessionless_instances_fall_back_to_fresh_session() {
+    fn sessionless_instances_yield_no_target() {
         let instances = vec![
             instance("inst-a", Some("/w/a"), vec![]),
             instance("inst-b", Some("/w/b"), vec![]),
         ];
-        let (inst, attach, cwd) = pick_target(&instances).expect("a target exists");
-        assert_eq!(inst, "inst-a");
-        assert_eq!(attach, None, "no history means session/new, no attach");
-        assert_eq!(cwd, "/w/a");
+        assert!(
+            pick_target(&instances).is_none(),
+            "no sessions anywhere means the empty state, not session/new"
+        );
     }
 
-    /// An instance with no workspace falls back to "/" for the fresh
-    /// session's cwd (session/load's cwd is backend-authoritative anyway).
+    /// An instance with no workspace falls back to "/" for the attach cwd
+    /// (session/load's cwd is backend-authoritative anyway).
     #[test]
     fn missing_workspace_falls_back_to_root() {
-        let instances = vec![instance("inst-a", None, vec![])];
+        let instances = vec![instance("inst-a", None, vec![session("s_a", Some(1))])];
         let (_, attach, cwd) = pick_target(&instances).expect("a target exists");
-        assert_eq!(attach, None);
+        assert_eq!(attach, "s_a");
         assert_eq!(cwd, "/");
     }
 
