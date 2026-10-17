@@ -76,9 +76,15 @@ use protocol::toast::{Toast, ToastState};
 use protocol::ws::{TungsteniteWsFactory, WsFactory};
 use protocol::workflow::{
     AmendRunSettingsBody, AmendRunSettingsResponse, ConversationRunSummary, ConversationRunsResponse,
-    DismissRunResponse, WorkflowCreatePromptResponse, WorkflowDetailResponse,
-    WorkflowOverviewResponse, WorkflowRunEvent, WorkflowRunEventsResponse, WorkflowRunRow,
-    WorkflowRunsHistoryResponse, WorkflowScope, WorkflowStartResponse,
+    DismissRunResponse, RunArtifactsResponse, WorkflowArtifact, WorkflowArtifactItemsResponse,
+    WorkflowArtifactReadResponse, WorkflowCreatePromptResponse, WorkflowDetailResponse,
+    WorkflowNodeResultResponse, WorkflowOverviewResponse, WorkflowRunEvent,
+    WorkflowRunEventsResponse, WorkflowRunRow, WorkflowRunsHistoryResponse, WorkflowScope,
+    WorkflowStartResponse, WorkflowWorkspaceNode, WorkflowWorkspaceResponse,
+};
+use protocol::workflow_run_detail::{
+    artifact_is_preset, binary_verdict, decode_base64, latest_version, map_artifact_items,
+    merge_artifact_items, ArtifactDataItem, READ_CHUNK,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -453,6 +459,27 @@ pub enum UiCommand {
     /// The run page's "Load more" — the next journal page past the highest
     /// sequence held (`afterSequence` cursor, `hasMore` gate).
     WorkflowRunLoadMore,
+    /// The run page's Retry (TS: the explicit button when the first pull
+    /// failed and the run is settled) — the head read again.
+    WorkflowRunRetryEvents,
+    /// The run page's tab strip (TS `setTab`, batch L): the artifacts and
+    /// workspace tabs load lazily on their first open — one fetch per tab.
+    WorkflowRunSelectTab { tab: WorkflowRunTab },
+    /// A workspace row (TS `loadNode`): expand its result (one GET on the
+    /// node's site/ordinal), or collapse it when it is the open one.
+    WorkflowRunToggleNode {
+        key: String,
+        site_id: String,
+        ordinal: u64,
+    },
+    /// An artifact row (TS `setOpenArtifact`): open the viewer and start its
+    /// first read (text chunk or data page, by kind).
+    WorkflowRunOpenArtifact { artifact_id: String },
+    /// The viewer's back.
+    WorkflowRunCloseArtifact,
+    /// The viewer's "Load more": the next text chunk (`nextOffset`) or the
+    /// next data page (`afterSequence`), by kind.
+    WorkflowRunArtifactLoadMore,
     /// The run page's back gesture.
     CloseWorkflowRun,
     /// POST …/settings (TS `amendWorkflowRun`): three-state body; a supersede
@@ -962,8 +989,49 @@ pub struct WorkflowDetailView {
     pub summaries: HashMap<String, Vec<ConversationRunSummary>>,
 }
 
-/// One open run sub-page (TS `WorkflowRunDetail`, events tab only — the
-/// artifacts/workspace tabs stay out of batch J).
+/// The run page's three tabs (TS `Tab`): the journal is the default view,
+/// artifacts and the workspace only cost a request once opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRunTab {
+    Events,
+    Artifacts,
+    Workspace,
+}
+
+/// One expanded workspace node's result (TS `nodeResult`): `body` is the
+/// error when the backend sent one, else the result.
+#[derive(Debug, Clone)]
+pub struct WorkflowNodeResultView {
+    pub key: String,
+    pub status: Option<String>,
+    pub body: Value,
+    pub truncated: bool,
+}
+
+/// The open artifact viewer (TS `ArtifactViewer` locals). Text kinds
+/// (markdown / file) stream through `text`; the preset kinds (board / table
+/// / metrics / chart) through `items`; anything else renders its metadata.
+#[derive(Debug, Clone)]
+pub struct WorkflowArtifactViewerView {
+    pub artifact: WorkflowArtifact,
+    pub busy: bool,
+    /// The lossy UTF-8 decode of every byte held so far (shared so the
+    /// snapshot clone stays cheap); `None` until the first chunk lands, or
+    /// after an undecodable chunk.
+    pub text: Option<Arc<str>>,
+    /// The binary verdict (>1% U+FFFD once the chunks stop, or an
+    /// undecodable base64 payload).
+    pub binary: bool,
+    pub total_bytes: Option<u64>,
+    /// `Some` = another chunk follows (the "Load more" gate).
+    pub next_offset: Option<u64>,
+    /// The preset kinds' paginated inventory; `None` until the first page.
+    pub items: Option<Vec<ArtifactDataItem>>,
+    pub items_has_more: bool,
+}
+
+/// One open run sub-page (TS `WorkflowRunDetail`): the journal events
+/// (default tab), the artifacts, and the workspace nodes.
 #[derive(Debug, Clone)]
 pub struct WorkflowRunView {
     pub instance_id: String,
@@ -982,6 +1050,19 @@ pub struct WorkflowRunView {
     /// The summary says the run is unsettled (or is still unknown).
     pub active: bool,
     pub amend_busy: bool,
+    pub tab: WorkflowRunTab,
+    /// `None` = never landed (loading or failed — the empty state must not
+    /// dress a failure up as "no artifacts produced").
+    pub artifacts: Option<Vec<WorkflowArtifact>>,
+    pub artifacts_busy: bool,
+    pub nodes: Option<Vec<WorkflowWorkspaceNode>>,
+    pub nodes_busy: bool,
+    /// The one expanded workspace row.
+    pub node_result: Option<WorkflowNodeResultView>,
+    /// The row key whose result read is in flight.
+    pub node_busy: Option<String>,
+    /// The open artifact viewer (replaces the tabs while open).
+    pub artifact: Option<WorkflowArtifactViewerView>,
 }
 
 /// The whole workbench state the view renders.
@@ -1338,6 +1419,39 @@ enum LoopEvent {
     },
     /// POST …/settings (the amendment) settled.
     WorkflowRunAmended(Result<AmendRunSettingsResponse, SettingsApiError>),
+    /// GET …/artifacts settled for the open run (the artifacts tab's lazy
+    /// read, batch L).
+    WorkflowRunArtifacts {
+        seq: u64,
+        result: Result<RunArtifactsResponse, SettingsApiError>,
+    },
+    /// GET …/workspace settled for the open run (the workspace tab's lazy
+    /// read).
+    WorkflowRunWorkspace {
+        seq: u64,
+        result: Result<WorkflowWorkspaceResponse, SettingsApiError>,
+    },
+    /// GET …/nodes/{site}/{ordinal} settled: one expanded workspace row.
+    WorkflowRunNodeResult {
+        seq: u64,
+        key: String,
+        result: Result<WorkflowNodeResultResponse, SettingsApiError>,
+    },
+    /// GET …/artifacts/{id}/read settled: one text chunk of the open
+    /// viewer (`seq` is the VIEWER's — a late chunk for a closed or
+    /// re-opened viewer must not land).
+    WorkflowRunArtifactChunk {
+        seq: u64,
+        append: bool,
+        result: Result<WorkflowArtifactReadResponse, SettingsApiError>,
+    },
+    /// GET …/artifacts/{id}/data settled: one page of the open viewer's
+    /// inventory (same viewer-seq contract).
+    WorkflowRunArtifactItems {
+        seq: u64,
+        initial: bool,
+        result: Result<WorkflowArtifactItemsResponse, SettingsApiError>,
+    },
 }
 
 /// `AcpHandlers` forwarding into the driver loop's channel, tagged with the
@@ -1867,10 +1981,12 @@ struct WorkflowDetailPanel {
     busy: bool,
 }
 
-/// One run sub-page's driver state (TS `WorkflowRunDetail` locals, events
-/// tab only). The 3s poll appends via the `afterSequence` cursor; `fail`
-/// counts consecutive failed summary reads (two retire the poll →
-/// `session_dead`, the read-only degradation).
+/// One run sub-page's driver state (TS `WorkflowRunDetail` locals). The 3s
+/// poll appends via the `afterSequence` cursor; `fail` counts consecutive
+/// failed summary reads (two retire the poll → `session_dead`, the
+/// read-only degradation). The artifacts/workspace tabs hold their lazy
+/// reads; the open artifact viewer and the one expanded node ride along —
+/// a supersede re-point resets all of it (the TS `key={runId}` remount).
 #[derive(Default)]
 struct WorkflowRunPanel {
     seq: u64,
@@ -1886,6 +2002,70 @@ struct WorkflowRunPanel {
     fail: u32,
     session_dead: bool,
     amend_busy: bool,
+    tab: WorkflowRunTab,
+    artifacts: Option<Vec<WorkflowArtifact>>,
+    artifacts_busy: bool,
+    nodes: Option<Vec<WorkflowWorkspaceNode>>,
+    nodes_busy: bool,
+    node_result: Option<WorkflowNodeResultView>,
+    node_busy: Option<String>,
+    artifact: Option<WorkflowArtifactViewer>,
+}
+
+impl Default for WorkflowRunTab {
+    fn default() -> Self {
+        WorkflowRunTab::Events
+    }
+}
+
+/// The open artifact viewer's driver state (TS `ArtifactViewer` locals).
+/// `seq` is the viewer's own read guard (bumped per open). Text kinds keep
+/// the RAW bytes across chunks and re-decode the whole buffer (the TS
+/// streaming TextDecoder's guarantee: a chunk boundary splitting a
+/// multi-byte character never becomes U+FFFD).
+struct WorkflowArtifactViewer {
+    seq: u64,
+    artifact: WorkflowArtifact,
+    busy: bool,
+    bytes: Vec<u8>,
+    text: Option<Arc<str>>,
+    binary: bool,
+    total_bytes: Option<u64>,
+    next_offset: Option<u64>,
+    items: Option<Vec<ArtifactDataItem>>,
+    items_has_more: bool,
+    /// The last item sequence received (the `afterSequence` cursor).
+    items_cursor: Option<u64>,
+}
+
+impl WorkflowArtifactViewer {
+    fn view(&self) -> WorkflowArtifactViewerView {
+        WorkflowArtifactViewerView {
+            artifact: self.artifact.clone(),
+            busy: self.busy,
+            text: self.text.clone(),
+            binary: self.binary,
+            total_bytes: self.total_bytes,
+            next_offset: self.next_offset,
+            items: self.items.clone(),
+            items_has_more: self.items_has_more,
+        }
+    }
+}
+
+impl WorkflowRunPanel {
+    /// The supersede re-point / fresh-open reset of everything the TS
+    /// `key={runId}` remount drops: tabs, lazy payloads, the viewer.
+    fn reset_tabs(&mut self) {
+        self.tab = WorkflowRunTab::Events;
+        self.artifacts = None;
+        self.artifacts_busy = false;
+        self.nodes = None;
+        self.nodes_busy = false;
+        self.node_result = None;
+        self.node_busy = None;
+        self.artifact = None;
+    }
 }
 
 impl WorkflowsPanel {
@@ -1911,6 +2091,20 @@ impl WorkflowsPanel {
 /// journal (TS `maxSequence`).
 fn max_run_sequence(events: &[WorkflowRunEvent]) -> u64 {
     events.iter().map(|e| e.sequence).max().unwrap_or(0)
+}
+
+/// The journal append (TS `fetchEvents`'s non-initial branch): an append
+/// page is sequence-filtered REGARDLESS — a cursor the server could not
+/// honor answers with the FULL journal, which must never re-append onto the
+/// list. Keeps only incoming sequences past the highest one held.
+fn merge_run_events(
+    held: Vec<WorkflowRunEvent>,
+    incoming: Vec<WorkflowRunEvent>,
+) -> Vec<WorkflowRunEvent> {
+    let floor = max_run_sequence(&held);
+    let mut merged = held;
+    merged.extend(incoming.into_iter().filter(|e| e.sequence > floor));
+    merged
 }
 
 struct Driver {
@@ -3417,7 +3611,11 @@ impl Driver {
         } else {
             Some(max_run_sequence(r.events.as_deref().unwrap_or(&[])))
         };
-        self.workflows.run.as_mut().unwrap().events_busy = !initial;
+        // One journal read at a time (TS `eventsInFlight`): the tick and the
+        // "Load more" both gate on this flag, so a manual append cannot race
+        // the 3s poll into reading the SAME cursor twice. The flag clears
+        // when this read lands (success or failure).
+        self.workflows.run.as_mut().unwrap().events_busy = true;
         let hub = self.settings_client();
         let hub2 = self.settings_client();
         let tx = self.loop_tx.clone();
@@ -3484,10 +3682,7 @@ impl Driver {
         if initial {
             r.events = Some(res.events);
         } else if let Some(held) = r.events.take() {
-            let floor = max_run_sequence(&held);
-            let mut merged = held;
-            merged.extend(res.events.into_iter().filter(|e| e.sequence > floor));
-            r.events = Some(merged);
+            r.events = Some(merge_run_events(held, res.events));
         }
     }
 
@@ -3508,10 +3703,12 @@ impl Driver {
                     if repointed {
                         // The new run's journal is a fresh sequence space —
                         // the old cursor must not survive (the TS
-                        // key={runId} remount).
+                        // key={runId} remount), and neither do the lazy
+                        // tabs, the open viewer, or the expanded node.
                         r.events = None;
                         r.has_more = false;
                         r.summary = None;
+                        r.reset_tabs();
                     }
                 }
                 if repointed {
@@ -3533,6 +3730,379 @@ impl Driver {
                 }
                 self.config_notice = Some(format!("amend run settings failed: {e}"));
             }
+        }
+    }
+
+    // ---- the run page's lazy tabs + viewer (batch L) ----
+
+    /// Whether the hub is reachable for a run-page read (the same phase
+    /// gate the journal reads use).
+    fn workflow_reads_allowed(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        )
+    }
+
+    /// The artifacts tab's lazy read (TS `useEffect([tab])`): one fetch on
+    /// first open; a failed read leaves `None` so re-opening retries.
+    fn spawn_workflow_run_artifacts(&mut self) {
+        if !self.workflow_reads_allowed() {
+            return;
+        }
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.artifacts.is_some() || r.artifacts_busy {
+            return;
+        }
+        r.artifacts_busy = true;
+        let (seq, instance_id, session_id, run_id) =
+            (r.seq, r.instance_id.clone(), r.session_id.clone(), r.run_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.run_artifacts(&instance_id, &session_id, &run_id).await;
+            let _ = tx.send(LoopEvent::WorkflowRunArtifacts { seq, result });
+        });
+    }
+
+    /// The workspace tab's lazy read (same contract as the artifacts).
+    fn spawn_workflow_run_workspace(&mut self) {
+        if !self.workflow_reads_allowed() {
+            return;
+        }
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.nodes.is_some() || r.nodes_busy {
+            return;
+        }
+        r.nodes_busy = true;
+        let (seq, instance_id, session_id, run_id) =
+            (r.seq, r.instance_id.clone(), r.session_id.clone(), r.run_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.run_workspace(&instance_id, &session_id, &run_id).await;
+            let _ = tx.send(LoopEvent::WorkflowRunWorkspace { seq, result });
+        });
+    }
+
+    fn on_workflow_run_artifacts(
+        &mut self,
+        seq: u64,
+        result: Result<RunArtifactsResponse, SettingsApiError>,
+    ) {
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.seq != seq {
+            return;
+        }
+        r.artifacts_busy = false;
+        match result {
+            Ok(res) => {
+                // The route hands raw values; one that does not even carry
+                // an id cannot be listed (TS would render an idless row —
+                // nothing to open). Permissive on everything else.
+                r.artifacts = Some(
+                    res.artifacts
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter_map(|v| serde_json::from_value::<WorkflowArtifact>(v).ok())
+                        .collect(),
+                );
+            }
+            Err(e) => {
+                self.config_notice = Some(format!("load artifacts failed: {e}"));
+            }
+        }
+    }
+
+    fn on_workflow_run_workspace(
+        &mut self,
+        seq: u64,
+        result: Result<WorkflowWorkspaceResponse, SettingsApiError>,
+    ) {
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.seq != seq {
+            return;
+        }
+        r.nodes_busy = false;
+        match result {
+            Ok(res) => r.nodes = Some(res.nodes),
+            Err(e) => {
+                self.config_notice = Some(format!("load workspace failed: {e}"));
+            }
+        }
+    }
+
+    /// One workspace row's result read (TS `loadNode`): the LATEST asked
+    /// row wins — `node_busy` names it, a late answer for another row is
+    /// dropped.
+    fn spawn_workflow_run_node(&mut self, key: String, site_id: String, ordinal: u64) {
+        if !self.workflow_reads_allowed() {
+            return;
+        }
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        r.node_busy = Some(key.clone());
+        let (seq, instance_id, session_id, run_id) =
+            (r.seq, r.instance_id.clone(), r.session_id.clone(), r.run_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub
+                .run_node_result(&instance_id, &session_id, &run_id, &site_id, ordinal)
+                .await;
+            let _ = tx.send(LoopEvent::WorkflowRunNodeResult { seq, key, result });
+        });
+    }
+
+    fn on_workflow_run_node_result(
+        &mut self,
+        seq: u64,
+        key: String,
+        result: Result<WorkflowNodeResultResponse, SettingsApiError>,
+    ) {
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        if r.seq != seq || r.node_busy.as_deref() != Some(key.as_str()) {
+            return;
+        }
+        r.node_busy = None;
+        match result {
+            Ok(res) => {
+                // TS: the error wins over the result when the backend sent
+                // one; a missing both renders as an empty scalar.
+                let body = res
+                    .error
+                    .filter(|e| !e.is_null())
+                    .or(res.result)
+                    .unwrap_or(Value::Null);
+                r.node_result = Some(WorkflowNodeResultView {
+                    key,
+                    status: res.status,
+                    body,
+                    truncated: res.truncated.unwrap_or(false),
+                });
+            }
+            Err(e) => {
+                self.config_notice = Some(format!("load node result failed: {e}"));
+            }
+        }
+    }
+
+    /// Opens the viewer for one listed artifact (TS `setOpenArtifact`) and
+    /// starts its first read by kind: markdown/file stream text chunks,
+    /// the four preset kinds page their inventory, anything else has
+    /// nothing to fetch (its metadata card renders from the row).
+    fn open_workflow_artifact(&mut self, artifact_id: &str) {
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        let Some(artifact) = r
+            .artifacts
+            .as_ref()
+            .and_then(|list| list.iter().find(|a| a.id == artifact_id))
+            .cloned()
+        else {
+            return;
+        };
+        self.workflows.workflow_seq += 1;
+        let kind = artifact.kind.clone();
+        r.artifact = Some(WorkflowArtifactViewer {
+            seq: self.workflows.workflow_seq,
+            artifact,
+            busy: false,
+            bytes: Vec::new(),
+            text: None,
+            binary: false,
+            total_bytes: None,
+            next_offset: None,
+            items: None,
+            items_has_more: false,
+            items_cursor: None,
+        });
+        if kind == "markdown" || kind == "file" {
+            self.spawn_workflow_artifact_chunk(0, false);
+        } else if artifact_is_preset(&kind) {
+            self.spawn_workflow_artifact_items(true);
+        }
+    }
+
+    /// One text chunk of the open viewer (TS `loadChunk`): `READ_CHUNK`
+    /// bytes from `offset` of the artifact's latest version.
+    fn spawn_workflow_artifact_chunk(&mut self, offset: u64, append: bool) {
+        if !self.workflow_reads_allowed() {
+            return;
+        }
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        let Some(v) = &mut r.artifact else {
+            return;
+        };
+        if v.busy {
+            return;
+        }
+        v.busy = true;
+        let (seq, artifact_id, version) = (v.seq, v.artifact.id.clone(), latest_version(&v.artifact));
+        let (instance_id, session_id, run_id) =
+            (r.instance_id.clone(), r.session_id.clone(), r.run_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub
+                .run_artifact_read(
+                    &instance_id,
+                    &session_id,
+                    &run_id,
+                    &artifact_id,
+                    version,
+                    offset,
+                    Some(READ_CHUNK),
+                )
+                .await;
+            let _ = tx.send(LoopEvent::WorkflowRunArtifactChunk { seq, append, result });
+        });
+    }
+
+    fn on_workflow_run_artifact_chunk(
+        &mut self,
+        seq: u64,
+        append: bool,
+        result: Result<WorkflowArtifactReadResponse, SettingsApiError>,
+    ) {
+        let Some(v) = self
+            .workflows
+            .run
+            .as_mut()
+            .and_then(|r| r.artifact.as_mut())
+            .filter(|v| v.seq == seq)
+        else {
+            return;
+        };
+        v.busy = false;
+        let res = match result {
+            Ok(res) => res,
+            Err(e) => {
+                self.config_notice = Some(format!("read artifact failed: {e}"));
+                return;
+            }
+        };
+        v.total_bytes = res.total_bytes;
+        v.next_offset = res.next_offset;
+        match decode_base64(&res.data_base64) {
+            Some(chunk) => {
+                if !append {
+                    v.bytes.clear();
+                }
+                v.bytes.extend_from_slice(&chunk);
+                let text = String::from_utf8_lossy(&v.bytes).into_owned();
+                // The verdict reads the WHOLE text once the chunks stop
+                // coming (TS: the effect on `nextOffset === null`); it
+                // never flips back.
+                if v.next_offset.is_none() && binary_verdict(&text) {
+                    v.binary = true;
+                }
+                v.text = Some(Arc::from(text));
+            }
+            None => {
+                // TS `atob` threw: the payload is not text at all.
+                v.binary = true;
+                v.text = None;
+                v.bytes.clear();
+            }
+        }
+    }
+
+    /// One inventory page of the open viewer (TS `loadData`): the head, or
+    /// the page past the last sequence held.
+    fn spawn_workflow_artifact_items(&mut self, initial: bool) {
+        if !self.workflow_reads_allowed() {
+            return;
+        }
+        let Some(r) = &mut self.workflows.run else {
+            return;
+        };
+        let Some(v) = &mut r.artifact else {
+            return;
+        };
+        if v.busy {
+            return;
+        }
+        v.busy = true;
+        let after = if initial { None } else { v.items_cursor };
+        let (seq, artifact_id) = (v.seq, v.artifact.id.clone());
+        let (instance_id, session_id, run_id) =
+            (r.instance_id.clone(), r.session_id.clone(), r.run_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub
+                .run_artifact_data(&instance_id, &session_id, &run_id, &artifact_id, after, None)
+                .await;
+            let _ = tx.send(LoopEvent::WorkflowRunArtifactItems { seq, initial, result });
+        });
+    }
+
+    fn on_workflow_run_artifact_items(
+        &mut self,
+        seq: u64,
+        initial: bool,
+        result: Result<WorkflowArtifactItemsResponse, SettingsApiError>,
+    ) {
+        let Some(v) = self
+            .workflows
+            .run
+            .as_mut()
+            .and_then(|r| r.artifact.as_mut())
+            .filter(|v| v.seq == seq)
+        else {
+            return;
+        };
+        v.busy = false;
+        let res = match result {
+            Ok(res) => res,
+            Err(e) => {
+                self.config_notice = Some(format!("load artifact items failed: {e}"));
+                return;
+            }
+        };
+        if let Some(last) = res.items.last().and_then(|it| it.sequence) {
+            v.items_cursor = Some(last);
+        }
+        let mapped = map_artifact_items(res.items);
+        v.items = Some(match v.items.take() {
+            // Same defensive dedupe as the journal poll: an unadvancing
+            // cursor answers with the same page — keep only new sequences.
+            Some(held) if !initial => merge_artifact_items(held, mapped),
+            _ => mapped,
+        });
+        v.items_has_more = res.has_more.unwrap_or(false);
+    }
+
+    /// The viewer's "Load more": the next text chunk or the next page.
+    fn workflow_artifact_load_more(&mut self) {
+        let Some(v) = self.workflows.run.as_ref().and_then(|r| r.artifact.as_ref()) else {
+            return;
+        };
+        if v.busy {
+            return;
+        }
+        let kind = v.artifact.kind.as_str();
+        if kind == "markdown" || kind == "file" {
+            if let Some(offset) = v.next_offset {
+                self.spawn_workflow_artifact_chunk(offset, true);
+            }
+        } else if artifact_is_preset(kind) && v.items_has_more {
+            self.spawn_workflow_artifact_items(false);
         }
     }
 
@@ -4724,6 +5294,21 @@ impl Driver {
                 self.on_workflow_run_events(seq, initial, result);
             }
             LoopEvent::WorkflowRunAmended(result) => self.on_workflow_run_amended(result),
+            LoopEvent::WorkflowRunArtifacts { seq, result } => {
+                self.on_workflow_run_artifacts(seq, result);
+            }
+            LoopEvent::WorkflowRunWorkspace { seq, result } => {
+                self.on_workflow_run_workspace(seq, result);
+            }
+            LoopEvent::WorkflowRunNodeResult { seq, key, result } => {
+                self.on_workflow_run_node_result(seq, key, result);
+            }
+            LoopEvent::WorkflowRunArtifactChunk { seq, append, result } => {
+                self.on_workflow_run_artifact_chunk(seq, append, result);
+            }
+            LoopEvent::WorkflowRunArtifactItems { seq, initial, result } => {
+                self.on_workflow_run_artifact_items(seq, initial, result);
+            }
         }
     }
 
@@ -5527,14 +6112,10 @@ impl Driver {
                     session_id,
                     run_id,
                     name,
-                    summary: None,
-                    events: None,
-                    events_busy: false,
-                    has_more: false,
-                    next_poll_at: 0,
-                    fail: 0,
-                    session_dead: false,
-                    amend_busy: false,
+                    // The first poll tick comes one interval after the mount
+                    // (TS setInterval) — the open's own head read covers now.
+                    next_poll_at: self.clock.now_ms() + WORKFLOW_RUN_POLL_MS,
+                    ..WorkflowRunPanel::default()
                 });
                 self.spawn_workflow_run_reads(true);
             }
@@ -5548,6 +6129,55 @@ impl Driver {
                     self.spawn_workflow_run_reads(false);
                 }
             }
+            UiCommand::WorkflowRunRetryEvents => {
+                if self
+                    .workflows
+                    .run
+                    .as_ref()
+                    .is_some_and(|r| r.events.is_none() && !r.events_busy)
+                {
+                    self.spawn_workflow_run_reads(true);
+                }
+            }
+            UiCommand::WorkflowRunSelectTab { tab } => {
+                if let Some(r) = self.workflows.run.as_mut() {
+                    r.tab = tab;
+                }
+                match tab {
+                    WorkflowRunTab::Events => {}
+                    WorkflowRunTab::Artifacts => self.spawn_workflow_run_artifacts(),
+                    WorkflowRunTab::Workspace => self.spawn_workflow_run_workspace(),
+                }
+            }
+            UiCommand::WorkflowRunToggleNode {
+                key,
+                site_id,
+                ordinal,
+            } => {
+                let open = self
+                    .workflows
+                    .run
+                    .as_ref()
+                    .and_then(|r| r.node_result.as_ref())
+                    .is_some_and(|n| n.key == key);
+                if open {
+                    // Tap again collapses (TS `loadNode`'s first branch).
+                    if let Some(r) = self.workflows.run.as_mut() {
+                        r.node_result = None;
+                    }
+                } else {
+                    self.spawn_workflow_run_node(key, site_id, ordinal);
+                }
+            }
+            UiCommand::WorkflowRunOpenArtifact { artifact_id } => {
+                self.open_workflow_artifact(&artifact_id);
+            }
+            UiCommand::WorkflowRunCloseArtifact => {
+                if let Some(r) = self.workflows.run.as_mut() {
+                    r.artifact = None;
+                }
+            }
+            UiCommand::WorkflowRunArtifactLoadMore => self.workflow_artifact_load_more(),
             UiCommand::CloseWorkflowRun => {
                 self.workflows.run = None;
                 self.workflows.workflow_seq += 1;
@@ -6104,6 +6734,78 @@ impl Driver {
                     .unwrap_or(u64::MAX),
                 &mut sig,
             );
+            // The lazy tabs + viewer (batch L): every painted field.
+            mix(r.tab as u64, &mut sig);
+            mix(r.artifacts_busy as u64, &mut sig);
+            mix(
+                r.artifacts
+                    .as_ref()
+                    .map(|list| {
+                        let mut s: u64 = list.len() as u64;
+                        for a in list {
+                            s = s.wrapping_mul(31).wrapping_add(fold_str(&a.id));
+                            s = s.wrapping_mul(31).wrapping_add(
+                                a.versions.as_ref().map(|v| v.len() as u64).unwrap_or(0),
+                            );
+                            s = s.wrapping_mul(31).wrapping_add(a.item_count.unwrap_or(0));
+                        }
+                        s
+                    })
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(r.nodes_busy as u64, &mut sig);
+            mix(
+                r.nodes
+                    .as_ref()
+                    .map(|list| {
+                        let mut s: u64 = list.len() as u64;
+                        for n in list {
+                            s = s.wrapping_mul(31).wrapping_add(fold_str(
+                                n.status.as_deref().unwrap_or(""),
+                            ));
+                            s = s.wrapping_mul(31).wrapping_add(n.updated_at.unwrap_or(0));
+                        }
+                        s
+                    })
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(
+                r.node_busy.as_deref().map(fold_str).unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            mix(
+                r.node_result
+                    .as_ref()
+                    .map(|n| fold_str(&n.key) ^ fold_str(&n.body.to_string()).rotate_left(7))
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
+            if let Some(v) = &r.artifact {
+                mix(v.seq, &mut sig);
+                mix(v.busy as u64, &mut sig);
+                mix(v.binary as u64, &mut sig);
+                mix(v.text.as_ref().map(|t| t.len() as u64).unwrap_or(u64::MAX), &mut sig);
+                mix(v.next_offset.unwrap_or(u64::MAX), &mut sig);
+                mix(v.total_bytes.unwrap_or(u64::MAX), &mut sig);
+                mix(v.items_has_more as u64, &mut sig);
+                mix(
+                    v.items
+                        .as_ref()
+                        .map(|items| {
+                            let mut s: u64 = items.len() as u64;
+                            for it in items {
+                                s = s.wrapping_mul(31).wrapping_add(it.sequence);
+                            }
+                            s
+                        })
+                        .unwrap_or(u64::MAX),
+                    &mut sig,
+                );
+            } else {
+                mix(u64::MAX - 1, &mut sig);
+            }
         }
         sig
     }
@@ -6281,6 +6983,14 @@ impl Driver {
                         session_dead: r.session_dead,
                         active,
                         amend_busy: r.amend_busy,
+                        tab: r.tab,
+                        artifacts: r.artifacts.clone(),
+                        artifacts_busy: r.artifacts_busy,
+                        nodes: r.nodes.clone(),
+                        nodes_busy: r.nodes_busy,
+                        node_result: r.node_result.clone(),
+                        node_busy: r.node_busy.clone(),
+                        artifact: r.artifact.as_ref().map(WorkflowArtifactViewer::view),
                     }
                 }),
                 busy: self.workflows.busy,
@@ -7000,8 +7710,37 @@ type _TabViewMap = HashMap<u64, ()>;
 mod tests {
     // Plain #[test] with explicit imports — this file has no kit glob, but
     // the sibling test modules' explicit-import shape is the convention.
-    use super::pick_target;
+    use super::{max_run_sequence, merge_run_events, pick_target};
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
+    use protocol::workflow::WorkflowRunEvent;
+
+    fn run_event(sequence: u64) -> WorkflowRunEvent {
+        WorkflowRunEvent {
+            sequence,
+            r#type: "log".to_string(),
+            payload: Default::default(),
+            truncated: None,
+        }
+    }
+
+    /// L4's full-replay dedupe (TS `fetchEvents`): a degenerate cursor
+    /// makes the server answer with the WHOLE journal — only sequences past
+    /// the highest one held may append, and the floor is the MAX seen, not
+    /// the last element (a clipped page can end on a lower sequence).
+    #[test]
+    fn journal_append_filters_replayed_prefix() {
+        let held = vec![run_event(1), run_event(3), run_event(2)];
+        assert_eq!(max_run_sequence(&held), 3, "the cursor is the max, not the tail");
+        let replayed_full = vec![run_event(1), run_event(2), run_event(3), run_event(4), run_event(5)];
+        let merged = merge_run_events(held, replayed_full);
+        assert_eq!(
+            merged.iter().map(|e| e.sequence).collect::<Vec<_>>(),
+            vec![1, 3, 2, 4, 5]
+        );
+        // An empty hold appends everything (the floor is 0).
+        let merged = merge_run_events(Vec::new(), vec![run_event(1)]);
+        assert_eq!(merged.len(), 1);
+    }
 
     fn session(session_id: &str, updated_at: Option<u64>) -> HubSessionInfo {
         HubSessionInfo {

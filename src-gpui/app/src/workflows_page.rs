@@ -1,30 +1,38 @@
 //! The Workflows page (batch J, requirements §"workflow parity"): the
 //! desktop port of `src/screens/config/WorkflowsPage.tsx` and its run-detail
-//! events view, over the hub's machine-level `/api/workflow-overview` —
-//! the page renders the answer as-is (one group per workspace plus the
-//! GLOBAL group, the machine-wide live zone, the finished complement).
+//! view, over the hub's machine-level `/api/workflow-overview` — the page
+//! renders the answer as-is (one group per workspace plus the GLOBAL group,
+//! the machine-wide live zone, the finished complement).
 //!
 //! Three layers, exactly like the TS page stack: the overview list, one
-//! workflow (detail + journal history + start), one run (the journal events
-//! rendered through `protocol::workflow_run_event_text`, cursor-paginated
-//! via `afterSequence` + `hasMore`). Actions address the row's own instance
-//! — the hub's `ownerInstanceId` annotation, falling back to the connected
-//! tab's instance (the TS launch-memory fallback has no desktop analogue:
-//! this client keeps no launch memory, so a row without an
-//! `acpSessionId` stays read-only).
+//! workflow (detail + journal history + start), one run. The run page
+//! (batch L, `WorkflowRunDetail.tsx`) carries the three tabs — the journal
+//! events rendered through `protocol::workflow_run_event_text` and sliced
+//! per phase (`protocol::workflow_run_detail`), the artifacts with their
+//! per-kind viewer, the workspace nodes with the expandable result — the
+//! artifacts and the workspace loading lazily on first open. Actions address
+//! the row's own instance — the hub's `ownerInstanceId` annotation, falling
+//! back to the connected tab's instance (the TS launch-memory fallback has
+//! no desktop analogue: this client keeps no launch memory, so a row without
+//! an `acpSessionId` stays read-only).
 //!
 //! The WorkflowGate sheet (J2) is the machine-level switch's three-position
 //! picker (auto / on / off) over `PUT /settings/workflow-gate`.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{AnyElement, Context, Entity, Rgba, Window, div, px, rgb};
+use gpui::{
+    canvas, point, pulsating_between, size, Animation, AnyElement, Bounds, Context, Entity, Hsla,
+    PathBuilder, Rgba, Window, div, fill as quad_fill, px, rgb,
+};
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
 };
@@ -33,17 +41,30 @@ use gpui_kit::*;
 use gpui_kit::TestSupportExt as _;
 use protocol::settings::{GateOverride, WorkflowGateBlock, WorkflowGateModeSetting};
 use protocol::workflow::{
-    ConversationRunSummary, WorkflowArgDeclaration, WorkflowDetailResponse, WorkflowHubGroup,
-    WorkflowRunEvent, WorkflowRunRow, WorkflowScope,
+    ConversationRunSummary, WorkflowArgDeclaration, WorkflowArtifact, WorkflowDetailResponse,
+    WorkflowHubGroup, WorkflowRunEvent, WorkflowRunRow, WorkflowScope, WorkflowWorkspaceNode,
 };
 use protocol::workflow_args::{
     args_declaration, args_initial_values, parse_args_input, typed_args_report,
 };
-use protocol::workflow_run_event_text::{describe_run_event, status_word, RunEventTone, Translate};
+use protocol::workflow_run_detail::{
+    args_text, artifact_is_preset, artifact_meta, artifact_spec, board_columns, chart_fmt,
+    chart_model, fmt_duration, key_value_cards, latest_version, metrics_tiles, node_key,
+    node_ref_line, node_result_body, node_summary_text, op_family, phase_slices, phases,
+    pretty_json, table_model, ArtifactDataItem, ChartKind, KeyValueCard, NodeResultBody,
+    OpFamily, PhaseEntry, PhaseSlice, PhaseSlices,
+};
+use protocol::workflow_run_event_text::{
+    describe_run_event, node_state_word, reduce_slice, status_word, ActorLine, NodeAgg, NodeState,
+    RunEventTone, Translate,
+};
 use rust_i18n::t;
 
 use crate::i18n::fill;
-use crate::runtime::{UiCommand, WorkflowDetailView, WorkflowRunView, WorkflowsPageView};
+use crate::runtime::{
+    UiCommand, WorkflowArtifactViewerView, WorkflowDetailView, WorkflowNodeResultView,
+    WorkflowRunTab, WorkflowRunView, WorkflowsPageView,
+};
 use crate::workbench::Workbench;
 
 // ---------------------------------------------------------------------------
@@ -213,15 +234,27 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
         .expect("render_workflows_page with no open page");
     let runtime = wb.runtime.clone();
 
-    // The header's back target follows the layer.
-    let (title, back): (String, UiCommand) = if page.run.is_some() {
-        (
-            page.run
-                .as_ref()
-                .and_then(|r| r.name.clone())
-                .unwrap_or_else(|| t!("zconfig.workflows").into_owned()),
-            UiCommand::CloseWorkflowRun,
-        )
+    // The header's back target follows the layer. With an artifact viewer
+    // open, back closes the viewer first (the TS back-gesture ladder:
+    // overlay, then page) and the title is the artifact's.
+    let (title, back): (String, UiCommand) = if let Some(run) = &page.run {
+        if let Some(viewer) = &run.artifact {
+            (
+                viewer
+                    .artifact
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| viewer.artifact.id.clone()),
+                UiCommand::WorkflowRunCloseArtifact,
+            )
+        } else {
+            (
+                run.name
+                    .clone()
+                    .unwrap_or_else(|| t!("zconfig.workflows").into_owned()),
+                UiCommand::CloseWorkflowRun,
+            )
+        }
     } else if let Some(d) = &page.detail {
         (d.name.clone(), UiCommand::CloseWorkflowDetail)
     } else {
@@ -1153,7 +1186,7 @@ fn tail8(id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// The run body (journal events)
+// The run body (TS WorkflowRunDetail): header card, tab strip, one tab
 // ---------------------------------------------------------------------------
 
 fn render_run_body(
@@ -1163,11 +1196,19 @@ fn render_run_body(
     cx: &Context<Workbench>,
 ) -> AnyElement {
     let theme = cx.theme();
+    // The artifact viewer replaces the whole body while open (the TS
+    // ViewerShell is a full-screen overlay); the page header's back closes
+    // it.
+    if let Some(viewer) = &run.artifact {
+        return render_artifact_viewer(wb, viewer, cx);
+    }
     let mut list = div()
         .id("workflow-run-list")
         .flex_1()
         .min_h_0()
+        .min_w_0()
         .overflow_y_scroll()
+        .overflow_x_hidden()
         .pb_4();
 
     // The read-only degradation note (the polls stopped believing the
@@ -1324,35 +1365,141 @@ fn render_run_body(
     }
     list = list.child(header);
 
-    // The journal: each event one row — the protocol renderer's label +
-    // detail, never raw JSON by default.
+    // The tab strip (TS `tabs`): Progress / Artifacts / Workspace — the
+    // two data tabs load lazily on their first open.
+    list = list.child(render_run_tabs(run, wb, theme));
+
+    match run.tab {
+        WorkflowRunTab::Events => list = render_run_events_tab(list, wb, run, cx),
+        WorkflowRunTab::Artifacts => list = render_run_artifacts_tab(list, wb, run, cx),
+        WorkflowRunTab::Workspace => list = render_run_workspace_tab(list, wb, run, cx),
+    }
+    list.into_any_element()
+}
+
+/// The run page's tab pills (the usage page's segmented control shape).
+fn render_run_tabs(run: &WorkflowRunView, wb: &Workbench, theme: &component::Theme) -> AnyElement {
+    let tabs = [
+        (WorkflowRunTab::Events, "events", "zconfig.workflowEvents"),
+        (WorkflowRunTab::Artifacts, "artifacts", "zconfig.workflowArtifacts"),
+        (WorkflowRunTab::Workspace, "workspace", "zconfig.workflowWorkspace"),
+    ];
+    let mut row = div()
+        .flex()
+        .gap(px(4.))
+        .mx_3()
+        .mb_2()
+        .flex_none()
+        .p(px(3.))
+        .rounded_lg()
+        .bg(theme.secondary);
+    for (tab, slug, key) in tabs {
+        let active = run.tab == tab;
+        let runtime = wb.runtime.clone();
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("workflow-run-tab-{slug}")))
+                .test_support()
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .py(px(5.))
+                .rounded_md()
+                .text_size(px(11.))
+                .cursor_pointer()
+                .bg(if active {
+                    theme.title_bar
+                } else {
+                    gpui::transparent_black()
+                })
+                .text_color(if active {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .font_weight(if active {
+                    FontWeight::MEDIUM
+                } else {
+                    FontWeight::NORMAL
+                })
+                .child(t!(key).into_owned())
+                .on_click(move |_, _, _| {
+                    runtime.send(UiCommand::WorkflowRunSelectTab { tab });
+                }),
+        );
+    }
+    row.into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// The events tab (the journal sliced per phase)
+// ---------------------------------------------------------------------------
+
+fn render_run_events_tab(
+    mut list: gpui::Stateful<gpui::Div>,
+    wb: &Workbench,
+    run: &WorkflowRunView,
+    cx: &Context<Workbench>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    let events = run.events.as_deref().unwrap_or(&[]);
+
+    // The phase timeline rides above the sections whenever any phase was
+    // entered; the head pulses while the run flies.
+    let entered = phases(events);
+    if !entered.is_empty() {
+        list = list.child(render_phase_timeline(&entered, run.active, theme, cx));
+    }
+
     match &run.events {
-        None => {
-            if run.active {
-                list = list.child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .py_8()
-                        .child(Spinner::new()),
-                );
-            }
-        }
         Some(events) if events.is_empty() => {
             list = list.child(empty_card(&t!("zconfig.workflowEventsEmpty"), theme));
         }
-        Some(events) => {
+        _ => {
+            // Events sliced at every phase-entered boundary; a slice renders
+            // only the nodes/actors it OWNS (nodeHome/actorHome — replayed
+            // resume prefixes must not double-render).
+            let sliced = phase_slices(events);
             let mut block = rows_card(theme);
-            for ev in events {
-                block = block.child(render_event_row(ev, theme));
+            let mut painted = 0usize;
+            for (index, slice) in sliced.slices.iter().enumerate() {
+                if let Some(section) = render_phase_section(wb, slice, index, &sliced, cx) {
+                    block = block.child(section);
+                    painted += 1;
+                }
             }
-            list = list.child(block);
+            if painted > 0 {
+                list = list.child(block);
+            }
         }
     }
 
+    // The explicit Retry (TS: the first pull failed and the run settled).
+    if run.events.is_none() && !run.session_dead && !run.active {
+        let runtime = wb.runtime.clone();
+        list = list.child(
+            div().px_3().child(
+                Button::new("workflow-run-retry")
+                    .secondary()
+                    .small()
+                    .w_full()
+                    .label(t!("zconfig.workflowRetry").into_owned())
+                    .on_click(move |_, _, _| runtime.send(UiCommand::WorkflowRunRetryEvents)),
+            ),
+        );
+    }
+    // Still nothing while the run flies: the silent loading state.
+    if run.events.is_none() && run.active {
+        list = list.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .py_8()
+                .child(Spinner::new()),
+        );
+    }
     // The cursor's next page: `afterSequence` past the highest sequence
     // held, gated on the server's `hasMore`.
     if run.has_more && run.events.is_some() {
@@ -1369,56 +1516,1712 @@ fn render_run_body(
             ),
         );
     }
-    list.into_any_element()
+    list
 }
 
-/// One journal row: the readable label + detail (the protocol renderer),
-/// styled by tone; a failed row reads red, an unknown kind monospace.
-fn render_event_row(ev: &WorkflowRunEvent, theme: &component::Theme) -> AnyElement {
+/// The vertical mini timeline (TS `PhaseTimeline`): one row per entered
+/// phase with a connecting spine; the newest row is the head — pulsing
+/// while the run flies, plain once it settles.
+fn render_phase_timeline(
+    entered: &[PhaseEntry],
+    running: bool,
+    theme: &component::Theme,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let mut col = div()
+        .id("workflow-run-phases")
+        .test_support()
+        .flex()
+        .flex_col()
+        .m_3()
+        .mb_1()
+        .px_4()
+        .pt_3();
+    let reduce_motion = cx.reduce_motion();
+    for (i, p) in entered.iter().enumerate() {
+        let head = i == entered.len() - 1;
+        let dot = div()
+            .mt(px(3.))
+            .size(px(10.))
+            .flex_none()
+            .rounded_full()
+            .bg(if head {
+                theme.info
+            } else {
+                theme.success.opacity(0.8)
+            });
+        // The live head breathes (upstream animate-pulse); reduce-motion
+        // renders it solid.
+        let dot: AnyElement = if head && running && !reduce_motion {
+            dot.with_animation(
+                SharedString::from("wf-phase-head-pulse"),
+                Animation::new(Duration::from_millis(1200))
+                    .repeat()
+                    .with_easing(pulsating_between(0.4, 1.0)),
+                |this, delta| this.opacity(delta),
+            )
+            .into_any_element()
+        } else {
+            dot.into_any_element()
+        };
+        let label = if p.times > 1 {
+            format!("{} · ×{}", p.name, p.times)
+        } else {
+            p.name.clone()
+        };
+        col = col.child(
+            div()
+                .id(SharedString::from(format!("wf-phase-{i}-{}", slug_run_id(&p.name))))
+                .test_support()
+                .flex()
+                .min_w_0()
+                .gap(px(10.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .child(dot)
+                        .when(!head, |this| {
+                            this.child(
+                                div()
+                                    .w(px(1.))
+                                    .flex_1()
+                                    .min_h(px(12.))
+                                    .bg(theme.border),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .pb_2()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(11.))
+                        .font_weight(if head {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
+                        .text_color(if head {
+                            theme.foreground
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .truncate()
+                        .child(label),
+                ),
+        );
+    }
+    col.into_any_element()
+}
+
+/// One phase section (TS `PhaseSection`): header, hired actors, folded
+/// nodes, usage, leftover journal rows, the settle. `None` when the slice
+/// owns nothing (its nodes/actors live in other slices).
+fn render_phase_section(
+    wb: &Workbench,
+    slice: &PhaseSlice,
+    slice_index: usize,
+    sliced: &PhaseSlices,
+    cx: &Context<Workbench>,
+) -> Option<AnyElement> {
+    let theme = cx.theme();
+    let fold = reduce_slice(&Catalog, &slice.events);
+    let own_nodes: Vec<&NodeAgg> = fold
+        .nodes
+        .iter()
+        .filter(|n| sliced.node_home.get(&n.key) == Some(&slice_index))
+        .collect();
+    let own_actors: Vec<&ActorLine> = fold
+        .actors
+        .iter()
+        .filter(|a| sliced.actor_home.get(&a.key) == Some(&slice_index))
+        .collect();
+    if own_actors.is_empty()
+        && own_nodes.is_empty()
+        && fold.others.is_empty()
+        && fold.settled.is_none()
+        && fold.spent_tokens.is_none()
+    {
+        return None;
+    }
+    let mut section = div()
+        .id(SharedString::from(format!(
+            "wf-phase-section-{}",
+            slice.phase
+                .as_deref()
+                .map(slug_run_id)
+                .unwrap_or_else(|| "pre".to_string())
+        )))
+        .test_support()
+        .flex()
+        .flex_col();
+    if let Some(phase) = &slice.phase {
+        section = section.child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .px_4()
+                .pt_3()
+                .pb_1()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(12.))
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .child(phase.clone()),
+                )
+                .when(!own_nodes.is_empty(), |this| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(theme.muted_foreground)
+                            .child(fill(
+                                &t!("zconfig.workflowPhaseNodes"),
+                                &[("n", &own_nodes.len().to_string())],
+                            )),
+                    )
+                }),
+        );
+    }
+    for a in own_actors {
+        section = section.child(
+            div()
+                .px_4()
+                .py(px(4.))
+                .min_w_0()
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .truncate()
+                .child(format!("{} · {}", t!("zconfig.wfEvActorCreated"), a.label)),
+        );
+    }
+    for n in own_nodes {
+        section = section.child(render_node_line(n, theme, cx));
+    }
+    if let Some(spent) = fold.spent_tokens {
+        section = section.child(
+            div()
+                .px_4()
+                .py(px(4.))
+                .text_size(px(10.))
+                .text_color(theme.muted_foreground)
+                .child(format!(
+                    "{} · {} tokens",
+                    t!("zconfig.wfEvUsageUpdated"),
+                    fmt_grouped(spent)
+                )),
+        );
+    }
+    for ev in &fold.others {
+        section = section.child(render_event_row(wb, ev, cx));
+    }
+    if let Some(ev) = &fold.settled {
+        section = section.child(render_event_row(wb, ev, cx));
+    }
+    Some(section.into_any_element())
+}
+
+/// One folded node line (TS `NodeLine`): state dot + identity + activity +
+/// the outcome word; a failed node carries its error underneath.
+fn render_node_line(n: &NodeAgg, theme: &component::Theme, cx: &Context<Workbench>) -> AnyElement {
+    let (dot_color, pulse) = match n.state {
+        NodeState::Ok => (theme.success, false),
+        NodeState::Failed => (theme.danger, false),
+        NodeState::Cancelled => (theme.muted_foreground, false),
+        NodeState::Waiting | NodeState::Repairing => (theme.warning, false),
+        // queued / executing: the pulse dot already says "live".
+        _ => (theme.info, true),
+    };
+    let word = node_state_word(&Catalog, n.state);
+    let word_color = match n.state {
+        NodeState::Failed => theme.danger_foreground,
+        NodeState::Ok => theme.success_foreground.opacity(0.8),
+        _ => theme.muted_foreground,
+    };
+    let title = n.label.clone().unwrap_or_else(|| match n.ordinal {
+        Some(ord) => format!("{}@{}", n.site, ordinal_text(ord)),
+        None => n.site.clone(),
+    });
+    let sub = n.activity.clone().or_else(|| n.head.clone());
+    let dot = div()
+        .size(px(6.))
+        .flex_none()
+        .rounded_full()
+        .bg(dot_color);
+    let dot: AnyElement = if pulse && !cx.reduce_motion() {
+        dot.with_animation(
+            SharedString::from("wf-node-line-pulse"),
+            Animation::new(Duration::from_millis(1200))
+                .repeat()
+                .with_easing(pulsating_between(0.4, 1.0)),
+            |this, delta| this.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        dot.into_any_element()
+    };
+    div()
+        .id(SharedString::from(format!("wf-node-line-{}", slug_run_id(&n.key))))
+        .test_support()
+        .flex()
+        .flex_col()
+        .px_4()
+        .py(px(4.))
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .min_w_0()
+                .child(dot)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(match sub {
+                            Some(sub) => format!("{title} — {sub}"),
+                            None => title,
+                        }),
+                )
+                .when_some(word, |this, word| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(word_color)
+                            .child(word),
+                    )
+                }),
+        )
+        .when(
+            n.state == NodeState::Failed && n.error.is_some(),
+            |this| {
+                this.child(
+                    div()
+                        .pl(px(14.))
+                        .text_size(px(10.))
+                        .text_color(theme.danger_foreground.opacity(0.9))
+                        .truncate()
+                        .child(n.error.clone().unwrap_or_default()),
+                )
+            },
+        )
+        .into_any_element()
+}
+
+/// One journal row (TS `EventRow`): the readable label + detail (the
+/// protocol renderer), the raw payload behind an explicit toggle. Sequence
+/// numbers stay out of the default view — they are journal coordinates,
+/// not information.
+fn render_event_row(wb: &Workbench, ev: &WorkflowRunEvent, cx: &Context<Workbench>) -> AnyElement {
+    let theme = cx.theme();
     let desc = describe_run_event(&Catalog, ev);
-    let label_color = if desc.mono_label.unwrap_or(false) {
+    let mono = desc.mono_label.unwrap_or(false);
+    let label_color = if mono {
         theme.muted_foreground
     } else if desc.tone == RunEventTone::Failed {
         theme.danger_foreground
     } else {
         theme.foreground
     };
+    let raw_key = format!("ev-{}", ev.sequence);
+    let wb_handle = cx.entity();
     div()
         .id(SharedString::from(format!("wf-event-{}", ev.sequence)))
         .test_support()
         .flex()
-        .items_baseline()
-        .gap_2()
+        .flex_col()
+        .min_w_0()
         .px_4()
         .py_2()
         .border_b_1()
         .border_color(theme.border)
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+        .on_click({
+            let key = raw_key.clone();
+            move |_, _, cx| {
+                wb_handle.update(cx, |wb, cx| wb.toggle_workflow_raw(&key, cx));
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .gap_2()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .max_w(px(240.))
+                        .min_w_0()
+                        .truncate()
+                        .font_family(if mono {
+                            theme.mono_font_family.clone()
+                        } else {
+                            theme.font_family.clone()
+                        })
+                        .text_size(px(11.))
+                        .text_color(label_color)
+                        .child(desc.label),
+                )
+                .when_some(desc.detail, |this, detail| {
+                    this.child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_size(px(10.))
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    )
+                }),
+        )
+        .when(wb.workflow_raw_open.contains(&raw_key), |this| {
+            this.child(render_raw_body(
+                wb,
+                &raw_key,
+                &serde_json::Value::Object(ev.payload.clone()),
+                cx,
+            ))
+        })
+        .into_any_element()
+}
+
+/// The shared raw-JSON toggle (TS `RawData`): the escape hatch, never the
+/// default view.
+fn render_raw_body(
+    wb: &Workbench,
+    key: &str,
+    value: &serde_json::Value,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let open = wb.workflow_raw_open.contains(key);
+    let wb_handle = cx.entity();
+    let key_owned = key.to_owned();
+    div()
+        .id(SharedString::from(format!("wf-raw-{key}")))
+        .test_support()
+        .mt_2()
+        .child(
+            div()
+                .id(SharedString::from(format!("wf-raw-{key}-toggle")))
+                .test_support()
+                .flex()
+                .items_center()
+                .gap(px(4.))
+                .cursor_pointer()
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .child(if open { "▾" } else { "▸" })
+                .child(t!("zconfig.workflowRawData").into_owned())
+                .on_click(move |_, _, cx| {
+                    let key = key_owned.clone();
+                    wb_handle.update(cx, |wb, cx| wb.toggle_workflow_raw(&key, cx));
+                }),
+        )
+        .when(open, |this| {
+            this.child(pre_block(
+                &format!("wf-raw-{key}-body"),
+                &pretty_json(value),
+                theme.muted_foreground,
+                theme,
+            ))
+        })
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// The artifacts tab
+// ---------------------------------------------------------------------------
+
+fn render_run_artifacts_tab(
+    mut list: gpui::Stateful<gpui::Div>,
+    wb: &Workbench,
+    run: &WorkflowRunView,
+    cx: &Context<Workbench>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    match &run.artifacts {
+        Some(artifacts) if artifacts.is_empty() => {
+            list = list.child(empty_card(&t!("zconfig.workflowArtifactsEmpty"), theme));
+        }
+        Some(artifacts) => {
+            let mut block = rows_card(theme);
+            for a in artifacts {
+                let runtime = wb.runtime.clone();
+                let artifact_id = a.id.clone();
+                let slug = slug_run_id(&a.id);
+                let meta = {
+                    let mut parts = vec![a.kind.clone()];
+                    if a.versions.as_ref().is_some_and(|v| !v.is_empty()) {
+                        parts.push(format!("v{}", latest_version(a)));
+                    }
+                    if let Some(count) = a.item_count {
+                        parts.push(count.to_string());
+                    }
+                    parts.join(" · ")
+                };
+                block = block.child(
+                    div()
+                        .id(SharedString::from(format!("wf-artifact-row-{slug}")))
+                        .test_support()
+                        .flex()
+                        .items_start()
+                        .gap_3()
+                        .min_w_0()
+                        .px_4()
+                        .py_3()
+                        .cursor_pointer()
+                        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+                        .on_click(move |_, _, _| {
+                            runtime.send(UiCommand::WorkflowRunOpenArtifact { artifact_id: artifact_id.clone() });
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(theme.foreground)
+                                        .truncate()
+                                        .child(a.title.clone().unwrap_or_else(|| a.id.clone())),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .text_color(theme.muted_foreground)
+                                        .truncate()
+                                        .child(meta),
+                                ),
+                        ),
+                );
+            }
+            list = list.child(block);
+        }
+        None => {
+            // Never landed: loading, or a failed lazy read (the banner
+            // carries the failure) — re-picking the tab retries.
+            if run.artifacts_busy {
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .py_8()
+                        .child(Spinner::new()),
+                );
+            } else {
+                let runtime = wb.runtime.clone();
+                list = list.child(
+                    div().px_3().child(
+                        Button::new("workflow-artifacts-retry")
+                            .secondary()
+                            .small()
+                            .w_full()
+                            .label(t!("zconfig.workflowRetry").into_owned())
+                            .on_click(move |_, _, _| {
+                                runtime.send(UiCommand::WorkflowRunSelectTab {
+                                    tab: WorkflowRunTab::Artifacts,
+                                })
+                            }),
+                    ),
+                );
+            }
+        }
+    }
+    list
+}
+
+// ---------------------------------------------------------------------------
+// The workspace tab
+// ---------------------------------------------------------------------------
+
+fn render_run_workspace_tab(
+    mut list: gpui::Stateful<gpui::Div>,
+    wb: &Workbench,
+    run: &WorkflowRunView,
+    cx: &Context<Workbench>,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    match &run.nodes {
+        Some(nodes) if nodes.is_empty() => {
+            list = list.child(empty_card(&t!("zconfig.workflowWorkspaceEmpty"), theme));
+        }
+        Some(nodes) => {
+            let mut block = rows_card(theme);
+            for (i, n) in nodes.iter().enumerate() {
+                block = block.child(render_workspace_row(wb, run, n, i, cx));
+            }
+            list = list.child(block);
+        }
+        None => {
+            if run.nodes_busy {
+                list = list.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .py_8()
+                        .child(Spinner::new()),
+                );
+            } else {
+                let runtime = wb.runtime.clone();
+                list = list.child(
+                    div().px_3().child(
+                        Button::new("workflow-workspace-retry")
+                            .secondary()
+                            .small()
+                            .w_full()
+                            .label(t!("zconfig.workflowRetry").into_owned())
+                            .on_click(move |_, _, _| {
+                                runtime.send(UiCommand::WorkflowRunSelectTab {
+                                    tab: WorkflowRunTab::Workspace,
+                                })
+                            }),
+                    ),
+                );
+            }
+        }
+    }
+    list
+}
+
+/// One workspace row (TS the workspace tab's node rows): the op tile scans
+/// by color before text; the WHAT (call args) leads, the internal ref and
+/// byte counts demote to a meta line. Tap expands the node's result.
+fn render_workspace_row(
+    wb: &Workbench,
+    run: &WorkflowRunView,
+    n: &WorkflowWorkspaceNode,
+    index: usize,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let key = node_key(n, index);
+    let slug = slug_run_id(&key);
+    let dur = fmt_duration(n.created_at, n.updated_at);
+    let exit_bad = n.summary.as_ref().is_some_and(|s| s.exit_code.unwrap_or(0) != 0);
+    let runtime = wb.runtime.clone();
+    let (site_id, ordinal) = (n.site_id.clone(), n.ordinal);
+    let key_for_click = key.clone();
+    let what = args_text(n)
+        .or_else(|| n.op.clone())
+        .unwrap_or_else(|| key.clone());
+    let mut meta_parts = vec![node_ref_line(n)];
+    if let Some(s) = &n.summary {
+        meta_parts.push(node_summary_text(s));
+    }
+    let meta = meta_parts.join(" · ");
+
+    let mut row = div()
+        .id(SharedString::from(format!("wf-workspace-row-{slug}")))
+        .test_support()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .px_4()
+        .py(px(10.))
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+        .on_click(move |_, _, _| {
+            // TS `loadNode` returns early without a site/ordinal address.
+            if let (Some(site), Some(ord)) = (site_id.clone(), ordinal) {
+                runtime.send(UiCommand::WorkflowRunToggleNode {
+                    key: key_for_click.clone(),
+                    site_id: site,
+                    ordinal: ord,
+                });
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.))
+                .min_w_0()
+                .child(op_tile(n.op.as_deref(), theme))
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .truncate()
+                                .child(what),
+                        )
+                        .when(!meta.is_empty(), |this| {
+                            this.child(
+                                div()
+                                    .min_w_0()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(px(10.))
+                                    .text_color(if exit_bad {
+                                        theme.danger_foreground.opacity(0.9)
+                                    } else {
+                                        theme.muted_foreground
+                                    })
+                                    .truncate()
+                                    .child(meta),
+                            )
+                        }),
+                )
+                .when_some(dur, |this, dur| {
+                    this.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.))
+                            .text_color(theme.muted_foreground)
+                            .child(format!("+{dur}")),
+                    )
+                })
+                .child(status_badge(
+                    n.status.as_deref(),
+                    &format!("workspace-{slug}"),
+                    theme,
+                )),
+        );
+    if run.node_busy.as_deref() == Some(key.as_str()) {
+        row = row.child(
+            div()
+                .id(SharedString::from(format!("wf-node-busy-{slug}")))
+                .test_support()
+                .pl(px(38.))
+                .pt_1()
+                .child(Spinner::new().xsmall()),
+        );
+    } else if let Some(result) = run.node_result.as_ref().filter(|r| r.key == key) {
+        row = row.child(render_node_result(wb, result, cx));
+    }
+    row.into_any_element()
+}
+
+/// The op tile (TS `OP_TILE`): a small colored square keyed by the op
+/// family — read/search/git/exec/write — carrying the op's first two
+/// characters.
+fn op_tile(op: Option<&str>, theme: &component::Theme) -> AnyElement {
+    let (bg, fg) = match op_family(op) {
+        OpFamily::Read => (theme.info.opacity(0.15), theme.info),
+        OpFamily::Search => (theme.accent.opacity(0.15), theme.accent),
+        OpFamily::Git => (theme.warning.opacity(0.15), theme.warning),
+        OpFamily::Exec => (theme.success.opacity(0.15), theme.success),
+        OpFamily::Write => (theme.danger.opacity(0.15), theme.danger),
+        OpFamily::Other => (theme.secondary, theme.muted_foreground),
+    };
+    div()
+        .flex_none()
+        .size(px(28.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_lg()
+        .bg(bg)
+        .font_family(theme.mono_font_family.clone())
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(fg)
+        .child(op.unwrap_or("?").chars().take(2).collect::<String>().to_uppercase())
+        .into_any_element()
+}
+
+/// One expanded node result (TS `NodeResultView`): structured before raw —
+/// strings render as text, world.run-shaped results split into exit code +
+/// output streams, plain objects become key-value rows.
+fn render_node_result(
+    wb: &Workbench,
+    result: &WorkflowNodeResultView,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let slug = slug_run_id(&result.key);
+    let mut card = div()
+        .id(SharedString::from(format!("wf-node-result-{slug}")))
+        .test_support()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .mt_2()
+        .p_3()
+        .rounded_xl()
+        .bg(theme.secondary)
+        .border_1()
+        .border_color(theme.border);
+    // v4 node status enum: running | completed | failed — red is for failed
+    // only; anything else (incl. unknown tokens) stays quiet.
+    if result.status.as_deref() == Some("failed") {
+        card = card.child(
+            div()
+                .pb(px(6.))
+                .text_size(px(11.))
+                .text_color(theme.danger_foreground)
+                .child(result.status.clone().unwrap_or_default()),
+        );
+    }
+    card = match node_result_body(&result.body) {
+        NodeResultBody::Text(text) => card.child(pre_block(
+            &format!("wf-node-result-{slug}-text"),
+            &text,
+            theme.muted_foreground,
+            theme,
+        )),
+        NodeResultBody::Run {
+            exit_code,
+            stdout,
+            stderr,
+        } => card
+            .when_some(exit_code, |this, code| {
+                this.child(
+                    div()
+                        .pb(px(6.))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(11.))
+                        .text_color(if code != 0.0 {
+                            theme.danger_foreground
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(format!("exit {}", ordinal_text(code))),
+                )
+            })
+            .when_some(stdout, |this, out| {
+                this.child(pre_block(
+                    &format!("wf-node-result-{slug}-stdout"),
+                    &out,
+                    theme.muted_foreground,
+                    theme,
+                ))
+            })
+            .when_some(stderr, |this, err| {
+                this.child(pre_block(
+                    &format!("wf-node-result-{slug}-stderr"),
+                    &err,
+                    theme.danger_foreground.opacity(0.9),
+                    theme,
+                ))
+            }),
+        NodeResultBody::Record(rows) => card.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(rows.iter().map(|(k, v)| {
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap_3()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .flex_none()
+                                .max_w(px(40.))
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .truncate()
+                                .child(k.clone()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .child(v.clone()),
+                        )
+                })),
+        ),
+        NodeResultBody::Scalar(text) => card.child(
+            div()
+                .min_w_0()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .child(text),
+        ),
+    };
+    if result.truncated {
+        card = card.child(
+            div()
+                .pt_1()
+                .text_size(px(10.))
+                .text_color(theme.muted_foreground)
+                .child(t!("zconfig.workflowTruncated").into_owned()),
+        );
+    }
+    let raw_key = format!("node-{}", result.key);
+    card.child(render_raw_body(wb, &raw_key, &result.body, cx))
+        .into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// The artifact viewer (TS ArtifactViewer + WorkflowArtifactViews)
+// ---------------------------------------------------------------------------
+
+fn render_artifact_viewer(
+    wb: &Workbench,
+    viewer: &WorkflowArtifactViewerView,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let kind = viewer.artifact.kind.as_str();
+    let preset = artifact_is_preset(kind);
+    let mut list = div()
+        .id("workflow-artifact-viewer")
+        .test_support()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .overflow_y_scroll()
+        .overflow_x_hidden()
+        .pb_4();
+
+    // Nothing landed yet: the initial read is in flight.
+    if viewer.busy && viewer.text.is_none() && viewer.items.is_none() {
+        return div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Spinner::new())
+            .into_any_element();
+    }
+
+    let spec = artifact_spec(&viewer.artifact);
+    let items = viewer.items.as_deref().unwrap_or(&[]);
+    if kind == "markdown" && !viewer.binary && viewer.text.is_some() {
+        // markdown: decode finished when the text landed (TS renders only
+        // once the whole (first) chunk decoded).
+        list = list.child(
+            div()
+                .id("wf-artifact-markdown")
+                .test_support()
+                .px_4()
+                .pt_3()
+                .child(TextView::markdown(
+                    "wf-artifact-markdown",
+                    viewer.text.clone().expect("checked above"),
+                )),
+        );
+    } else if kind == "file" {
+        if viewer.binary {
+            let bytes = viewer
+                .total_bytes
+                .map(|b| b.to_string())
+                .or_else(|| viewer.text.as_ref().map(|t| t.chars().count().to_string()))
+                .unwrap_or_else(|| "0".to_owned());
+            list = list.child(empty_card(
+                &fill(&t!("zconfig.workflowBinary"), &[("bytes", bytes.as_str())]),
+                theme,
+            ));
+        } else if let Some(text) = &viewer.text {
+            list = list.child(
+                div()
+                    .id("wf-artifact-file")
+                    .test_support()
+                    .pt_3()
+                    .child(pre_block("wf-artifact-file-body", text, theme.muted_foreground, theme)),
+            );
+        }
+        if viewer.next_offset.is_some() {
+            let runtime = wb.runtime.clone();
+            list = list.child(
+                div().px_3().pt_3().child(
+                    Button::new("workflow-artifact-load-more")
+                        .secondary()
+                        .small()
+                        .w_full()
+                        .label(t!("zconfig.workflowLoadMore").into_owned())
+                        .disabled(viewer.busy)
+                        .on_click(move |_, _, _| runtime.send(UiCommand::WorkflowRunArtifactLoadMore)),
+                ),
+            );
+        }
+    } else if kind == "table" {
+        list = list.child(render_table_view(items, spec, theme));
+    } else if kind == "metrics" {
+        list = list.child(render_metrics_tiles(items, spec, theme));
+    } else if kind == "board" {
+        list = list.child(render_board_view(items, spec, theme));
+    } else if kind == "chart" {
+        list = list.child(render_chart_view(items, spec, theme));
+    } else {
+        // Unknown kinds (and a binary markdown): a metadata card plus the
+        // raw JSON — the shape is open, so new kinds still read.
+        list = list.child(render_artifact_meta_card(wb, &viewer.artifact, theme, cx));
+    }
+
+    // The preset kinds keep the raw items one toggle away, plus their own
+    // pagination.
+    if preset {
+        let raw: Vec<serde_json::Value> = items.iter().map(|it| it.item.clone()).collect();
+        list = list.child(
+            div().px_4().pt_1().child(render_raw_body(
+                wb,
+                "art-items",
+                &serde_json::Value::Array(raw),
+                cx,
+            )),
+        );
+        if viewer.items_has_more {
+            let runtime = wb.runtime.clone();
+            list = list.child(
+                div().px_3().pt_3().child(
+                    Button::new("workflow-artifact-load-more")
+                        .secondary()
+                        .small()
+                        .w_full()
+                        .label(t!("zconfig.workflowLoadMore").into_owned())
+                        .disabled(viewer.busy)
+                        .on_click(move |_, _, _| {
+                            runtime.send(UiCommand::WorkflowRunArtifactLoadMore)
+                        }),
+                ),
+            );
+        }
+    }
+    list.into_any_element()
+}
+
+/// The key-value fallback (TS `KeyValueCards`).
+fn render_key_value_cards(cards: &[(u64, KeyValueCard)], theme: &component::Theme) -> AnyElement {
+    let mut col = div().flex().flex_col().gap_2().px_3().pt_2();
+    for (seq, card) in cards {
+        col = col.child(match card {
+            KeyValueCard::Text(text) => pre_block(
+                &format!("wf-kv-text-{seq}"),
+                text,
+                theme.muted_foreground,
+                theme,
+            ),
+            KeyValueCard::Record(rows) => div()
+                .id(SharedString::from(format!("wf-kv-card-{seq}")))
+                .test_support()
+                .px_3()
+                .py_2()
+                .rounded_xl()
+                .bg(theme.title_bar)
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .children(rows.iter().map(|(k, v)| kv_row(k, v, theme)))
+                .into_any_element(),
+        });
+    }
+    col.into_any_element()
+}
+
+fn kv_row(k: &str, v: &str, theme: &component::Theme) -> AnyElement {
+    div()
+        .flex()
+        .items_baseline()
+        .gap_3()
+        .min_w_0()
         .child(
             div()
                 .flex_none()
-                .max_w(px(240.))
-                .truncate()
-                .font_family(if desc.mono_label.unwrap_or(false) {
-                    theme.mono_font_family.clone()
-                } else {
-                    theme.font_family.clone()
-                })
+                .max_w(px(120.))
                 .text_size(px(11.))
-                .text_color(label_color)
-                .child(desc.label),
+                .text_color(theme.muted_foreground)
+                .truncate()
+                .child(k.to_owned()),
         )
-        .when_some(desc.detail, |this, detail| {
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .text_right()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(11.))
+                .text_color(theme.foreground)
+                .child(v.to_owned()),
+        )
+        .into_any_element()
+}
+
+/// The table view (TS `TableView`), or the fallback when neither a spec nor
+/// a first row names columns.
+fn render_table_view(
+    items: &[ArtifactDataItem],
+    spec: Option<&serde_json::Value>,
+    theme: &component::Theme,
+) -> AnyElement {
+    match table_model(items, spec) {
+        Some(model) => {
+            let mut col = div()
+                .id("wf-table-view")
+                .test_support()
+                .flex()
+                .flex_col()
+                .px_3()
+                .pt_2()
+                .min_w_0()
+                // A header row of declared columns, then one row per item;
+                // cells truncate so a wide row cannot push the page wide.
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .px_2()
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .children(
+                            model
+                                .columns
+                                .iter()
+                                .map(|c| {
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .text_size(px(11.))
+                                        .text_color(theme.foreground)
+                                        .truncate()
+                                        .child(c.clone())
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                );
+            for (i, row) in model.rows.iter().enumerate() {
+                col = col.child(
+                    div()
+                        .id(SharedString::from(format!("wf-table-row-{i}")))
+                        .test_support()
+                        .flex()
+                        .gap_2()
+                        .px_2()
+                        .py(px(6.))
+                        .border_b_1()
+                        .border_color(theme.border.opacity(0.5))
+                        .children(
+                            row.iter()
+                                .map(|cell| {
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(11.))
+                                        .text_color(theme.muted_foreground)
+                                        .child(cell.clone())
+                                        .into_any_element()
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                );
+            }
+            col.into_any_element()
+        }
+        None => render_key_value_cards(
+            &key_value_cards(
+                &items
+                    .iter()
+                    .filter(|it| !it.item.is_object())
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            theme,
+        ),
+    }
+}
+
+/// The metrics tiles (TS `MetricsTiles`), or the fallback.
+fn render_metrics_tiles(
+    items: &[ArtifactDataItem],
+    spec: Option<&serde_json::Value>,
+    theme: &component::Theme,
+) -> AnyElement {
+    match metrics_tiles(items, spec) {
+        Some(tiles) => {
+            // Two per row (TS grid-cols-2).
+            let mut outer = div()
+                .id("wf-metrics-view")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .px_3()
+                .pt_2();
+            for pair in tiles.chunks(2) {
+                outer = outer.child(
+                    div().flex().gap_2().children(pair.iter().map(|tile| {
+                        div()
+                            .flex()
+                            .flex_1()
+                            .flex_col()
+                            .min_w_0()
+                            .px_3()
+                            .py(px(10.))
+                            .rounded_xl()
+                            .bg(theme.title_bar)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .truncate()
+                                    .child(tile.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .pt(px(2.))
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(px(15.))
+                                    .text_color(theme.foreground)
+                                    .truncate()
+                                    .child(format!(
+                                        "{}{}",
+                                        tile.value,
+                                        tile.unit
+                                            .as_deref()
+                                            .map(|u| format!(" {u}"))
+                                            .unwrap_or_default()
+                                    )),
+                            )
+                            .into_any_element()
+                    })),
+                );
+            }
+            outer.into_any_element()
+        }
+        None => render_key_value_cards(&key_value_cards(items), theme),
+    }
+}
+
+/// The board view (TS `BoardView`): columns render as sections, one under
+/// the other, in spec order; unknown statuses trail.
+fn render_board_view(
+    items: &[ArtifactDataItem],
+    spec: Option<&serde_json::Value>,
+    theme: &component::Theme,
+) -> AnyElement {
+    match board_columns(items, spec) {
+        Some(columns) => {
+            let mut outer = div()
+                .id("wf-board-view")
+                .test_support()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .px_3()
+                .pt_2();
+            for col in &columns {
+                let mut section = div()
+                    .id(SharedString::from(format!("wf-board-col-{}", slug_run_id(&col.name))))
+                    .test_support()
+                    .flex()
+                    .flex_col()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .pb_1()
+                            .mb(px(6.))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_size(px(12.))
+                                    .text_color(theme.foreground)
+                                    .truncate()
+                                    .child(col.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(col.cards.len().to_string()),
+                            ),
+                    );
+                if col.cards.is_empty() {
+                    section = section.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(t!("zconfig.workflowBoardEmpty").into_owned()),
+                    );
+                } else {
+                    section = section.child(
+                        div().flex().flex_col().gap(px(6.)).children(
+                            col.cards.iter().map(|card| {
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "wf-board-card-{}",
+                                        slug_run_id(&card.key)
+                                    )))
+                                    .test_support()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w_0()
+                                    .px_3()
+                                    .py_2()
+                                    .rounded_xl()
+                                    .bg(theme.title_bar)
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(px(11.))
+                                            .text_color(theme.foreground)
+                                            .truncate()
+                                            .child(card.title.clone()),
+                                    )
+                                    .children(
+                                        card.details
+                                            .iter()
+                                            .map(|(k, v)| kv_row(k, v, theme))
+                                            .collect::<Vec<_>>(),
+                                    )
+                            }),
+                        ),
+                    );
+                }
+                outer = outer.child(section);
+            }
+            outer.into_any_element()
+        }
+        None => render_key_value_cards(&key_value_cards(items), theme),
+    }
+}
+
+/// The chart view (TS `ChartView`): a small inline canvas — grid, baseline,
+/// series by kind — with the y-axis labels beside it, the category labels
+/// and the latest-per-series legend under it.
+fn render_chart_view(
+    items: &[ArtifactDataItem],
+    spec: Option<&serde_json::Value>,
+    theme: &component::Theme,
+) -> AnyElement {
+    let Some(model) = chart_model(items, spec) else {
+        return render_key_value_cards(&key_value_cards(items), theme);
+    };
+    let grid_color = theme.chart_grid;
+    let baseline_color = theme.muted_foreground.opacity(0.35);
+    let series_colors: [Hsla; 5] = [
+        theme.info,
+        theme.success,
+        theme.danger,
+        theme.warning,
+        theme.accent,
+    ];
+    let m = model.clone();
+    let plot = canvas(
+        move |_, _, _| (),
+        move |bounds, _, window, _| {
+            // A small inset keeps frac-0/frac-1 marks from clipping.
+            let inset = px(6.);
+            let b = Bounds::new(
+                point(bounds.origin.x + inset, bounds.origin.y + inset),
+                size(bounds.size.width - inset * 2.0, bounds.size.height - inset * 2.0),
+            );
+            let plot_h = b.size.height;
+            let plot_w = b.size.width;
+            let y_of = |v: f64| b.origin.y + plot_h * (1.0 - m.y_frac(v) as f32);
+            let x_of = |v: f64| b.origin.x + plot_w * m.x_frac(v) as f32;
+            for v in m.grid_values() {
+                let y = y_of(v);
+                window.paint_quad(quad_fill(
+                    Bounds::new(point(b.origin.x, y), size(plot_w, px(1.))),
+                    grid_color,
+                ));
+            }
+            if let Some(base) = m.baseline {
+                let y = y_of(base);
+                let mut path = PathBuilder::stroke(px(1.)).dash_array(&[px(3.), px(3.)]);
+                path.move_to(point(b.origin.x, y));
+                path.line_to(point(b.origin.x + plot_w, y));
+                if let Ok(path) = path.build() {
+                    window.paint_path(path, baseline_color);
+                }
+            }
+            let series_count = m.series.len().max(1) as f32;
+            match m.kind {
+                ChartKind::Scatter => {
+                    for (si, s) in m.series.iter().enumerate() {
+                        let color = series_colors[si % series_colors.len()];
+                        for p in &s.points {
+                            let (x, y) = (x_of(p.0), y_of(p.1));
+                            window.paint_quad(
+                                quad_fill(
+                                    Bounds::new(point(x - px(2.), y - px(2.)), size(px(4.), px(4.))),
+                                    color,
+                                )
+                                .corner_radii(px(2.)),
+                            );
+                        }
+                    }
+                }
+                ChartKind::Bar => {
+                    // Bars sit AT their x value; sibling series share the
+                    // slot, side by side (TS's layout).
+                    let n = m
+                        .series
+                        .iter()
+                        .map(|s| s.points.len())
+                        .max()
+                        .unwrap_or(1)
+                        .max(1);
+                    let bar_w = ((plot_w / ((n as f32) * series_count)) * 0.7).max(px(1.5));
+                    let bottom = b.origin.y + plot_h;
+                    for (si, s) in m.series.iter().enumerate() {
+                        let color = series_colors[si % series_colors.len()];
+                        for p in &s.points {
+                            let cx = x_of(p.0) + (si as f32 - (series_count - 1.0) / 2.0) * bar_w;
+                            let top = y_of(p.1);
+                            let h = (bottom - top).max(px(1.));
+                            window.paint_quad(
+                                quad_fill(
+                                    Bounds::new(point(cx - bar_w / 2.0, top), size(bar_w, h)),
+                                    color.opacity(0.85),
+                                )
+                                .corner_radii(px(1.)),
+                            );
+                        }
+                    }
+                }
+                ChartKind::Line => {
+                    for (si, s) in m.series.iter().enumerate() {
+                        let color = series_colors[si % series_colors.len()];
+                        if s.points.len() == 1 {
+                            let (x, y) = (x_of(s.points[0].0), y_of(s.points[0].1));
+                            window.paint_quad(
+                                quad_fill(
+                                    Bounds::new(point(x - px(3.), y - px(3.)), size(px(6.), px(6.))),
+                                    color,
+                                )
+                                .corner_radii(px(3.)),
+                            );
+                            continue;
+                        }
+                        let mut path = PathBuilder::stroke(px(1.5));
+                        let mut first = true;
+                        for p in &s.points {
+                            let at = point(x_of(p.0), y_of(p.1));
+                            if first {
+                                path.move_to(at);
+                                first = false;
+                            } else {
+                                path.line_to(at);
+                            }
+                        }
+                        if let Ok(path) = path.build() {
+                            window.paint_path(path, color);
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .w_full()
+    .h(px(180.))
+    .rounded_lg()
+    .bg(theme.secondary);
+
+    let mut outer = div()
+        .id("wf-chart-view")
+        .test_support()
+        .flex()
+        .flex_col()
+        .px_3()
+        .pt_2();
+    // The y gridline labels ride beside the plot (top = max).
+    let grid = model.grid_values();
+    outer = outer.child(
+        div()
+            .flex()
+            .gap(px(6.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .justify_between()
+                    .items_end()
+                    .h(px(180.))
+                    .w(px(40.))
+                    .text_size(px(9.))
+                    .text_color(theme.muted_foreground)
+                    .child(chart_fmt(grid[2]))
+                    .child(chart_fmt(grid[1]))
+                    .child(chart_fmt(grid[0])),
+            )
+            .child(div().flex_1().min_w_0().child(plot)),
+    );
+    // Category labels (≤12, TS's cap), first-seen order.
+    if !model.categories.is_empty() && model.categories.len() <= 12 {
+        outer = outer.child(
+            div()
+                .flex()
+                .justify_between()
+                .pl(px(46.))
+                .pt(px(2.))
+                .text_size(px(9.))
+                .text_color(theme.muted_foreground)
+                .children(
+                    model
+                        .categories
+                        .iter()
+                        .map(|c| {
+                            let label = if c.chars().count() > 6 {
+                                format!("{}…", c.chars().take(5).collect::<String>())
+                            } else {
+                                c.clone()
+                            };
+                            div().min_w_0().truncate().child(label).into_any_element()
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+        );
+    }
+    // The legend: the latest value per series under the chart.
+    outer = outer.child(
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.))
+            .pt_2()
+            .children(
+                model
+                    .series
+                    .iter()
+                    .enumerate()
+                    .map(|(si, s)| {
+                        let color = series_colors[si % series_colors.len()];
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.))
+                            .min_w_0()
+                            .child(div().flex_none().size(px(6.)).rounded_full().bg(color))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .truncate()
+                                    .child(s.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(px(11.))
+                                    .text_color(theme.foreground)
+                                    .child(format!(
+                                        "{}{}",
+                                        s.last.map(chart_fmt).unwrap_or_else(|| "—".to_owned()),
+                                        s.unit
+                                            .as_deref()
+                                            .map(|u| format!(" {u}"))
+                                            .unwrap_or_default()
+                                    )),
+                            )
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+    );
+    if model.use_log {
+        outer = outer.child(
+            div()
+                .pt_1()
+                .text_size(px(10.))
+                .text_color(theme.muted_foreground)
+                .child("log scale"),
+        );
+    }
+    outer.into_any_element()
+}
+
+/// The unknown-kind metadata card (TS `ArtifactMetaCard`).
+fn render_artifact_meta_card(
+    wb: &Workbench,
+    artifact: &WorkflowArtifact,
+    theme: &component::Theme,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let meta = artifact_meta(artifact);
+    let mut col = div()
+        .id("wf-artifact-meta")
+        .test_support()
+        .flex()
+        .flex_col()
+        .px_3()
+        .pt_3()
+        .min_w_0()
+        .child(
+            div()
+                .flex_none()
+                .self_start()
+                .px(px(6.))
+                .py(px(1.))
+                .rounded_md()
+                .bg(theme.secondary)
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(10.))
+                .text_color(theme.muted_foreground)
+                .child(meta.kind.clone()),
+        )
+        .when_some(meta.description.clone(), |this, description| {
             this.child(
                 div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(10.))
+                    .pt_2()
+                    .text_size(px(11.))
                     .text_color(theme.muted_foreground)
-                    .child(detail),
+                    .min_w_0()
+                    .child(description),
             )
         })
+        .child(
+            div()
+                .mt_2()
+                .px_3()
+                .py_2()
+                .rounded_xl()
+                .bg(theme.title_bar)
+                .border_1()
+                .border_color(theme.border)
+                .flex()
+                .flex_col()
+                .gap(px(2.))
+                .child(kv_row("id", &meta.id, theme))
+                .when_some(meta.content_type.clone(), |this, ty| {
+                    this.child(kv_row("type", &ty, theme))
+                })
+                .when_some(meta.source_path.clone(), |this, path| {
+                    this.child(kv_row(&t!("zconfig.workflowSourcePath").into_owned(), &path, theme))
+                })
+                .when_some(meta.item_count, |this, count| {
+                    this.child(kv_row("items", &count.to_string(), theme))
+                })
+                .children(
+                    meta.extras
+                        .iter()
+                        .map(|(k, v)| kv_row(k, v, theme))
+                        .collect::<Vec<_>>(),
+                ),
+        );
+    col = col.child(render_raw_body(
+        wb,
+        "artifact",
+        &serde_json::to_value(artifact).unwrap_or(serde_json::Value::Null),
+        cx,
+    ));
+    col.into_any_element()
+}
+
+// ---------------------------------------------------------------------------
+// Small text helpers
+// ---------------------------------------------------------------------------
+
+/// A monospace text block (the TS `<pre>`): wraps instead of scrolling
+/// horizontally, capped in height like `max-h-*`; mega-lines chop (the
+/// file viewer's display rule) and the tail over 1000 rendered lines is
+/// elided (a layout guard the DOM <pre> gets for free).
+fn pre_block(id: &str, text: &str, color: Hsla, theme: &component::Theme) -> AnyElement {
+    const MAX_RENDER_LINES: usize = 1000;
+    const MAX_LINE_CHARS: usize = 2000;
+    let mut lines: Vec<String> = text
+        .split('\n')
+        .take(MAX_RENDER_LINES + 1)
+        .map(|line| {
+            if line.chars().count() > MAX_LINE_CHARS {
+                let mut head: String = line.chars().take(MAX_LINE_CHARS).collect();
+                head.push_str(" …");
+                head
+            } else if line.is_empty() {
+                " ".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
+    let total = text.split('\n').count();
+    if total > MAX_RENDER_LINES {
+        lines.truncate(MAX_RENDER_LINES);
+        lines.push(format!("… {} more lines", total - MAX_RENDER_LINES));
+    }
+    div()
+        .id(SharedString::from(id.to_owned()))
+        .test_support()
+        .flex()
+        .flex_col()
+        .min_w_0()
+        .max_h(px(256.))
+        .overflow_y_scroll()
+        .children(lines.into_iter().map(|line| {
+            div()
+                .min_w_0()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(11.))
+                .text_color(color)
+                .child(line)
+        }))
         .into_any_element()
+}
+
+/// `n.toLocaleString()` (en-US grouping) for the usage line's token counts.
+fn fmt_grouped(n: f64) -> String {
+    let negative = n < 0.0;
+    let int = n.abs().trunc() as u64;
+    let digits = int.to_string();
+    let grouped = digits
+        .as_bytes()
+        .rchunks(3)
+        .rev()
+        .map(std::str::from_utf8)
+        .map(Result::unwrap)
+        .collect::<Vec<_>>()
+        .join(",");
+    if negative {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// A JS number's display form (ordinals, exit codes): integers without a
+/// fraction print bare.
+fn ordinal_text(n: f64) -> String {
+    if n.fract() == 0.0 && n.abs() < 1e15 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1611,6 +3414,17 @@ impl Workbench {
         self.workflow_start_form = None;
         self.workflow_amend_form = None;
         self.workflow_form_subs.clear();
+        cx.notify();
+    }
+
+    /// Flips one raw-payload toggle on the run page (TS `EventRow` /
+    /// `RawData` `setOpen(!open)`): `ev-{sequence}` for a journal row,
+    /// `node-{key}` for an expanded node, `artifact` / `art-items` for the
+    /// viewer. View-local — the payload already sits in the snapshot.
+    pub(crate) fn toggle_workflow_raw(&mut self, key: &str, cx: &mut Context<Self>) {
+        if !self.workflow_raw_open.remove(key) {
+            self.workflow_raw_open.insert(key.to_owned());
+        }
         cx.notify();
     }
 
@@ -2373,20 +4187,23 @@ fn start_field_row(
 mod workflows_tests {
     use super::WorkflowStartForm;
     use crate::runtime::{
-        Phase, ProtocolRuntime, UiCommand, WorkflowDetailView, WorkflowRunView,
-        WorkflowsPageView, WorkbenchSnapshot,
+        Phase, ProtocolRuntime, UiCommand, WorkflowArtifactViewerView, WorkflowDetailView,
+        WorkflowNodeResultView, WorkflowRunTab, WorkflowRunView, WorkflowsPageView,
+        WorkbenchSnapshot,
     };
     use crate::workbench::Workbench;
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        px, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext, WindowBounds,
+        px, AppContext as _, Bounds, Entity, Point, Size, TestAppContext, WindowBounds,
         WindowOptions,
     };
     use protocol::settings::{GateOverride, WorkflowGateBlock, WorkflowGateModeSetting};
     use protocol::workflow::{
-        ConversationRunSummary, WorkflowDetailResponse, WorkflowEntry, WorkflowHubGroup,
-        WorkflowOverviewResponse, WorkflowRunEvent, WorkflowRunRow, WorkflowScope,
+        ConversationRunSummary, WorkflowArtifact, WorkflowDetailResponse, WorkflowEntry,
+        WorkflowHubGroup, WorkflowOverviewResponse, WorkflowRunEvent, WorkflowRunRow,
+        WorkflowScope, WorkflowWorkspaceNode,
     };
+    use protocol::workflow_run_detail::ArtifactDataItem;
     use std::collections::BTreeMap;
 
     fn run_row(run_id: &str, name: &str, status: &str, session: Option<&str>) -> WorkflowRunRow {
@@ -2506,7 +4323,60 @@ mod workflows_tests {
             session_dead: false,
             active: true,
             amend_busy: false,
+            tab: WorkflowRunTab::Events,
+            artifacts: None,
+            artifacts_busy: false,
+            nodes: None,
+            nodes_busy: false,
+            node_result: None,
+            node_busy: None,
+            artifact: None,
         }
+    }
+
+    fn artifact(
+        id: &str,
+        kind: &str,
+        title: Option<&str>,
+        extra: serde_json::Value,
+    ) -> WorkflowArtifact {
+        let mut full = serde_json::json!({ "id": id, "kind": kind });
+        if let Some(title) = title {
+            full["title"] = serde_json::json!(title);
+        }
+        if let (Some(full_obj), Some(extra_obj)) = (full.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra_obj {
+                full_obj.insert(k.clone(), v.clone());
+            }
+        }
+        serde_json::from_value(full).expect("artifact parses")
+    }
+
+    fn viewer(
+        art: WorkflowArtifact,
+        text: Option<&str>,
+        items: Option<Vec<ArtifactDataItem>>,
+    ) -> WorkflowArtifactViewerView {
+        WorkflowArtifactViewerView {
+            artifact: art,
+            busy: false,
+            text: text.map(|t| std::sync::Arc::from(t)),
+            binary: false,
+            total_bytes: text.map(|t| t.len() as u64),
+            next_offset: None,
+            items,
+            items_has_more: false,
+        }
+    }
+
+    fn workspace_node(op: &str, args: serde_json::Value) -> WorkflowWorkspaceNode {
+        serde_json::from_value(serde_json::json!({
+            "siteId": "port", "ordinal": 2, "op": op, "args": args,
+            "status": "completed",
+            "summary": { "resultBytes": 1844, "exitCode": 0, "stdoutBytes": 100 },
+            "createdAt": 1760526010000u64, "updatedAt": 1760526120000u64,
+        }))
+        .expect("node parses")
     }
 
     fn event(sequence: u64, kind: &str, payload: serde_json::Value) -> WorkflowRunEvent {
@@ -2648,8 +4518,10 @@ mod workflows_tests {
         .unwrap();
     }
 
-    /// The run view renders the journal through the protocol renderer, and
-    /// the cursor's "Load more" dispatches the append read.
+    /// The run view renders the journal through the protocol renderer —
+    /// plain rows as event rows, node lifecycles folded into node lines
+    /// inside their phase section, the phase timeline above — and the
+    /// cursor's "Load more" dispatches the append read.
     #[gpui_kit::test]
     fn workflow_run_events_render_and_paginate(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -2659,11 +4531,17 @@ mod workflows_tests {
         let runtime = ProtocolRuntime::inert();
         let events = vec![
             event(1, "run-started", serde_json::json!({})),
+            event(2, "phase-entered", serde_json::json!({ "name": "map", "ordinal": 1 })),
             event(
-                2,
+                3,
                 "node-dispatched",
-                serde_json::json!({ "actorName": "impl", "instance": "site@1" }),
+                serde_json::json!({
+                    "actorName": "impl",
+                    "instance": { "siteId": "site", "ordinal": 1 }
+                }),
             ),
+            event(4, "log", serde_json::json!({ "message": "hello" })),
+            event(5, "phase-entered", serde_json::json!({ "name": "map", "ordinal": 2 })),
         ];
         let mut snap = WorkbenchSnapshot::initial();
         snap.phase = Phase::Connected;
@@ -2673,18 +4551,279 @@ mod workflows_tests {
         let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            // One row per journal event, the live-run header actions, and
-            // the cursor's next-page control.
+            // The tab strip, the phase timeline (map ×2 folded into ONE
+            // row), the leading slice's run-started row, the folded node
+            // line and the log row inside the "map" section, the live-run
+            // header actions, and the cursor's next-page control.
+            assert!(window.find("workflow-run-tab-events").visible());
+            assert!(window.find("workflow-run-phases").visible());
+            assert!(window.find("wf-phase-0-map").visible());
+            assert!(window.try_find("wf-phase-1-map").is_none(), "re-entry folds, not repeats");
             assert!(window.find("wf-event-1").visible());
-            assert!(window.find("wf-event-2").visible());
+            assert!(window.find("wf-phase-section-map").visible());
+            assert!(window.find("wf-node-line-site_1").visible());
+            assert!(window.find("wf-event-4").visible());
+            assert!(
+                window.try_find("wf-event-3").is_none(),
+                "a node-* event folds into its node line, never a bare row"
+            );
             assert!(window.find("workflow-run-stop").visible());
             assert!(window.find("workflow-run-amend-open").visible());
+            assert!(
+                window.try_find("workflow-run-resume").is_none(),
+                "a flying run is not resumable"
+            );
             assert!(window.find("workflow-run-load-more").visible());
             window.click("workflow-run-load-more", cx);
             let sent = runtime.recorded_commands();
             assert!(
                 sent.iter().any(|c| matches!(c, UiCommand::WorkflowRunLoadMore)),
                 "load more must dispatch the append read, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// L3: a journal row's raw payload sits behind an explicit toggle —
+    /// clicking the row opens the pretty JSON, clicking again closes it.
+    #[gpui_kit::test]
+    fn workflow_run_event_row_toggles_raw_payload(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let events = vec![event(7, "log", serde_json::json!({ "message": "hello" }))];
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut view = page_view(None);
+        view.run = Some(run_view(events, false));
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.try_find("wf-raw-ev-7-body").is_none(), "summary by default");
+            window.click("wf-event-7", cx);
+            window.render_frame(cx);
+            assert!(window.find("wf-raw-ev-7-body").visible(), "the raw JSON opens");
+            window.click("wf-event-7", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("wf-raw-ev-7-body").is_none(), "and closes again");
+        })
+        .unwrap();
+    }
+
+    /// L5: a settled, resumable run shows Resume and neither Stop nor
+    /// Configure (both are live-run controls).
+    #[gpui_kit::test]
+    fn workflow_run_header_buttons_follow_state(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut run = run_view(Vec::new(), false);
+        run.active = false;
+        if let Some(summary) = run.summary.as_mut() {
+            summary.status = "cancelled".to_string();
+            summary.resumable = true;
+        }
+        let mut view = page_view(None);
+        view.run = Some(run);
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("workflow-run-resume").visible());
+            assert!(window.try_find("workflow-run-stop").is_none());
+            assert!(window.try_find("workflow-run-amend-open").is_none());
+            window.click("workflow-run-resume", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::WorkflowResumeRun { run_id, session_id, instance_id, .. }
+                        if run_id == "run-1" && session_id == "s1" && instance_id == "inst-a"
+                )),
+                "resume must dispatch on the run's address, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// L1: picking the Artifacts tab dispatches the tab select (the lazy
+    /// read rides the driver); a loaded list opens its viewer on click.
+    #[gpui_kit::test]
+    fn workflow_run_tabs_switch_and_artifacts_open(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut run = run_view(Vec::new(), false);
+        run.tab = WorkflowRunTab::Artifacts;
+        run.artifacts = Some(vec![
+            artifact(
+                "art-0001",
+                "markdown",
+                Some("Checklist report"),
+                serde_json::json!({ "versions": [{ "version": 1 }, { "version": 2 }] }),
+            ),
+            artifact("art-0003", "board", Some("Port board"), serde_json::json!({ "itemCount": 12 })),
+        ]);
+        let mut view = page_view(None);
+        view.run = Some(run);
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("wf-artifact-row-art-0001").visible());
+            assert!(window.find("wf-artifact-row-art-0003").visible());
+            window.click("workflow-run-tab-workspace", cx);
+            window.click("wf-artifact-row-art-0001", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::WorkflowRunSelectTab { tab } if *tab == WorkflowRunTab::Workspace
+                )),
+                "the tab pill must dispatch the select, got {sent:?}"
+            );
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::WorkflowRunOpenArtifact { artifact_id } if artifact_id == "art-0001"
+                )),
+                "an artifact row must open its viewer, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// L1: the artifact viewer draws the spec-driven table (declared
+    /// columns, key dedupe) with the raw items one toggle away, and the page
+    /// header's back closes the VIEWER first (the TS back ladder).
+    #[gpui_kit::test]
+    fn workflow_run_artifact_viewer_table_and_back(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut run = run_view(Vec::new(), false);
+        run.tab = WorkflowRunTab::Artifacts;
+        let table = artifact(
+            "art-0002",
+            "table",
+            Some("Port table"),
+            serde_json::json!({
+                "spec": {
+                    "key": "title",
+                    "columns": [{ "field": "title", "label": "File" }, { "field": "state" }]
+                }
+            }),
+        );
+        run.artifacts = Some(vec![table.clone()]);
+        run.artifact = Some(viewer(
+            table,
+            None,
+            Some(vec![
+                ArtifactDataItem {
+                    sequence: 1,
+                    item: serde_json::json!({ "title": "hub.rs", "state": "todo" }),
+                },
+                ArtifactDataItem {
+                    sequence: 2,
+                    item: serde_json::json!({ "title": "hub.rs", "state": "done" }),
+                },
+            ]),
+        ));
+        let mut view = page_view(None);
+        view.run = Some(run);
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("workflow-artifact-viewer").visible());
+            assert!(window.find("wf-table-view").visible());
+            assert!(window.find("wf-table-row-0").visible());
+            assert!(
+                window.try_find("wf-table-row-1").is_none(),
+                "the keyed replace folds two items into one row"
+            );
+            // The raw items toggle: closed, then open.
+            assert!(window.try_find("wf-raw-art-items-body").is_none());
+            window.click("wf-raw-art-items-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.find("wf-raw-art-items-body").visible());
+            // Back closes the viewer, not the run page.
+            window.click("workflows-back", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(c, UiCommand::WorkflowRunCloseArtifact)),
+                "back must close the viewer first, got {sent:?}"
+            );
+            assert!(
+                !sent.iter().any(|c| matches!(c, UiCommand::CloseWorkflowRun)),
+                "the run page must stay open under the viewer"
+            );
+        })
+        .unwrap();
+    }
+
+    /// L1: the workspace tab renders the op-tile rows; a click expands the
+    /// node's result (one GET), and a landed result paints structured
+    /// before raw — exit code + stdout, raw JSON behind the toggle.
+    #[gpui_kit::test]
+    fn workflow_run_workspace_rows_expand(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut run = run_view(Vec::new(), false);
+        run.tab = WorkflowRunTab::Workspace;
+        run.nodes = Some(vec![workspace_node(
+            "world.run",
+            serde_json::json!({ "command": "cargo test -p protocol" }),
+        )]);
+        run.node_result = Some(WorkflowNodeResultView {
+            key: "port:2".to_string(),
+            status: Some("completed".to_string()),
+            body: serde_json::json!({ "exitCode": 0, "stdout": "ok\n38 passed", "stderr": "" }),
+            truncated: false,
+        });
+        let mut view = page_view(None);
+        view.run = Some(run);
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("wf-workspace-row-port_2").visible());
+            assert!(window.find("wf-badge-workspace-port_2").visible());
+            assert!(window.find("wf-node-result-port_2").visible());
+            assert!(window.find("wf-node-result-port_2-stdout").visible());
+            assert!(window.try_find("wf-raw-node-port:2-body").is_none());
+            window.click("wf-raw-node-port:2-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.find("wf-raw-node-port:2-body").visible());
+            window.click("wf-workspace-row-port_2", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::WorkflowRunToggleNode { key, site_id, ordinal }
+                        if key == "port:2" && site_id == "port" && *ordinal == 2
+                )),
+                "the row must toggle its node result, got {sent:?}"
             );
         })
         .unwrap();

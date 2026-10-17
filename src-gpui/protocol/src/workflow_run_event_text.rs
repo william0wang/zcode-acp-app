@@ -65,8 +65,9 @@ fn as_record(v: Option<&Value>) -> Option<&Map<String, Value>> {
     v.and_then(Value::as_object)
 }
 
-/// JS `String(n)` parity for the numbers these payloads carry.
-fn fmt_num(n: f64) -> String {
+/// JS `String(n)` parity for the numbers these payloads carry (shared with
+/// the run-detail models in `workflow_run_detail`).
+pub(crate) fn fmt_num(n: f64) -> String {
     if n.fract() == 0.0 && n.abs() < 1e15 {
         format!("{}", n as i64)
     } else {
@@ -78,8 +79,9 @@ fn fmt_num_opt(n: Option<f64>) -> String {
     n.map(fmt_num).unwrap_or_else(|| "?".to_owned())
 }
 
-/// `n.toLocaleString()` (en-US grouping) — the usage line's token counts.
-fn thousands(n: f64) -> String {
+/// `n.toLocaleString()` (en-US grouping) — the usage line's token counts
+/// (shared with the chart axis formatter in `workflow_run_detail`).
+pub(crate) fn thousands(n: f64) -> String {
     let negative = n < 0.0;
     let int = (n.abs().trunc()) as u64;
     let frac = n.abs().fract();

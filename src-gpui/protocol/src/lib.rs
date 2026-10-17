@@ -57,6 +57,9 @@
 //!   report computation (`src/lib/workflow-args.ts`, `WorkflowArgsForm.tsx`)
 //! - [`workflow_run_event_text`] — journal event rendering + slice folding
 //!   (`src/components/config/workflowRunEventText.ts`)
+//! - [`workflow_run_detail`] — the run-detail view's pure halves: phase fold
+//!   + slicing, workspace row text, node-result shape, preset artifact
+//!   models (`WorkflowRunDetail.tsx`, `WorkflowArtifactViews.tsx`)
 //! - [`image`] — client-side attachment downsampling/re-encoding
 //!   (`src/lib/image.ts`, ADR 0007): pick/paste/drop → ACP image block
 
@@ -84,6 +87,7 @@ pub mod system_stats;
 pub mod toast;
 pub mod workflow;
 pub mod workflow_args;
+pub mod workflow_run_detail;
 pub mod workflow_run_event_text;
 pub mod ws;
 

@@ -200,6 +200,12 @@ pub struct Workbench {
     pub(crate) workflow_form_subs: Vec<Subscription>,
     /// The WorkflowGate sheet (batch J) — view-local overlay.
     pub(crate) workflow_gate_sheet: bool,
+    /// The run page's open raw-payload toggles (batch L, TS `EventRow`'s
+    /// `open` + `RawData`): the expanded raw keys, scoped to the open run —
+    /// a run switch clears them (the TS key={runId} remount).
+    pub(crate) workflow_raw_open: std::collections::HashSet<String>,
+    /// The run id the toggles belong to.
+    workflow_raw_run: Option<String>,
     /// The Hooks page's expanded event (view-local fold, TS `open`).
     pub(crate) hooks_open_event: Option<String>,
     /// The Backups page's armed restore confirm (TS `confirm`): the
@@ -755,6 +761,8 @@ impl Workbench {
             workflow_amend_form: None,
             workflow_form_subs: Vec::new(),
             workflow_gate_sheet: false,
+            workflow_raw_open: std::collections::HashSet::new(),
+            workflow_raw_run: None,
             hooks_open_event: None,
             backup_confirm: None,
             server_remove_armed: None,
@@ -1032,6 +1040,19 @@ impl Workbench {
                     self.workflow_start_form = None;
                     self.workflow_amend_form = None;
                     self.workflow_form_subs.clear();
+                }
+                // The run page's raw toggles are run-local state (the TS
+                // remount drops them with the view); a run switch or close
+                // clears, a supersede re-point included.
+                let raw_run = self
+                    .snap
+                    .workflows_page
+                    .as_ref()
+                    .and_then(|p| p.run.as_ref())
+                    .map(|r| r.run_id.clone());
+                if raw_run != self.workflow_raw_run {
+                    self.workflow_raw_open.clear();
+                    self.workflow_raw_run = raw_run;
                 }
                 // The spend gesture is page-local state (TS useState); a
                 // page closed under an open confirm dialog drops it.
