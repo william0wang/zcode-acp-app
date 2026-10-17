@@ -10,6 +10,7 @@ import type { WorkflowRunEvent } from "../src/lib/types";
 import {
   describeRunEvent,
   newestFirst,
+  phasePaints,
   phaseRows,
   reduceSlice,
   refText,
@@ -223,6 +224,18 @@ describe("phaseRows", () => {
     // Homed in a later slice (resume replay): the report rejoins the phase,
     // the lifecycle rows do not.
     expect(phaseRows(fold, () => false).map((e) => e.sequence)).toEqual([5, 3, 1]);
+  });
+});
+
+describe("phasePaints", () => {
+  it("an empty just-entered phase paints nothing and cannot be the head", () => {
+    const fold = reduceSlice(t, [
+      ev(1, "log", { message: "x" }),
+      ev(2, "node-dispatched", { instance: instance("scan", 1) }),
+    ]);
+    const owns = (key: string) => key === "scan@1";
+    expect(phasePaints(fold, owns, () => false)).toBe(true);
+    expect(phasePaints(reduceSlice(t, []), owns, () => false)).toBe(false);
   });
 });
 
