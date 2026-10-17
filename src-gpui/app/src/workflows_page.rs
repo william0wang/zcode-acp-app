@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    canvas, point, pulsating_between, size, Animation, AnyElement, Bounds, Context, Entity, Hsla,
-    PathBuilder, Rgba, Window, div, fill as quad_fill, px, rgb,
+    canvas, point, pulsating_between, radians, size, Animation, AnyElement, Bounds, Context,
+    Entity, Hsla, PathBuilder, Pixels, Rgba, Window, div, fill as quad_fill, px, rgb,
 };
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -50,13 +50,14 @@ use protocol::workflow_args::{
 use protocol::workflow_run_detail::{
     args_text, artifact_is_preset, artifact_meta, artifact_spec, board_columns, chart_fmt,
     chart_model, fmt_duration, key_value_cards, latest_version, metrics_tiles, node_key,
-    node_ref_line, node_result_body, node_summary_text, op_family, phase_slices, phases,
-    pretty_json, table_model, ArtifactDataItem, ChartKind, KeyValueCard, NodeResultBody,
-    OpFamily, PhaseEntry, PhaseSlice, PhaseSlices,
+    node_ref_line, node_result_body, node_summary_text, op_family, phase_paints, phase_rows,
+    phase_slices, pretty_json, table_model, ArtifactDataItem, ChartKind, KeyValueCard,
+    NodeResultBody, OpFamily, PhaseSlice, PhaseSlices,
 };
 use protocol::workflow_run_event_text::{
-    describe_run_event, node_state_word, reduce_slice, status_word, ActorLine, NodeAgg, NodeState,
-    RunEventTone, Translate,
+    describe_run_event, describe_run_event_with, node_state_word, newest_first, reduce_slice,
+    status_word, ActorLine, DescribeOptions, NodeAgg, NodeState, RunEventTone, SliceFold,
+    Translate,
 };
 use rust_i18n::t;
 
@@ -1662,29 +1663,63 @@ fn render_run_events_tab(
     cx: &Context<Workbench>,
 ) -> gpui::Stateful<gpui::Div> {
     let theme = cx.theme();
-    let events = run.events.as_deref().unwrap_or(&[]);
 
-    // The phase timeline rides above the sections whenever any phase was
-    // entered; the head pulses while the run flies.
-    let entered = phases(events);
-    if !entered.is_empty() {
-        list = list.child(render_phase_timeline(&entered, run.active, theme, cx));
+    // The cursor's next page loads NEWER events, which render on top — the
+    // control rides above the cards (TS `workflowLoadNewer`).
+    if run.has_more && run.events.is_some() {
+        let runtime = wb.runtime.clone();
+        list = list.child(
+            div().px_3().pt_3().child(
+                Button::new("workflow-run-load-newer")
+                    .secondary()
+                    .small()
+                    .w_full()
+                    .label(t!("zconfig.workflowLoadNewer").into_owned())
+                    .disabled(run.events_busy)
+                    .on_click(move |_, _, _| runtime.send(UiCommand::WorkflowRunLoadMore)),
+            ),
+        );
     }
 
-    match &run.events {
-        Some(events) if events.is_empty() => {
+    if let Some(events) = &run.events {
+        if events.is_empty() {
             list = list.child(empty_card(&t!("zconfig.workflowEventsEmpty"), theme));
-        }
-        _ => {
-            // Events sliced at every phase-entered boundary; a slice renders
-            // only the nodes/actors it OWNS (nodeHome/actorHome — replayed
-            // resume prefixes must not double-render).
+        } else {
+            // Phase cards read newest-first: the newest slice is where the
+            // run stands and sits on top; older phases fold beneath it. The
+            // folds fold per slice (nodeHome/actorHome — replayed resume
+            // prefixes must not double-render); the slices are reduced once
+            // here so the head verdict and the cards share them.
             let sliced = phase_slices(events);
+            let cards: Vec<(usize, &PhaseSlice, SliceFold)> = sliced
+                .slices
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i, s, reduce_slice(&Catalog, &s.events)))
+                .collect();
+            // The newest slice that actually paints is the visible head —
+            // a just-entered phase owns nothing yet and must not leave the
+            // content beneath it folded shut behind a card that never
+            // renders.
+            let head = cards
+                .iter()
+                .rev()
+                .find(|(i, _, f)| phase_paints(f, &sliced, *i))
+                .map(|(i, _, _)| *i);
             let mut block = rows_card(theme);
             let mut painted = 0usize;
-            for (index, slice) in sliced.slices.iter().enumerate() {
-                if let Some(section) = render_phase_section(wb, slice, index, &sliced, cx) {
-                    block = block.child(section);
+            for (index, slice, fold) in cards.iter().rev() {
+                let bare = cards.len() == 1 && slice.phase.is_none();
+                let open = wb
+                    .workflow_phase_open
+                    .get(index)
+                    .copied()
+                    .unwrap_or(Some(*index) == head);
+                if let Some(card) = render_phase_card(
+                    wb, slice, fold, *index, &sliced, Some(*index) == head, run.active, bare,
+                    open, cx,
+                ) {
+                    block = block.child(card);
                     painted += 1;
                 }
             }
@@ -1719,216 +1754,76 @@ fn render_run_events_tab(
                 .child(Spinner::new()),
         );
     }
-    // The cursor's next page: `afterSequence` past the highest sequence
-    // held, gated on the server's `hasMore`.
-    if run.has_more && run.events.is_some() {
-        let runtime = wb.runtime.clone();
-        list = list.child(
-            div().px_3().child(
-                Button::new("workflow-run-load-more")
-                    .secondary()
-                    .small()
-                    .w_full()
-                    .label(t!("zconfig.workflowLoadMore").into_owned())
-                    .disabled(run.events_busy)
-                    .on_click(move |_, _, _| runtime.send(UiCommand::WorkflowRunLoadMore)),
-            ),
-        );
-    }
     list
 }
 
-/// The vertical mini timeline (TS `PhaseTimeline`): one row per entered
-/// phase with a connecting spine; the newest row is the head — pulsing
-/// while the run flies, plain once it settles.
-fn render_phase_timeline(
-    entered: &[PhaseEntry],
-    running: bool,
-    theme: &component::Theme,
-    cx: &Context<Workbench>,
-) -> AnyElement {
-    let mut col = div()
-        .id("workflow-run-phases")
-        .test_support()
-        .flex()
-        .flex_col()
-        .m_3()
-        .mb_1()
-        .px_4()
-        .pt_3();
-    let reduce_motion = cx.reduce_motion();
-    for (i, p) in entered.iter().enumerate() {
-        let head = i == entered.len() - 1;
-        let dot = div()
-            .mt(px(3.))
-            .size(px(10.))
-            .flex_none()
-            .rounded_full()
-            .bg(if head {
-                theme.info
-            } else {
-                theme.success.opacity(0.8)
-            });
-        // The live head breathes (upstream animate-pulse); reduce-motion
-        // renders it solid.
-        let dot: AnyElement = if head && running && !reduce_motion {
-            dot.with_animation(
-                SharedString::from("wf-phase-head-pulse"),
-                Animation::new(Duration::from_millis(1200))
-                    .repeat()
-                    .with_easing(pulsating_between(0.4, 1.0)),
-                |this, delta| this.opacity(delta),
-            )
-            .into_any_element()
-        } else {
-            dot.into_any_element()
-        };
-        let label = if p.times > 1 {
-            format!("{} · ×{}", p.name, p.times)
-        } else {
-            p.name.clone()
-        };
-        col = col.child(
-            div()
-                .id(SharedString::from(format!("wf-phase-{i}-{}", slug_run_id(&p.name))))
-                .test_support()
-                .flex()
-                .min_w_0()
-                .gap(px(10.))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .child(dot)
-                        .when(!head, |this| {
-                            this.child(
-                                div()
-                                    .w(px(1.))
-                                    .flex_1()
-                                    .min_h(px(12.))
-                                    .bg(theme.border),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .pb_2()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
-                        .font_weight(if head {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_color(if head {
-                            theme.foreground
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .truncate()
-                        .child(label),
-                ),
-        );
-    }
-    col.into_any_element()
-}
-
-/// One phase section (TS `PhaseSection`): header, hired actors, folded
-/// nodes, usage, leftover journal rows, the settle. `None` when the slice
-/// owns nothing (its nodes/actors live in other slices).
-fn render_phase_section(
+/// One phase's card (TS `PhaseSection`): the header carries the phase's
+/// state and folds the body; only the visible head phase opens by default.
+/// The body reads newest-first — the settle, the phase's journal rows, then
+/// its steps, the hiring/usage footer last — so the latest message is the
+/// first thing seen. Nodes/actors are filtered to the ones this slice OWNS
+/// (`nodeHome`/`actorHome` — replayed resume prefixes must not
+/// double-render).
+fn render_phase_card(
     wb: &Workbench,
     slice: &PhaseSlice,
+    fold: &SliceFold,
     slice_index: usize,
     sliced: &PhaseSlices,
+    head: bool,
+    running: bool,
+    bare: bool,
+    open: bool,
     cx: &Context<Workbench>,
 ) -> Option<AnyElement> {
     let theme = cx.theme();
-    let fold = reduce_slice(&Catalog, &slice.events);
-    let own_nodes: Vec<&NodeAgg> = fold
-        .nodes
-        .iter()
-        .filter(|n| sliced.node_home.get(&n.key) == Some(&slice_index))
-        .collect();
+    let is_own = |key: &str| sliced.node_home.get(key) == Some(&slice_index);
+    let own_nodes: Vec<&NodeAgg> = fold.nodes.iter().filter(|n| is_own(&n.key)).collect();
     let own_actors: Vec<&ActorLine> = fold
         .actors
         .iter()
         .filter(|a| sliced.actor_home.get(&a.key) == Some(&slice_index))
         .collect();
-    if own_actors.is_empty()
-        && own_nodes.is_empty()
-        && fold.others.is_empty()
-        && fold.settled.is_none()
-        && fold.spent_tokens.is_none()
-    {
+    let journal = phase_rows(fold, &is_own);
+    if !phase_paints(fold, sliced, slice_index) {
         return None;
     }
-    let mut section = div()
-        .id(SharedString::from(format!(
-            "wf-phase-section-{}",
-            slice.phase
-                .as_deref()
-                .map(slug_run_id)
-                .unwrap_or_else(|| "pre".to_string())
-        )))
-        .test_support()
-        .flex()
-        .flex_col();
-    if let Some(phase) = &slice.phase {
-        section = section.child(
-            div()
-                .flex()
-                .items_baseline()
-                .gap_2()
-                .px_4()
-                .pt_3()
-                .pb_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
-                        .text_color(theme.foreground)
-                        .truncate()
-                        .child(phase.clone()),
-                )
-                .when(!own_nodes.is_empty(), |this| {
-                    this.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.))
-                            .text_color(theme.muted_foreground)
-                            .child(fill(
-                                &t!("zconfig.workflowPhaseNodes"),
-                                &[("n", &own_nodes.len().to_string())],
-                            )),
-                    )
-                }),
-        );
+
+    // The body, newest first (TS PhaseSection): the settle closes the run,
+    // then the phase-level journal rows, then the steps (each a fold of its
+    // own), the hiring/usage footer last.
+    let mut body = div().flex().flex_col();
+    if let Some(ev) = &fold.settled {
+        body = body.child(render_event_row(wb, ev, px(16.), false, cx));
     }
-    for a in own_actors {
-        section = section.child(
+    for ev in &journal {
+        body = body.child(render_event_row(wb, ev, px(16.), false, cx));
+    }
+    for n in &own_nodes {
+        body = body.child(render_step_row(wb, n, cx));
+    }
+    if !own_actors.is_empty() {
+        body = body.child(
             div()
                 .px_4()
                 .py(px(4.))
                 .min_w_0()
-                .text_size(px(11.))
+                .text_size(px(10.))
                 .text_color(theme.muted_foreground)
                 .truncate()
-                .child(format!("{} · {}", t!("zconfig.wfEvActorCreated"), a.label)),
+                .child(format!(
+                    "{} · {}",
+                    t!("zconfig.wfEvActorCreated"),
+                    own_actors
+                        .iter()
+                        .map(|a| a.label.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" · ")
+                )),
         );
     }
-    for n in own_nodes {
-        section = section.child(render_node_line(n, theme, cx));
-    }
     if let Some(spent) = fold.spent_tokens {
-        section = section.child(
+        body = body.child(
             div()
                 .px_4()
                 .py(px(4.))
@@ -1941,18 +1836,144 @@ fn render_phase_section(
                 )),
         );
     }
-    for ev in &fold.others {
-        section = section.child(render_event_row(wb, ev, cx));
+
+    let id = format!(
+        "wf-phase-section-{}",
+        slice
+            .phase
+            .as_deref()
+            .map(slug_run_id)
+            .unwrap_or_else(|| "pre".to_string())
+    );
+    // The only slice and it has no phase: no card chrome, just the rows.
+    if bare {
+        return Some(
+            div()
+                .id(SharedString::from(id))
+                .test_support()
+                .flex()
+                .flex_col()
+                .child(body)
+                .into_any_element(),
+        );
     }
-    if let Some(ev) = &fold.settled {
-        section = section.child(render_event_row(wb, ev, cx));
+
+    let failed = own_nodes.iter().any(|n| n.state == NodeState::Failed)
+        || fold
+            .settled
+            .as_ref()
+            .is_some_and(|ev| describe_run_event(&Catalog, ev).tone == RunEventTone::Failed);
+    let pulse = head && running && !failed;
+    let dot = div()
+        .size(px(8.))
+        .flex_none()
+        .rounded_full()
+        .bg(if failed {
+            theme.danger
+        } else if head && running {
+            theme.info
+        } else {
+            theme.success.opacity(0.8)
+        });
+    // The live head breathes (upstream animate-pulse); reduce-motion
+    // renders it solid.
+    let dot: AnyElement = if pulse && !cx.reduce_motion() {
+        dot.with_animation(
+            SharedString::from("wf-phase-card-pulse"),
+            Animation::new(Duration::from_millis(1200))
+                .repeat()
+                .with_easing(pulsating_between(0.4, 1.0)),
+            |this, delta| this.opacity(delta),
+        )
+        .into_any_element()
+    } else {
+        dot.into_any_element()
+    };
+    let name = slice
+        .phase
+        .clone()
+        .unwrap_or_else(|| t!("zconfig.workflowPhasePrelude").into_owned());
+    let title = match slice.ordinal {
+        Some(n) if n >= 2 => format!("{name} ×{n}"),
+        _ => name,
+    };
+    let wb_toggle = cx.entity();
+    let open_now = open;
+    let header = div()
+        .id(SharedString::from(format!("wf-phase-head-{slice_index}")))
+        .test_support()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py_2()
+        .min_w_0()
+        .cursor_pointer()
+        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+        .border_b_1()
+        .border_color(if open {
+            theme.border
+        } else {
+            gpui::transparent_black()
+        })
+        .on_click(move |_, _, cx| {
+            wb_toggle.update(cx, |wb, cx| {
+                wb.set_workflow_phase_open(slice_index, !open_now, cx)
+            });
+        })
+        .child(dot)
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(px(12.))
+                .text_color(if head {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .truncate()
+                .child(title),
+        )
+        .when(!own_nodes.is_empty(), |this| {
+            this.child(
+                div()
+                    .flex_none()
+                    .text_size(px(10.))
+                    .text_color(theme.muted_foreground)
+                    .child(fill(
+                        &t!("zconfig.workflowPhaseNodes"),
+                        &[("n", &own_nodes.len().to_string())],
+                    )),
+            )
+        })
+        .child(
+            Icon::new(IconName::ChevronRight)
+                .small()
+                .flex_none()
+                .text_color(theme.muted_foreground)
+                .when(open, |icon| icon.rotate(radians(std::f32::consts::FRAC_PI_2))),
+        );
+    let mut card = div()
+        .id(SharedString::from(id))
+        .test_support()
+        .flex()
+        .flex_col()
+        .child(header);
+    if open {
+        card = card.child(body);
     }
-    Some(section.into_any_element())
+    Some(card.into_any_element())
 }
 
-/// One folded node line (TS `NodeLine`): state dot + identity + activity +
-/// the outcome word; a failed node carries its error underneath.
-fn render_node_line(n: &NodeAgg, theme: &component::Theme, cx: &Context<Workbench>) -> AnyElement {
+/// One step's row (TS `StepRow`): the folded line is state dot + identity +
+/// activity + the outcome word; clicking opens the step's own detail — the
+/// instruction head, the error, and its journal rows newest-first (the
+/// instance ref omitted: the row already says whose they are).
+fn render_step_row(wb: &Workbench, n: &NodeAgg, cx: &Context<Workbench>) -> AnyElement {
+    let theme = cx.theme();
+    let open = wb.workflow_step_open.contains(&n.key);
     let (dot_color, pulse) = match n.state {
         NodeState::Ok => (theme.success, false),
         NodeState::Failed => (theme.danger, false),
@@ -1989,6 +2010,9 @@ fn render_node_line(n: &NodeAgg, theme: &component::Theme, cx: &Context<Workbenc
     } else {
         dot.into_any_element()
     };
+    let wb_toggle = cx.entity();
+    let toggle_key = n.key.clone();
+    let open_now = open;
     div()
         .id(SharedString::from(format!("wf-node-line-{}", slug_run_id(&n.key))))
         .test_support()
@@ -1999,10 +2023,23 @@ fn render_node_line(n: &NodeAgg, theme: &component::Theme, cx: &Context<Workbenc
         .min_w_0()
         .child(
             div()
+                .id(SharedString::from(format!(
+                    "wf-step-head-{}",
+                    slug_run_id(&n.key)
+                )))
+                .test_support()
                 .flex()
                 .items_center()
                 .gap_2()
                 .min_w_0()
+                .cursor_pointer()
+                .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+                .on_click(move |_, _, cx| {
+                    let key = toggle_key.clone();
+                    wb_toggle.update(cx, |wb, cx| {
+                        wb.set_workflow_step_open(&key, !open_now, cx)
+                    });
+                })
                 .child(dot)
                 .child(
                     div()
@@ -2024,31 +2061,93 @@ fn render_node_line(n: &NodeAgg, theme: &component::Theme, cx: &Context<Workbenc
                             .text_color(word_color)
                             .child(word),
                     )
-                }),
+                })
+                .child(
+                    Icon::new(IconName::ChevronRight)
+                        .xsmall()
+                        .flex_none()
+                        .text_color(theme.muted_foreground)
+                        .when(open, |icon| {
+                            icon.rotate(radians(std::f32::consts::FRAC_PI_2))
+                        }),
+                ),
         )
-        .when(
-            n.state == NodeState::Failed && n.error.is_some(),
-            |this| {
-                this.child(
+        .when(!open && n.state == NodeState::Failed && n.error.is_some(), |this| {
+            this.child(
+                div()
+                    .pl(px(14.))
+                    .text_size(px(10.))
+                    .text_color(theme.danger_foreground.opacity(0.9))
+                    .truncate()
+                    .child(n.error.clone().unwrap_or_default()),
+            )
+        })
+        .when(open, |this| {
+            // The step's own detail, newest first. The rows drop the
+            // instance ref (the row already says whose they are) and sit
+            // flush with the spine instead of the card's padding.
+            let mut detail = div()
+                .id(SharedString::from(format!(
+                    "wf-step-body-{}",
+                    slug_run_id(&n.key)
+                )))
+                .test_support()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .ml(px(3.))
+                .mt_1()
+                .pl_3()
+                .border_l_1()
+                .border_color(theme.border);
+            if let Some(head_text) = &n.head {
+                detail = detail.child(
                     div()
-                        .pl(px(14.))
-                        .text_size(px(10.))
+                        .min_w_0()
+                        .pb_1()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(head_text.clone()),
+                );
+            }
+            if let Some(error) = &n.error {
+                detail = detail.child(
+                    div()
+                        .min_w_0()
+                        .pb_1()
+                        .text_size(px(11.))
                         .text_color(theme.danger_foreground.opacity(0.9))
-                        .truncate()
-                        .child(n.error.clone().unwrap_or_default()),
-                )
-            },
-        )
+                        .child(error.clone()),
+                );
+            }
+            let mut rows: Vec<&WorkflowRunEvent> = n.events.iter().collect();
+            rows.sort_by(|a, b| newest_first(a, b));
+            for ev in rows {
+                detail = detail.child(render_event_row(wb, ev, px(0.), true, cx));
+            }
+            this.child(detail)
+        })
         .into_any_element()
 }
 
 /// One journal row (TS `EventRow`): the readable label + detail (the
 /// protocol renderer), the raw payload behind an explicit toggle. Sequence
-/// numbers stay out of the default view — they are journal coordinates,
-/// not information.
-fn render_event_row(wb: &Workbench, ev: &WorkflowRunEvent, cx: &Context<Workbench>) -> AnyElement {
+/// numbers stay out of the default view — they are journal coordinates, not
+/// information. `left_pad` aligns rows nested under a step's spine;
+/// `omit_site` drops the instance ref there.
+fn render_event_row(
+    wb: &Workbench,
+    ev: &WorkflowRunEvent,
+    left_pad: Pixels,
+    omit_site: bool,
+    cx: &Context<Workbench>,
+) -> AnyElement {
     let theme = cx.theme();
-    let desc = describe_run_event(&Catalog, ev);
+    let desc = describe_run_event_with(
+        &Catalog,
+        ev,
+        DescribeOptions { omit_site },
+    );
     let mono = desc.mono_label.unwrap_or(false);
     let label_color = if mono {
         theme.muted_foreground
@@ -2065,7 +2164,8 @@ fn render_event_row(wb: &Workbench, ev: &WorkflowRunEvent, cx: &Context<Workbenc
         .flex()
         .flex_col()
         .min_w_0()
-        .px_4()
+        .pl(left_pad)
+        .pr_4()
         .py_2()
         .border_b_1()
         .border_color(theme.border)
@@ -3846,6 +3946,34 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Sets one phase card's fold (TS `phaseOpen[i] = !(phaseOpen[i] ?? i ===
+    /// headSlice)`): the render side passes the flipped effective state, so
+    /// an explicit entry always wins over the head default.
+    pub(crate) fn set_workflow_phase_open(
+        &mut self,
+        slice_index: usize,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.workflow_phase_open.insert(slice_index, open);
+        cx.notify();
+    }
+
+    /// Sets one step row's expansion (TS `StepRow`'s `setOpen`).
+    pub(crate) fn set_workflow_step_open(
+        &mut self,
+        key: &str,
+        open: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if open {
+            self.workflow_step_open.insert(key.to_owned());
+        } else {
+            self.workflow_step_open.remove(key);
+        }
+        cx.notify();
+    }
+
     /// TS `canSubmit` for the start form: the typed report's error (a
     /// malformed number / JSON field, a missing required field) or the
     /// free-form parse error keeps the submit disabled.
@@ -4992,21 +5120,28 @@ mod workflows_tests {
         let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
         cx.update_window(handle.into(), |_, window, cx| {
             window.render_frame(cx);
-            // The tab strip, the phase timeline (map ×2 folded into ONE
-            // row), the leading slice's run-started row, the folded node
-            // line and the log row inside the "map" section, the live-run
-            // header actions, and the cursor's next-page control.
+            // The tab strip; the phase cards read newest-first — the "map"
+            // slice (the newest one that paints; the empty ×2 re-entry
+            // renders nothing) open on top, the prelude folded beneath it;
+            // the folded step row and the log row inside "map", the
+            // live-run header actions, and the cursor's next-page control
+            // above the cards.
             assert!(window.find("workflow-run-tab-events").visible());
-            assert!(window.find("workflow-run-phases").visible());
-            assert!(window.find("wf-phase-0-map").visible());
-            assert!(window.try_find("wf-phase-1-map").is_none(), "re-entry folds, not repeats");
-            assert!(window.find("wf-event-1").visible());
+            assert!(
+                window.try_find("workflow-run-phases").is_none(),
+                "no standalone timeline — the card headers are it"
+            );
+            assert!(window.find("wf-phase-head-1").visible());
             assert!(window.find("wf-phase-section-map").visible());
             assert!(window.find("wf-node-line-site_1").visible());
             assert!(window.find("wf-event-4").visible());
             assert!(
+                window.try_find("wf-event-1").is_none(),
+                "the prelude folds shut by default"
+            );
+            assert!(
                 window.try_find("wf-event-3").is_none(),
-                "a node-* event folds into its node line, never a bare row"
+                "a node-* event folds into its step row, never a bare row"
             );
             assert!(window.find("workflow-run-stop").visible());
             assert!(window.find("workflow-run-amend-open").visible());
@@ -5014,13 +5149,22 @@ mod workflows_tests {
                 window.try_find("workflow-run-resume").is_none(),
                 "a flying run is not resumable"
             );
-            assert!(window.find("workflow-run-load-more").visible());
-            window.click("workflow-run-load-more", cx);
+            assert!(window.find("workflow-run-load-newer").visible());
+            window.click("workflow-run-load-newer", cx);
             let sent = runtime.recorded_commands();
             assert!(
                 sent.iter().any(|c| matches!(c, UiCommand::WorkflowRunLoadMore)),
-                "load more must dispatch the append read, got {sent:?}"
+                "load newer must dispatch the append read, got {sent:?}"
             );
+            // The prelude unfolds on its header click.
+            window.click("wf-phase-head-0", cx);
+            window.render_frame(cx);
+            assert!(window.find("wf-event-1").visible());
+            // The step unfolds into its own detail (site ref omitted).
+            window.click("wf-step-head-site_1", cx);
+            window.render_frame(cx);
+            assert!(window.find("wf-step-body-site_1").visible());
+            assert!(window.find("wf-event-3").visible());
         })
         .unwrap();
     }

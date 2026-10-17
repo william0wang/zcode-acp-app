@@ -2156,6 +2156,9 @@ impl WorkflowsPanel {
     }
 }
 
+/// Journal pages drained per run-events call (TS `DRAIN_PAGES`).
+const RUN_EVENT_DRAIN_PAGES: usize = 8;
+
 /// Highest journal sequence held — the safe `afterSequence` cursor. NOT the
 /// last element's sequence: a clipped journal page can end on an event
 /// without one, and a degenerate cursor makes the server replay the whole
@@ -3845,7 +3848,53 @@ impl Driver {
             let _ = tx.send(LoopEvent::WorkflowRunSummary { seq, result });
         });
         tokio::spawn(async move {
-            let result = hub2.run_events(&instance_id2, &session_id2, &run_id, after).await;
+            // Newest-first reads want the journal's tail (TS `fetchEvents`'s
+            // drain loop): pull up to RUN_EVENT_DRAIN_PAGES pages per call so
+            // a long settled journal does not open on its OLDEST page with
+            // the ending hidden behind a button. `events_busy` stays raised
+            // across the whole drain — the pages land as one.
+            let result = 'drain: {
+                let mut held: Vec<WorkflowRunEvent> = Vec::new();
+                let mut more = false;
+                let mut cursor = after;
+                for _ in 0..RUN_EVENT_DRAIN_PAGES {
+                    match hub2
+                        .run_events(&instance_id2, &session_id2, &run_id, cursor)
+                        .await
+                    {
+                        Ok(res) => {
+                            more = res.has_more.unwrap_or(false);
+                            let next = res.events.iter().map(|e| e.sequence).max();
+                            held = merge_run_events(held, res.events);
+                            if !more {
+                                break;
+                            }
+                            cursor = Some(match (cursor, next) {
+                                (Some(c), Some(n)) => c.max(n),
+                                (Some(c), None) => c,
+                                (None, Some(n)) => n,
+                                // An empty page that still claims has_more:
+                                // keep the incoming cursor and stop climbing.
+                                (None, None) => 0,
+                            });
+                        }
+                        // A failed page with earlier pages already in hand
+                        // keeps them (TS `if (!res) break`): only a total
+                        // failure surfaces as an error.
+                        Err(err) => {
+                            if held.is_empty() {
+                                break 'drain Err(err);
+                            }
+                            break;
+                        }
+                    }
+                }
+                Ok(WorkflowRunEventsResponse {
+                    ok: true,
+                    events: held,
+                    has_more: Some(more),
+                })
+            };
             let _ = tx2.send(LoopEvent::WorkflowRunEvents { seq, initial, result });
         });
     }

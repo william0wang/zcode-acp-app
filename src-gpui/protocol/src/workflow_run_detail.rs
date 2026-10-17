@@ -22,7 +22,9 @@ use crate::workflow::{
     WorkflowArtifact, WorkflowArtifactItem, WorkflowNodeSummary, WorkflowRunEvent,
     WorkflowRunEventPayload, WorkflowWorkspaceNode,
 };
-use crate::workflow_run_event_text::{actor_key_of, fmt_num, instance_key_of, thousands};
+use crate::workflow_run_event_text::{
+    actor_key_of, fmt_num, instance_key_of, newest_first, thousands, SliceFold,
+};
 
 /// Pretty JSON cap (TS `JSON_CAP`): a huge payload must not wedge the layout.
 pub const JSON_CAP: usize = 20_000;
@@ -408,6 +410,8 @@ pub fn phases(events: &[WorkflowRunEvent]) -> Vec<PhaseEntry> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PhaseSlice {
     pub phase: Option<String>,
+    /// The marker's re-entry count (resume replays); ≥2 is worth showing.
+    pub ordinal: Option<u64>,
     pub events: Vec<WorkflowRunEvent>,
 }
 
@@ -426,6 +430,7 @@ pub fn phase_slices(events: &[WorkflowRunEvent]) -> PhaseSlices {
     let mut out = PhaseSlices::default();
     let mut cur = PhaseSlice {
         phase: None,
+        ordinal: None,
         events: Vec::new(),
     };
     for e in events {
@@ -434,9 +439,15 @@ pub fn phase_slices(events: &[WorkflowRunEvent]) -> PhaseSlices {
             let name = payload_str(p, "phaseName")
                 .or_else(|| payload_str(p, "name"))
                 .unwrap_or_else(|| "?".to_owned());
+            let ordinal = p
+                .get("ordinal")
+                .and_then(Value::as_f64)
+                .filter(|o| o.fract() == 0.0 && *o >= 1.0)
+                .map(|o| o as u64);
             push_if_used(&mut out.slices, &mut cur);
             cur = PhaseSlice {
                 phase: Some(name),
+                ordinal,
                 events: Vec::new(),
             };
             continue;
@@ -461,10 +472,52 @@ fn push_if_used(slices: &mut Vec<PhaseSlice>, cur: &mut PhaseSlice) {
             cur,
             PhaseSlice {
                 phase: None,
+                ordinal: None,
                 events: Vec::new(),
             },
         ));
     }
+}
+
+/// The rows a phase card lists at its own level, newest first (TS
+/// `phaseRows`): everything no step owns, plus the non-lifecycle rows
+/// (reports, cache closes) of steps homed in ANOTHER slice — a resume
+/// replay moves a step to its last slice, and the reports it filed earlier
+/// must not vanish with it.
+pub fn phase_rows(fold: &SliceFold, is_own: &dyn Fn(&str) -> bool) -> Vec<WorkflowRunEvent> {
+    let mut rows = fold.others.clone();
+    for n in &fold.nodes {
+        if !is_own(&n.key) {
+            rows.extend(
+                n.events
+                    .iter()
+                    .filter(|e| !e.r#type.starts_with("node-"))
+                    .cloned(),
+            );
+        }
+    }
+    rows.sort_by(newest_first);
+    rows
+}
+
+/// Does a phase card paint at all: it owns a node or an actor, lists journal
+/// rows, or carries the settle/usage. The newest PAINTING slice is the run's
+/// visible head — an empty just-entered phase must not leave the content
+/// beneath it folded shut behind a card that never renders.
+pub fn phase_paints(fold: &SliceFold, sliced: &PhaseSlices, slice_index: usize) -> bool {
+    if fold.settled.is_some() || fold.spent_tokens.is_some() {
+        return true;
+    }
+    if fold.actors.iter().any(|a| sliced.actor_home.get(&a.key) == Some(&slice_index))
+        || fold
+            .nodes
+            .iter()
+            .any(|n| sliced.node_home.get(&n.key) == Some(&slice_index))
+    {
+        return true;
+    }
+    let is_own = |key: &str| sliced.node_home.get(key) == Some(&slice_index);
+    !phase_rows(fold, &is_own).is_empty()
 }
 
 // ─── the artifact text channel ───────────────────────────────────────────────
@@ -1128,6 +1181,7 @@ pub fn artifact_meta(a: &WorkflowArtifact) -> ArtifactMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow_run_event_text::reduce_slice;
     use serde_json::json;
 
     fn event(sequence: u64, kind: &str, payload: Value) -> WorkflowRunEvent {
@@ -1559,5 +1613,83 @@ mod tests {
             meta.extras,
             vec![("frobnicate".to_owned(), "true".to_owned())]
         );
+    }
+
+    // ── the newest-first phase cards (mobile parity)
+
+    /// reduce_slice needs a Translate; the identity catalog is enough — the
+    /// folds under test read no localized words.
+    struct TextCatalog;
+
+    impl crate::workflow_run_event_text::Translate for TextCatalog {
+        fn t(&self, key: &str, _values: &[(&'static str, String)]) -> String {
+            key.to_owned()
+        }
+    }
+
+    #[test]
+    fn slices_capture_the_reentry_ordinal() {
+        let sliced = phase_slices(&[
+            event(1, "phase-entered", json!({ "name": "map", "ordinal": 1 })),
+            event(2, "log", json!({ "message": "x" })),
+            event(3, "phase-entered", json!({ "name": "map", "ordinal": 2 })),
+        ]);
+        assert_eq!(sliced.slices[0].ordinal, Some(1));
+        assert_eq!(sliced.slices[1].ordinal, Some(2));
+        // A marker without an ordinal carries none.
+        let bare = phase_slices(&[event(1, "phase-entered", json!({ "name": "a" }))]);
+        assert_eq!(bare.slices[0].ordinal, None);
+    }
+
+    #[test]
+    fn phase_rows_free_orphan_reports_and_sort_newest_first() {
+        let events = vec![
+            event(1, "log", json!({ "message": "first" })),
+            event(
+                2,
+                "node-dispatched",
+                json!({ "instance": { "siteId": "s", "ordinal": 1 }, "actorName": "impl" }),
+            ),
+            event(
+                3,
+                "report",
+                json!({ "instance": { "siteId": "s", "ordinal": 1 }, "item": "filed" }),
+            ),
+            event(
+                4,
+                "node-settled",
+                json!({ "instance": { "siteId": "s", "ordinal": 1 }, "outcome": "ok" }),
+            ),
+            event(5, "log", json!({ "message": "last" })),
+        ];
+        let fold = reduce_slice(&TextCatalog, &events);
+        let seqs = |rows: &[WorkflowRunEvent]| {
+            rows.iter().map(|e| e.sequence).collect::<Vec<_>>()
+        };
+        // The step is owned here: its report stays inside the step.
+        assert_eq!(seqs(&phase_rows(&fold, &|_| true)), vec![5, 1]);
+        // Homed in a later slice (resume replay): the report rejoins the
+        // phase, the lifecycle rows do not.
+        assert_eq!(seqs(&phase_rows(&fold, &|_| false)), vec![5, 3, 1]);
+    }
+
+    #[test]
+    fn phase_paints_covers_each_channel() {
+        let events = vec![
+            event(1, "phase-entered", json!({ "name": "a" })),
+            event(2, "log", json!({ "message": "x" })),
+            event(3, "phase-entered", json!({ "name": "b" })),
+        ];
+        let sliced = phase_slices(&events);
+        let folds: Vec<SliceFold> = sliced
+            .slices
+            .iter()
+            .map(|s| reduce_slice(&TextCatalog, &s.events))
+            .collect();
+        // A journal row paints.
+        assert!(phase_paints(&folds[0], &sliced, 0));
+        // An empty just-entered phase paints nothing — it must not become
+        // the visible head over the content beneath it.
+        assert!(!phase_paints(&folds[1], &sliced, 1));
     }
 }

@@ -216,6 +216,11 @@ pub struct Workbench {
     /// `open` + `RawData`): the expanded raw keys, scoped to the open run —
     /// a run switch clears them (the TS key={runId} remount).
     pub(crate) workflow_raw_open: std::collections::HashSet<String>,
+    /// Phase-card folds on the run page, keyed by slice index (TS
+    /// `phaseOpen[i] ?? i === headSlice`: absent = only the head open).
+    pub(crate) workflow_phase_open: std::collections::HashMap<usize, bool>,
+    /// Expanded step rows on the run page, keyed by node key.
+    pub(crate) workflow_step_open: std::collections::HashSet<String>,
     /// The run id the toggles belong to.
     workflow_raw_run: Option<String>,
     /// The Hooks page's expanded event (view-local fold, TS `open`).
@@ -778,6 +783,8 @@ impl Workbench {
             workflow_delete_confirm: false,
             workflow_detail_key: None,
             workflow_raw_open: std::collections::HashSet::new(),
+            workflow_phase_open: std::collections::HashMap::new(),
+            workflow_step_open: std::collections::HashSet::new(),
             workflow_raw_run: None,
             hooks_open_event: None,
             backup_confirm: None,
@@ -1090,6 +1097,10 @@ impl Workbench {
                     .map(|r| r.run_id.clone());
                 if raw_run != self.workflow_raw_run {
                     self.workflow_raw_open.clear();
+                    // The phase/step folds are run-local state too (the TS
+                    // remount drops them with the view).
+                    self.workflow_phase_open.clear();
+                    self.workflow_step_open.clear();
                     self.workflow_raw_run = raw_run;
                 }
                 // The spend gesture is page-local state (TS useState); a

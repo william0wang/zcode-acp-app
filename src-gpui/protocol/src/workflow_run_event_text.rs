@@ -237,11 +237,31 @@ fn qid_tag(p: &WorkflowRunEventPayload) -> Option<String> {
     Some(format!("…{tail}"))
 }
 
+/// Options for [`describe_run_event_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DescribeOptions {
+    /// Drop the `site@ordinal` ref from the detail — rows nested under their
+    /// own step already say which instance they belong to.
+    pub omit_site: bool,
+}
+
 /// One journal event → one readable line. The field names per kind come from
 /// the engine's RunEvent union (dynamic-workflow/src/engine/types.ts).
 pub fn describe_run_event(t: &dyn Translate, ev: &WorkflowRunEvent) -> RunEventDesc {
+    describe_run_event_with(t, ev, DescribeOptions::default())
+}
+
+pub fn describe_run_event_with(
+    t: &dyn Translate,
+    ev: &WorkflowRunEvent,
+    opts: DescribeOptions,
+) -> RunEventDesc {
     let p = &ev.payload;
-    let site = p.get("instance").and_then(ref_text);
+    let site = if opts.omit_site {
+        None
+    } else {
+        p.get("instance").and_then(ref_text)
+    };
     match ev.r#type.as_str() {
         "run-started" => RunEventDesc {
             label: t.t("zconfig.wfEvRunStarted", &[]),
@@ -589,6 +609,9 @@ pub struct NodeAgg {
     /// Latest observed activity (progress tool, wait cause, repair attempt).
     pub activity: Option<String>,
     pub error: Option<String>,
+    /// The step's own journal rows (its lifecycle plus the reports it
+    /// filed), oldest first — the detail a collapsed step row expands into.
+    pub events: Vec<WorkflowRunEvent>,
 }
 
 pub fn node_state_word(t: &dyn Translate, state: NodeState) -> Option<String> {
@@ -665,6 +688,8 @@ pub fn reduce_slice(t: &dyn Translate, events: &[WorkflowRunEvent]) -> SliceFold
             let mut head = prev.and_then(|n| n.head.clone());
             let mut activity = prev.and_then(|n| n.activity.clone());
             let mut error = prev.and_then(|n| n.error.clone());
+            let mut own = prev.map(|n| n.events.clone()).unwrap_or_default();
+            own.push(ev.clone());
             match ev.r#type.as_str() {
                 "node-queued" => {
                     state = NodeState::Queued;
@@ -765,6 +790,7 @@ pub fn reduce_slice(t: &dyn Translate, events: &[WorkflowRunEvent]) -> SliceFold
                 head,
                 activity,
                 error,
+                events: own,
             };
             match nodes.iter_mut().find(|n| n.key == key) {
                 Some(slot) => *slot = next,
@@ -772,10 +798,25 @@ pub fn reduce_slice(t: &dyn Translate, events: &[WorkflowRunEvent]) -> SliceFold
             }
             continue;
         }
+        if ev.r#type == "report" || ev.r#type == "import-cache-closed" {
+            // Filed by a step this slice knows → the step's own detail. A
+            // script-level row (no instance ref) stays a phase row.
+            if let Some(site) = p.get("instance").and_then(ref_text) {
+                if let Some(slot) = nodes.iter_mut().find(|n| n.key == site) {
+                    slot.events.push(ev.clone());
+                    continue;
+                }
+            }
+        }
         fold.others.push(ev.clone());
     }
     fold.nodes = nodes;
     fold
+}
+
+/// Sorts highest sequence first (TS `newestFirst`).
+pub fn newest_first(a: &WorkflowRunEvent, b: &WorkflowRunEvent) -> std::cmp::Ordering {
+    b.sequence.cmp(&a.sequence)
 }
 
 #[cfg(test)]
@@ -1103,5 +1144,115 @@ mod tests {
             out.settled.as_ref().map(|e| e.r#type.clone()),
             Some("run-settled".to_owned())
         );
+    }
+
+    #[test]
+    fn keeps_each_steps_own_rows_and_nests_its_reports() {
+        let out = reduce_slice(
+            &Catalog,
+            &[
+                ev(
+                    1,
+                    "node-queued",
+                    json!({ "instance": instance("scan", 1), "instructionsHead": "scan the repo" }),
+                ),
+                ev(
+                    2,
+                    "node-dispatched",
+                    json!({ "instance": instance("scan", 1), "actorName": "scout" }),
+                ),
+                ev(
+                    3,
+                    "node-progress",
+                    json!({ "instance": instance("scan", 1), "turn": 2 }),
+                ),
+                ev(
+                    4,
+                    "report",
+                    json!({ "instance": instance("scan", 1), "item": "filed" }),
+                ),
+                ev(5, "report", json!({ "item": "script-level" })),
+                ev(6, "log", json!({ "message": "narration" })),
+                ev(
+                    7,
+                    "import-cache-closed",
+                    json!({ "instance": instance("scan", 1), "actorName": "scout" }),
+                ),
+                ev(
+                    8,
+                    "node-settled",
+                    json!({ "instance": instance("scan", 1), "outcome": "ok" }),
+                ),
+            ],
+        );
+        assert_eq!(out.nodes.len(), 1);
+        let seqs: Vec<u64> = out.nodes[0].events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4, 7, 8]);
+        // A report without an instance ref belongs to the script, not a step.
+        let other_seqs: Vec<u64> = out.others.iter().map(|e| e.sequence).collect();
+        assert_eq!(other_seqs, vec![5, 6]);
+    }
+
+    #[test]
+    fn a_settled_step_keeps_its_history_and_ignores_replayed_rows() {
+        let out = reduce_slice(
+            &Catalog,
+            &[
+                ev(
+                    1,
+                    "node-dispatched",
+                    json!({ "instance": instance("scan", 1) }),
+                ),
+                ev(
+                    2,
+                    "node-settled",
+                    json!({ "instance": instance("scan", 1), "outcome": "ok" }),
+                ),
+                ev(
+                    3,
+                    "node-dispatched",
+                    json!({ "instance": instance("scan", 1) }),
+                ),
+                ev(
+                    4,
+                    "report",
+                    json!({ "instance": instance("scan", 1), "item": "late" }),
+                ),
+            ],
+        );
+        assert_eq!(out.nodes[0].state, NodeState::Ok);
+        let seqs: Vec<u64> = out.nodes[0].events.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn describe_run_event_with_omits_the_site_ref_for_nested_rows() {
+        let e = ev(
+            3,
+            "node-progress",
+            json!({
+                "instance": instance("scan", 4),
+                "turn": 2,
+                "lastTool": { "name": "Read", "target": "a.ts" },
+            }),
+        );
+        let plain = describe_run_event(&Catalog, &e);
+        assert!(plain.detail.as_deref().unwrap().contains("scan@4"));
+        let nested = describe_run_event_with(&Catalog, &e, DescribeOptions { omit_site: true });
+        let detail = nested.detail.unwrap();
+        assert!(!detail.contains("scan@4"));
+        assert!(detail.contains("Read"));
+    }
+
+    #[test]
+    fn newest_first_sorts_descending() {
+        let mut rows = vec![
+            ev(2, "log", json!({})),
+            ev(5, "log", json!({})),
+            ev(1, "log", json!({})),
+        ];
+        rows.sort_by(newest_first);
+        let seqs: Vec<u64> = rows.iter().map(|e| e.sequence).collect();
+        assert_eq!(seqs, vec![5, 2, 1]);
     }
 }
