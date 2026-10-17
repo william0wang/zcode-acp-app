@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { ArrowLeft, RefreshCw, SlidersHorizontal, Square } from "lucide-react";
+import { ArrowLeft, ChevronRight, RefreshCw, SlidersHorizontal, Square } from "lucide-react";
 import { useBackHandler } from "../../lib/backNav";
 import { useAppStore } from "../../store/appStore";
 import { MarkdownText } from "../Markdown";
@@ -23,13 +23,15 @@ import {
   cellText,
 } from "./WorkflowArtifactViews";
 import {
-  actorKeyOf,
   describeRunEvent,
-  instanceKeyOf,
+  newestFirst,
   nodeStateWord,
+  phaseRows,
   reduceSlice,
+  slicePhases,
   statusWord,
   type NodeAgg,
+  type PhaseSlice,
 } from "./workflowRunEventText";
 
 // One workflow run's detail view (bridge 0.48.0, ADR-0029): the journal
@@ -188,6 +190,13 @@ function argsText(n: WorkflowWorkspaceNode): string | undefined {
 /** Cap the chunk ask: ≤512KiB is the upstream per-read maximum anyway. */
 const READ_CHUNK = 256 * 1024;
 
+/**
+ * Journal pages drained per pull. The view reads newest-first, so a long
+ * settled journal must not open on its OLDEST page with the ending hidden
+ * behind a button; the bound keeps one pull from walking a huge journal.
+ */
+const DRAIN_PAGES = 8;
+
 type Tab = "events" | "artifacts" | "workspace";
 
 export function WorkflowRunDetail({
@@ -231,10 +240,15 @@ export function WorkflowRunDetail({
   // memory went stale (bridge restart, closed session) and every tick would
   // fail. The view degrades to a read-only notice instead of erroring forever.
   const [sessionDead, setSessionDead] = useState(false);
-  // One fetch at a time: a manual "Load more" racing the 3s tick would read
+  // One fetch at a time: a manual "Load newer" racing the 3s tick would read
   // the SAME afterSequence from two closures and append the batch twice.
   const eventsInFlight = useRef(false);
   const failCount = useRef(0);
+  // Mirror of `events` for the pollers: the drain loop and the tick read the
+  // cursor from here so neither closure re-binds on every append.
+  const eventsRef = useRef<WorkflowRunEvent[] | null>(null);
+  // Explicit phase folds by slice index; absent = only the newest phase open.
+  const [phaseOpen, setPhaseOpen] = useState<Record<number, boolean>>({});
 
   useBackHandler(() => {
     if (openArtifact || nodeResult) {
@@ -264,31 +278,36 @@ export function WorkflowRunDetail({
       if (eventsInFlight.current) return;
       eventsInFlight.current = true;
       setEventsBusy(true);
-      const after = initial ? undefined : maxSequence(events);
-      const res = await workflowAction(
-        "load run events",
-        (c) => c.runEvents(instanceId, sessionId, runId, after),
-        silent,
-      );
-      eventsInFlight.current = false;
-      setEventsBusy(false);
-      if (!res) return;
-      if (initial) {
-        setEvents(res.events);
-      } else {
+      let held: WorkflowRunEvent[] | null = initial ? null : eventsRef.current;
+      let more: boolean | null = null;
+      for (let page = 0; page < DRAIN_PAGES; page++) {
+        const after = held === null ? undefined : maxSequence(held);
+        const res = await workflowAction(
+          "load run events",
+          (c) => c.runEvents(instanceId, sessionId, runId, after),
+          silent,
+        );
+        if (!res) break;
         // Defensive dedupe: an `after` the server could not honor answers
         // with the FULL journal — keep only sequences past what we hold.
-        setEvents((prev) => {
-          const floor = maxSequence(prev);
-          return [
-            ...(prev ?? []),
-            ...res.events.filter((e) => typeof e.sequence === "number" && e.sequence > floor),
-          ];
-        });
+        const floor = maxSequence(held);
+        const fresh =
+          held === null
+            ? res.events
+            : res.events.filter((e) => typeof e.sequence === "number" && e.sequence > floor);
+        held = [...(held ?? []), ...fresh];
+        eventsRef.current = held;
+        setEvents(held);
+        more = res.hasMore === true;
+        if (!more) break;
       }
-      setHasMore(res.hasMore === true);
+      // A failed first page leaves the gate as it was; otherwise it reads
+      // true only when the bound cut the drain short.
+      if (more !== null) setHasMore(more);
+      eventsInFlight.current = false;
+      setEventsBusy(false);
     },
-    [workflowAction, instanceId, sessionId, runId, events],
+    [workflowAction, instanceId, sessionId, runId],
   );
 
   // First paint: summary + the journal's head. (The mount effect in
@@ -310,10 +329,10 @@ export function WorkflowRunDetail({
     if (!active) return;
     const id = setInterval(async () => {
       const ok = await refreshSummary(true);
-      // `events === null` means the first pull failed — pull from the head
+      // A null mirror means the first pull failed — pull from the head
       // again instead of skipping forever (eventsInFlight makes the overlap
       // with a still-running earlier pull safe).
-      await fetchEvents(events === null, true);
+      await fetchEvents(eventsRef.current === null, true);
       if (ok) {
         failCount.current = 0;
       } else if (++failCount.current >= 2) {
@@ -321,7 +340,7 @@ export function WorkflowRunDetail({
       }
     }, 3000);
     return () => clearInterval(id);
-  }, [active, refreshSummary, fetchEvents, events]);
+  }, [active, refreshSummary, fetchEvents]);
 
   // Tabs load lazily — the journal is the default view, artifacts and the
   // workspace only cost a request once they are opened.
@@ -351,68 +370,12 @@ export function WorkflowRunDetail({
     if (ok) void refreshSummary();
   }
 
-  // Phases entered so far (journal `phase-entered` events), merged per name:
-  // a re-entered phase counts up (`×N`), the last one is where the run
-  // currently stands. Resume replays the prefix, so fold by max ordinal.
-  const phases = useMemo(() => {
-    const seen = new Map<string, number>();
-    for (const e of events ?? []) {
-      if (e.type !== "phase-entered") continue;
-      const p = e.payload ?? {};
-      const name = typeof p.name === "string" && p.name ? p.name : null;
-      if (!name) continue;
-      const ordinal = typeof p.ordinal === "number" ? p.ordinal : 1;
-      seen.set(name, Math.max(seen.get(name) ?? 0, ordinal));
-    }
-    return [...seen.entries()].map(([name, times]) => ({ name, times }));
-  }, [events]);
-
-  // Events sliced at every phase-entered boundary (the journal has no
-  // phase-exited — entering N implies N-1 done): each slice renders as one
-  // phase section. A leading slice (phase: null) holds whatever preceded the
-  // first phase. Resume REPLAYS the script prefix — the same instances and
-  // actors re-emit into later slices — so each node renders only in the slice
-  // holding its LAST event and each actor only in the slice of its FIRST
-  // creation (nodeHome/actorHome); without that, a resumed run shows every
-  // node twice.
-  const phaseSlices = useMemo<{
-    slices: PhaseSlice[];
-    nodeHome: Map<string, number>;
-    actorHome: Map<string, number>;
-  }>(() => {
-    const slices: PhaseSlice[] = [];
-    const nodeHome = new Map<string, number>();
-    const actorHome = new Map<string, number>();
-    let cur: PhaseSlice = { phase: null, events: [] };
-    const pushIfUsed = () => {
-      if (cur.events.length > 0 || cur.phase !== null) slices.push(cur);
-    };
-    for (const e of events ?? []) {
-      if (e.type === "phase-entered") {
-        const p = e.payload ?? {};
-        const name =
-          typeof p.phaseName === "string" && p.phaseName
-            ? p.phaseName
-            : typeof p.name === "string" && p.name
-              ? p.name
-              : "?";
-        pushIfUsed();
-        cur = { phase: name, events: [] };
-        continue;
-      }
-      cur.events.push(e);
-      // `slices.length` is cur's own index — cur is not pushed yet.
-      const idx = slices.length;
-      if (e.type.startsWith("node-")) {
-        nodeHome.set(instanceKeyOf(e.payload ?? {}), idx);
-      } else if (e.type === "actor-created") {
-        const key = actorKeyOf(e.payload ?? {});
-        if (!actorHome.has(key)) actorHome.set(key, idx);
-      }
-    }
-    pushIfUsed();
-    return { slices, nodeHome, actorHome };
-  }, [events]);
+  // Phase cards read newest-first: the newest slice is where the run stands
+  // and sits on top; older phases fold beneath it (slicePhases documents the
+  // replay-safe node/actor homing).
+  const phaseSlices = useMemo(() => slicePhases(events ?? []), [events]);
+  const headSlice = phaseSlices.slices.length - 1;
+  const phaseCards = phaseSlices.slices.map((slice, i) => ({ slice, i })).reverse();
 
   const tabs: Array<{ id: Tab; label: string }> = [
     { id: "events", label: t("zconfig.workflowEvents") },
@@ -508,49 +471,52 @@ export function WorkflowRunDetail({
             {t("zconfig.workflowSessionLost")}
           </p>
         )}
-        {tab === "events" && (
-          <>
-            {phases.length > 0 && <PhaseTimeline phases={phases} running={active} />}
-            {events !== null && events.length === 0 ? (
-              <ConfigEmpty text={t("zconfig.workflowEventsEmpty")} />
-            ) : (
-              <div className="px-4">
-                {phaseSlices.slices.map((slice, i) => (
-                  <PhaseSection
-                    key={`${i}-${slice.phase ?? "pre"}`}
-                    slice={slice}
-                    sliceIndex={i}
-                    nodeHome={phaseSlices.nodeHome}
-                    actorHome={phaseSlices.actorHome}
-                  />
-                ))}
-                {events === null && !sessionDead && !active && (
-                  <button
-                    onClick={() => void fetchEvents(true)}
-                    disabled={eventsBusy}
-                    className="mb-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
-                  >
-                    {t("zconfig.workflowRetry")}
-                  </button>
-                )}
-                {events === null && !sessionDead && active && (
-                  <div className="flex justify-center py-8">
-                    <RefreshCw className="size-5 animate-spin text-faint" />
-                  </div>
-                )}
-                {hasMore && events !== null && (
-                  <button
-                    onClick={() => void fetchEvents(false)}
-                    disabled={eventsBusy}
-                    className="mb-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
-                  >
-                    {t("zconfig.workflowLoadMore")}
-                  </button>
-                )}
-              </div>
-            )}
-          </>
-        )}
+        {tab === "events" &&
+          (events !== null && events.length === 0 ? (
+            <ConfigEmpty text={t("zconfig.workflowEventsEmpty")} />
+          ) : (
+            <div className="px-4">
+              {hasMore && events !== null && (
+                <button
+                  onClick={() => void fetchEvents(false)}
+                  disabled={eventsBusy}
+                  className="mb-3 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+                >
+                  {t("zconfig.workflowLoadNewer")}
+                </button>
+              )}
+              {events === null && !sessionDead && !active && (
+                <button
+                  onClick={() => void fetchEvents(true)}
+                  disabled={eventsBusy}
+                  className="mb-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+                >
+                  {t("zconfig.workflowRetry")}
+                </button>
+              )}
+              {events === null && !sessionDead && active && (
+                <div className="flex justify-center py-8">
+                  <RefreshCw className="size-5 animate-spin text-faint" />
+                </div>
+              )}
+              {phaseCards.map(({ slice, i }) => (
+                <PhaseSection
+                  key={`${i}-${slice.phase ?? "pre"}`}
+                  slice={slice}
+                  sliceIndex={i}
+                  nodeHome={phaseSlices.nodeHome}
+                  actorHome={phaseSlices.actorHome}
+                  head={i === headSlice}
+                  running={active}
+                  bare={phaseSlices.slices.length === 1 && slice.phase === null}
+                  open={phaseOpen[i] ?? i === headSlice}
+                  onToggle={() =>
+                    setPhaseOpen((s) => ({ ...s, [i]: !(s[i] ?? i === headSlice) }))
+                  }
+                />
+              ))}
+            </div>
+          ))}
 
         {tab === "artifacts" && (
           <>
@@ -818,57 +784,15 @@ function AmendSheet({
   );
 }
 
-/** One phase's slice of the journal, bounded by phase-entered events. */
-interface PhaseSlice {
-  /** null = the leading slice before the first phase-entered. */
-  phase: string | null;
-  events: WorkflowRunEvent[];
-}
-
 /**
- * Vertical mini timeline: one row per entered phase with a connecting spine.
- * Entering phase N means N-1 finished; the newest row is the head — pulsing
- * while the run flies, plain once it settles. Vertical because this is a
- * phone: a horizontal station strip truncates behind a sideways scroll the
- * user cannot know exists.
+ * One step (a dispatched node) folded to a line: state dot + name +
+ * task/activity + outcome word. Tapping opens the step's own detail — the
+ * instruction head, the error, and its journal rows newest-first — so the
+ * phase list stays a list of steps rather than a dump of every row.
  */
-function PhaseTimeline({
-  phases,
-  running,
-}: {
-  phases: Array<{ name: string; times: number }>;
-  running: boolean;
-}) {
-  return (
-    <ol className="mx-4 mb-3 flex flex-col">
-      {phases.map((p, i) => {
-        const head = i === phases.length - 1;
-        return (
-          <li key={`${i}-${p.name}`} className="flex gap-2.5">
-            <span className="flex flex-col items-center">
-              <span
-                className={`mt-[3px] size-2.5 shrink-0 rounded-full ${
-                  head ? (running ? "animate-pulse bg-sky-400" : "bg-sky-400") : "bg-emerald-400/80"
-                }`}
-              />
-              {!head && <span className="min-h-3 w-px flex-1 bg-white/15" />}
-            </span>
-            <span
-              className={`pb-2 font-mono text-[11px] ${head ? "font-medium text-ink" : "text-dim"}`}
-            >
-              {p.name}
-              {p.times > 1 ? ` · ×${p.times}` : ""}
-            </span>
-          </li>
-        );
-      })}
-    </ol>
-  );
-}
-
-/** One node's folded line: state dot + name + task/activity + outcome word. */
-function NodeLine({ n }: { n: NodeAgg }) {
+function StepRow({ n }: { n: NodeAgg }) {
   const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
   const dot =
     n.state === "ok"
       ? "bg-emerald-400"
@@ -884,27 +808,48 @@ function NodeLine({ n }: { n: NodeAgg }) {
     n.state === "failed" ? "text-red-300" : n.state === "ok" ? "text-emerald-300/80" : "text-faint";
   const title = n.label ?? `${n.site || "?"}${n.ordinal !== undefined ? `@${n.ordinal}` : ""}`;
   const sub = n.activity ?? n.head;
+  const rows = open ? [...n.events].sort(newestFirst) : [];
   return (
     <div className="py-1">
-      <div className="flex items-center gap-2">
+      <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-2 text-left">
         <span className={`size-1.5 shrink-0 rounded-full ${dot}`} />
         <span className="min-w-0 flex-1 truncate text-[11px] text-dim">
           {title}
           {sub ? <span className="text-faint"> — {sub}</span> : null}
         </span>
         {word !== null && <span className={`shrink-0 text-[10px] ${wordCls}`}>{word}</span>}
-      </div>
-      {n.state === "failed" && n.error ? (
+        <ChevronRight
+          className={`size-3 shrink-0 text-faint transition-transform ${open ? "rotate-90" : ""}`}
+        />
+      </button>
+      {!open && n.state === "failed" && n.error ? (
         <p className="mt-0.5 truncate pl-3.5 text-[10px] text-red-300/90">{n.error}</p>
       ) : null}
+      {open && (
+        <div className="ml-[3px] mt-1 border-l border-hairline pl-3">
+          {n.head ? (
+            <p className="break-words pb-1 text-[11px] leading-snug text-dim">{n.head}</p>
+          ) : null}
+          {n.error ? (
+            <p className="break-words pb-1 text-[11px] leading-snug text-red-300/90">{n.error}</p>
+          ) : null}
+          {rows.map((ev) => (
+            <EventRow key={ev.sequence} ev={ev} omitSite />
+          ))}
+        </div>
+      )}
     </div>
   );
 }
 
 /**
- * One phase section: header, hired actors, folded nodes, usage, leftovers.
+ * One phase card. The header carries the phase's state (live while it is the
+ * run's head, done or failed otherwise) and folds the body; only the newest
+ * phase opens by default. The body reads newest-first — the settlement, then
+ * the phase's journal rows, then its steps (each a fold of its own), with the
+ * hiring/usage footer last — so the latest message is the first thing seen.
  * Nodes/actors are filtered to the ones this slice OWNS (their last/first
- * event fell here) — see phaseSlices for why replayed prefixes must not
+ * event fell here) — see slicePhases for why replayed prefixes must not
  * double-render.
  */
 function PhaseSection({
@@ -912,56 +857,92 @@ function PhaseSection({
   sliceIndex,
   nodeHome,
   actorHome,
+  head,
+  running,
+  bare,
+  open,
+  onToggle,
 }: {
   slice: PhaseSlice;
   sliceIndex: number;
   nodeHome: Map<string, number>;
   actorHome: Map<string, number>;
+  /** The newest slice — where the run currently stands. */
+  head: boolean;
+  running: boolean;
+  /** The only slice and it has no phase: no card chrome, just the rows. */
+  bare: boolean;
+  open: boolean;
+  onToggle: () => void;
 }) {
   const { t } = useTranslation();
-  const { actors, nodes, others, settled, spentTokens } = useMemo(
-    () => reduceSlice(t, slice.events),
-    [t, slice],
-  );
-  const ownNodes = nodes.filter((n) => nodeHome.get(n.key) === sliceIndex);
+  const fold = useMemo(() => reduceSlice(t, slice.events), [t, slice]);
+  const { actors, nodes, settled, spentTokens } = fold;
+  const isOwn = (key: string) => nodeHome.get(key) === sliceIndex;
+  const ownNodes = nodes.filter((n) => isOwn(n.key));
   const ownActors = actors.filter((a) => actorHome.get(a.key) === sliceIndex);
+  const journal = phaseRows(fold, isOwn);
   if (
     ownActors.length === 0 &&
     ownNodes.length === 0 &&
-    others.length === 0 &&
+    journal.length === 0 &&
     settled === null &&
     spentTokens === null
   )
     return null;
-  return (
-    <section className="mb-3">
-      {slice.phase !== null && (
-        <header className="mb-1 flex items-baseline gap-2 border-b border-hairline pb-1">
-          <span className="font-mono text-xs font-medium text-ink">{slice.phase}</span>
-          {ownNodes.length > 0 && (
-            <span className="text-[10px] text-faint">
-              {t("zconfig.workflowPhaseNodes", { n: ownNodes.length })}
-            </span>
-          )}
-        </header>
-      )}
-      {ownActors.map((a) => (
-        <p key={a.key} className="truncate py-1 text-[11px] text-faint">
-          {t("zconfig.wfEvActorCreated")} · {a.label}
-        </p>
-      ))}
-      {ownNodes.map((n) => (
-        <NodeLine key={n.key} n={n} />
-      ))}
-      {spentTokens !== null && (
-        <p className="py-1 text-[10px] tabular-nums text-faint">
-          {t("zconfig.wfEvUsageUpdated")} · {spentTokens.toLocaleString()} tokens
-        </p>
-      )}
-      {others.map((ev) => (
+  const failed =
+    ownNodes.some((n) => n.state === "failed") ||
+    (settled !== null && describeRunEvent(t, settled).tone === "failed");
+  const dot = failed
+    ? "bg-red-400"
+    : head && running
+      ? "animate-pulse bg-sky-400"
+      : "bg-emerald-400/80";
+  const footer = [
+    ownActors.length > 0
+      ? `${t("zconfig.wfEvActorCreated")} · ${ownActors.map((a) => a.label).join(" · ")}`
+      : null,
+    spentTokens !== null
+      ? `${t("zconfig.wfEvUsageUpdated")} · ${spentTokens.toLocaleString()} tokens`
+      : null,
+  ].filter((v): v is string => v !== null);
+  const body = (
+    <>
+      {settled !== null && <EventRow ev={settled} />}
+      {journal.map((ev) => (
         <EventRow key={ev.sequence} ev={ev} />
       ))}
-      {settled !== null && <EventRow ev={settled} />}
+      {ownNodes.map((n) => (
+        <StepRow key={n.key} n={n} />
+      ))}
+      {footer.map((line) => (
+        <p key={line} className="truncate py-1 text-[10px] tabular-nums text-faint">
+          {line}
+        </p>
+      ))}
+    </>
+  );
+  if (bare) return <section className="mb-3">{body}</section>;
+  return (
+    <section className="mb-2 rounded-xl bg-surface ring-1 ring-hairline">
+      <button onClick={onToggle} className="flex w-full items-center gap-2 px-3 py-2 text-left">
+        <span className={`size-2 shrink-0 rounded-full ${dot}`} />
+        <span className="min-w-0 flex-1 truncate font-mono text-xs font-medium text-ink">
+          {slice.phase ?? t("zconfig.workflowPhasePrelude")}
+          {slice.ordinal !== undefined && slice.ordinal >= 2 ? (
+            <span className="font-normal text-faint"> ×{slice.ordinal}</span>
+          ) : null}
+        </span>
+        {ownNodes.length > 0 && (
+          <span className="shrink-0 text-[10px] text-faint">
+            {t("zconfig.workflowPhaseNodes", { n: ownNodes.length })}
+          </span>
+        )}
+        <ChevronRight
+          className={`size-3.5 shrink-0 text-faint transition-transform ${open ? "rotate-90" : ""}`}
+        />
+      </button>
+      {open && <div className="px-3 pb-2">{body}</div>}
     </section>
   );
 }
@@ -969,12 +950,13 @@ function PhaseSection({
 /**
  * One journal row: a readable label + detail line (describeRunEvent), payload
  * reachable behind an explicit raw toggle. Sequence numbers stay out of the
- * default view — they are journal coordinates, not information.
+ * default view — they are journal coordinates, not information. `omitSite`
+ * drops the instance ref for rows already nested under their step.
  */
-function EventRow({ ev }: { ev: WorkflowRunEvent }) {
+function EventRow({ ev, omitSite }: { ev: WorkflowRunEvent; omitSite?: boolean }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const desc = describeRunEvent(t, ev);
+  const desc = describeRunEvent(t, ev, omitSite ? { omitSite } : undefined);
   return (
     <div className="border-b border-hairline py-2 last:border-0">
       <button onClick={() => setOpen(!open)} className="flex w-full items-baseline gap-2 text-left">
