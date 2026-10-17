@@ -585,6 +585,29 @@ export function phaseRows(
   return [...fold.others, ...orphans].sort(newestFirst);
 }
 
+/**
+ * Does a phase card paint at all: it owns a node or an actor, lists journal
+ * rows, or carries the settle/usage. The newest PAINTING slice is the run's
+ * visible head — an empty just-entered phase must not leave the content
+ * beneath it folded shut behind a card that never renders.
+ */
+export function phasePaints(
+  fold: {
+    actors: Array<{ key: string }>;
+    nodes: NodeAgg[];
+    others: WorkflowRunEvent[];
+    settled: WorkflowRunEvent | null;
+    spentTokens: number | null;
+  },
+  ownsNode: (key: string) => boolean,
+  ownsActor: (key: string) => boolean,
+): boolean {
+  if (fold.settled !== null || fold.spentTokens !== null) return true;
+  if (fold.actors.some((a) => ownsActor(a.key))) return true;
+  if (fold.nodes.some((n) => ownsNode(n.key))) return true;
+  return phaseRows(fold, ownsNode).length > 0;
+}
+
 // ─── Phase slicing ──────────────────────────────────────────────────────────
 
 /** One phase's slice of the journal, bounded by phase-entered events. */

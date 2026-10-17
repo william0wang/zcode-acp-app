@@ -26,6 +26,7 @@ import {
   describeRunEvent,
   newestFirst,
   nodeStateWord,
+  phasePaints,
   phaseRows,
   reduceSlice,
   slicePhases,
@@ -372,9 +373,26 @@ export function WorkflowRunDetail({
 
   // Phase cards read newest-first: the newest slice is where the run stands
   // and sits on top; older phases fold beneath it (slicePhases documents the
-  // replay-safe node/actor homing).
+  // replay-safe node/actor homing). The visible head is the newest slice
+  // that actually paints — a just-entered phase owns nothing yet and must
+  // not leave the content beneath it folded shut behind a card that never
+  // renders.
   const phaseSlices = useMemo(() => slicePhases(events ?? []), [events]);
-  const headSlice = phaseSlices.slices.length - 1;
+  const headSlice = useMemo(() => {
+    for (let i = phaseSlices.slices.length - 1; i >= 0; i--) {
+      const fold = reduceSlice(t, phaseSlices.slices[i].events);
+      if (
+        phasePaints(
+          fold,
+          (key) => phaseSlices.nodeHome.get(key) === i,
+          (key) => phaseSlices.actorHome.get(key) === i,
+        )
+      ) {
+        return i;
+      }
+    }
+    return -1;
+  }, [t, phaseSlices]);
   const phaseCards = phaseSlices.slices.map((slice, i) => ({ slice, i })).reverse();
 
   const tabs: Array<{ id: Tab; label: string }> = [
