@@ -1479,7 +1479,10 @@ enum LoopEvent {
         result: Result<WorkflowRunEventsResponse, SettingsApiError>,
     },
     /// POST …/settings (the amendment) settled.
-    WorkflowRunAmended(Result<AmendRunSettingsResponse, SettingsApiError>),
+    WorkflowRunAmended {
+        seq: u64,
+        result: Result<AmendRunSettingsResponse, SettingsApiError>,
+    },
     /// GET …/artifacts settled for the open run (the artifacts tab's lazy
     /// read, batch L).
     WorkflowRunArtifacts {
@@ -3953,13 +3956,24 @@ impl Driver {
         }
     }
 
-    /// The amendment settled: on success re-point the run view when the
-    /// amendment superseded the flying run (the NEW id continues the work —
-    /// its journal cursor starts over, so the reads reset), then reload.
+    /// The amendment settled (seq-guarded — a stale answer must not re-point
+    /// whatever run page is open now): on success re-point the run view when
+    /// the amendment superseded the flying run (the NEW id continues the
+    /// work — its journal cursor starts over, so the reads reset), then
+    /// reload.
     fn on_workflow_run_amended(
         &mut self,
+        seq: u64,
         result: Result<AmendRunSettingsResponse, SettingsApiError>,
     ) {
+        if !self
+            .workflows
+            .run
+            .as_ref()
+            .is_some_and(|r| r.seq == seq)
+        {
+            return;
+        }
         match result {
             Ok(res) => {
                 let mut repointed = false;
@@ -5603,7 +5617,9 @@ impl Driver {
             LoopEvent::WorkflowRunEvents { seq, initial, result } => {
                 self.on_workflow_run_events(seq, initial, result);
             }
-            LoopEvent::WorkflowRunAmended(result) => self.on_workflow_run_amended(result),
+            LoopEvent::WorkflowRunAmended { seq, result } => {
+                self.on_workflow_run_amended(seq, result)
+            }
             LoopEvent::WorkflowRunArtifacts { seq, result } => {
                 self.on_workflow_run_artifacts(seq, result);
             }
@@ -6614,13 +6630,14 @@ impl Driver {
                 body,
             } => {
                 if self.workflows.run.as_ref().is_some_and(|r| !r.amend_busy) {
+                    let seq = self.workflows.run.as_ref().unwrap().seq;
                     self.workflows.run.as_mut().unwrap().amend_busy = true;
                     let hub = self.settings_client();
                     let tx = self.loop_tx.clone();
                     tokio::spawn(async move {
                         let result =
                             hub.amend_run_settings(&instance_id, &run_id, &session_id, body).await;
-                        let _ = tx.send(LoopEvent::WorkflowRunAmended(result));
+                        let _ = tx.send(LoopEvent::WorkflowRunAmended { seq, result });
                     });
                 }
             }

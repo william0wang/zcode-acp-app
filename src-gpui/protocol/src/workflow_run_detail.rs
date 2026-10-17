@@ -629,7 +629,8 @@ pub fn table_model(items: &[ArtifactDataItem], spec: Option<&Value>) -> Option<T
         .filter(|k| !k.is_empty());
 
     // Newest-wins dedupe on the declared key, keeping first-seen order
-    // (JS Map::set semantics); non-record items keep their own slot.
+    // (JS Map::set semantics). Keyed mode keeps only records — TS drops the
+    // non-record items outright (WorkflowArtifactViews.tsx:163).
     let mut rows: Vec<(usize, Option<Map<String, Value>>)> = Vec::new();
     let mut index: HashMap<String, usize> = HashMap::new();
     for (i, it) in items.iter().enumerate() {
@@ -648,6 +649,8 @@ pub fn table_model(items: &[ArtifactDataItem], spec: Option<&Value>) -> Option<T
                     }
                 }
             }
+            // Keyed: a non-record item is not a row.
+            (_, Some(_)) => continue,
             _ => rows.push((i, record)),
         }
     }
@@ -1422,6 +1425,27 @@ mod tests {
             { "sequence": 2, "item": 42 }
         ]));
         assert!(table_model(&items, None).is_none());
+    }
+
+    #[test]
+    fn table_keyed_drops_non_records() {
+        // TS keeps only keyed records in keyed mode; the strays do not get
+        // their own single-cell rows (WorkflowArtifactViews.tsx:163).
+        let spec = json!({ "key": "title" });
+        let mixed = items(json!([
+            { "sequence": 1, "item": { "title": "hub.rs", "state": "done" } },
+            { "sequence": 2, "item": "stray text" },
+            { "sequence": 3, "item": 42 }
+        ]));
+        let model = table_model(&mixed, Some(&spec)).expect("spec is usable");
+        assert_eq!(model.rows.len(), 1);
+        assert_eq!(model.rows[0][0], "hub.rs");
+        // All non-records under a key: nothing rows — the KV fallback.
+        let stray = items(json!([
+            { "sequence": 1, "item": "stray" },
+            { "sequence": 2, "item": 7 }
+        ]));
+        assert!(table_model(&stray, Some(&spec)).is_none());
     }
 
     #[test]

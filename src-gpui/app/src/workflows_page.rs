@@ -80,6 +80,14 @@ pub(crate) struct Catalog;
 impl Translate for Catalog {
     fn t(&self, key: &str, values: &[(&'static str, String)]) -> String {
         let text: String = t!(key).into_owned();
+        // rust-i18n answers a miss with the key itself; the protocol's
+        // i18next contract expects the caller's defaultValue to surface
+        // (statusWord's unknown-token passthrough shows raw tokens).
+        if text == key {
+            if let Some((_, fallback)) = values.iter().find(|(k, _)| *k == "defaultValue") {
+                return fallback.clone();
+            }
+        }
         let args: Vec<(&str, &str)> =
             values.iter().map(|(k, v)| (*k, v.as_str())).collect();
         fill(&text, &args)
@@ -1838,7 +1846,7 @@ fn render_phase_card(
     }
 
     let id = format!(
-        "wf-phase-section-{}",
+        "wf-phase-section-{slice_index}-{}",
         slice
             .phase
             .as_deref()
@@ -5132,7 +5140,7 @@ mod workflows_tests {
                 "no standalone timeline — the card headers are it"
             );
             assert!(window.find("wf-phase-head-1").visible());
-            assert!(window.find("wf-phase-section-map").visible());
+            assert!(window.find("wf-phase-section-1-map").visible());
             assert!(window.find("wf-node-line-site_1").visible());
             assert!(window.find("wf-event-4").visible());
             assert!(
