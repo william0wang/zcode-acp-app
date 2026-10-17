@@ -448,3 +448,22 @@ pub struct WorkflowCreatePromptResponse {
     pub ok: bool,
     pub prompt: String,
 }
+
+/// APP-side launch-memory entry (TS `WorkflowLaunch`,
+/// `src/lib/workflow-launches.ts`): the runId → acpSessionId join a
+/// successful `POST …/start` mints — the only moment both ids are in the
+/// app's hands, and nothing server-side maps them back for a remote
+/// client. The APP layer persists the table (beside its server book);
+/// consumers treat a stale entry as a read-only row, not an error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowLaunch {
+    pub run_id: String,
+    pub acp_session_id: String,
+    pub instance_id: String,
+    pub name: String,
+    pub scope: WorkflowScope,
+    /// Epoch-ms of the start (LRU ordering evidence; the list order itself
+    /// is the recency).
+    pub at: u64,
+}

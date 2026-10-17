@@ -26,6 +26,7 @@ mod system_status;
 mod ui_prefs;
 mod usage_page;
 mod workbench;
+mod workflow_launches;
 mod workflows_page;
 mod zconfig_pages;
 

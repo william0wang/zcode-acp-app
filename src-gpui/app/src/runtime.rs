@@ -92,6 +92,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::file_browser::{file_kind_of, viewer_next_window, viewer_window, FileKind};
 use crate::http_transport::{LocalHttpTransport, SettingsApiTransport};
 use crate::pending_store::{merge_pending_queues, pending_path, PendingStore};
+use crate::workflow_launches::{launches_path, WorkflowLaunchStore};
 
 /// The 120ms update-coalescing batch the TS store runs (appStore.ts
 /// `updateQueue`); the driver's tick is its timer.
@@ -124,6 +125,10 @@ const WORKFLOWS_POLL_IDLE_MS: u64 = 30_000;
 /// Run-detail journal poll cadence while the run is unsettled (TS
 /// WorkflowRunDetail's 3s tick): live-ness is polling, not push.
 const WORKFLOW_RUN_POLL_MS: u64 = 3_000;
+/// One workflow's runs-history poll cadence while its newest run flies (TS
+/// WorkflowDetail's 5s tick, `skipDetail` mode: meta is static between
+/// runs, only history + summaries refresh).
+const WORKFLOW_DETAIL_POLL_MS: u64 = 5_000;
 
 /// Env-gated stderr trace for the driver lifecycle (ZCODE_ACP_TRACE=1) —
 /// the slice's connection story, observable without a debugger.
@@ -424,6 +429,30 @@ pub enum UiCommand {
     /// no dedicated REST — the bridge's own chat-prefill doctrine. The
     /// driver stages the prompt into the composer and closes the page.
     WorkflowPromoteGlobal { name: String },
+    /// PUT …/meta (TS `saveMeta`): the whole-meta REPLACE with the rest of
+    /// the loaded meta merged back in — description required, an empty
+    /// whenToUse drops the key (never sent as "").
+    UpdateWorkflowMeta {
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+        /// The complete next meta object (the form already merged).
+        meta: Value,
+    },
+    /// POST …/move (TS `moveToProject`): global → this project; on success
+    /// the page backs out to the overview.
+    MoveWorkflowToProject {
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+    },
+    /// DELETE …/workflows/{scope}/{name} (TS `remove`): the armed two-step
+    /// confirm's fire; on success the page backs out to the overview.
+    DeleteWorkflow {
+        scope: WorkflowScope,
+        name: String,
+        instance_id: String,
+    },
     /// GET …/workflow-create-prompt (TS `createViaChat`): stage the bridge's
     /// prefilled "create via conversation" prompt, never auto-send it.
     WorkflowCreateViaChat { instance_id: String },
@@ -435,12 +464,16 @@ pub enum UiCommand {
         name: Option<String>,
         instance_id: String,
     },
-    /// POST …/stop (TS `stopWorkflowRun`): `session/cancelBackgroundTask`
-    /// via the hub — 409 = already settled.
+    /// POST …/stop (TS `stopWorkflowRun`): the hub route first (it reaches
+    /// ANY instance), `session/cancelBackgroundTask` over the ACP socket as
+    /// the fallback — `None` (or a failed hub stop) falls through to the
+    /// connected tab's socket; 409 = already settled.
     WorkflowStopRun {
         run_id: String,
         session_id: String,
-        instance_id: String,
+        /// The resolved owner (hub annotation → launch memory → connected
+        /// instance); `None` rides the ACP fallback directly.
+        instance_id: Option<String>,
     },
     /// POST …/dismiss (TS `dismissWorkflowRun`): hide one settled journal
     /// row; the reloads make it leave every list.
@@ -971,6 +1004,19 @@ pub struct WorkflowsPageView {
     /// The active tab's instance — the LAST-RESORT action address (TS
     /// `instanceId`): rows the hub could not place fall back to it.
     pub action_instance: Option<String>,
+    /// The launch-memory joins for the run rows this page paints (batch M,
+    /// TS `lookupLaunch`): run id → the session/instance the app's own
+    /// start minted. Rows without an `acpSessionId` resolve through this
+    /// table into actionable rows; a stale entry just fails its open.
+    pub launches: HashMap<String, WorkflowLaunchRef>,
+}
+
+/// One launch-memory resolution carried to the view (the two fields the
+/// row ladders read off a launch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowLaunchRef {
+    pub instance_id: String,
+    pub acp_session_id: String,
 }
 
 /// One open workflow sub-page (TS `WorkflowDetail`).
@@ -1389,6 +1435,21 @@ enum LoopEvent {
         name: String,
         instance_id: String,
         result: Result<WorkflowStartResponse, SettingsApiError>,
+    },
+    /// PUT …/workflows/{scope}/{name}/meta settled for the open detail page.
+    WorkflowMetaUpdated {
+        seq: u64,
+        result: Result<Value, SettingsApiError>,
+    },
+    /// POST …/workflows/{scope}/{name}/move settled.
+    WorkflowMoved {
+        seq: u64,
+        result: Result<Value, SettingsApiError>,
+    },
+    /// DELETE …/workflows/{scope}/{name} settled.
+    WorkflowDeleted {
+        seq: u64,
+        result: Result<Value, SettingsApiError>,
     },
     /// GET …/workflow-create-prompt settled.
     WorkflowCreatePrompt(Result<WorkflowCreatePromptResponse, SettingsApiError>),
@@ -1952,6 +2013,12 @@ struct WorkflowsPanel {
     /// reads it while the page is closed.
     gate: Option<WorkflowGateBlock>,
     gate_busy: bool,
+    /// The lazy gate-probe seed (batch M): true until the first attempt
+    /// fires — the gated config entry and the session manage row need the
+    /// verdict to appear at all (TS probes on the panel/screen mount; the
+    /// desktop surfaces are always mounted, so the first live instance
+    /// triggers the one-shot).
+    gate_probe_pending: bool,
     /// Epoch-ms when the overview poll fires next while open.
     next_poll_at: u64,
     /// The open workflow sub-page; `seq` invalidates in-flight reads on
@@ -1979,6 +2046,9 @@ struct WorkflowDetailPanel {
     /// summaries (the resume button's source of truth).
     summaries: HashMap<String, Vec<ConversationRunSummary>>,
     busy: bool,
+    /// Epoch-ms when the 5s history poll fires next (armed only while this
+    /// workflow's newest run flies — TS WorkflowDetail's `runActive` tick).
+    next_runs_poll_at: u64,
 }
 
 /// One run sub-page's driver state (TS `WorkflowRunDetail` locals). The 3s
@@ -2077,6 +2147,7 @@ impl WorkflowsPanel {
         self.overview = None;
         self.gate = None;
         self.gate_busy = false;
+        self.gate_probe_pending = true;
         self.next_poll_at = 0;
         self.detail = None;
         self.run = None;
@@ -2126,6 +2197,11 @@ struct Driver {
     /// back on every queue change (the TS localStorage map's port —
     /// `pending_prompts` in `SessionCore` stays the in-memory truth).
     pending: PendingStore,
+    /// The persisted workflow-launch memory (batch M): run id → the
+    /// session/instance `POST …/start` minted — the TS
+    /// `zcode.workflowLaunches` table's port. The driver is the single
+    /// writer; the view reads the per-row joins off the snapshot.
+    launches: WorkflowLaunchStore,
 
     instances: Vec<HubInstance>,
     /// Discovery failure note (sidebar hint) — the hub REST call failing.
@@ -2209,6 +2285,7 @@ impl Driver {
             )
             .unwrap_or_default(),
             pending: PendingStore::load(&pending_path()),
+            launches: WorkflowLaunchStore::load(&launches_path()),
             instances: Vec::new(),
             discovery_note: None,
             next_discovery_at: 0,
@@ -2234,7 +2311,12 @@ impl Driver {
             },
             usage: UsagePanel::new(),
             sections: Default::default(),
-            workflows: WorkflowsPanel::default(),
+            // The gate's lazy one-shot probe arms with the driver (the TS
+            // panel mounts probe while the verdict is unknown).
+            workflows: WorkflowsPanel {
+                gate_probe_pending: true,
+                ..Default::default()
+            },
             config_notice: None,
             pending_restart: false,
             toast: ToastState::new(),
@@ -3224,6 +3306,43 @@ impl Driver {
             .map(|t| t.instance_id.clone())
     }
 
+    /// The launch-memory joins for the run rows the open page paints
+    /// (batch M, TS `lookupLaunch` per row): run id → the session/instance
+    /// this app's own start minted. Scoped to the visible rows so the
+    /// snapshot carries a handful of entries, never the whole 200-deep
+    /// table.
+    fn workflow_launch_joins(&self) -> HashMap<String, WorkflowLaunchRef> {
+        let page_open = self.workflows.open;
+        let rows: Vec<&str> = if !page_open {
+            Vec::new()
+        } else {
+            let mut rows = Vec::new();
+            if let Some(o) = &self.workflows.overview {
+                rows.extend(o.active_runs.iter().map(|r| r.run_id.as_str()));
+                rows.extend(o.recent_runs.iter().map(|r| r.run_id.as_str()));
+            }
+            if let Some(d) = &self.workflows.detail {
+                if let Some(runs) = &d.runs {
+                    rows.extend(runs.iter().map(|r| r.run_id.as_str()));
+                }
+            }
+            rows
+        };
+        rows.into_iter()
+            .filter_map(|run_id| {
+                self.launches.lookup(run_id).map(|l| {
+                    (
+                        run_id.to_string(),
+                        WorkflowLaunchRef {
+                            instance_id: l.instance_id.clone(),
+                            acp_session_id: l.acp_session_id.clone(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Anything flying anywhere (TS WorkflowsPage `anyRunning`): the badges'
     /// union across the overview's last-runs and the active-run zone drives
     /// the poll cadence.
@@ -3263,7 +3382,10 @@ impl Driver {
     }
 
     /// The overview settled: success replaces the snapshot (the app renders
-    /// the hub's answer as-is — no client-side merging); a failure keeps
+    /// the hub's answer as-is — no client-side merging) and re-arms the NEXT
+    /// poll off the fresh answer's liveness (the TS effect re-runs when
+    /// `anyRunning` flips — an open that lands on live runs must not wait
+    /// out the idle interval the pre-read state picked). A failure keeps
     /// the last snapshot, except the FIRST load, which still needs a story.
     /// A 404 is the old-hub window (bridge < 0.60.0) — the actionable
     /// "restart the hub" error, not a dead spinner.
@@ -3273,6 +3395,13 @@ impl Driver {
             Ok(overview) => {
                 self.workflows.overview = Some(overview);
                 self.workflows.error = None;
+                let live = self.workflows_any_active();
+                self.workflows.next_poll_at = self.clock.now_ms()
+                    + if live {
+                        WORKFLOWS_POLL_LIVE_MS
+                    } else {
+                        WORKFLOWS_POLL_IDLE_MS
+                    };
             }
             Err(e) if e.status() == Some(404) => {
                 if self.workflows.overview.is_none() {
@@ -3434,11 +3563,20 @@ impl Driver {
         }
         if let Ok(runs) = result {
             d.runs = Some(runs.runs.clone());
+            // The resumable-verdict ladder collects every session a row can
+            // act on: this app's launch memory FIRST (batch M — a row the
+            // bridge never aliased still resolves), then the bridge-joined
+            // `acpSessionId` (bridge 0.57).
             let sessions: Vec<String> = {
                 let mut seen = std::collections::HashSet::new();
                 runs.runs
                     .iter()
-                    .filter_map(|r| r.acp_session_id.clone())
+                    .filter_map(|r| {
+                        self.launches
+                            .lookup(&r.run_id)
+                            .map(|l| l.acp_session_id.clone())
+                            .or_else(|| r.acp_session_id.clone())
+                    })
                     .filter(|sid| seen.insert(sid.clone()))
                     .collect()
             };
@@ -3483,8 +3621,10 @@ impl Driver {
 
     /// POST …/start settled: on success the page closes and the returned
     /// `acpSessionId` opens as a tab (the TS closeConfig + openSession
-    /// pair). A failure re-opens nothing — the notice owns the story and
-    /// the form stays gone (the TS toast path).
+    /// pair), and the minted runId → session join lands in the launch
+    /// memory (the only place it will ever be readable — history rows
+    /// carry the BACKEND session id). A failure re-opens nothing — the
+    /// notice owns the story and the form stays gone (the TS toast path).
     fn on_workflow_started(
         &mut self,
         scope: WorkflowScope,
@@ -3495,6 +3635,22 @@ impl Driver {
         self.workflows.busy = false;
         match result {
             Ok(res) => {
+                if let Some(run_id) = res.run_id.clone() {
+                    let launch = protocol::workflow::WorkflowLaunch {
+                        run_id,
+                        acp_session_id: res.acp_session_id.clone(),
+                        instance_id: instance_id.clone(),
+                        name: name.clone(),
+                        scope,
+                        at: 0,
+                    };
+                    if let Err(e) = self
+                        .launches
+                        .remember(launch, self.clock.now_ms(), &launches_path())
+                    {
+                        traceln!("[driver] launch memory save failed: {e}");
+                    }
+                }
                 self.workflows.open = false;
                 self.workflows.detail = None;
                 self.open_session_by_id(res.acp_session_id, instance_id);
@@ -3502,6 +3658,68 @@ impl Driver {
             Err(e) => {
                 self.config_notice =
                     Some(format!("start workflow \"{name}\" ({scope:?}) failed: {e}"));
+            }
+        }
+    }
+
+    /// PUT …/meta settled (seq-guarded): a success reloads the whole detail
+    /// (TS `if (res) void load()`); a failure explains itself in the notice
+    /// — the sheet already closed on submit, like the amend form.
+    fn on_workflow_meta_updated(
+        &mut self,
+        seq: u64,
+        result: Result<Value, SettingsApiError>,
+    ) {
+        let Some(d) = &mut self.workflows.detail else {
+            return;
+        };
+        if d.seq != seq {
+            return;
+        }
+        d.busy = false;
+        match result {
+            Ok(_) => self.spawn_workflow_detail_loads(),
+            Err(e) => {
+                self.config_notice = Some(format!("save description failed: {e}"));
+            }
+        }
+    }
+
+    /// POST …/move settled (batch M): on success the page backs out to the
+    /// overview (TS `onBack`) — the workflow now lives under the project's
+    /// group, so the detail's scope is stale by construction. Seq-guarded:
+    /// a late answer from a replaced page only reports, never navigates.
+    fn on_workflow_moved(&mut self, seq: u64, result: Result<Value, SettingsApiError>) {
+        self.workflows.busy = false;
+        match result {
+            Ok(_) if self.workflows.detail.as_ref().is_some_and(|d| d.seq == seq) => {
+                self.workflows.detail = None;
+                self.workflows.workflow_seq += 1;
+                let now = self.clock.now_ms();
+                self.spawn_workflow_overview(now);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.config_notice = Some(format!("move workflow failed: {e}"));
+            }
+        }
+    }
+
+    /// DELETE …/workflows/{scope}/{name} settled (batch M): on success the
+    /// page backs out to the overview (TS `remove` → `onBack`). Same
+    /// seq-guard as the move.
+    fn on_workflow_deleted(&mut self, seq: u64, result: Result<Value, SettingsApiError>) {
+        self.workflows.busy = false;
+        match result {
+            Ok(_) if self.workflows.detail.as_ref().is_some_and(|d| d.seq == seq) => {
+                self.workflows.detail = None;
+                self.workflows.workflow_seq += 1;
+                let now = self.clock.now_ms();
+                self.spawn_workflow_overview(now);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.config_notice = Some(format!("delete workflow failed: {e}"));
             }
         }
     }
@@ -4579,6 +4797,40 @@ impl Driver {
         if self.workflows.open && now >= self.workflows.next_poll_at {
             self.spawn_workflow_overview(now);
         }
+        // The gate's lazy one-shot probe (batch M): the gated config entry
+        // and the session manage row need the verdict to render at all —
+        // TS probes on the panel/screen mount; the desktop surfaces mount
+        // with the window, so the first live instance triggers the seed.
+        // The pending flag clears only when the probe actually fires (the
+        // spawn's own phase/instance guards would otherwise eat it while
+        // bootstrapping).
+        if self.workflows.gate.is_none()
+            && self.workflows.gate_probe_pending
+            && matches!(
+                self.phase,
+                Phase::Discovering | Phase::Connected | Phase::Reconnecting
+            )
+            && self.active_instance_id().is_some()
+        {
+            self.workflows.gate_probe_pending = false;
+            self.spawn_workflow_gate_probe();
+        }
+        // One workflow's runs-history poll (TS WorkflowDetail's 5s tick,
+        // `skipDetail` mode): armed only while its newest run flies — meta
+        // is static between runs, so only history + summaries refresh.
+        let detail_poll_due = self.workflows.detail.as_ref().is_some_and(|d| {
+            !d.busy
+                && d.runs
+                    .as_ref()
+                    .is_some_and(|runs| runs.iter().any(|r| crate::workflows_page::run_is_active(&r.status)))
+                && now >= d.next_runs_poll_at
+        });
+        if detail_poll_due {
+            if let Some(d) = self.workflows.detail.as_mut() {
+                d.next_runs_poll_at = now + WORKFLOW_DETAIL_POLL_MS;
+            }
+            self.spawn_workflow_runs_load();
+        }
         // The run view's 3s journal poll (TS WorkflowRunDetail): live while
         // the run is unsettled or its status is still unknown; two failed
         // ticks retire it (session_dead) and the read-only notice stays.
@@ -5277,6 +5529,15 @@ impl Driver {
                 instance_id,
                 result,
             } => self.on_workflow_started(scope, name, instance_id, result),
+            LoopEvent::WorkflowMetaUpdated { seq, result } => {
+                self.on_workflow_meta_updated(seq, result);
+            }
+            LoopEvent::WorkflowMoved { seq, result } => {
+                self.on_workflow_moved(seq, result);
+            }
+            LoopEvent::WorkflowDeleted { seq, result } => {
+                self.on_workflow_deleted(seq, result);
+            }
             LoopEvent::WorkflowCreatePrompt(result) => self.on_workflow_create_prompt(result),
             LoopEvent::WorkflowRunResumed {
                 session_id,
@@ -5980,6 +6241,7 @@ impl Driver {
                     runs: None,
                     summaries: HashMap::new(),
                     busy: false,
+                    next_runs_poll_at: 0,
                 });
                 self.spawn_workflow_detail_loads();
             }
@@ -6039,6 +6301,66 @@ impl Driver {
                     images: Vec::new(),
                 }));
             }
+            UiCommand::UpdateWorkflowMeta {
+                scope,
+                name,
+                instance_id,
+                meta,
+            } => {
+                // Only the OPEN page's write rides (a stale form's submit
+                // after a back must not fire).
+                if let Some(d) = &self.workflows.detail {
+                    if !d.busy {
+                        let seq = d.seq;
+                        self.workflows.detail.as_mut().unwrap().busy = true;
+                        let hub = self.settings_client();
+                        let tx = self.loop_tx.clone();
+                        tokio::spawn(async move {
+                            let result =
+                                hub.workflow_update_meta(&instance_id, scope, &name, meta).await;
+                            let _ = tx.send(LoopEvent::WorkflowMetaUpdated { seq, result });
+                        });
+                    }
+                }
+            }
+            UiCommand::MoveWorkflowToProject {
+                scope,
+                name,
+                instance_id,
+            } => {
+                // The button lives on the open detail page — no page, no
+                // write (and the seq guard below drops late answers).
+                if let Some(d) = &self.workflows.detail {
+                    if !d.busy && !self.workflows.busy {
+                        self.workflows.busy = true;
+                        let seq = d.seq;
+                        let hub = self.settings_client();
+                        let tx = self.loop_tx.clone();
+                        tokio::spawn(async move {
+                            let result = hub.workflow_move(&instance_id, scope, &name).await;
+                            let _ = tx.send(LoopEvent::WorkflowMoved { seq, result });
+                        });
+                    }
+                }
+            }
+            UiCommand::DeleteWorkflow {
+                scope,
+                name,
+                instance_id,
+            } => {
+                if let Some(d) = &self.workflows.detail {
+                    if !d.busy && !self.workflows.busy {
+                        self.workflows.busy = true;
+                        let seq = d.seq;
+                        let hub = self.settings_client();
+                        let tx = self.loop_tx.clone();
+                        tokio::spawn(async move {
+                            let result = hub.workflow_delete(&instance_id, scope, &name).await;
+                            let _ = tx.send(LoopEvent::WorkflowDeleted { seq, result });
+                        });
+                    }
+                }
+            }
             UiCommand::WorkflowCreateViaChat { instance_id } => {
                 if !self.workflows.busy {
                     self.workflows.busy = true;
@@ -6079,8 +6401,62 @@ impl Driver {
                     self.workflows.busy = true;
                     let hub = self.settings_client();
                     let tx = self.loop_tx.clone();
+                    // The fallback rung: the CONNECTED tab's socket — the
+                    // ACP `session/cancelBackgroundTask` route only reaches
+                    // the bridge the socket is dialled into (TS `acp`).
+                    let acp = self
+                        .active_tab
+                        .and_then(|id| self.tab(id))
+                        .filter(|t| t.state == TabPhase::Connected)
+                        .and_then(|t| t.conn.clone());
                     tokio::spawn(async move {
-                        let result = hub.workflow_stop(&instance_id, &run_id, &session_id).await;
+                        // Hub first (reaches ANY instance); `None` skips the
+                        // rung entirely. A failed hub stop falls through to
+                        // the ACP socket rather than reporting defeat —
+                        // EXCEPT a 409 (already settled): nothing left to
+                        // cancel, and the settle refresh below takes over.
+                        let mut result = match instance_id.as_deref() {
+                            Some(iid) if !iid.is_empty() => {
+                                hub.workflow_stop(iid, &run_id, &session_id).await
+                            }
+                            _ => Err(SettingsApiError::Network(
+                                "no instance owns this run".to_string(),
+                            )),
+                        };
+                        let settled = matches!(
+                            result,
+                            Err(ref e) if e.status() == Some(409)
+                        );
+                        if result.is_err() && !settled {
+                            if let Some(conn) = acp {
+                                let params = serde_json::json!({
+                                    "sessionId": session_id,
+                                    "taskId": run_id,
+                                });
+                                match conn.request("session/cancelBackgroundTask", params).await {
+                                    // TS reads `cancelled === true` as the
+                                    // only success shape; anything else
+                                    // keeps the hub error (or names it).
+                                    Ok(v) if v.get("cancelled") == Some(&Value::Bool(true)) => {
+                                        result = Ok(v);
+                                    }
+                                    Ok(_) => {
+                                        if result.is_err() {
+                                            result = Err(SettingsApiError::Unexpected(
+                                                "run not found or already settled".to_string(),
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        if result.is_err() {
+                                            result = Err(SettingsApiError::Unexpected(format!(
+                                                "acp cancel: {e}"
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         let _ = tx.send(LoopEvent::WorkflowRunStopped(result));
                     });
                 }
@@ -6670,6 +7046,22 @@ impl Driver {
             &mut sig,
         );
         mix(wf.gate_busy as u64, &mut sig);
+        // The launch-memory joins (batch M): a freshly remembered launch
+        // makes rows actionable — the paint must follow the table. The fold
+        // is XOR-commutative on purpose: a HashMap's iteration order is
+        // arbitrary, and a multiplicative fold would jitter the signature
+        // (spurious repaints) across identical maps.
+        {
+            let joins = self.workflow_launch_joins();
+            mix(joins.len() as u64, &mut sig);
+            let mut s: u64 = 0;
+            for (run_id, l) in &joins {
+                s ^= fold_str(run_id)
+                    ^ fold_str(&l.instance_id).rotate_left(8)
+                    ^ fold_str(&l.acp_session_id).rotate_left(16);
+            }
+            mix(s, &mut sig);
+        }
         if let Some(d) = &wf.detail {
             mix(d.seq, &mut sig);
             mix(fold_str(&d.name), &mut sig);
@@ -6995,6 +7387,7 @@ impl Driver {
                 }),
                 busy: self.workflows.busy,
                 action_instance: self.active_instance_id(),
+                launches: self.workflow_launch_joins(),
             }),
             workflow_gate: self.workflows.gate.clone(),
             workflow_gate_busy: self.workflows.gate_busy,

@@ -62,8 +62,8 @@ use rust_i18n::t;
 
 use crate::i18n::fill;
 use crate::runtime::{
-    UiCommand, WorkflowArtifactViewerView, WorkflowDetailView, WorkflowNodeResultView,
-    WorkflowRunTab, WorkflowRunView, WorkflowsPageView,
+    UiCommand, WorkflowArtifactViewerView, WorkflowDetailView, WorkflowLaunchRef,
+    WorkflowNodeResultView, WorkflowRunTab, WorkflowRunView, WorkflowsPageView,
 };
 use crate::workbench::Workbench;
 
@@ -468,6 +468,7 @@ fn render_overview_body(wb: &Workbench, page: &WorkflowsPageView, cx: &Context<W
                 "active",
                 page.action_instance.as_deref(),
                 page.busy,
+                page.launches.get(&r.run_id),
                 wb,
                 cx,
             ));
@@ -488,6 +489,7 @@ fn render_overview_body(wb: &Workbench, page: &WorkflowsPageView, cx: &Context<W
                 "recent",
                 page.action_instance.as_deref(),
                 page.busy,
+                page.launches.get(&r.run_id),
                 wb,
                 cx,
             ));
@@ -541,13 +543,19 @@ fn render_overview_body(wb: &Workbench, page: &WorkflowsPageView, cx: &Context<W
 }
 
 /// One row of the active/recent zones: label, stamp, badge, and the
-/// Detail/Stop (active) or Detail/dismiss (recent) controls.
+/// Detail/Stop (active) or Detail/dismiss (recent) controls. The session
+/// ladder is the TS one: launch memory → the row's bridge-joined
+/// `acpSessionId` (absent = read-only row); the instance ladder adds the
+/// hub's owner annotation ahead of launch memory, with the connected tab's
+/// instance last. Recent rows additionally carry the stamp · tokens ·
+/// artifact-count chips line (TS RecentRunsBlock).
 fn render_run_zone_row(
     r: &WorkflowRunRow,
     index: usize,
     zone: &str,
     action_instance: Option<&str>,
     busy: bool,
+    launch: Option<&WorkflowLaunchRef>,
     wb: &Workbench,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -556,13 +564,14 @@ fn render_run_zone_row(
         .name
         .clone()
         .unwrap_or_else(|| r.run_id.chars().take(12).collect());
-    // The hub's owner annotation is the live truth; the connected tab's
-    // instance is the last resort. No acpSessionId → read-only row.
-    let row_instance = r
+    let row_instance: Option<String> = r
         .owner_instance_id
         .clone()
+        .or_else(|| launch.map(|l| l.instance_id.clone()))
         .or_else(|| action_instance.map(str::to_string));
-    let row_session = r.acp_session_id.clone();
+    let row_session: Option<String> = launch
+        .map(|l| l.acp_session_id.clone())
+        .or_else(|| r.acp_session_id.clone());
     let key = format!("{zone}-{index}");
     let slug_run = slug_run_id(&r.run_id);
 
@@ -571,12 +580,34 @@ fn render_run_zone_row(
         div()
             .flex_1()
             .min_w_0()
-            .text_size(px(12.))
-            .text_color(theme.foreground)
-            .truncate()
-            .child(label.clone()),
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .truncate()
+                    .child(label.clone()),
+            )
+            // The finished complement's chips line (TS shape): stamp ·
+            // tokens · artifact count, only the parts the row carries.
+            .when(zone == "recent" && !run_meta_line(r).is_empty(), |this| {
+                this.child(
+                    div()
+                        .id(SharedString::from(format!("wf-{key}-meta")))
+                        .test_support()
+                        .min_w_0()
+                        .text_size(px(10.))
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(run_meta_line(r)),
+                )
+            }),
     );
-    if let Some(at) = r.updated_at {
+    // TS shape: the ACTIVE row's stamp rides the label line; the RECENT
+    // row's stamp lives inside its chips line instead.
+    if let Some(at) = r.updated_at.filter(|_| zone != "recent") {
         line = line.child(
             div()
                 .flex_none()
@@ -586,8 +617,34 @@ fn render_run_zone_row(
         );
     }
     line = line.child(status_badge(Some(&r.status), &key, theme));
+
+    // Dismissal hides one settled run from every bridge-served list; it
+    // needs only an INSTANCE to address (TS `dismiss`'s ladder stops at
+    // `iid`), so a recent row without a session still dismisses.
+    if zone == "recent" {
+        if let Some(instance_id) = row_instance.clone() {
+            let runtime = wb.runtime.clone();
+            let run_id = r.run_id.clone();
+            line = line.child(
+                Button::new(SharedString::from(format!("wf-{key}-dismiss-{slug_run}")))
+                    .ghost()
+                    .xsmall()
+                    .label("×")
+                    .tooltip(t!("zconfig.workflowDismissRun").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, _| {
+                        runtime.send(UiCommand::DismissWorkflowRun {
+                            instance_id: instance_id.clone(),
+                            run_id: run_id.clone(),
+                        });
+                    }),
+            );
+        }
+    }
     card = card.child(line);
 
+    // Detail/Stop need BOTH halves of the address (an openable session on
+    // an instance that can act on it).
     if let (Some(instance_id), Some(session_id)) = (row_instance.clone(), row_session.clone()) {
         let mut actions = div().flex().flex_wrap().gap(px(6.));
         let runtime = wb.runtime.clone();
@@ -627,23 +684,7 @@ fn render_run_zone_row(
                         runtime.send(UiCommand::WorkflowStopRun {
                             run_id: run_id.clone(),
                             session_id: session_stop.clone(),
-                            instance_id: instance_stop.clone(),
-                        });
-                    }),
-            );
-        } else {
-            let runtime = wb.runtime.clone();
-            let (run_id, instance_dismiss) = (r.run_id.clone(), instance_id.clone());
-            actions = actions.child(
-                Button::new(SharedString::from(format!("wf-{key}-dismiss-{slug_run}")))
-                    .ghost()
-                    .xsmall()
-                    .label(t!("zconfig.workflowDismissRun").into_owned())
-                    .disabled(busy)
-                    .on_click(move |_, _, _| {
-                        runtime.send(UiCommand::DismissWorkflowRun {
-                            instance_id: instance_dismiss.clone(),
-                            run_id: run_id.clone(),
+                            instance_id: Some(instance_stop.clone()),
                         });
                     }),
             );
@@ -850,7 +891,7 @@ fn render_detail_body(
     }
 
     // The identity card: scope chip (+ the instance for a project scope),
-    // description, whenToUse, the file path.
+    // description, whenToUse, the file path, and the meta edit entry.
     let mut card = rows_card(theme).child(
         div()
             .flex()
@@ -887,6 +928,7 @@ fn render_detail_body(
                 )
             }),
     );
+    let meta_loaded = detail.detail.is_some();
     if let Some(d) = &detail.detail {
         card = card
             .when_some(meta_string(d, "description"), |this, text| {
@@ -913,7 +955,6 @@ fn render_detail_body(
                 this.child(
                     div()
                         .px_4()
-                        .pb_3()
                         .w_full()
                         .font_family(theme.mono_font_family.clone())
                         .text_size(px(10.))
@@ -923,9 +964,36 @@ fn render_detail_body(
                 )
             });
     }
+    // Edit meta (TS `MetaSheet`): exactly the two prose fields; the button
+    // needs the loaded detail (the merge base of the whole-meta replace).
+    if meta_loaded {
+        let wb_handle = cx.entity();
+        card = card.child(
+            div()
+                .px_4()
+                .py_2()
+                .flex_none()
+                .child(
+                    Button::new("workflow-meta-edit-open")
+                        .secondary()
+                        .outline()
+                        .xsmall()
+                        .label(t!("zconfig.workflowEditDescription").into_owned())
+                        .on_click(move |_, window, cx| {
+                            wb_handle.update(cx, |this, cx| {
+                                this.open_workflow_meta_form(window, cx);
+                            });
+                        }),
+                ),
+        );
+    }
     list = list.child(card);
 
-    // The start + promote controls.
+    // The start + scope-change + delete controls. The two scope moves are
+    // BOTH present in the product, one direction per scope: project →
+    // global rides the chat-prefill path (no dedicated REST), global →
+    // project the REST move. Delete arms an inline two-step confirm (a
+    // mislabeled tap must not delete a saved workflow).
     let wb_handle = cx.entity();
     let (scope, name, instance_id) =
         (detail.scope, detail.name.clone(), detail.instance_id.clone());
@@ -943,29 +1011,140 @@ fn render_detail_body(
                 });
             }),
     );
+    let mut scope_row = div().pt_2().flex().gap_2();
     if detail.scope == WorkflowScope::Project {
         // Promote-to-global rides the chat-prefill path (no dedicated REST).
         let runtime = wb.runtime.clone();
         let name = detail.name.clone();
-        controls = controls.child(
-            div().pt_2().child(
-                Button::new("workflow-promote-global")
-                    .secondary()
-                    .outline()
-                    .small()
-                    .w_full()
-                    .icon(IconName::ArrowUp)
-                    .label(t!("zconfig.workflowPromoteGlobal").into_owned())
-                    .on_click(move |_, _, _| {
-                        runtime.send(UiCommand::WorkflowPromoteGlobal { name: name.clone() });
-                    }),
-            ),
+        scope_row = scope_row.child(
+            Button::new("workflow-promote-global")
+                .secondary()
+                .outline()
+                .small()
+                .flex_1()
+                .icon(IconName::ArrowUp)
+                .label(t!("zconfig.workflowPromoteGlobal").into_owned())
+                .on_click(move |_, _, _| {
+                    runtime.send(UiCommand::WorkflowPromoteGlobal { name: name.clone() });
+                }),
+        );
+    } else {
+        // global → this project: the REST move (TS `moveToProject`).
+        let runtime = wb.runtime.clone();
+        let (scope, name, instance_id) =
+            (detail.scope, detail.name.clone(), detail.instance_id.clone());
+        scope_row = scope_row.child(
+            Button::new("workflow-move-project")
+                .secondary()
+                .outline()
+                .small()
+                .flex_1()
+                .icon(IconName::ArrowDown)
+                .label(t!("zconfig.workflowMoveToProject").into_owned())
+                .disabled(page.busy)
+                .on_click(move |_, _, _| {
+                    runtime.send(UiCommand::MoveWorkflowToProject {
+                        scope,
+                        name: name.clone(),
+                        instance_id: instance_id.clone(),
+                    });
+                }),
         );
     }
+    if wb.workflow_delete_confirm {
+        let wb_cancel = cx.entity();
+        let runtime = wb.runtime.clone();
+        let (scope, name, instance_id) =
+            (detail.scope, detail.name.clone(), detail.instance_id.clone());
+        scope_row = scope_row
+            .child(
+                Button::new("workflow-delete-cancel")
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        wb_cancel.update(cx, |this, cx| this.cancel_workflow_delete(cx));
+                    }),
+            )
+            .child(
+                Button::new("workflow-delete-confirm")
+                    .danger()
+                    .small()
+                    .flex_1()
+                    .label(t!("zconfig.workflowConfirmDelete").into_owned())
+                    .disabled(page.busy)
+                    .on_click(move |_, _, _| {
+                        runtime.send(UiCommand::DeleteWorkflow {
+                            scope,
+                            name: name.clone(),
+                            instance_id: instance_id.clone(),
+                        });
+                    }),
+            );
+    } else {
+        let wb_arm = cx.entity();
+        scope_row = scope_row.child(
+            Button::new("workflow-delete-arm")
+                .secondary()
+                .outline()
+                .small()
+                .flex_1()
+                .icon(KitIconName::Trash)
+                .label(t!("zconfig.workflowDelete").into_owned())
+                .on_click(move |_, _, cx| {
+                    wb_arm.update(cx, |this, cx| this.arm_workflow_delete(cx));
+                }),
+        );
+    }
+    controls = controls.child(scope_row);
     list = list.child(controls);
 
+    // The script: read-only, folded behind an explicit Show/Hide (TS
+    // `scriptOpen`) — the app never edits the script.
+    if let Some(script) = detail
+        .detail
+        .as_ref()
+        .and_then(|d| d.script.as_ref())
+        .filter(|s| !s.is_empty())
+    {
+        let wb_toggle = cx.entity();
+        let open = wb.workflow_script_open;
+        let mut block = rows_card(theme).child(block_title(&t!("zconfig.workflowScript"), theme));
+        block = block.child(
+            Button::new("workflow-script-toggle")
+                .ghost()
+                .xsmall()
+                .w_full()
+                .text_left()
+                .label(if open {
+                    t!("zconfig.workflowHideScript").into_owned()
+                } else {
+                    t!("zconfig.workflowShowScript").into_owned()
+                })
+                .on_click(move |_, _, cx| {
+                    wb_toggle.update(cx, |this, cx| this.toggle_workflow_script(cx));
+                }),
+        );
+        if open {
+            block = block.child(
+                div()
+                    .px_4()
+                    .pb_3()
+                    .min_w_0()
+                    .child(pre_block(
+                        "workflow-script-body",
+                        script,
+                        theme.muted_foreground,
+                        theme,
+                    )),
+            );
+        }
+        list = list.child(block);
+    }
+
     // The run history: rows with the summary-joined status/resumable
-    // verdicts; a row without an acpSessionId stays read-only.
+    // verdicts; the session ladder adds launch memory ahead of the
+    // bridge-joined alias, so this app's own launches stay actionable.
     let mut runs_block = rows_card(theme).child(block_title(&t!("zconfig.workflowRunsTitle"), theme));
     match &detail.runs {
         None => {}
@@ -984,6 +1163,7 @@ fn render_detail_body(
                 runs_block = runs_block.child(render_detail_run_row(
                     r,
                     detail,
+                    page.launches.get(&r.run_id),
                     page.busy,
                     wb,
                     cx,
@@ -993,6 +1173,36 @@ fn render_detail_body(
     }
     list = list.child(runs_block);
     list.into_any_element()
+}
+
+/// The whole-meta merge behind the edit form (TS `saveMeta`): the write
+/// REPLACES the whole meta, so the untouched `rest` of the loaded meta
+/// rides back in — with the OLD `whenToUse` stripped first (an empty new
+/// value drops the key entirely, and the spread would silently carry the
+/// stale one back). Description is required non-empty upstream.
+pub(crate) fn merge_workflow_meta(
+    existing: Option<&BTreeMap<String, serde_json::Value>>,
+    description: &str,
+    when_to_use: &str,
+) -> Option<serde_json::Value> {
+    let description = description.trim();
+    if description.is_empty() {
+        return None;
+    }
+    let mut next = serde_json::Map::new();
+    if let Some(existing) = existing {
+        for (k, v) in existing {
+            if k != "whenToUse" && k != "description" {
+                next.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    next.insert("description".to_string(), serde_json::Value::String(description.to_string()));
+    let when_to_use = when_to_use.trim();
+    if !when_to_use.is_empty() {
+        next.insert("whenToUse".to_string(), serde_json::Value::String(when_to_use.to_string()));
+    }
+    Some(serde_json::Value::Object(next))
 }
 
 /// The detail payload's prose meta field (TS reads `meta.description` /
@@ -1009,13 +1219,22 @@ fn meta_string(d: &WorkflowDetailResponse, key: &str) -> Option<String> {
 fn render_detail_run_row(
     r: &WorkflowRunRow,
     detail: &WorkflowDetailView,
+    launch: Option<&WorkflowLaunchRef>,
     busy: bool,
     wb: &Workbench,
     cx: &Context<Workbench>,
 ) -> AnyElement {
     let theme = cx.theme();
-    let row_session = r.acp_session_id.clone();
-    let row_instance = detail.instance_id.clone();
+    // The session ladder (TS): launch memory wins for runs this app started
+    // (it knows the owning instance), then the bridge-joined alias (bridge
+    // 0.57.0); the instance falls back to the page's own — a history row
+    // carries no owner annotation.
+    let row_session: Option<String> = launch
+        .map(|l| l.acp_session_id.clone())
+        .or_else(|| r.acp_session_id.clone());
+    let row_instance: String = launch
+        .map(|l| l.instance_id.clone())
+        .unwrap_or_else(|| detail.instance_id.clone());
     let summary: Option<&ConversationRunSummary> = row_session
         .as_ref()
         .and_then(|sid| detail.summaries.get(sid))
@@ -1334,7 +1553,7 @@ fn render_run_body(
                     runtime.send(UiCommand::WorkflowStopRun {
                         run_id: run_id.clone(),
                         session_id: session_id.clone(),
-                        instance_id: instance_id.clone(),
+                        instance_id: Some(instance_id.clone()),
                     });
                 }),
         );
@@ -3283,6 +3502,16 @@ pub(crate) struct WorkflowAmendForm {
     pub(crate) clear_concurrency: bool,
 }
 
+/// The meta edit form's state (TS `MetaSheet`): exactly the two prose
+/// fields, prefilled from the loaded detail.
+pub(crate) struct WorkflowMetaForm {
+    pub(crate) scope: WorkflowScope,
+    pub(crate) name: String,
+    pub(crate) instance_id: String,
+    pub(crate) description: Entity<TextareaState>,
+    pub(crate) when_to_use: Entity<TextareaState>,
+}
+
 impl Workbench {
     /// Opens the start sheet (TS `setStarting(true)`): the typed form when
     /// the workflow declares args, the free-form JSON textarea otherwise.
@@ -3409,10 +3638,199 @@ impl Workbench {
         cx.notify();
     }
 
+    /// Opens the meta edit sheet (TS `setEditingDesc(true)`): the two prose
+    /// fields prefilled from the open detail page's loaded meta.
+    pub fn open_workflow_meta_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(detail) = self
+            .snap
+            .workflows_page
+            .as_ref()
+            .and_then(|p| p.detail.as_ref())
+        else {
+            return;
+        };
+        let (scope, name, instance_id) =
+            (detail.scope, detail.name.clone(), detail.instance_id.clone());
+        let (description_text, when_to_use_text) = match &detail.detail {
+            Some(d) => (
+                meta_string(d, "description").unwrap_or_default(),
+                meta_string(d, "whenToUse").unwrap_or_default(),
+            ),
+            None => (String::new(), String::new()),
+        };
+        let description = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx);
+            state.set_value(description_text, window, cx);
+            state
+        });
+        let when_to_use = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx);
+            state.set_value(when_to_use_text, window, cx);
+            state
+        });
+        let mut subs = Vec::new();
+        for entity in [&description, &when_to_use] {
+            subs.push(cx.subscribe(entity, |_, _, _: &InputEvent, cx| cx.notify()));
+        }
+        self.workflow_meta_form = Some(WorkflowMetaForm {
+            scope,
+            name,
+            instance_id,
+            description,
+            when_to_use,
+        });
+        self.workflow_form_subs = subs;
+        cx.notify();
+    }
+
+    /// TS `canSubmit` for the meta sheet: description is required non-empty
+    /// (upstream refuses blank) — whenToUse is optional by construction.
+    fn workflow_meta_can_submit(&self, cx: &Context<Self>) -> bool {
+        let Some(form) = &self.workflow_meta_form else {
+            return false;
+        };
+        !form.description.read(cx).value().trim().is_empty()
+    }
+
+    /// The meta sheet's submit (TS `saveMeta`): build the whole next meta
+    /// (the write REPLACES, so the untouched rest merges back in; an empty
+    /// whenToUse drops the key), dispatch, and close — the page's notice
+    /// banner carries the outcome, the reload the success.
+    fn submit_workflow_meta_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.workflow_meta_form else {
+            return;
+        };
+        let existing = self
+            .snap
+            .workflows_page
+            .as_ref()
+            .and_then(|p| p.detail.as_ref())
+            .and_then(|d| d.detail.as_ref())
+            .and_then(|d| d.meta.as_ref());
+        let meta = merge_workflow_meta(
+            existing,
+            &form.description.read(cx).value(),
+            &form.when_to_use.read(cx).value(),
+        );
+        // A blank description cannot happen through the UI (the submit
+        // stays disabled); if it slips through anyway, the merge returns
+        // None and nothing dispatches — a blank write must never leave.
+        if let Some(meta) = meta {
+            let (scope, name, instance_id) =
+                (form.scope, form.name.clone(), form.instance_id.clone());
+            self.runtime.send(UiCommand::UpdateWorkflowMeta {
+                scope,
+                name,
+                instance_id,
+                meta,
+            });
+        }
+        self.workflow_meta_form = None;
+        self.workflow_form_subs.clear();
+        cx.notify();
+    }
+
+    /// The meta edit sheet (TS `MetaSheet`).
+    pub fn render_workflow_meta_form(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let Some(form) = &self.workflow_meta_form else {
+            return div().into_any_element();
+        };
+        let can_submit = self.workflow_meta_can_submit(cx);
+        let mut column = div()
+            .id("workflow-meta-form")
+            .test_support()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_x_hidden();
+        column = column.child(form_header(
+            &t!("zconfig.workflowEditDescription").into_owned(),
+            "workflow-form-back",
+            theme,
+            cx,
+        ));
+        let wb = cx.entity();
+        let body = div()
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .max_w(rems(46.))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.foreground)
+                            .child(t!("zconfig.workflowDescription").into_owned()),
+                    )
+                    .child(Textarea::new(&form.description).small()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(theme.foreground)
+                            .child(t!("zconfig.workflowWhenToUse").into_owned()),
+                    )
+                    .child(Textarea::new(&form.when_to_use).small()),
+            )
+            .child(
+                Button::new("workflow-meta-submit")
+                    .primary()
+                    .w_full()
+                    .label(t!("common.save").into_owned())
+                    .disabled(!can_submit)
+                    .on_click(move |_, _, cx| {
+                        wb.update(cx, |this, cx| this.submit_workflow_meta_form(cx));
+                    }),
+            );
+        column
+            .child(
+                div()
+                    .id("workflow-meta-body")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    /// The script fold (TS `setScriptOpen(!scriptOpen)`): view-local, reset
+    /// when the open workflow changes.
+    pub(crate) fn toggle_workflow_script(&mut self, cx: &mut Context<Self>) {
+        self.workflow_script_open = !self.workflow_script_open;
+        cx.notify();
+    }
+
+    /// The delete confirm's arm (TS `setConfirmDelete(true)`).
+    pub(crate) fn arm_workflow_delete(&mut self, cx: &mut Context<Self>) {
+        self.workflow_delete_confirm = true;
+        cx.notify();
+    }
+
+    /// The delete confirm's cancel (TS `setConfirmDelete(false)`).
+    pub(crate) fn cancel_workflow_delete(&mut self, cx: &mut Context<Self>) {
+        self.workflow_delete_confirm = false;
+        cx.notify();
+    }
+
     /// Closes whichever workflow form is open (a header back).
     pub(crate) fn close_workflow_form(&mut self, cx: &mut Context<Self>) {
         self.workflow_start_form = None;
         self.workflow_amend_form = None;
+        self.workflow_meta_form = None;
         self.workflow_form_subs.clear();
         cx.notify();
     }
@@ -4259,6 +4677,7 @@ mod workflows_tests {
             run: None,
             busy: false,
             action_instance: Some("inst-a".to_string()),
+            launches: std::collections::HashMap::new(),
         }
     }
 
@@ -4416,6 +4835,28 @@ mod workflows_tests {
             )
             .expect("open test window")
         })
+    }
+
+    /// Click `id` until the runtime records SOMETHING (bounded): at high
+    /// suite parallelism the kit's pointer dispatch occasionally drops the
+    /// very first click on a freshly opened window — the target resolves
+    /// against a frame a concurrent suite-mate's scheduling displaced. A
+    /// click that landed needs no retry, and a re-fired duplicate still
+    /// satisfies the `any`-style assertions the callers make. Harness
+    /// sensitivity only — no production behavior rides on this.
+    fn click_recorded(
+        window: &mut gpui_kit::Window,
+        id: gpui_kit::SharedString,
+        runtime: &ProtocolRuntime,
+        cx: &mut gpui_kit::App,
+    ) {
+        let before = runtime.recorded_commands().len();
+        for _ in 0..3 {
+            window.click(id.clone(), cx);
+            if runtime.recorded_commands().len() > before {
+                return;
+            }
+        }
     }
 
     /// The overview paints the group card with its last-run badge, the live
@@ -4903,5 +5344,321 @@ mod workflows_tests {
             );
         })
         .unwrap();
+    }
+
+    /// Batch M (M1): the meta edit sheet — the whole-meta REPLACE merges the
+    /// untouched rest back in (the args declaration survives), an emptied
+    /// whenToUse DROPS the key, and a blank description keeps the submit
+    /// disabled.
+    #[gpui_kit::test]
+    fn workflow_meta_form_merges_rest_and_drops_empty_when_to_use(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let meta = BTreeMap::from([
+            (
+                "args".to_string(),
+                serde_json::json!({ "target": { "type": "string", "required": true } }),
+            ),
+            (
+                "description".to_string(),
+                serde_json::json!("Deploy the app"),
+            ),
+            ("whenToUse".to_string(), serde_json::json!("When deploying")),
+        ]);
+        let mut view = page_view(None);
+        view.detail = Some(detail_view(meta));
+        snap.workflows_page = Some(view);
+        let (handle, wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // The identity card's edit entry opens the sheet, prefilled.
+            window.click("workflow-meta-edit-open", cx);
+            window.render_frame(cx);
+            assert!(window.find("workflow-meta-form").visible());
+            // A cleared description disables the submit — nothing dispatches.
+            wb.update(cx, |wb, cx| {
+                let form = wb.workflow_meta_form.as_ref().expect("form open");
+                form.description
+                    .update(cx, |s, cx| s.set_value("   ", window, cx));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.click("workflow-meta-submit", cx);
+            assert!(
+                !runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::UpdateWorkflowMeta { .. })),
+                "a blank description must not write"
+            );
+            // A new description with an EMPTIED whenToUse: the args rest
+            // merges back, whenToUse is absent (never "").
+            wb.update(cx, |wb, cx| {
+                let form = wb.workflow_meta_form.as_ref().expect("form open");
+                form.description
+                    .update(cx, |s, cx| s.set_value("Ship it", window, cx));
+                form.when_to_use
+                    .update(cx, |s, cx| s.set_value("", window, cx));
+                cx.notify();
+            });
+            window.render_frame(cx);
+            window.click("workflow-meta-submit", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::UpdateWorkflowMeta { scope, name, instance_id, meta }
+                        if *scope == WorkflowScope::Global
+                            && name == "deploy"
+                            && instance_id == "inst-a"
+                            && *meta == serde_json::json!({
+                                "args": { "target": { "type": "string", "required": true } },
+                                "description": "Ship it",
+                            })
+                )),
+                "the submit must carry the merged whole meta, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Batch M (M2 + M3): a GLOBAL workflow offers the REST move to project
+    /// (the project scope keeps the chat-prefill promote), and delete is a
+    /// two-step confirm — the arm alone dispatches nothing.
+    #[gpui_kit::test]
+    fn workflow_detail_move_and_two_step_delete(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut view = page_view(None);
+        view.detail = Some(detail_view(BTreeMap::new()));
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // Global scope: move-to-project present, promote absent.
+            assert!(window.find("workflow-move-project").visible());
+            assert!(
+                window.try_find("workflow-promote-global").is_none(),
+                "promote is the PROJECT scope's direction"
+            );
+            window.click("workflow-move-project", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::MoveWorkflowToProject { scope, name, instance_id }
+                        if *scope == WorkflowScope::Global
+                            && name == "deploy"
+                            && instance_id == "inst-a"
+                )),
+                "move must dispatch the REST route, got {sent:?}"
+            );
+            // Delete arms, cancels, arms again, then fires.
+            assert!(window.try_find("workflow-delete-confirm").is_none());
+            window.click("workflow-delete-arm", cx);
+            window.render_frame(cx);
+            assert!(window.find("workflow-delete-cancel").visible());
+            window.click("workflow-delete-cancel", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("workflow-delete-confirm").is_none());
+            window.click("workflow-delete-arm", cx);
+            window.render_frame(cx);
+            window.click("workflow-delete-confirm", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::DeleteWorkflow { scope, name, instance_id }
+                        if *scope == WorkflowScope::Global
+                            && name == "deploy"
+                            && instance_id == "inst-a"
+                )),
+                "the confirmed delete must dispatch, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Batch M (M4): the script renders read-only behind an explicit
+    /// Show/Hide fold — closed by default, one click opens, another closes.
+    #[gpui_kit::test]
+    fn workflow_detail_script_folds(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        let mut view = page_view(None);
+        view.detail = Some(detail_view(BTreeMap::new()));
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(window.find("workflow-script-toggle").visible());
+            assert!(
+                window.try_find("workflow-script-body").is_none(),
+                "the script is folded by default"
+            );
+            window.click("workflow-script-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.find("workflow-script-body").visible());
+            window.click("workflow-script-toggle", cx);
+            window.render_frame(cx);
+            assert!(window.try_find("workflow-script-body").is_none());
+        })
+        .unwrap();
+    }
+
+    /// Batch M (M5 + M7): zone rows without a bridge-joined session resolve
+    /// through the launch memory into actionable rows — Stop addresses the
+    /// launch's own instance/session, the recent row carries its chips line
+    /// and dismisses without a session at all.
+    #[gpui_kit::test]
+    fn launch_memory_makes_zone_rows_actionable(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let mut overview = overview_fixture();
+        let mut active = run_row("run-7", "deploy", "running", None);
+        active.owner_instance_id = None;
+        let mut recent = run_row("run-8", "deploy", "completed", None);
+        recent.owner_instance_id = None;
+        overview.active_runs = vec![active];
+        overview.recent_runs = vec![recent];
+        let mut view = page_view(Some(overview));
+        view.launches = [
+            (
+                "run-7",
+                crate::runtime::WorkflowLaunchRef {
+                    instance_id: "inst-launch".to_string(),
+                    acp_session_id: "s-launch".to_string(),
+                },
+            ),
+            (
+                "run-8",
+                crate::runtime::WorkflowLaunchRef {
+                    instance_id: "inst-launch".to_string(),
+                    acp_session_id: "s-recent".to_string(),
+                },
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        let mut snap = WorkbenchSnapshot::initial();
+        snap.phase = Phase::Connected;
+        snap.workflows_page = Some(view);
+        let (handle, _wb) = open_workbench(cx, runtime.clone(), snap);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.render_frame(cx);
+            // The active row: Detail + Stop on the launch's own address.
+            assert!(window.find("wf-active-0-detail").visible());
+            assert!(window.find("wf-active-0-stop-run-7").visible());
+            click_recorded(
+                window,
+                gpui_kit::SharedString::from("wf-active-0-stop-run-7"),
+                &runtime,
+                cx,
+            );
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::WorkflowStopRun { run_id, session_id, instance_id }
+                        if run_id == "run-7"
+                            && session_id == "s-launch"
+                            && instance_id.as_deref() == Some("inst-launch")
+                )),
+                "stop must ride the launch memory's address, got {sent:?}"
+            );
+            // Repaint between the two interactions (the kit click rides
+            // the last completed frame; a stale one can drop the second
+            // click under load).
+            window.render_frame(cx);
+            // The recent row: chips line + Detail + dismiss (no session
+            // needed for the dismiss).
+            assert!(window.find("wf-recent-0-meta").visible());
+            assert!(window.find("wf-recent-0-detail").visible());
+            assert!(window.find("wf-recent-0-dismiss-run-8").visible());
+            click_recorded(
+                window,
+                gpui_kit::SharedString::from("wf-recent-0-detail"),
+                &runtime,
+                cx,
+            );
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::OpenWorkflowRun { run_id, session_id, instance_id, .. }
+                        if run_id == "run-8"
+                            && session_id == "s-recent"
+                            && instance_id == "inst-launch"
+                )),
+                "detail must ride the launch memory's address, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The merge behind the meta write (plain logic, no window): rest
+    /// preserved, old whenToUse stripped, empty new whenToUse dropped,
+    /// blank description refused.
+    #[test]
+    fn merge_workflow_meta_shapes() {
+        let existing = BTreeMap::from([
+            (
+                "args".to_string(),
+                serde_json::json!({ "target": { "type": "string" } }),
+            ),
+            ("description".to_string(), serde_json::json!("old")),
+            ("whenToUse".to_string(), serde_json::json!("stale")),
+        ]);
+        let merged = super::merge_workflow_meta(
+            Some(&existing),
+            "  Ship it  ",
+            "  when downtime allows  ",
+        )
+        .expect("non-empty description merges");
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "args": { "target": { "type": "string" } },
+                "description": "Ship it",
+                "whenToUse": "when downtime allows",
+            })
+        );
+        // An emptied whenToUse drops the key (never ""), and the old value
+        // must not ride the spread back in.
+        let merged = super::merge_workflow_meta(Some(&existing), "Ship it", "  ").unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "args": { "target": { "type": "string" } },
+                "description": "Ship it",
+            })
+        );
+        // A blank description is refused outright (required upstream).
+        assert!(super::merge_workflow_meta(Some(&existing), "   ", "x").is_none());
+        assert!(super::merge_workflow_meta(None, "", "x").is_none());
+        // No loaded detail yet still produces a valid minimal object.
+        assert_eq!(
+            super::merge_workflow_meta(None, "D", "").unwrap(),
+            serde_json::json!({ "description": "D" })
+        );
     }
 }

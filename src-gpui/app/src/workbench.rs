@@ -69,7 +69,9 @@ use crate::runtime::{
 use crate::quota_page::SpendStage;
 use crate::system_status::render_system_status_page;
 use crate::usage_page::render_usage_page;
-use crate::workflows_page::{WorkflowAmendForm, WorkflowStartForm};
+use crate::workflows_page::{
+    WorkflowAmendForm, WorkflowMetaForm, WorkflowStartForm,
+};
 use crate::zconfig_pages::ZConfigForm;
 
 /// Stream-reveal timing for streamed markdown chunks (the Claude-style fade
@@ -196,10 +198,20 @@ pub struct Workbench {
     pub(crate) workflow_start_form: Option<WorkflowStartForm>,
     /// The run-settings amendment sheet (batch J); `None` = closed.
     pub(crate) workflow_amend_form: Option<WorkflowAmendForm>,
+    /// The meta edit sheet (batch M, TS `MetaSheet`); `None` = closed.
+    pub(crate) workflow_meta_form: Option<WorkflowMetaForm>,
     /// Keeps whichever workflow form's input subscriptions alive.
     pub(crate) workflow_form_subs: Vec<Subscription>,
     /// The WorkflowGate sheet (batch J) — view-local overlay.
     pub(crate) workflow_gate_sheet: bool,
+    /// The detail page's script fold (batch M, TS `scriptOpen`): view-local,
+    /// reset when the open workflow changes.
+    pub(crate) workflow_script_open: bool,
+    /// The detail page's armed delete confirm (batch M, TS `confirmDelete`).
+    pub(crate) workflow_delete_confirm: bool,
+    /// The detail page the script fold + delete confirm belong to (scope +
+    /// name + instance): a workflow switch or close resets both.
+    workflow_detail_key: Option<String>,
     /// The run page's open raw-payload toggles (batch L, TS `EventRow`'s
     /// `open` + `RawData`): the expanded raw keys, scoped to the open run —
     /// a run switch clears them (the TS key={runId} remount).
@@ -759,8 +771,12 @@ impl Workbench {
             zconfig_form_subs: Vec::new(),
             workflow_start_form: None,
             workflow_amend_form: None,
+            workflow_meta_form: None,
             workflow_form_subs: Vec::new(),
             workflow_gate_sheet: false,
+            workflow_script_open: false,
+            workflow_delete_confirm: false,
+            workflow_detail_key: None,
             workflow_raw_open: std::collections::HashSet::new(),
             workflow_raw_run: None,
             hooks_open_event: None,
@@ -870,6 +886,13 @@ impl Workbench {
                 self.runtime.send(UiCommand::FilesNavigate {
                     path: String::new(),
                 });
+            }
+            // Docking the config panel seeds the gate probe (batch M — TS
+            // ZCodeConfigScreen's mount effect): the gated Workflows entry
+            // cannot render until the verdict lands, and an unprobed verdict
+            // is fail-closed.
+            if panel == DockPanel::Config && self.snap.workflow_gate.is_none() {
+                self.runtime.send(UiCommand::ProbeWorkflowGate);
             }
         }
         cx.notify();
@@ -1039,7 +1062,22 @@ impl Workbench {
                 if self.snap.workflows_page.is_none() {
                     self.workflow_start_form = None;
                     self.workflow_amend_form = None;
+                    self.workflow_meta_form = None;
                     self.workflow_form_subs.clear();
+                }
+                // The detail page's view-local gestures (batch M): the
+                // script fold and the armed delete confirm reset with the
+                // workflow (the TS component's local state).
+                let detail_key = self
+                    .snap
+                    .workflows_page
+                    .as_ref()
+                    .and_then(|p| p.detail.as_ref())
+                    .map(|d| format!("{:?}/{}/{}", d.scope, d.name, d.instance_id));
+                if detail_key != self.workflow_detail_key {
+                    self.workflow_detail_key = detail_key;
+                    self.workflow_script_open = false;
+                    self.workflow_delete_confirm = false;
                 }
                 // The run page's raw toggles are run-local state (the TS
                 // remount drops them with the view); a run switch or close
@@ -2222,14 +2260,11 @@ impl Workbench {
         // (icon, title, description, entry command constructor). The command
         // is built inside the click closure — click listeners are `Fn`, so a
         // prebuilt command would have to be Clone for nothing. The five
-        // batch-I sections ride the same list (requirements §7), and the
-        // Workflows page rides it too (batch J).
-        let entries: [(
-            KitIconName,
-            &str,
-            &str,
-            fn() -> UiCommand,
-        ); 10] = [
+        // batch-I sections ride the same list (requirements §7); the
+        // Workflows page joins only while the gate verdict says the feature
+        // is ON (batch M — TS hides the row unless `workflowGate?.enabled
+        // === true`; fail-closed, the gate switch row below is the way in).
+        let mut entries: Vec<(KitIconName, &str, &str, fn() -> UiCommand)> = vec![
             (
                 KitIconName::Boxes,
                 "Models",
@@ -2294,18 +2329,26 @@ impl Workbench {
                     page: crate::runtime::ConfigPageKind::Backups,
                 },
             ),
-            (
+        ];
+        if self
+            .snap
+            .workflow_gate
+            .as_ref()
+            .is_some_and(|g| g.enabled)
+        {
+            entries.push((
                 KitIconName::Workflow,
                 "Workflows",
                 "Saved dynamic workflows and their runs",
                 || UiCommand::OpenWorkflows,
-            ),
-        ];
+            ));
+        }
         for (icon, title, description, open) in entries {
             let runtime = runtime.clone();
             column = column.child(
                 div()
                     .id(SharedString::from(format!("config-entry-{title}")))
+                    .test_support()
                     .flex()
                     .items_start()
                     .gap_2()
@@ -2355,6 +2398,7 @@ impl Workbench {
         column = column.child(
             div()
                 .id("config-entry-Workflow switch")
+                .test_support()
                 .flex()
                 .items_start()
                 .gap_2()
@@ -3036,23 +3080,57 @@ impl Workbench {
         // Config chips (the TS ConfigSheet at desktop distance): the active
         // tab's model / mode / thought picks, one dropdown each. Only with a
         // live session — the TS guard (`connState === "open"` + active id).
-        if let Some(view) = self.snap.active.as_ref() {
-            if matches!(view.phase, TabPhase::Connected) && !view.config_options.is_empty() {
-                strip = strip.child(
+        // The manage-workflows entry (batch M, the TS SessionPanel's single
+        // workflow row) rides the same trailing group: shown when the gate
+        // verdict is ON and a session is attached; opens the Workflows page.
+        let chips_row = self.snap.active.as_ref().and_then(|view| {
+            matches!(view.phase, TabPhase::Connected)
+                .then(|| !view.config_options.is_empty())
+                .filter(|has| *has)
+                .map(|_| {
                     div()
-                        .ml_auto()
                         .flex()
                         .items_center()
                         .gap_1()
                         .min_w_0()
-                        .pr_1()
                         .children(
                             view.config_options
                                 .iter()
-                                .map(|opt| self.render_config_chip(opt, cx)),
-                        ),
-                );
-            }
+                                .map(|opt| self.render_config_chip(opt, cx))
+                                .collect::<Vec<_>>(),
+                        )
+                })
+        });
+        let session_live = self
+            .snap
+            .active
+            .as_ref()
+            .and_then(|t| t.session_id.clone())
+            .is_some();
+        let manage_row = (session_live
+            && self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled))
+            .then(|| {
+                let runtime = self.runtime.clone();
+                Button::new("session-manage-workflows")
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::new(KitIconName::Workflow))
+                    .tooltip(t!("panel.workflowManage").into_owned())
+                    .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows))
+                    .into_any_element()
+            });
+        if chips_row.is_some() || manage_row.is_some() {
+            strip = strip.child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .min_w_0()
+                    .pr_1()
+                    .children(chips_row)
+                    .children(manage_row),
+            );
         }
         strip.into_any_element()
     }
@@ -4658,7 +4736,7 @@ impl Render for Workbench {
                 },
             )
             // The Workflows page (batch J): the same contract — the open
-            // start/amend form replaces the page while open.
+            // start/amend/meta form replaces the page while open.
             .when_some(
                 self.snap.workflows_page.clone(),
                 |this, _page| {
@@ -4666,6 +4744,8 @@ impl Render for Workbench {
                         self.render_workflow_start_form(cx)
                     } else if self.workflow_amend_form.is_some() {
                         self.render_workflow_amend_form(cx)
+                    } else if self.workflow_meta_form.is_some() {
+                        self.render_workflow_meta_form(cx)
                     } else {
                         crate::workflows_page::render_workflows_page(self, cx)
                     })
@@ -5459,6 +5539,104 @@ mod chip_tests {
                         if config_id == "model" && value == "glm-4-air"
                 )),
                 "the pick must reach the runtime, got {sent:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Batch M (M6): the workflow entries follow the gate verdict — the
+    /// session strip's manage row and the config panel's Workflows entry
+    /// render only while the verdict reads ON with a live session; the gate
+    /// SWITCH row itself never hides (the override is the way in).
+    #[gpui_kit::test]
+    fn workflow_entries_follow_gate_and_session(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let open = |cx: &mut TestAppContext, runtime: crate::runtime::ProtocolRuntime, gate_on: bool| {
+            let mut snap = connected_snapshot();
+            snap.workflow_gate = Some(protocol::settings::WorkflowGateBlock {
+                enabled: gate_on,
+                mode: "env".to_string(),
+                source: "remote".to_string(),
+                r#override: None,
+            });
+            // Tall window: the config panel scrolls, and only painted rows
+            // register ids — the whole entry list must fit one frame.
+            let (handle, wb) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: Point::default(),
+                            size: Size {
+                                width: px(800.),
+                                height: px(2400.),
+                            },
+                        })),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        let runtime = runtime.clone();
+                        cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
+                    },
+                )
+                .expect("open test window")
+            });
+            (handle, wb)
+        };
+        // Verdict ON + live session: the manage row renders and opens the
+        // Workflows page; the config panel's entry renders too.
+        let runtime = ProtocolRuntime::inert();
+        let (handle, wb) = open(cx, runtime.clone(), true);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("session-manage-workflows").visible());
+            window.click("session-manage-workflows", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(c, UiCommand::OpenWorkflows)),
+                "the manage row must open the workflows page, got {sent:?}"
+            );
+        })
+        .unwrap();
+        // The config panel: dock it and check the entry (still verdict ON).
+        wb.update(cx, |wb, cx| {
+            wb.toggle_dock_panel(super::DockPanel::Config, cx);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("config-entry-Workflows").visible());
+            assert!(
+                window.find("config-entry-Workflow switch").visible(),
+                "the gate switch row never hides"
+            );
+        })
+        .unwrap();
+
+        // Verdict OFF: the manage row and the gated entry disappear (the
+        // fail-closed rule), the switch row stays. A second window keeps the
+        // two cases' state independent.
+        let runtime = ProtocolRuntime::inert();
+        let (handle, wb) = open(cx, runtime.clone(), false);
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("session-manage-workflows").is_none(),
+                "an off verdict must not surface the manage row"
+            );
+        })
+        .unwrap();
+        wb.update(cx, |wb, cx| {
+            wb.toggle_dock_panel(super::DockPanel::Config, cx);
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.try_find("config-entry-Workflows").is_none());
+            assert!(
+                window.find("config-entry-Workflow switch").visible(),
+                "the switch row is the always-visible way in"
             );
         })
         .unwrap();
