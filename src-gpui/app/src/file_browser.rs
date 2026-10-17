@@ -157,6 +157,21 @@ pub fn open_in_file_manager(abs: &str) -> Result<(), String> {
         .map_err(|e| format!("{program}: {e}"))
 }
 
+/// Open one local FILE with the OS default application (the mobile
+/// viewer-header affordance, `open_local_path` reveal=false), or reveal it
+/// in the file manager (`open -R` on macOS). argv only, never a shell.
+pub fn open_local_path(abs: &str, reveal: bool) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut cmd = std::process::Command::new(program);
+    if reveal && cfg!(target_os = "macos") {
+        cmd.arg("-R");
+    }
+    cmd.arg(abs)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("{program}: {e}"))
+}
+
 /// The absolute machine path of one browsed directory — the listing's root
 /// plus the relative path (TS FileBrowser `openCurrentDir`).
 pub fn absolute_dir(root: &str, path: &str) -> String {
@@ -546,50 +561,84 @@ pub(crate) fn render_file_viewer(
     view: &FileViewerView,
     runtime: &ProtocolRuntime,
     wb: &gpui::WeakEntity<crate::workbench::Workbench>,
+    local_abs: Option<String>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     let mut column = div().flex().flex_col().h_full();
 
-    // Header: close, name, the size meta (TS viewer header).
-    column = column.child(
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .p_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(
-                Button::new("file-viewer-close")
+    // Header: close, name, the size meta (TS viewer header), then the two
+    // local affordances the mobile viewer carries (FileViewer.tsx:679-696):
+    // open with the OS default application + reveal in the file manager —
+    // loopback hubs only (the file must live on this machine).
+    let mut header = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .p_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            Button::new("file-viewer-close")
+                .ghost()
+                .xsmall()
+                .icon(KitIconName::X)
+                .tooltip("Back to the file list")
+                .on_click({
+                    let runtime = runtime.clone();
+                    move |_, _, _| runtime.send(UiCommand::FilesCloseView)
+                }),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(13.))
+                .text_color(theme.foreground)
+                .child(view.name.clone()),
+        )
+        .child(
+            div()
+                .id("file-viewer-meta")
+                .test_support()
+                .flex_none()
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .child(format!("{} · {}", fmt_size(view.size), kind_label(view.kind))),
+        );
+    if let Some(abs) = local_abs {
+        for (id, icon, tooltip, reveal) in [
+            (
+                "file-viewer-open",
+                KitIconName::ExternalLink,
+                "Open with the default application",
+                false,
+            ),
+            (
+                "file-viewer-reveal",
+                KitIconName::FolderOpen,
+                "Show in Finder",
+                true,
+            ),
+        ] {
+            let wb_open = wb.clone();
+            let abs = abs.clone();
+            header = header.child(
+                Button::new(id)
                     .ghost()
                     .xsmall()
-                    .icon(KitIconName::X)
-                    .tooltip("Back to the file list")
-                    .on_click({
-                        let runtime = runtime.clone();
-                        move |_, _, _| runtime.send(UiCommand::FilesCloseView)
+                    .icon(icon)
+                    .tooltip(tooltip)
+                    .on_click(move |_, _, cx| {
+                        if let Err(e) = open_local_path(&abs, reveal) {
+                            wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
+                        }
                     }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(13.))
-                    .text_color(theme.foreground)
-                    .child(view.name.clone()),
-            )
-            .child(
-                div()
-                    .id("file-viewer-meta")
-                    .test_support()
-                    .flex_none()
-                    .text_size(px(11.))
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{} · {}", fmt_size(view.size), kind_label(view.kind))),
-            ),
-    );
+            );
+        }
+    }
+    column = column.child(header);
 
     // Body ladder: loading / error+retry / deferred kinds / text rows.
     let mut body = div().flex().flex_col().gap(px(2.)).p_2();

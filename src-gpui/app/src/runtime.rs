@@ -4514,13 +4514,16 @@ impl Driver {
                     }
                     self.toast.notify(
                         now,
-                        "Session ended — it reappears if the editor still holds it open",
+                        // The TS store sets the notice KEY (appStore.ts:2011)
+                        // and the UI localizes; resolving here covers the
+                        // desktop's raw-string toast/error slots equally.
+                        &rust_i18n::t!("notice.sessionClosed"),
                     );
                 }
                 Err(e) => {
                     let msg = if e.status == Some(409) {
                         // A turn is in flight — stop it first (ADR-0006).
-                        "the session is running — stop the turn before ending it".to_string()
+                        rust_i18n::t!("notice.sessionRunning").into_owned()
                     } else {
                         format!("close session failed: {e}")
                     };
@@ -4547,14 +4550,13 @@ impl Driver {
                         for inst in &mut self.instances {
                             inst.sessions.retain(|s| s.session_id != session_id);
                         }
-                        self.toast.notify(now, "Deleted from history — nothing was purged");
+                        self.toast.notify(now, &rust_i18n::t!("notice.sessionDeleted"));
                     }
                     Err(e) => {
                         let msg = if e.status == Some(409) {
                             // Live or a turn in flight (ADR-0031): ending the
                             // live copy is the end action's job.
-                            "the session is still live — end it before deleting its history"
-                                .to_string()
+                            rust_i18n::t!("notice.sessionDeleteLive").into_owned()
                         } else {
                             format!("delete session failed: {e}")
                         };
@@ -4578,7 +4580,7 @@ impl Driver {
                     Err(e) => {
                         let msg = if e.status == Some(404) {
                             // Bridge < 0.17.0: the route itself is missing.
-                            "this hub is too old for remote session-create".to_string()
+                            rust_i18n::t!("projectDialog.tooOld").into_owned()
                         } else {
                             format!("projects: {e}")
                         };
@@ -4615,7 +4617,7 @@ impl Driver {
                             // Entering browse lists HOME, which always
                             // exists — a 404 there is a bridge too old for
                             // /api/fs/list (the TS `first` distinction).
-                            "this hub is too old for directory browsing".to_string()
+                            rust_i18n::t!("projectDialog.tooOld").into_owned()
                         } else {
                             format!("browse: {e}")
                         };
@@ -4640,7 +4642,7 @@ impl Driver {
                     }
                     Err(e) => {
                         let msg = if e.status == Some(403) {
-                            "this project is not in the hub's allowlist".to_string()
+                            rust_i18n::t!("notice.projectUnknown").into_owned()
                         } else {
                             format!("create session failed: {e}")
                         };

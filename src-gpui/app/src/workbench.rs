@@ -57,8 +57,10 @@ use protocol::image::{
 };
 
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
-use crate::file_browser::{render_file_viewer, render_files_panel, FilesPanelCtx};
-use crate::i18n::fill;
+use crate::file_browser::{
+    absolute_dir, is_loopback_hub, render_file_viewer, render_files_panel, FilesPanelCtx,
+};
+use crate::i18n::{fill, fmt_relative, now_ms, parse_iso_ms, t_count};
 use crate::models_page::ModelsForm;
 use crate::runtime::{
     FsBrowseView, HistoryRow, HistorySelected, NewSessionView, Phase, ProtocolRuntime,
@@ -168,6 +170,9 @@ pub struct Workbench {
     /// segment, so a name hit is a path hit).
     new_session_filter: Entity<InputState>,
     _ns_filter_sub: Subscription,
+    /// The history panel's project-layer filter (TS ProjectHistoryDialog).
+    history_filter: Entity<InputState>,
+    _history_filter_sub: Subscription,
     _search_sub: Subscription,
     /// The Servers section's add-server form (Connection Profile book,
     /// CONTEXT.md): name / hub URL / bearer token.
@@ -200,6 +205,9 @@ pub struct Workbench {
     /// The Backups page's armed restore confirm (TS `confirm`): the
     /// (file, path) the second gesture would restore.
     pub(crate) backup_confirm: Option<(String, String)>,
+    /// The servers panel's armed remove (TS two-click delete): the profile
+    /// id and when the 3s confirm window opened.
+    pub(crate) server_remove_armed: Option<(String, std::time::Instant)>,
     /// The quota page's spend gesture (TS `confirm` useState): which window,
     /// and whether the below-threshold warning has been answered. Lives only
     /// inside the page — a page closed under an open gesture drops it so a
@@ -322,6 +330,9 @@ enum PartView {
         last_text: String,
         thought: bool,
         fold: Option<bool>,
+        /// The thought body's scroll state (persisted per part so the
+        /// streaming bottom-pin can read the LAST frame's extent).
+        scroll: gpui::ScrollHandle,
     },
     /// User text — plain, never markdown-parsed (pasted code must not be
     /// reinterpreted as formatting).
@@ -373,6 +384,7 @@ fn new_markdown_part(text: &str, thought: bool, cx: &mut Context<Workbench>) -> 
         last_text: text.to_string(),
         thought,
         fold: None,
+        scroll: gpui::ScrollHandle::new(),
     }
 }
 
@@ -672,6 +684,12 @@ impl Workbench {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
         let ns_filter_sub =
             cx.subscribe(&new_session_filter, |_, _, _: &InputEvent, cx| cx.notify());
+        // The history panel's project-layer filter (TS ProjectHistoryDialog
+        // :413-421) — the same shape as the chooser's.
+        let history_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
+        let history_filter_sub =
+            cx.subscribe(&history_filter, |_, _, _: &InputEvent, cx| cx.notify());
         let add_server_name =
             cx.new(|cx| InputState::new(window, cx).placeholder("Name (e.g. dev box)"));
         let add_server_url =
@@ -724,6 +742,8 @@ impl Workbench {
             _search_sub: search_sub,
             new_session_filter,
             _ns_filter_sub: ns_filter_sub,
+            history_filter,
+            _history_filter_sub: history_filter_sub,
             add_server_name,
             add_server_url,
             add_server_token,
@@ -737,6 +757,7 @@ impl Workbench {
             workflow_gate_sheet: false,
             hooks_open_event: None,
             backup_confirm: None,
+            server_remove_armed: None,
             quota_confirm: None,
             copied_row: None,
             plan_open: false,
@@ -2015,13 +2036,36 @@ impl Workbench {
             }
             let runtime_remove = runtime.clone();
             let remove_id = server.id.clone();
+            // Two-click delete (TS ConnectScreen:46-54): the first click
+            // arms a 3s confirm window; the re-click validates the window
+            // at CLICK time, so a stale armed label can never delete.
+            let armed = matches!(&self.server_remove_armed, Some((id, at))
+                if *id == server.id && at.elapsed() < std::time::Duration::from_secs(3));
+            let wb_arm = cx.entity();
+            let arm_id = server.id.clone();
             row = row.child(
                 Button::new(SharedString::from(format!("server-remove-{}", server.id)))
                     .secondary()
                     .small()
-                    .label("Remove")
-                    .on_click(move |_, _, _| {
-                        runtime_remove.send(UiCommand::RemoveServer { id: remove_id.clone() })
+                    .label(if armed { "Confirm remove" } else { "Remove" })
+                    .on_click(move |_, _, cx| {
+                        let arm_id = arm_id.clone();
+                        let confirmed = wb_arm.update(cx, |wb, cx| {
+                            let fresh = matches!(&wb.server_remove_armed, Some((id, at))
+                                if *id == arm_id
+                                    && at.elapsed() < std::time::Duration::from_secs(3));
+                            wb.server_remove_armed = if fresh {
+                                None
+                            } else {
+                                Some((arm_id.clone(), std::time::Instant::now()))
+                            };
+                            cx.notify();
+                            fresh
+                        });
+                        if confirmed {
+                            runtime_remove
+                                .send(UiCommand::RemoveServer { id: remove_id.clone() });
+                        }
                     }),
             );
             column = column.child(row);
@@ -2034,7 +2078,9 @@ impl Workbench {
         let token = self.add_server_token.clone();
         let add_runtime = runtime.clone();
         let can_add = !self.add_server_name.read(cx).value().trim().is_empty()
-            && !self.add_server_url.read(cx).value().trim().is_empty();
+            && !self.add_server_url.read(cx).value().trim().is_empty()
+            // TS ConnectScreen:147 — the token is required, not optional.
+            && !self.add_server_token.read(cx).value().trim().is_empty();
         column = column.child(
             div()
                 .flex()
@@ -2667,15 +2713,29 @@ impl Workbench {
                     );
                 }
                 (Some(list), _) => {
-                    if list.is_empty() {
+                    // The project-layer filter (TS ProjectHistoryDialog
+                    // :413-421): case-insensitive path match, the same
+                    // shape as the chooser's.
+                    column = column
+                        .child(div().px_1().child(Input::new(&self.history_filter).small()));
+                    let q = self.history_filter.read(cx).value().trim().to_lowercase();
+                    let shown: Vec<_> = list
+                        .iter()
+                        .filter(|p| q.is_empty() || p.workspace_path.to_lowercase().contains(&q))
+                        .collect();
+                    if shown.is_empty() {
                         column = column.child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(theme.muted_foreground)
-                                .child("No known projects yet."),
+                                .child(if list.is_empty() {
+                                    "No known projects yet.".to_string()
+                                } else {
+                                    t!("historyDialog.empty").into_owned()
+                                }),
                         );
                     }
-                    for p in list {
+                    for p in shown {
                         let runtime = self.runtime.clone();
                         let workspace = p.workspace_path.clone();
                         column = column.child(
@@ -2700,9 +2760,12 @@ impl Workbench {
                                 )
                                 .child(
                                     div()
+                                        .flex_none()
                                         .text_size(px(10.))
                                         .text_color(theme.muted_foreground)
-                                        .child(format!("{}", p.sessions)),
+                                        // TS ProjectHistoryDialog:529 — count
+                                        // plus fmtRelative(lastActive).
+                                        .child(project_meta_line(p.sessions, p.last_active)),
                                 )
                                 .on_click(move |_, _, _| {
                                     runtime.send(UiCommand::HistoryOpenProject {
@@ -2884,7 +2947,17 @@ impl Workbench {
                     } else if row.live {
                         "live".to_string()
                     } else {
-                        row.updated_at.clone().unwrap_or_default()
+                        // TS SessionList:185 — fmtRelative(updatedAt); the
+                        // history rows carry ISO stamps, so parse first and
+                        // fall back to the raw text when the shape is odd.
+                        row.updated_at
+                            .as_deref()
+                            .map(|iso| {
+                                parse_iso_ms(iso)
+                                    .map(|ms| fmt_relative(ms, now_ms()))
+                                    .unwrap_or_else(|| iso.to_string())
+                            })
+                            .unwrap_or_default()
                     }),
             )
             .child(actions)
@@ -3058,7 +3131,7 @@ impl Workbench {
                 .items_center()
                 .gap_1()
                 .px_3()
-                .py_1_5()
+                .py(px(6.))
                 .cursor_pointer()
                 .hover(|h| h.bg(theme.secondary))
                 .on_click(move |_, _, cx| {
@@ -3364,7 +3437,12 @@ impl Workbench {
         // Send now (hidden while replaying/disconnected), Edit (back into
         // the composer), and discard.
         if let Some(t) = self.tab.as_ref() {
-            let connected = matches!(t.phase, TabPhase::Connected);
+            // TS ChatView:932 — Send now needs connState "open" AND the
+            // replay finished; the phase flips Connected before load_session
+            // runs, so loading_session alone would leave a dead button up
+            // through the whole replay (force_send refuses while loading).
+            let connected =
+                matches!(t.phase, TabPhase::Connected) && !t.loading_session;
             for (index, draft) in t.pending.iter().enumerate() {
                 let runtime = self.runtime.clone();
                 let mut row = div()
@@ -3381,7 +3459,7 @@ impl Workbench {
                         .flex_none()
                         .text_size(px(9.))
                         .text_color(theme.muted_foreground)
-                        .child("pending"),
+                        .child(t!("chat.pending").into_owned()),
                 );
                 row = row.child(
                     div()
@@ -3410,7 +3488,7 @@ impl Workbench {
                         Button::new(("pending-send", index))
                             .ghost()
                             .xsmall()
-                            .label("Send now")
+                            .label(t!("chat.sendNow").into_owned())
                             .tooltip("Interrupt the running turn and send this one first")
                             .on_click(move |_, _, _| {
                                 runtime.send(UiCommand::ForceSendPendingAt { index })
@@ -3565,9 +3643,14 @@ impl Workbench {
                     }
                 }),
         );
+        // Auto-grow (TS ChatView:830-846 — rows=1, min 36px, max 128px):
+        // the height tracks the draft's logical lines; wrapped-long-line
+        // overflow keeps scrolling internally inside the 128px cap.
+        let composer_lines = self.composer.read(cx).value().lines().count().max(1);
+        let composer_h = px((36. + (composer_lines.saturating_sub(1) as f32) * 18.).min(128.));
         controls = controls.child(
             Textarea::new(&self.composer)
-                .h(px(84.))
+                .h(composer_h)
                 .flex_1()
                 // Desktop paste: clipboard rasters and copied files ride
                 // the same pipeline as picks (ChatView onPaste).
@@ -3906,6 +3989,23 @@ fn short_id(id: &str, fallback: &str) -> String {
 }
 
 /// ProjectHistoryDialog's `projectName`: the last path segment.
+/// `{count} sessions · {relative}` — the TS project rows' meta line
+/// (`t("…sessionCount", {count})` + `fmtRelative(lastActive)`, both the
+/// chooser and the history dialog); the relative half drops when the
+/// stamp is absent.
+fn project_meta_line(sessions: u64, last_active: u64) -> String {
+    let count = fill(
+        &t_count("projectDialog.sessionCount", sessions),
+        &[("count", &sessions.to_string())],
+    );
+    let rel = fmt_relative(last_active, now_ms());
+    if rel.is_empty() {
+        count
+    } else {
+        format!("{count} · {rel}")
+    }
+}
+
 fn project_name(path: &str) -> String {
     path.trim_end_matches('/')
         .rsplit('/')
@@ -4090,6 +4190,7 @@ fn render_assistant_row(
                 state,
                 thought: true,
                 fold,
+                scroll,
                 ..
             } => {
                 // ThoughtCard (ChatView.tsx:264): auto-open while it is the
@@ -4119,7 +4220,7 @@ fn render_assistant_row(
                         .items_center()
                         .gap_1()
                         .px_3()
-                        .py_1_5()
+                        .py(px(6.))
                         .cursor_pointer()
                         .hover(|h| h.bg(theme.title_bar))
                         .on_click({
@@ -4149,9 +4250,18 @@ fn render_assistant_row(
                         ),
                 );
                 if open {
+                    // TS ChatView:282-287 — while streaming AND open, pin
+                    // the capped body to its bottom every render so the
+                    // newest tokens stay in view. The handle carries the
+                    // previous frame's extent (one-frame lag, like the TS
+                    // post-render effect).
+                    if streaming {
+                        scroll.scroll_to_bottom();
+                    }
                     card = card.child(
                         div()
                             .id(SharedString::from(format!("thought-body-{}", row.id)))
+                            .track_scroll(scroll)
                             .max_h(px(208.))
                             .overflow_y_scroll()
                             .px_3()
@@ -4281,7 +4391,7 @@ fn render_assistant_row(
                             .border_t_1()
                             .border_color(theme.border)
                             .px_2()
-                            .py_1_5()
+                            .py(px(6.))
                             .font_family(theme.mono_font_family.clone())
                             .text_size(px(11.))
                             .line_height(relative(1.45))
@@ -4560,10 +4670,21 @@ impl Render for Workbench {
             // full-screen reader; later siblings paint above, so this goes
             // last.
             .when_some(self.snap.files.viewing.clone(), |this, view| {
+                // The viewer's local affordances (mobile FileViewer header):
+                // an absolute path exists only where the hub is loopback AND
+                // a listing names the workspace root (the canLocal pair).
+                let local_abs = self
+                    .snap
+                    .hub_addr
+                    .as_deref()
+                    .filter(|addr| is_loopback_hub(addr))
+                    .zip(self.snap.files.listing.as_ref().map(|l| l.root.clone()))
+                    .map(|(_, root)| absolute_dir(&root, &view.path));
                 this.child(render_file_viewer(
                     &view,
                     &runtime,
                     &cx.entity().downgrade(),
+                    local_abs,
                     cx,
                 ))
             })
@@ -4913,7 +5034,7 @@ impl Workbench {
                             .items_center()
                             .gap_2()
                             .px_2()
-                            .py_1_5()
+                            .py(px(6.))
                             .rounded_md()
                             .cursor_pointer()
                             .hover(|h| h.bg(theme.secondary))
@@ -4962,7 +5083,7 @@ impl Workbench {
                                 .child(if busy {
                                     "creating…".to_string()
                                 } else {
-                                    format!("{} sessions", p.sessions)
+                                    project_meta_line(p.sessions, p.last_active)
                                 }),
                         );
                         list = list.child(row);
@@ -5866,6 +5987,12 @@ mod files_tests {
                 window.find("file-viewer-foot").visible(),
                 "the footer states the line count"
             );
+            // The local affordances (mobile viewer header): open with the
+            // default application + reveal in Finder — the fixture's hub is
+            // loopback and the listing names the root. Never clicked here —
+            // both shell out to `open`.
+            assert!(window.find("file-viewer-open").visible());
+            assert!(window.find("file-viewer-reveal").visible());
             window.click("file-viewer-close", cx);
             assert!(
                 runtime

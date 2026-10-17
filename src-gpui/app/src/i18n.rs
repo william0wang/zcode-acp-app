@@ -93,6 +93,111 @@ pub(crate) fn locale_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Wall-clock epoch milliseconds for render-time relative stamps (the TS
+/// `fmtRelative` reads `Date.now()` at render the same way).
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The TS `fmtRelative` (dayjs `fromNow`) against the active locale.
+pub(crate) fn fmt_relative(ts_ms: u64, now_ms: u64) -> String {
+    fmt_relative_in(&rust_i18n::locale().to_string(), ts_ms, now_ms)
+}
+
+/// dayjs `relativeTime` with its default thresholds, in the two catalog
+/// locales (en / zh-cn wordings verbatim). A zero stamp renders empty like
+/// TS; a stamp in the future clamps to "a few seconds ago" (history data
+/// is past by construction).
+pub(crate) fn fmt_relative_in(locale: &str, ts_ms: u64, now_ms: u64) -> String {
+    if ts_ms == 0 {
+        return String::new();
+    }
+    let zh = locale.to_ascii_lowercase().starts_with("zh");
+    let secs = now_ms.saturating_sub(ts_ms) as f64 / 1000.0;
+    let mins = secs / 60.0;
+    let hours = mins / 60.0;
+    let days = hours / 24.0;
+    let months = days / 30.436875;
+    let years = days / 365.2425;
+    let r = |v: f64| v.round() as u64;
+    // dayjs thresholds: the unit-less rows reuse the previous unit's value.
+    if r(secs) <= 44 {
+        return if zh { "几秒前".into() } else { "a few seconds ago".into() };
+    }
+    if r(secs) <= 89 {
+        return if zh { "1 分钟前".into() } else { "a minute ago".into() };
+    }
+    if r(mins) <= 44 {
+        let n = r(mins);
+        return if zh { format!("{n} 分钟前") } else { format!("{n} minutes ago") };
+    }
+    if r(mins) <= 89 {
+        return if zh { "1 小时前".into() } else { "an hour ago".into() };
+    }
+    if r(hours) <= 21 {
+        let n = r(hours);
+        return if zh { format!("{n} 小时前") } else { format!("{n} hours ago") };
+    }
+    if r(hours) <= 35 {
+        return if zh { "1 天前".into() } else { "a day ago".into() };
+    }
+    if r(days) <= 25 {
+        let n = r(days);
+        return if zh { format!("{n} 天前") } else { format!("{n} days ago") };
+    }
+    if r(days) <= 45 {
+        return if zh { "1 个月前".into() } else { "a month ago".into() };
+    }
+    if r(months) <= 10 {
+        let n = r(months);
+        return if zh { format!("{n} 个月前") } else { format!("{n} months ago") };
+    }
+    if r(months) <= 17 {
+        return if zh { "1 年前".into() } else { "a year ago".into() };
+    }
+    let n = r(years).max(2);
+    if zh { format!("{n} 年前") } else { format!("{n} years ago") }
+}
+
+/// Epoch ms from the bridge's ISO-8601 UTC stamps (`2026-10-01T10:00:00Z`,
+/// optional fractional seconds); anything else is `None`. The history rows
+/// carry ISO where discovery carries epoch ms.
+pub(crate) fn parse_iso_ms(s: &str) -> Option<u64> {
+    let s = s.trim().strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let (y, m, day): (i64, u32, u32) = (
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+        d.next()?.parse().ok()?,
+    );
+    let (hms, frac) = time.split_once('.').unwrap_or((time, ""));
+    let mut t = hms.split(':');
+    let (hh, mm): (u64, u64) = (t.next()?.parse().ok()?, t.next()?.parse().ok()?);
+    let ss: u64 = t.next().map(|v| v.parse().ok()).unwrap_or(Some(0))?;
+    let millis: u64 = if frac.is_empty() {
+        0
+    } else {
+        let digits: String = frac.chars().take(3).collect();
+        let padded = format!("{digits:0<3}");
+        padded.parse().ok()?
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as i64;
+    let doy = (153 * m as i64 + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    if days < 0 {
+        return None;
+    }
+    Some((days as u64) * 86_400_000 + hh * 3_600_000 + mm * 60_000 + ss * 1_000 + millis)
+}
+
 #[cfg(test)]
 mod tests {
     // Explicit imports, NOT `use super::*` — matches the sibling test
@@ -137,6 +242,36 @@ mod tests {
         // An absent placeholder stays literal; an extra arg is a no-op.
         assert_eq!(fill("Below {{pct}}%", &[("pct", "90")]), "Below 90%");
         assert_eq!(fill("plain text", &[("pct", "90")]), "plain text");
+    }
+
+    #[test]
+    fn relative_stamps_follow_dayjs_thresholds_in_both_locales() {
+        use super::{fmt_relative_in, parse_iso_ms};
+        let now = 1_800_000_000_000u64;
+        let ago = |secs: u64| now - secs * 1000;
+        assert_eq!(fmt_relative_in("en", 0, now), "");
+        assert_eq!(fmt_relative_in("en", ago(10), now), "a few seconds ago");
+        assert_eq!(fmt_relative_in("zh-CN", ago(10), now), "几秒前");
+        assert_eq!(fmt_relative_in("en", ago(60), now), "a minute ago");
+        assert_eq!(fmt_relative_in("en", ago(5 * 60), now), "5 minutes ago");
+        assert_eq!(fmt_relative_in("zh-CN", ago(5 * 60), now), "5 分钟前");
+        assert_eq!(fmt_relative_in("en", ago(60 * 60), now), "an hour ago");
+        assert_eq!(fmt_relative_in("en", ago(3 * 3600), now), "3 hours ago");
+        assert_eq!(fmt_relative_in("en", ago(26 * 3600), now), "a day ago");
+        assert_eq!(fmt_relative_in("zh-CN", ago(3 * 86_400), now), "3 天前");
+        assert_eq!(fmt_relative_in("en", ago(40 * 86_400), now), "a month ago");
+        assert_eq!(fmt_relative_in("en", ago(90 * 86_400), now), "3 months ago");
+        assert_eq!(fmt_relative_in("en", ago(400 * 86_400), now), "a year ago");
+        assert_eq!(fmt_relative_in("zh-CN", ago(800 * 86_400), now), "2 年前");
+        // A future stamp clamps to the floor instead of "in …".
+        assert_eq!(fmt_relative_in("en", now + 5_000, now), "a few seconds ago");
+
+        // ISO stamps the history rows carry.
+        assert_eq!(parse_iso_ms("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso_ms("1970-01-02T00:00:01.5Z"), Some(86_401_500));
+        assert_eq!(parse_iso_ms("2026-10-01T10:00:00Z"), Some(1_790_848_800_000));
+        assert_eq!(parse_iso_ms("not a stamp"), None);
+        assert_eq!(parse_iso_ms("2026-10-01"), None);
     }
 
     #[test]

@@ -61,6 +61,9 @@ pub struct ApprovalCard {
     body: Option<Entity<TextViewState>>,
     /// Per-field description markdown (question forms).
     descriptions: Vec<Entity<TextViewState>>,
+    /// The tool shape's raw-input pane fold (TS PermissionDialog's
+    /// `<details>` — closed by default, the summary is the tool name).
+    raw_open: bool,
 }
 
 /// One markdown pane entity for the card (plan / question / descriptions).
@@ -145,6 +148,7 @@ impl ApprovalCard {
             others,
             body,
             descriptions,
+            raw_open: false,
         }
     }
 }
@@ -181,9 +185,11 @@ pub fn render_approval_card(
                         )
                     });
                 // The two options are fixed and well-known — make them the
-                // primary actions (ActionButtons plan branch).
+                // primary actions (ActionButtons plan branch; the approve
+                // match is TS `kind?.startsWith("allow")`, any allow_* kind).
                 let approve = p.options.iter().find(|o| {
-                    o.option_id == "approve" || o.kind.as_deref() == Some("allow_once")
+                    o.option_id == "approve"
+                        || o.kind.as_deref().is_some_and(|k| k.starts_with("allow"))
                 });
                 let reject = p.options.iter().find(|o| Some(*o) != approve);
                 let request_id = p.request_id;
@@ -282,17 +288,50 @@ pub fn render_approval_card(
                     if let Some(raw) =
                         ctx.and_then(|c| c.raw_input_text.clone()).filter(|t| !t.is_empty())
                     {
+                        // TS PermissionDialog:176-189 — the raw input folds
+                        // behind a <details> (closed by default) whose body
+                        // is capped at max-h-40 and scrolls.
+                        let open = state.raw_open;
+                        let card = card.clone();
+                        let workbench = workbench.clone();
+                        // The summary is `ctx.toolName ?? "input"`, verbatim TS.
+                        let summary = ctx
+                            .and_then(|c| c.tool_name.clone())
+                            .unwrap_or_else(|| "input".to_string());
                         column = column.child(
                             div()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(theme.background)
-                                .font_family(theme.mono_font_family.clone())
-                                .text_size(px(11.))
+                                .id("approval-raw-toggle")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .text_size(px(10.))
                                 .text_color(theme.muted_foreground)
-                                .child(raw),
+                                .cursor_pointer()
+                                .child(if open { "▾" } else { "▸" })
+                                .child(summary)
+                                .on_click(move |_, _, cx| {
+                                    card.update(cx, |state, _| state.raw_open = !state.raw_open);
+                                    if let Some(wb) = workbench.upgrade() {
+                                        wb.update(cx, |_, cx| cx.notify());
+                                    }
+                                }),
                         );
+                        if open {
+                            column = column.child(
+                                div()
+                                    .id("approval-raw-body")
+                                    .max_h(px(160.))
+                                    .overflow_y_scroll()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_md()
+                                    .bg(theme.background)
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(raw),
+                            );
+                        }
                     } else if let Some(first) = p.options.first() {
                         // No context at all: degrade gracefully to the first
                         // option's name (PermissionDialog's fallback).
