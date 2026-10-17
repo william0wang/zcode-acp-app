@@ -350,6 +350,7 @@ impl Workbench {
         let theme = cx.theme();
         let mut list = div()
             .id("models-list")
+            .test_support()
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -490,6 +491,7 @@ impl Workbench {
         let target = m.clone();
         div()
             .id(SharedString::from(format!("model-row-{index}-{key}")))
+            .test_support()
             .flex()
             .items_center()
             .gap_3()
@@ -736,6 +738,7 @@ impl Workbench {
             .child(
                 div()
                     .id("model-form-body")
+                    .test_support()
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()

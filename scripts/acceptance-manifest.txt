@@ -1,0 +1,77 @@
+# Automated acceptance manifest: every implemented feature mapped to the
+# tests that guard it. Format (one feature per line):
+#   feature-id :: Feature description :: kind:filter[,filter...]
+# kind: rust   = substring matched against `cargo test` full names
+#       vitest = substring matched against mobile test FILE names
+#       step   = a runner step id (build | smoke | tsc)
+# A feature PASSES when every filter has >= 1 passing test and no failing
+# one; a filter with zero matches reports NO COVERAGE (fails the run) —
+# this file is the feature inventory, keep it in sync with shipped work.
+
+# ---- desktop: connection & layout ----
+layout-guards :: Layout lint (no fractional size helpers) :: rust:no_fractional_style_helpers,rust:detection_spots_calls_not_words,rust:fractional_suffix_shapes
+cold-start :: Cold-start attach rule + landing empty state :: rust:accept_cold_start_landing_and_first_session,rust:cold_start_attaches_most_recently_updated_session,rust:sessionless_instances_yield_no_target,rust:no_instances_yields_no_target,rust:missing_workspace_falls_back_to_root,rust:untimestamped_sessions_rank_below_dated_ones
+hub-bootstrap :: Hub bootstrap (probe/spawn race, token, remote config) :: rust:bootstrap
+servers-book :: Connection profile book (switch, two-click remove, add form) :: rust:accept_settings_servers_entries_and_gate
+
+# ---- desktop: chat ----
+new-session-chooser :: New-session chooser (projects, filter, browse, create) :: rust:accept_new_session_chooser_browse_and_create,rust:project_filter_narrows_and_shows_no_match
+chat-stop-pending :: Esc stop + pending queue (send now / edit / discard) :: rust:accept_running_turn_stop_and_pending_queue,rust:pending_store
+thought-card :: Thought card folding (auto + manual) :: rust:accept_thought_card_folding
+config-chips :: Model/mode/thought chips :: rust:config_chips_render_and_pick
+display-details :: Title stats, tool cards, plan bar, copy, notice chips :: rust:title_stats_render_in_status_bar,rust:tool_call_expands_detail,rust:plan_bar_collapses_and_lists_entries,rust:copy_buttons_write_clipboard_and_notice_chip_has_none,rust:task_notification_parses_status_and_summary,rust:token_formatting_matches_the_tui_dock,rust:context_gauge_clamps_and_formats
+session-mgmt :: Session rename / end / delete tombstone :: rust:session_row_rename_sheet_prefills_and_saves,rust:session_row_menu_ends_session,rust:history_row_menu_deletes_tombstone
+slash-commands :: Slash command menu (filter, keys, dismissal) :: rust:slash_menu_filters_and_click_commits,rust:slash_menu_keys_navigate_commit_and_remember_dismissal,rust:token_scan_takes_the_word_around_the_caret,rust:matcher_strips_the_dollar_on_both_sides,rust:caret_park_counts_lines_and_characters
+media :: Image lightbox + file preview :: rust:message_image_click_opens_lightbox,rust:file_preview_enlarges_with_caption_and_backdrop_click_closes
+
+# ---- desktop: files ----
+files-panel :: Session files browser (listing, hidden toggle, breadcrumb, Finder) :: rust:files_panel_browses_and_toggles_hidden,rust:files_breadcrumb_navigates_to_prefix,rust:files_panel_notes_capability_gap_without_seeding,rust:path_helpers_join_strip_and_name,rust:kind_ladder_matches_the_ts_viewer,rust:size_formatting_matches_the_ts_viewer,rust:loopback_ladder_takes_host_only
+file-viewer :: Text viewer + local open/reveal buttons :: rust:file_viewer_renders_text_and_closes,rust:accept_file_viewer_local_buttons_follow_loopback,rust:display_lines_pad_empty_and_chop_mega_lines,rust:viewer_windows_never_exceed_the_server_cap,rust:stitch_probes_only_while_a_full_window_left_budget
+
+# ---- desktop: settings & config pages ----
+persistence-locale :: Pending queue on disk + language switch + ui prefs :: rust:pending_store,rust:language_segment_switches_chrome,rust:stored_locales_normalize_onto_the_catalogs
+config-five-pages :: Skills / MCP / Hooks / Agents / Backups pages :: rust:skills_switch_and_copy_dispatch,rust:mcp_row_opens_the_form_and_save_upserts,rust:hooks_master_switch_event_fold_and_entry_toggle,rust:agents_builtin_badge_personal_switch_and_form,rust:backups_restore_needs_the_second_gesture,rust:config_decode
+models-page :: Models page (list, context windows, form) :: rust:accept_models_usage_quota_pages,rust:models_builds_picker_options,rust:models_joins_the_context_window,rust:models_labels_models_the_way
+usage-page :: Usage page (platform + local tabs) :: rust:accept_models_usage_quota_pages,rust:usage_treats_a_machine_with_no_agent_database,rust:usage_unwraps_the_section,rust:window_usage_reads_the_cards_own_window
+quota-page :: Plan quota page (windows, reset cards, spend) :: rust:accept_models_usage_quota_pages,rust:quota_page,rust:reset_card,rust:threshold_
+system-status :: System status page :: rust:system_status
+
+# ---- desktop: workflows ----
+workflows-page :: Workflows overview, start form, gate sheet :: rust:workflows_overview_groups_navigate,rust:workflow_start_form_validates_and_submits,rust:workflow_gate_sheet_picks_position,rust:workflow_entries_follow_gate_and_session
+workflow-run-detail :: Run detail tabs, artifacts viewer, workspace, raw payload :: rust:workflow_run_tabs_switch_and_artifacts_open,rust:workflow_run_artifact_viewer_table_and_back,rust:workflow_run_workspace_rows_expand,rust:workflow_run_event_row_toggles_raw_payload,rust:workflow_run_header_buttons_follow_state,rust:workflow_run_detail
+run-detail-journal :: Run journal redesign (newest-first phases, step folds, drain) :: rust:workflow_run_events_render_and_paginate,rust:workflow_run_event_text,rust:newest_first
+workflow-actions :: Meta edit, move to project, two-step delete, script fold :: rust:workflow_detail_move_and_two_step_delete,rust:workflow_detail_script_folds,rust:workflow_meta_form_merges_rest,rust:merge_workflow_meta_shapes
+launch-memory :: Workflow launch memory (LRU rows, actionable zones) :: rust:launch_memory_makes_zone_rows_actionable,rust:workflow_launches
+workflow-protocol :: Workflow protocol (start/resume/journal/amend wire, args) :: rust:workflow_args,rust:workflow_start_round_trip,rust:workflow_list_round_trip,rust:workflow_gate_set_round_trip,rust:workflow_detail_round_trip,rust:workflow_overview_round_trip,rust:workflow_arg_declaration_round_trip,rust:workflow_create_prompt_round_trip
+
+# ---- desktop: protocol core ----
+acp-client :: ACP client (connect, requests, notifications) :: rust:acp_client
+approvals :: Permission / elicitation / plan approval cards :: rust:approval
+session-core :: Session core (send outcomes, queues, replay) :: rust:session::tests,rust:replay_meta_and_attach_parsing,rust:journal_append_filters_replayed_prefix
+reconnect :: Reconnect + attach reset :: rust:reconnect
+hub-client :: Hub REST client (instances, fs, quota, workflows routes) :: rust:hub_client
+i18n :: i18n catalogs, plurals, relative time :: rust:i18n
+
+# ---- mobile (vitest, by test file) ----
+mobile-acp-connection :: ACP connection handshake :: vitest:acp-connection
+mobile-auto-expand :: Editor auto-expand :: vitest:auto-expand
+mobile-back-nav :: Back navigation stack :: vitest:back-nav
+mobile-session-cache :: Session cache + snapshot races :: vitest:cache-hit,vitest:session-cache,vitest:cache-snapshot-race
+mobile-config-rules :: Config response shapes + store rules :: vitest:config-response-shapes,vitest:config-reset-rules,vitest:config-store-rules
+mobile-earlier-pages :: Earlier-page paging + stale halves :: vitest:earlier-late-page,vitest:earlier-page-fallback,vitest:earlier-page-routing,vitest:load-failure-stale-half
+mobile-fs :: Mobile fs (revive dead bridge, local open) :: vitest:fs-revive,vitest:local-open
+mobile-hub-clients :: Mobile hub + settings clients :: vitest:hub-client,vitest:hub-settings-client
+mobile-model-value :: Model value persistence :: vitest:model-value
+mobile-notify :: Notify toast routing :: vitest:notify-toast
+mobile-pending :: Mobile pending queue + flush race :: vitest:pending-queue,vitest:pending-flush-race
+mobile-platform-usage :: Platform usage decoding :: vitest:platform-usage
+mobile-reconnect :: Mobile reconnect wedge :: vitest:reconnect-wedge
+mobile-session-delete :: Mobile session delete :: vitest:session-delete-store
+mobile-storage :: Mobile storage layer :: vitest:storage
+mobile-workflow-text :: Mobile run-detail text (phases, steps, newest-first) :: vitest:workflow-run-event-text
+mobile-workflows-store :: Mobile workflows store :: vitest:workflows-store
+
+# ---- delivery steps (run by scripts/acceptance.sh) ----
+mobile-types :: Mobile typecheck (tsc --noEmit) :: step:tsc
+build-macos :: macOS release build (dist/ZCode-acp.app) :: step:build
+smoke-launch :: Smoke: launch the built app and quit cleanly :: step:smoke

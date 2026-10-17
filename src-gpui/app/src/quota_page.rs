@@ -1012,6 +1012,7 @@ impl Workbench {
         } else {
             let mut scroll = div()
                 .id("quota-body")
+                .test_support()
                 .flex_1()
                 .min_h_0()
                 .overflow_y_scroll()

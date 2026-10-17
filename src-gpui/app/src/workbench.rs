@@ -954,7 +954,7 @@ impl Workbench {
     /// otherwise it is ChatView's Cancel — `session/cancel` on the running
     /// turn. (The "/" menu's Escape never reaches here: the keystroke
     /// interceptor consumes it before the global binding.)
-    fn on_stop_turn(&mut self, _: &StopTurn, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_stop_turn(&mut self, _: &StopTurn, _window: &mut Window, cx: &mut Context<Self>) {
         if self.lightbox.take().is_some() {
             // View-local — closing it is purely ours.
         } else if self.rename_target.take().is_some() {
@@ -1598,6 +1598,8 @@ impl Workbench {
                     .when_some(self.snap.bootstrap_note.clone(), |this, note| {
                         this.child(
                             div()
+                                .id("status-bar-note")
+                                .test_support()
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(11.))
@@ -3498,6 +3500,8 @@ impl Workbench {
                     .justify_center()
                     .child(
                         div()
+                            .id("chat-empty-state")
+                            .test_support()
                             .text_color(theme.muted_foreground)
                             .text_size(px(13.))
                             .child(message),
@@ -4326,6 +4330,7 @@ fn render_assistant_row(
                 card = card.child(
                     div()
                         .id(SharedString::from(format!("thought-{}", row.id)))
+                        .test_support()
                         .flex()
                         .items_center()
                         .gap_1()
@@ -4371,6 +4376,7 @@ fn render_assistant_row(
                     card = card.child(
                         div()
                             .id(SharedString::from(format!("thought-body-{}", row.id)))
+                            .test_support()
                             .track_scroll(scroll)
                             .max_h(px(208.))
                             .overflow_y_scroll()
@@ -5308,6 +5314,7 @@ impl Workbench {
             body = body.child(
                 div()
                     .id("ns-parent")
+                    .test_support()
                     .flex()
                     .items_center()
                     .gap_2()
@@ -5353,6 +5360,7 @@ impl Workbench {
             body = body.child(
                 div()
                     .id(SharedString::from(format!("ns-dir-{path}")))
+                    .test_support()
                     .flex()
                     .items_center()
                     .gap_2()

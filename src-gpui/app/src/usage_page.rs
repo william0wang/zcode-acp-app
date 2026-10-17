@@ -404,6 +404,7 @@ where
 {
     div()
         .id(id)
+        .test_support()
         .flex()
         .flex_1()
         .items_center()
