@@ -117,13 +117,25 @@ function qidTag(p: Record<string, unknown>): string | undefined {
   return qid ? `…${qid.slice(-6)}` : undefined;
 }
 
+export interface DescribeOptions {
+  /**
+   * Drop the `site@ordinal` ref from the detail — rows nested under their own
+   * step already say which instance they belong to.
+   */
+  omitSite?: boolean;
+}
+
 /**
  * One journal event → one readable line. The field names per kind come from
  * the engine's RunEvent union (dynamic-workflow/src/engine/types.ts).
  */
-export function describeRunEvent(t: Translate, ev: WorkflowRunEvent): RunEventDesc {
+export function describeRunEvent(
+  t: Translate,
+  ev: WorkflowRunEvent,
+  opts?: DescribeOptions,
+): RunEventDesc {
   const p = ev.payload ?? {};
-  const site = refText(p.instance);
+  const site = opts?.omitSite ? undefined : refText(p.instance);
   switch (ev.type) {
     case "run-started":
       return { label: t("zconfig.wfEvRunStarted"), tone: "default" };
@@ -383,6 +395,11 @@ export interface NodeAgg {
   /** Latest observed activity (progress tool, wait cause, repair attempt). */
   activity?: string;
   error?: string;
+  /**
+   * The step's own journal rows (its lifecycle plus the reports it filed),
+   * oldest first — the detail a collapsed step row expands into.
+   */
+  events: WorkflowRunEvent[];
 }
 
 export function nodeStateWord(t: Translate, state: NodeState): string | null {
@@ -409,10 +426,11 @@ export function nodeStateWord(t: Translate, state: NodeState): string | null {
  * node's identity is its `instance` ref (`{siteId, ordinal}` — the engine's
  * own InstanceRef), NOT a top-level siteId field: reading the wrong spelling
  * collapses every node onto one empty key. node-* lifecycles fold per
- * instance into a single line (latest state; settled is final), actor-created
- * becomes a hiring line, usage updates collapse to the newest total,
- * run-settled closes the section, and the rest stay as journal rows for
- * describeRunEvent.
+ * instance into a single line (latest state; settled is final) and keep their
+ * own rows for the step's expandable detail, reports and cache closes filed
+ * by a known instance nest under that step, actor-created becomes a hiring
+ * line, usage updates collapse to the newest total, run-settled closes the
+ * section, and the rest stay as phase-level journal rows for describeRunEvent.
  */
 export function reduceSlice(t: Translate, events: WorkflowRunEvent[]) {
   const nodes = new Map<string, NodeAgg>();
@@ -450,6 +468,8 @@ export function reduceSlice(t: Translate, events: WorkflowRunEvent[]) {
       let head = prev?.head;
       let activity = prev?.activity;
       let error = prev?.error;
+      const own = prev?.events ?? [];
+      own.push(ev);
       switch (ev.type) {
         case "node-queued":
           state = "queued";
@@ -523,10 +543,104 @@ export function reduceSlice(t: Translate, events: WorkflowRunEvent[]) {
         ...(head !== undefined ? { head } : {}),
         ...(activity !== undefined ? { activity } : {}),
         ...(error !== undefined ? { error } : {}),
+        events: own,
       });
       continue;
+    }
+    if (ev.type === "report" || ev.type === "import-cache-closed") {
+      // Filed by a step this slice knows → the step's own detail. A script-
+      // level report (no instance ref) stays a phase row.
+      const site = refText(p.instance);
+      const owner = site === undefined ? undefined : nodes.get(site);
+      if (owner !== undefined) {
+        owner.events.push(ev);
+        continue;
+      }
     }
     others.push(ev);
   }
   return { actors, nodes: [...nodes.values()], others, settled, spentTokens };
+}
+
+/** Sort comparator: highest sequence first (a clipped row without one sinks). */
+export function newestFirst(a: WorkflowRunEvent, b: WorkflowRunEvent): number {
+  const sa = typeof a.sequence === "number" ? a.sequence : 0;
+  const sb = typeof b.sequence === "number" ? b.sequence : 0;
+  return sb - sa;
+}
+
+/**
+ * The rows a phase card lists at its own level, newest first: everything no
+ * step owns, plus the non-lifecycle rows (reports, cache closes) of steps
+ * homed in ANOTHER slice — a resume replay moves a step to its last slice,
+ * and the reports it filed earlier must not vanish with it.
+ */
+export function phaseRows(
+  fold: { nodes: NodeAgg[]; others: WorkflowRunEvent[] },
+  isOwn: (key: string) => boolean,
+): WorkflowRunEvent[] {
+  const orphans = fold.nodes
+    .filter((n) => !isOwn(n.key))
+    .flatMap((n) => n.events.filter((e) => !e.type.startsWith("node-")));
+  return [...fold.others, ...orphans].sort(newestFirst);
+}
+
+// ─── Phase slicing ──────────────────────────────────────────────────────────
+
+/** One phase's slice of the journal, bounded by phase-entered events. */
+export interface PhaseSlice {
+  /** null = the leading slice before the first phase-entered. */
+  phase: string | null;
+  /** The marker's re-entry count (resume replays); ≥2 is worth showing. */
+  ordinal?: number;
+  events: WorkflowRunEvent[];
+}
+
+export interface PhaseSlicing {
+  slices: PhaseSlice[];
+  /** Node key → index of the slice holding its LAST event. */
+  nodeHome: Map<string, number>;
+  /** Actor key → index of the slice holding its FIRST creation. */
+  actorHome: Map<string, number>;
+}
+
+/**
+ * Events sliced at every phase-entered boundary (the journal has no
+ * phase-exited — entering N implies N-1 done): each slice renders as one
+ * phase section. A leading slice (phase: null) holds whatever preceded the
+ * first phase. Resume REPLAYS the script prefix — the same instances and
+ * actors re-emit into later slices — so each node renders only in the slice
+ * holding its LAST event and each actor only in the slice of its FIRST
+ * creation (nodeHome/actorHome); without that, a resumed run shows every
+ * node twice.
+ */
+export function slicePhases(events: WorkflowRunEvent[]): PhaseSlicing {
+  const slices: PhaseSlice[] = [];
+  const nodeHome = new Map<string, number>();
+  const actorHome = new Map<string, number>();
+  let cur: PhaseSlice = { phase: null, events: [] };
+  const pushIfUsed = () => {
+    if (cur.events.length > 0 || cur.phase !== null) slices.push(cur);
+  };
+  for (const e of events) {
+    if (e.type === "phase-entered") {
+      const p = e.payload ?? {};
+      const name = str(p, "phaseName") ?? str(p, "name") ?? "?";
+      const ordinal = num(p, "ordinal");
+      pushIfUsed();
+      cur = { phase: name, events: [], ...(ordinal !== undefined ? { ordinal } : {}) };
+      continue;
+    }
+    cur.events.push(e);
+    // `slices.length` is cur's own index — cur is not pushed yet.
+    const idx = slices.length;
+    if (e.type.startsWith("node-")) {
+      nodeHome.set(instanceKeyOf(e.payload ?? {}), idx);
+    } else if (e.type === "actor-created") {
+      const key = actorKeyOf(e.payload ?? {});
+      if (!actorHome.has(key)) actorHome.set(key, idx);
+    }
+  }
+  pushIfUsed();
+  return { slices, nodeHome, actorHome };
 }
