@@ -40,7 +40,7 @@ use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{
     Input, InputEvent, InputState, Textarea, TextareaState,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::{TextView, TextViewMotion, TextViewState};
 use gpui_kit::component::{
@@ -57,6 +57,7 @@ use protocol::image::{
 };
 
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
+use crate::diff_view::{blocks_of, DiffBlock, DiffLineKind};
 use crate::file_browser::{
     absolute_dir, is_loopback_hub, render_file_viewer, render_files_panel, FilesPanelCtx,
 };
@@ -164,6 +165,10 @@ pub struct Workbench {
     dock_panel: DockPanel,
     dock_open: bool,
     dock_sizes: Entity<ResizableState>,
+    /// The right session panel (TS SessionPanel — the chat-side sheet):
+    /// view-local like the left dock, with its own splitter.
+    session_panel_open: bool,
+    session_dock_sizes: Entity<ResizableState>,
     /// The sessions panel's search field — the ⌘K target (TS SessionList's
     /// "Search sessions": title or workspace base name, substring).
     session_search: Entity<InputState>,
@@ -231,6 +236,16 @@ pub struct Workbench {
     /// The servers panel's armed remove (TS two-click delete): the profile
     /// id and when the 3s confirm window opened.
     pub(crate) server_remove_armed: Option<(String, std::time::Instant)>,
+    /// The servers panel's edit target (TS `connect.editServer`): the
+    /// profile id whose values sit prefilled in the shared add/edit form.
+    pub(crate) server_editing: Option<String>,
+    /// The file viewer's markdown source toggle (TS FileViewer: preview by
+    /// default, one toggle to source) — keyed by the viewed path so a new
+    /// file always starts in preview.
+    pub(crate) file_md_source: Option<(String, bool)>,
+    /// The App Update page's armed install confirm (TS `confirm` useState):
+    /// page-local, dropped when the page closes.
+    pub(crate) update_confirm: bool,
     /// The quota page's spend gesture (TS `confirm` useState): which window,
     /// and whether the below-threshold warning has been answered. Lives only
     /// inside the page — a page closed under an open gesture drops it so a
@@ -366,7 +381,10 @@ enum PartView {
     /// replay harness fold (`context-handoff` / `tool-transcript`), whose
     /// summary row stays clean (label only; a handoff shows the localized
     /// label, not the wire title); `expanded` is the manual fold state,
-    /// collapsed by default like the TS `<details>`.
+    /// collapsed by default like the TS `<details>`. `diffs` holds the
+    /// precomputed unified rows of the ACP diff blocks (TS ToolCard's
+    /// ReactDiffViewer), computed at the snapshot sync point so a frame
+    /// never pays for the LCS.
     ToolCall {
         label: SharedString,
         status: String,
@@ -374,6 +392,10 @@ enum PartView {
         detail: String,
         fold_kind: Option<String>,
         expanded: bool,
+        /// The ACP source blocks — the sync point's cheap change key for
+        /// recomputing `diffs`.
+        diff_src: Vec<protocol::acp::AcpDiffContent>,
+        diffs: Vec<DiffBlock>,
     },
     /// Prompt-attachment echo: the raster decoded once from the part's data
     /// URL. SVG (and anything gpui cannot rasterize) stays on the stub.
@@ -432,6 +454,8 @@ fn new_part_view(part: &ChatPart, role: ChatRole, cx: &mut Context<Workbench>) -
             detail: tc.detail.clone(),
             fold_kind: tc.fold_kind.clone(),
             expanded: false,
+            diff_src: tc.diffs.clone().unwrap_or_default(),
+            diffs: blocks_of(tc.diffs.as_deref().unwrap_or(&[])),
         },
     }
 }
@@ -444,6 +468,82 @@ fn tool_detail_head(detail: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// One ACP diff block's unified view — the TS `DiffBlock`
+/// (ChatView.tsx:166): path header, the capped-sides notice, then the
+/// +/- rows. Word-level diff and line numbers stay TS-side polish
+/// (jsdiff/ReactDiffViewer); line coloring is the functional core. Colors
+/// are the quiet-dark palette's emerald/red families (the theme's accent
+/// pair for running/failed states).
+fn render_diff_block(
+    block: &DiffBlock,
+    row_id: &str,
+    part_index: usize,
+    block_index: usize,
+    theme: &component::Theme,
+) -> gpui::Div {
+    let mut card = div()
+        .min_w_0()
+        .my(px(6.))
+        .mx_2()
+        .rounded_lg()
+        .border_1()
+        .border_color(theme.border)
+        .overflow_hidden();
+    if !block.path.is_empty() {
+        card = card.child(
+            div()
+                .id(SharedString::from(format!(
+                    "tool-diff-path-{row_id}-{part_index}-{block_index}"
+                )))
+                .truncate()
+                .px_2()
+                .py(px(3.))
+                .bg(theme.title_bar)
+                .border_b_1()
+                .border_color(theme.border)
+                .text_color(theme.muted_foreground)
+                .child(block.path.clone())
+                .test_support(),
+        );
+    }
+    if block.truncated {
+        card = card.child(
+            div()
+                .id(SharedString::from(format!(
+                    "tool-diff-trunc-{row_id}-{part_index}-{block_index}"
+                )))
+                .px_2()
+                .py(px(3.))
+                .bg(rgb(0x2a1d08))
+                .text_color(theme.warning_foreground)
+                .child(t!("chat.diffTruncated").to_string())
+                .test_support(),
+        );
+    }
+    let mut lines = div();
+    for l in &block.lines {
+        let (glyph, text_color, bg): (&str, Hsla, Option<Hsla>) = match l.kind {
+            DiffLineKind::Add => ("+", rgb(0x6ee7b7).into(), Some(rgb(0x0f2a1e).into())),
+            DiffLineKind::Del => ("-", rgb(0xfca5a5).into(), Some(rgb(0x33141a).into())),
+            DiffLineKind::Context => (" ", theme.muted_foreground, None),
+        };
+        let mut row = div()
+            .min_w_0()
+            .flex()
+            .px_2()
+            .gap_1()
+            .text_color(text_color);
+        if let Some(bg) = bg {
+            row = row.bg(bg);
+        }
+        lines = lines.child(
+            row.child(div().flex_none().child(glyph))
+                .child(div().min_w_0().child(l.text.clone())),
+        );
+    }
+    card.child(lines)
 }
 
 /// TUI parity (martty stats dock, ChatScreen.tsx `fmtTokens`): `128000` ->
@@ -474,6 +574,96 @@ fn fmt_context(used: u64, size: u64) -> String {
         ((used as f64 / size as f64) * 100.0).min(100.0)
     };
     format!("{pct:.1}%/{}", fmt_tokens(size))
+}
+
+/// The session row's status dot (the TS ActivityBadge ladder minus the
+/// text-only finished chip): awaiting > running > idle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActivityDot {
+    Awaiting,
+    Running,
+    Idle,
+}
+
+/// SessionList.tsx:29-87: the broadcast activity entry wins; discovery's
+/// REST `running` status is the heartbeat fallback (ADR-0005) ONLY for rows
+/// that have no activity entry at all — a known-idle entry must not be
+/// overridden by a stale REST flag.
+pub(crate) fn activity_dot(sess: &SessionRow) -> ActivityDot {
+    if sess.awaiting {
+        ActivityDot::Awaiting
+    } else if sess.running || (sess.rest_running && !sess.activity_known) {
+        ActivityDot::Running
+    } else {
+        ActivityDot::Idle
+    }
+}
+
+/// The just-finished chip's 60s window (TS `FINISHED_WINDOW_MS`).
+pub(crate) fn finished_fresh(sess: &SessionRow, now: u64) -> bool {
+    sess.finished_at
+        .is_some_and(|at| now < at.saturating_add(60_000))
+}
+
+/// One config option's picker data, shared by the toolbar chip and the
+/// session panel's row: the current value's display name (the raw value
+/// when the choices do not list it, `—` when unset) and the menu choices as
+/// `(value, name, active)`.
+fn config_option_view(opt: &protocol::acp::ConfigOption) -> (String, Vec<(String, String, bool)>) {
+    let current = opt
+        .current_value
+        .as_deref()
+        .map(|v| {
+            opt.options
+                .as_ref()
+                .and_then(|choices| choices.iter().find(|c| c.value == v))
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| v.to_string())
+        })
+        .unwrap_or_else(|| "—".to_string());
+    let choices = opt
+        .options
+        .iter()
+        .flatten()
+        .map(|c| {
+            (
+                c.value.clone(),
+                c.name.clone(),
+                Some(c.value.as_str()) == opt.current_value.as_deref(),
+            )
+        })
+        .collect();
+    (current, choices)
+}
+
+/// The picker menu: every choice with a check on the active row; picking a
+/// non-active row dispatches `session/set_config_option`. The builder runs
+/// on every open, so it clones per run.
+fn config_option_menu(
+    menu: PopupMenu,
+    runtime: &ProtocolRuntime,
+    config_id: &str,
+    choices: &[(String, String, bool)],
+) -> PopupMenu {
+    let mut m = menu;
+    for (value, name, active) in choices.iter().cloned() {
+        let runtime = runtime.clone();
+        let config_id = config_id.to_string();
+        // `new` (clickable Item), NOT `label` (a disabled caption).
+        m = m.item(
+            PopupMenuItem::new(name)
+                .checked(active)
+                .on_click(move |_, _, _| {
+                    if !active {
+                        runtime.send(UiCommand::SetConfigOption {
+                            config_id: config_id.clone(),
+                            value: value.clone(),
+                        })
+                    }
+                }),
+        );
+    }
+    m
 }
 
 /// A row's concatenated plain text (user speech) — the task-notification
@@ -595,16 +785,20 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
                 detail_head,
                 detail,
                 fold_kind,
+                diff_src,
+                diffs,
                 ..
             },
             ChatPart::ToolCall(tc),
         ) => {
             let head = tool_detail_head(&tc.detail);
+            let new_diffs = tc.diffs.as_deref().unwrap_or(&[]);
             if *status == tc.status
                 && *detail_head == head
                 && label.as_ref() == tc.tool_name
                 && *detail == tc.detail
                 && *fold_kind == tc.fold_kind
+                && diff_src.as_slice() == new_diffs
             {
                 return false;
             }
@@ -613,6 +807,10 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
             *detail_head = head;
             *detail = tc.detail.clone();
             *fold_kind = tc.fold_kind.clone();
+            // The LCS only re-runs when the source blocks changed (plain
+            // Vec compare — no diffing to decide whether to diff).
+            *diff_src = new_diffs.to_vec();
+            *diffs = blocks_of(new_diffs);
             true
         }
         _ => false,
@@ -738,6 +936,7 @@ impl Workbench {
             }
         });
         let dock_sizes = cx.new(|_| ResizableState::default());
+        let session_dock_sizes = cx.new(|_| ResizableState::default());
         // The composer is the primary surface — start focused.
         let focus = composer.read(cx).focus_handle(cx).clone();
         window.focus(&focus, cx);
@@ -761,6 +960,8 @@ impl Workbench {
             dock_panel: DockPanel::Sessions,
             dock_open: true,
             dock_sizes,
+            session_panel_open: false,
+            session_dock_sizes,
             session_search,
             _search_sub: search_sub,
             new_session_filter,
@@ -789,6 +990,9 @@ impl Workbench {
             hooks_open_event: None,
             backup_confirm: None,
             server_remove_armed: None,
+            server_editing: None,
+            file_md_source: None,
+            update_confirm: false,
             quota_confirm: None,
             copied_row: None,
             plan_open: false,
@@ -877,7 +1081,7 @@ impl Workbench {
 
     /// Rail toggle semantics: the docked panel's own icon collapses the
     /// dock; any other icon docks that panel (and opens the dock).
-    pub(crate) fn toggle_dock_panel(&mut self, panel: DockPanel, cx: &mut Context<Self>) {
+    fn toggle_dock_panel(&mut self, panel: DockPanel, cx: &mut Context<Self>) {
         if self.dock_open && self.dock_panel == panel {
             self.dock_open = false;
         } else {
@@ -897,8 +1101,28 @@ impl Workbench {
             // Docking the config panel seeds the gate probe (batch M — TS
             // ZCodeConfigScreen's mount effect): the gated Workflows entry
             // cannot render until the verdict lands, and an unprobed verdict
-            // is fail-closed.
-            if panel == DockPanel::Config && self.snap.workflow_gate.is_none() {
+            // is fail-closed. It also refreshes the quota card (TS
+            // QuotaSection's mount effect) so the allowance is current
+            // without a manual tap.
+            if panel == DockPanel::Config {
+                self.runtime.send(UiCommand::RefreshQuota);
+                if self.snap.workflow_gate.is_none() {
+                    self.runtime.send(UiCommand::ProbeWorkflowGate);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// The right session panel's toggle (TS ChatScreen's panel button).
+    /// Opening refreshes the quota card (the TS QuotaSection mount effect)
+    /// and probes the gate while unknown (the TS SessionPanel effect) — the
+    /// workflows row cannot render until the verdict lands.
+    pub(crate) fn toggle_session_panel(&mut self, cx: &mut Context<Self>) {
+        self.session_panel_open = !self.session_panel_open;
+        if self.session_panel_open {
+            self.runtime.send(UiCommand::RefreshQuota);
+            if self.snap.workflow_gate.is_none() {
                 self.runtime.send(UiCommand::ProbeWorkflowGate);
             }
         }
@@ -948,9 +1172,32 @@ impl Workbench {
         cx.notify();
     }
 
+    /// The open full-page config surface's close command, if one is up.
+    /// Esc-on-page is the TS settings screen's back button (backNav/Android
+    /// back); ChatView's cancel only applies on the chat surface the page
+    /// replaced.
+    fn open_config_page_close(&self) -> Option<UiCommand> {
+        if self.snap.system_status.is_some() {
+            Some(UiCommand::CloseSystemStatus)
+        } else if self.snap.models_page.is_some() {
+            Some(UiCommand::CloseModels)
+        } else if let Some(page) = self.snap.config_section_page.as_ref() {
+            Some(UiCommand::CloseConfigPage { page: page.kind })
+        } else if self.snap.quota_page.is_some() {
+            Some(UiCommand::CloseQuota)
+        } else if self.snap.usage_page.is_some() {
+            Some(UiCommand::CloseUsage)
+        } else if self.snap.workflows_page.is_some() {
+            Some(UiCommand::CloseWorkflows)
+        } else {
+            None
+        }
+    }
+
     /// Esc: close the topmost layer first — the lightbox swallows it (K2),
     /// then the rename sheet, the new-session sheet (the TS back-handler
     /// stack, `creating` guard included via the command's no-op-while-busy);
+    /// then an open config page closes (the settings screen's back);
     /// otherwise it is ChatView's Cancel — `session/cancel` on the running
     /// turn. (The "/" menu's Escape never reaches here: the keystroke
     /// interceptor consumes it before the global binding.)
@@ -961,6 +1208,8 @@ impl Workbench {
             // The rename sheet is view-local — closing it is purely ours.
         } else if self.snap.new_session.is_some() {
             self.runtime.send(UiCommand::NewSessionToggle);
+        } else if let Some(cmd) = self.open_config_page_close() {
+            self.runtime.send(cmd);
         } else if self.tab.as_ref().is_some_and(|t| t.running) {
             self.runtime.send(UiCommand::CancelTurn);
         }
@@ -1107,6 +1356,13 @@ impl Workbench {
                 // page closed under an open confirm dialog drops it.
                 if self.snap.quota_page.is_none() {
                     self.quota_confirm = None;
+                }
+                // Same for the App Update page's install confirm.
+                if !matches!(
+                    self.snap.config_section_page.as_ref().map(|p| p.kind),
+                    Some(crate::runtime::ConfigPageKind::AppUpdate)
+                ) {
+                    self.update_confirm = false;
                 }
                 self.apply_snapshot_inner(cx);
             }
@@ -1781,7 +2037,7 @@ impl Workbench {
                 .flex_1()
                 .min_h_0()
                 .child(rail)
-                .child(self.render_chat_column(cx))
+                .child(self.render_chat_area(cx))
                 .into_any_element();
         }
         let panel = match self.dock_panel {
@@ -1810,7 +2066,34 @@ impl Workbench {
                                     .flex_none()
                                     .child(panel),
                             )
-                            .child(resizable_panel().child(self.render_chat_column(cx))),
+                            .child(resizable_panel().child(self.render_chat_area(cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The chat area: the chat column alone, or split against the right
+    /// session panel while it is open (its own splitter — the left dock's
+    /// sizes are a different pair).
+    fn render_chat_area(&self, cx: &Context<Self>) -> AnyElement {
+        if !self.session_panel_open {
+            return self.render_chat_column(cx);
+        }
+        div()
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(
+                h_resizable("session-split")
+                    .with_state(&self.session_dock_sizes)
+                    .child(resizable_panel().child(self.render_chat_column(cx)))
+                    .child(
+                        resizable_panel()
+                            .size(px(280.))
+                            .size_range(px(220.)..px(480.))
+                            .flex_none()
+                            .child(self.render_session_panel(cx)),
                     ),
             )
             .into_any_element()
@@ -2106,6 +2389,34 @@ impl Workbench {
                         }),
                 );
             }
+            // Edit (TS connect.editServer, ConnectScreen.tsx:75-78): the
+            // shared form below becomes the edit form, prefilled from the
+            // record; Save keeps the active id and only re-dials when the
+            // EDITED server was the active one.
+            let wb_edit = cx.entity();
+            let edit_id = server.id.clone();
+            let (edit_name, edit_url, edit_token) =
+                (server.name.clone(), server.hub_url.clone(), server.token.clone());
+            let (pf_name, pf_url, pf_token) = (
+                self.add_server_name.clone(),
+                self.add_server_url.clone(),
+                self.add_server_token.clone(),
+            );
+            row = row.child(
+                Button::new(SharedString::from(format!("server-edit-{}", server.id)))
+                    .secondary()
+                    .small()
+                    .label("Edit")
+                    .on_click(move |_, window, cx| {
+                        wb_edit.update(cx, |wb, cx| {
+                            wb.server_editing = Some(edit_id.clone());
+                            cx.notify();
+                        });
+                        pf_name.update(cx, |s, cx| s.set_value(edit_name.clone(), window, cx));
+                        pf_url.update(cx, |s, cx| s.set_value(edit_url.clone(), window, cx));
+                        pf_token.update(cx, |s, cx| s.set_value(edit_token.clone(), window, cx));
+                    }),
+            );
             let runtime_remove = runtime.clone();
             let remove_id = server.id.clone();
             // Two-click delete (TS ConnectScreen:46-54): the first click
@@ -2143,16 +2454,92 @@ impl Workbench {
             column = column.child(row);
         }
 
-        // The add form: name / hub URL / token; Add saves (upsert + activate)
-        // and the driver re-dials the new profile.
+        // The shared add/edit form: name / hub URL / token. Add saves
+        // (upsert + activate) and the driver re-dials the new profile;
+        // Edit (server_editing) saves in place through UpdateServer and
+        // only re-dials when the edited server was the active one.
         let name = self.add_server_name.clone();
         let url = self.add_server_url.clone();
         let token = self.add_server_token.clone();
         let add_runtime = runtime.clone();
-        let can_add = !self.add_server_name.read(cx).value().trim().is_empty()
+        let editing_id = self.server_editing.clone();
+        let wb_form = cx.entity();
+        let can_submit = !self.add_server_name.read(cx).value().trim().is_empty()
             && !self.add_server_url.read(cx).value().trim().is_empty()
             // TS ConnectScreen:147 — the token is required, not optional.
             && !self.add_server_token.read(cx).value().trim().is_empty();
+        let actions: AnyElement = match &editing_id {
+            Some(id) => {
+                let save_id = id.clone();
+                let (name, url, token, wb_form) =
+                    (name.clone(), url.clone(), token.clone(), wb_form.clone());
+                let (cn, cu, ct, cw) =
+                    (name.clone(), url.clone(), token.clone(), wb_form.clone());
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        Button::new("server-save")
+                            .primary()
+                            .small()
+                            .label("Save")
+                            .disabled(!can_submit)
+                            .on_click(move |_, window, cx| {
+                                let n = name.read(cx).value().trim().to_string();
+                                let u = url.read(cx).value().trim().to_string();
+                                let t = token.read(cx).value().trim().to_string();
+                                name.update(cx, |s, cx| s.set_value("", window, cx));
+                                url.update(cx, |s, cx| s.set_value("", window, cx));
+                                token.update(cx, |s, cx| s.set_value("", window, cx));
+                                wb_form.update(cx, |wb, cx| {
+                                    wb.server_editing = None;
+                                    cx.notify();
+                                });
+                                add_runtime.send(UiCommand::UpdateServer {
+                                    id: save_id.clone(),
+                                    name: n,
+                                    hub_url: u,
+                                    token: t,
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("server-edit-cancel")
+                            .secondary()
+                            .small()
+                            .label("Cancel")
+                            .on_click(move |_, window, cx| {
+                                cn.update(cx, |s, cx| s.set_value("", window, cx));
+                                cu.update(cx, |s, cx| s.set_value("", window, cx));
+                                ct.update(cx, |s, cx| s.set_value("", window, cx));
+                                cw.update(cx, |wb, cx| {
+                                    wb.server_editing = None;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .into_any_element()
+            }
+            None => Button::new("server-add")
+                .primary()
+                .small()
+                .label("Add and connect")
+                .disabled(!can_submit)
+                .on_click(move |_, window, cx| {
+                    let n = name.read(cx).value().trim().to_string();
+                    let u = url.read(cx).value().trim().to_string();
+                    let t = token.read(cx).value().trim().to_string();
+                    name.update(cx, |s, cx| s.set_value("", window, cx));
+                    url.update(cx, |s, cx| s.set_value("", window, cx));
+                    token.update(cx, |s, cx| s.set_value("", window, cx));
+                    add_runtime.send(UiCommand::AddServer {
+                        name: n,
+                        hub_url: u,
+                        token: t,
+                    });
+                })
+                .into_any_element(),
+        };
         column = column.child(
             div()
                 .flex()
@@ -2163,31 +2550,16 @@ impl Workbench {
                     div()
                         .text_size(px(11.))
                         .text_color(theme.muted_foreground)
-                        .child("Add remote server"),
+                        .child(if editing_id.is_some() {
+                            "Edit remote server"
+                        } else {
+                            "Add remote server"
+                        }),
                 )
                 .child(Input::new(&self.add_server_name).small())
                 .child(Input::new(&self.add_server_url).small())
                 .child(Input::new(&self.add_server_token).small())
-                .child(
-                    Button::new("server-add")
-                        .primary()
-                        .small()
-                        .label("Add and connect")
-                        .disabled(!can_add)
-                        .on_click(move |_, window, cx| {
-                            let n = name.read(cx).value().trim().to_string();
-                            let u = url.read(cx).value().trim().to_string();
-                            let t = token.read(cx).value().trim().to_string();
-                            name.update(cx, |s, cx| s.set_value("", window, cx));
-                            url.update(cx, |s, cx| s.set_value("", window, cx));
-                            token.update(cx, |s, cx| s.set_value("", window, cx));
-                            add_runtime.send(UiCommand::AddServer {
-                                name: n,
-                                hub_url: u,
-                                token: t,
-                            });
-                        }),
-                ),
+                .child(actions),
         );
         column.into_any_element()
     }
@@ -2270,6 +2642,42 @@ impl Workbench {
         // paint time, so the pick re-renders the whole chrome at once.
         column = column.child(self.render_language_section(cx));
 
+        // The hub staleness check (TS SettingsPanel `checkHubUpgrade`): one
+        // button, busy while POST /api/upgrade flies, the verdict note under
+        // it. The hub alone decides whether to restart; discovery's poll and
+        // the tabs' reconnect ride out a respawn.
+        {
+            let runtime = runtime.clone();
+            let busy = self.snap.hub_upgrade_busy;
+            let mut block = div().flex().flex_col().gap_1().min_w_0().child(
+                Button::new("hub-upgrade-check")
+                    .secondary()
+                    .small()
+                    .w_full()
+                    .label(
+                        if busy {
+                            t!("panel.upgradeBusy")
+                        } else {
+                            t!("panel.upgrade")
+                        }
+                        .into_owned(),
+                    )
+                    .disabled(busy)
+                    .on_click(move |_, _, _| runtime.send(UiCommand::UpgradeHub)),
+            );
+            if let Some(note) = self.snap.hub_upgrade_note.as_deref() {
+                block = block.child(
+                    div()
+                        .id("hub-upgrade-note")
+                        .test_support()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(note.to_string()),
+                );
+            }
+            column = column.child(block);
+        }
+
         // (icon, title, description, entry command constructor). The command
         // is built inside the click closure — click listeners are `Fn`, so a
         // prebuilt command would have to be Clone for nothing. The five
@@ -2340,6 +2748,14 @@ impl Workbench {
                 "Restore an earlier version of a config file",
                 || UiCommand::OpenConfigPage {
                     page: crate::runtime::ConfigPageKind::Backups,
+                },
+            ),
+            (
+                KitIconName::Download,
+                "App update",
+                "Check the release channel and install a newer app",
+                || UiCommand::OpenConfigPage {
+                    page: crate::runtime::ConfigPageKind::AppUpdate,
                 },
             ),
         ];
@@ -2458,6 +2874,15 @@ impl Workbench {
                 }),
         );
 
+        // The account quota card (TS SettingsPanel's `<QuotaSection />`):
+        // hub-level, so it sits with the global settings as well as in the
+        // session panel.
+        if let Some(card) =
+            crate::quota_card::render_quota_card(&self.snap.quota_card, &self.runtime, theme)
+        {
+            column = column.child(card);
+        }
+
         div()
             .id("config-panel")
             .h_full()
@@ -2465,6 +2890,218 @@ impl Workbench {
             .min_w_0()
             .flex_none()
             .border_r_1()
+            .border_color(theme.border)
+            .bg(theme.title_bar)
+            .overflow_y_scroll()
+            .overflow_x_hidden()
+            .child(column)
+            .into_any_element()
+    }
+
+    // -- session panel (right) ----------------------------------------------
+
+    /// The right session panel (TS SessionPanel): the active session's
+    /// config options as full-width pickers, its turn stats (context,
+    /// cache hit, speed — the title bar's readouts at reading distance),
+    /// the gated workflows entry, and the shared quota card. Global settings
+    /// stay in the config dock.
+    fn render_session_panel(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let runtime = self.runtime.clone();
+        let wb_close = cx.entity();
+        let mut column = div().flex().flex_col().min_w_0();
+
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .h_9()
+                .px_3()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_family(theme.mono_font_family.clone())
+                        .text_color(theme.muted_foreground)
+                        .child(t!("panel.session").to_uppercase()),
+                )
+                .child(
+                    Button::new("session-panel-close")
+                        .ghost()
+                        .xsmall()
+                        .icon(KitIconName::X)
+                        .on_click(move |_, _, cx| {
+                            wb_close.update(cx, |this, cx| this.toggle_session_panel(cx));
+                        }),
+                ),
+        );
+
+        let session_live = self
+            .snap
+            .active
+            .as_ref()
+            .and_then(|t| t.session_id.clone())
+            .is_some();
+        let caption = |text: String| {
+            div()
+                .px_3()
+                .pt(px(12.))
+                .pb(px(2.))
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground.opacity(0.75))
+                .child(text.to_uppercase())
+        };
+
+        // Session-scoped config — meaningless until a session is attached
+        // (the TS guard), and the TS label fallback: a catalog miss shows
+        // the bridge's own option name, never the raw key.
+        if let Some(view) = self
+            .snap
+            .active
+            .as_ref()
+            .filter(|v| session_live && !v.config_options.is_empty())
+        {
+            column = column.child(caption(t!("config.title").into_owned()));
+            for opt in &view.config_options {
+                let key = format!("config.{}", opt.id);
+                let translated = t!(&key);
+                let label = if translated.as_ref() == key {
+                    opt.name.clone().unwrap_or_else(|| opt.id.clone())
+                } else {
+                    translated.into_owned()
+                };
+                let (current, choices) = config_option_view(opt);
+                let runtime = runtime.clone();
+                let config_id = opt.id.clone();
+                column = column.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .px_3()
+                        .py(px(4.))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(theme.muted_foreground)
+                                .child(label),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!("session-cfg-{}", opt.id)))
+                                .ghost()
+                                .xsmall()
+                                .min_w_0()
+                                .label(current)
+                                .dropdown_menu(move |menu, _, _| {
+                                    config_option_menu(menu, &runtime, &config_id, &choices)
+                                }),
+                        ),
+                );
+            }
+        }
+
+        // The turn readouts (the title bar's segments, spelled out): only
+        // the ones the session has reported.
+        if let Some(tab) = self.tab.as_ref().filter(|_| session_live) {
+            let mut rows: Vec<(&str, String)> = Vec::new();
+            if let Some(usage) = tab.usage.filter(|u| u.size > 0) {
+                rows.push(("Context", fmt_context(usage.used, usage.size)));
+            }
+            if let Some(hit) = tab.cache_hit {
+                rows.push(("Cache hit", format!("{hit}%")));
+            }
+            if let Some(stats) = tab.turn_stats {
+                rows.push(("Speed", format!("{} tok/s", stats.tps)));
+                rows.push((
+                    "Last turn",
+                    format!("{} tok · {:.1}s", stats.output_tokens, stats.seconds),
+                ));
+            }
+            if !rows.is_empty() {
+                column = column.child(caption("Session stats".to_string()));
+                let mut block = div()
+                    .id("session-panel-stats")
+                    .test_support()
+                    .flex()
+                    .flex_col();
+                for (label, value) in rows {
+                    block = block.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .px_3()
+                            .py(px(4.))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(12.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(label.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(12.))
+                                    .font_family(theme.mono_font_family.clone())
+                                    .text_color(theme.foreground)
+                                    .child(value),
+                            ),
+                    );
+                }
+                column = column.child(block);
+            }
+        }
+
+        // The single workflow entry (batch M): shown when the gate verdict
+        // is ON and a session is attached; everything workflow-specific
+        // lives INSIDE the management page.
+        if session_live && self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled) {
+            let runtime = runtime.clone();
+            column = column.child(caption(t!("panel.workflows").into_owned())).child(
+                Button::new("session-panel-workflows")
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .icon(KitIconName::Workflow)
+                    .label(t!("panel.workflowManage").into_owned())
+                    .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows)),
+            );
+        }
+
+        let quota = crate::quota_card::render_quota_card(&self.snap.quota_card, &self.runtime, theme);
+        let quota_present = quota.is_some();
+        if let Some(card) = quota {
+            column = column.child(card);
+        }
+        if !session_live && !quota_present {
+            column = column.child(
+                div()
+                    .id("session-panel-empty")
+                    .test_support()
+                    .px_3()
+                    .py_2()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("chat.noSession").into_owned()),
+            );
+        }
+
+        div()
+            .id("session-panel")
+            .test_support()
+            .h_full()
+            .w_full()
+            .min_w_0()
+            .flex_none()
+            .border_l_1()
             .border_color(theme.border)
             .bg(theme.title_bar)
             .overflow_y_scroll()
@@ -2629,13 +3266,17 @@ impl Workbench {
         let active = self.snap.active_tab == sess.open_tab && sess.open_tab.is_some();
         // 6px status dot (absolute — size_1_5() is RELATIVE here, see the
         // search-icon note).
+        // The TS ActivityBadge ladder (SessionList.tsx:29-87): awaiting >
+        // running > just-finished (60s) > idle; the discovery row's REST
+        // `running` status is the heartbeat fallback (ADR-0005) for rows
+        // with NO broadcast activity entry. The finished window's lapse
+        // needs no timer — discovery's 4s poll repaints the rows anyway.
+        let finished_fresh = finished_fresh(sess, now_ms());
         let mut dot = div().size(px(6.)).flex_none().rounded_full();
-        dot = if sess.running {
-            dot.bg(theme.accent)
-        } else if sess.awaiting {
-            dot.border_1().border_color(theme.warning_foreground)
-        } else {
-            dot.bg(theme.muted_foreground.opacity(0.4))
+        dot = match activity_dot(sess) {
+            ActivityDot::Awaiting => dot.border_1().border_color(theme.warning_foreground),
+            ActivityDot::Running => dot.bg(theme.accent),
+            ActivityDot::Idle => dot.bg(theme.muted_foreground.opacity(0.4)),
         };
         let instance_id = sess.instance_id.clone();
         let session_id = sess.session_id.clone();
@@ -2716,6 +3357,22 @@ impl Workbench {
                     .text_color(theme.foreground)
                     .child(title),
             )
+            .when(finished_fresh, |this| {
+                // The TS just-finished badge: text only, no dot (the dot
+                // above stays idle-colored while this chip shows).
+                this.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "session-finished-{}",
+                            sess.session_id
+                        )))
+                        .test_support()
+                        .flex_none()
+                        .text_size(px(10.))
+                        .text_color(theme.accent)
+                        .child(t!("chat.activityFinished").into_owned()),
+                )
+            })
             .when(sess.open_tab.is_some(), |this| {
                 this.child(
                     div()
@@ -3132,19 +3789,31 @@ impl Workbench {
                     .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows))
                     .into_any_element()
             });
-        if chips_row.is_some() || manage_row.is_some() {
-            strip = strip.child(
-                div()
-                    .ml_auto()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .min_w_0()
-                    .pr_1()
-                    .children(chips_row)
-                    .children(manage_row),
-            );
-        }
+        // The right session panel's toggle (TS ChatScreen's header button):
+        // always present — the panel also carries the hub-level quota card,
+        // which needs no session.
+        let wb_toggle = cx.entity();
+        let toggle = Button::new("session-panel-toggle")
+            .ghost()
+            .xsmall()
+            .icon(KitIconName::PanelRight)
+            .selected(self.session_panel_open)
+            .tooltip(t!("panel.session").into_owned())
+            .on_click(move |_, _, cx| {
+                wb_toggle.update(cx, |this, cx| this.toggle_session_panel(cx));
+            });
+        strip = strip.child(
+            div()
+                .ml_auto()
+                .flex()
+                .items_center()
+                .gap_1()
+                .min_w_0()
+                .pr_1()
+                .children(chips_row)
+                .children(manage_row)
+                .child(toggle),
+        );
         strip.into_any_element()
     }
 
@@ -3159,57 +3828,16 @@ impl Workbench {
         _cx: &Context<Self>,
     ) -> AnyElement {
         let runtime = self.runtime.clone();
-        let current = opt
-            .current_value
-            .as_deref()
-            .map(|v| {
-                opt.options
-                    .as_ref()
-                    .and_then(|choices| choices.iter().find(|c| c.value == v))
-                    .map(|c| c.name.clone())
-                    .unwrap_or_else(|| v.to_string())
-            })
-            .unwrap_or_else(|| "—".to_string());
         let title = opt.name.clone().unwrap_or_else(|| opt.id.clone());
-        // The builder runs on every open, so hand each run a fresh copy.
         let config_id = opt.id.clone();
-        let choices: Vec<(String, String, bool)> = opt
-            .options
-            .iter()
-            .flatten()
-            .map(|c| {
-                (
-                    c.value.clone(),
-                    c.name.clone(),
-                    Some(c.value.as_str()) == opt.current_value.as_deref(),
-                )
-            })
-            .collect();
+        let (current, choices) = config_option_view(opt);
         Button::new(SharedString::from(format!("cfg-{}", opt.id)))
             .ghost()
             .xsmall()
             .label(current)
             .tooltip(format!("{title}: pick the session's {title}"))
             .dropdown_menu(move |menu, _, _| {
-                let mut m = menu;
-                for (value, name, active) in choices.clone() {
-                    let runtime = runtime.clone();
-                    let config_id = config_id.clone();
-                    // `new` (clickable Item), NOT `label` (a disabled caption).
-                    m = m.item(
-                        PopupMenuItem::new(name).checked(active).on_click(
-                            move |_, _, _| {
-                                if !active {
-                                    runtime.send(UiCommand::SetConfigOption {
-                                        config_id: config_id.clone(),
-                                        value: value.clone(),
-                                    })
-                                }
-                            },
-                        ),
-                    );
-                }
-                m
+                config_option_menu(menu, &runtime, &config_id, &choices)
             })
             .into_any_element()
     }
@@ -4403,6 +5031,8 @@ fn render_assistant_row(
                 detail,
                 fold_kind,
                 expanded,
+                diff_src: _,
+                diffs,
             } => {
                 // ToolCard (E2 — ChatView.tsx:226 `<details>`): the summary
                 // row (glyph, name, detail head) is the toggle; the body is
@@ -4495,30 +5125,42 @@ fn render_assistant_row(
                         .test_support(),
                 );
                 if *expanded {
-                    card = card.child(
+                    // TS ToolCard body order: the diff blocks first, then the
+                    // plain detail <pre> under them (ChatView.tsx:240-255).
+                    let mut body = div()
+                        .id(SharedString::from(format!(
+                            "tool-detail-{}-{}",
+                            row.id, part_index
+                        )))
+                        .max_h(px(256.))
+                        .overflow_y_scroll()
+                        .min_w_0()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(11.))
+                        .line_height(relative(1.45));
+                    for (bi, block) in diffs.iter().enumerate() {
+                        body = body.child(render_diff_block(
+                            block,
+                            &row.id,
+                            part_index,
+                            bi,
+                            theme,
+                        ));
+                    }
+                    body = body.child(
                         div()
-                            .id(SharedString::from(format!(
-                                "tool-detail-{}-{}",
-                                row.id, part_index
-                            )))
-                            .max_h(px(256.))
-                            .overflow_y_scroll()
-                            .min_w_0()
-                            .border_t_1()
-                            .border_color(theme.border)
                             .px_2()
                             .py(px(6.))
-                            .font_family(theme.mono_font_family.clone())
-                            .text_size(px(11.))
-                            .line_height(relative(1.45))
                             .text_color(theme.muted_foreground)
                             .child(if detail.is_empty() {
                                 "…".to_string()
                             } else {
                                 detail.clone()
-                            })
-                            .test_support(),
+                            }),
                     );
+                    card = card.child(body.test_support());
                 }
                 column.child(card)
             }
@@ -4798,11 +5440,14 @@ impl Render for Workbench {
                     .filter(|addr| is_loopback_hub(addr))
                     .zip(self.snap.files.listing.as_ref().map(|l| l.root.clone()))
                     .map(|(_, root)| absolute_dir(&root, &view.path));
+                let md_source =
+                    matches!(&self.file_md_source, Some((p, true)) if *p == view.path);
                 this.child(render_file_viewer(
                     &view,
                     &runtime,
                     &cx.entity().downgrade(),
                     local_abs,
+                    md_source,
                     cx,
                 ))
             })
@@ -5832,6 +6477,57 @@ mod display_tests {
         .unwrap();
     }
 
+    /// A tool-call carrying ACP diff blocks paints the unified view (path
+    /// header, capped notice when a side is over-budget) above the plain
+    /// detail — the TS DiffBlock port (ChatView.tsx:166).
+    #[gpui_kit::test]
+    fn tool_call_diff_blocks_render_unified_view(cx: &mut TestAppContext) {
+        use protocol::acp::AcpDiffContent;
+        use protocol::chat::{ChatPart, ToolCallPart};
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        let mut tab = tab_view();
+        let mut msgs = messages_fixture();
+        msgs[1].parts.insert(
+            0,
+            ChatPart::ToolCall(ToolCallPart {
+                tool_call_id: "t0".to_string(),
+                tool_name: "Edit: src/main.rs".to_string(),
+                detail: "the file was edited".to_string(),
+                status: "completed".to_string(),
+                kind: Some("edit".to_string()),
+                raw_name: Some("Edit".to_string()),
+                fold_kind: None,
+                diffs: Some(vec![AcpDiffContent {
+                    r#type: "diff".to_string(),
+                    path: "src/main.rs".to_string(),
+                    old_text: Some("fn a() {}".to_string()),
+                    new_text: "fn a() { let x = 1; }".to_string(),
+                }]),
+            }),
+        );
+        tab.messages = msgs;
+        snap.active = Some(tab);
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("tool-a1-0", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("tool-diff-path-a1-0-0").visible(),
+                "the diff block's path header must render"
+            );
+            assert!(
+                window.find("tool-detail-a1-0").visible(),
+                "the plain detail still renders under the diff blocks"
+            );
+        })
+        .unwrap();
+    }
+
     /// E3: the plan/todo strip renders collapsed with its done/total summary
     /// and expands to the entry list on click.
     #[gpui_kit::test]
@@ -6175,7 +6871,9 @@ mod files_tests {
 
     /// F3: the simplified viewer renders the loaded whole-file text with
     /// numbered rows and the size meta, and its close dispatches
-    /// `FilesCloseView`.
+    /// `FilesCloseView`. A markdown-shaped name starts in the rendered
+    /// preview (TS FileViewer:206) and the header toggle flips to the
+    /// numbered source rows.
     #[gpui_kit::test]
     fn file_viewer_renders_text_and_closes(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -6199,6 +6897,16 @@ mod files_tests {
             window.draw(cx).clear(cx);
             assert!(window.find("file-viewer").visible());
             assert!(window.find("file-viewer-meta").visible());
+            assert!(
+                window.find("file-viewer-markdown").visible(),
+                "markdown files start in the rendered preview"
+            );
+            assert!(
+                window.find("file-viewer-md-toggle").visible(),
+                "the preview/source toggle renders for markdown files"
+            );
+            window.click("file-viewer-md-toggle", cx);
+            window.draw(cx).clear(cx);
             assert!(window.find("file-viewer-line-1").visible());
             assert!(window.find("file-viewer-line-2").visible());
             assert!(
@@ -6276,6 +6984,9 @@ mod session_action_tests {
             updated_at: Some(1),
             running: false,
             awaiting: false,
+            finished_at: None,
+            rest_running: false,
+            activity_known: false,
             open_tab: None,
         }
     }
@@ -6471,6 +7182,65 @@ mod session_action_tests {
                     UiCommand::OpenHistorySession { .. }
                 )),
                 "the menu trigger click must not resume the row"
+            );
+        })
+        .unwrap();
+    }
+
+    /// D: the ActivityBadge ladder's dot (SessionList.tsx:29-87) — awaiting
+    /// beats running, and discovery's REST `running` heartbeat is the
+    /// fallback ONLY for rows without a broadcast activity entry.
+    #[test]
+    fn session_badge_dot_ladder() {
+        use super::{activity_dot, ActivityDot};
+        let mut row = session_row("sess_1", None);
+        assert_eq!(activity_dot(&row), ActivityDot::Idle);
+        row.rest_running = true;
+        assert_eq!(activity_dot(&row), ActivityDot::Running, "no activity entry: the REST heartbeat is the fallback");
+        row.activity_known = true;
+        assert_eq!(activity_dot(&row), ActivityDot::Idle, "a known activity entry must not be overridden by a stale REST flag");
+        row.running = true;
+        assert_eq!(activity_dot(&row), ActivityDot::Running);
+        row.awaiting = true;
+        assert_eq!(activity_dot(&row), ActivityDot::Awaiting);
+    }
+
+    /// D: the just-finished chip's 60s window.
+    #[test]
+    fn session_badge_finished_window() {
+        use super::finished_fresh;
+        let mut row = session_row("sess_1", None);
+        assert!(!finished_fresh(&row, 10_000));
+        row.finished_at = Some(10_000);
+        assert!(finished_fresh(&row, 69_999));
+        assert!(!finished_fresh(&row, 70_000), "the window lapses at exactly +60s");
+    }
+
+    /// D (window): the finished chip paints inside the window and is gone
+    /// once discovery repaints past it.
+    #[gpui_kit::test]
+    fn session_finished_chip_paints_and_expires(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut fresh = sessions_snapshot();
+        fresh.sessions[0].finished_at = Some(super::now_ms());
+        let (handle, _wb, _runtime) = cx.update(|cx| open_test_window(cx, fresh));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("session-finished-sess_1").visible());
+        })
+        .unwrap();
+
+        let mut stale = sessions_snapshot();
+        stale.sessions[0].finished_at = Some(super::now_ms() - 61_000);
+        let (handle, _wb, _runtime) = cx.update(|cx| open_test_window(cx, stale));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("session-finished-sess_1").is_none(),
+                "the chip must lapse with the window"
             );
         })
         .unwrap();

@@ -98,7 +98,7 @@ fn fmt_percent(pct: f64) -> String {
 /// this renders UTC with an explicit suffix until the M4 i18n pass — the
 /// same tradeoff the System Status page's collected stamp makes. Pure
 /// civil-from-days arithmetic (Howard Hinnant), no dependencies.
-fn fmt_stamp_utc(ms: u64) -> String {
+pub(crate) fn fmt_stamp_utc(ms: u64) -> String {
     let secs = ms / 1000;
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
@@ -153,7 +153,7 @@ fn emerald_check() -> Hsla {
 }
 
 /// TS text-faint — one step dimmer than text-dim (muted_foreground).
-fn faint(theme: &Theme) -> gpui::Hsla {
+pub(crate) fn faint(theme: &Theme) -> gpui::Hsla {
     theme.muted_foreground.opacity(0.75)
 }
 
@@ -171,18 +171,38 @@ fn notice_text(notice: &str) -> String {
 /// One quota bar line (TS `QuotaRow`): mono label + `NN% · reset` (or the
 /// MCP row's absolute `used / total`) over a 4px heat bar.
 fn quota_row(theme: &Theme, item: &protocol::quota::QuotaItem) -> AnyElement {
-    let clamped = item.used_percent.clamp(0.0, 100.0);
     // CLI parity: only the MCP limit renders its absolute used/total; every
     // other row stays on `NN%`.
     let mcp_counts = match (&item.used_count, &item.total_count) {
         (Some(used), Some(total)) if item.key == "mcp" => Some((*used, *total)),
         _ => None,
     };
-    let value = match mcp_counts {
+    quota_bar_row(
+        theme,
+        &item.label,
+        item.used_percent,
+        item.next_reset_time,
+        mcp_counts,
+    )
+}
+
+/// The one row implementation both quota surfaces paint (TS exports
+/// `QuotaRow` for the same reason — the side-panel card and the plan page
+/// cannot drift apart visually): `counts` renders `used / total` instead of
+/// the percent.
+pub(crate) fn quota_bar_row(
+    theme: &Theme,
+    label: &str,
+    percent: f64,
+    reset_ms: Option<u64>,
+    counts: Option<(u64, u64)>,
+) -> AnyElement {
+    let clamped = percent.clamp(0.0, 100.0);
+    let value = match counts {
         Some((used, total)) => format!("{used} / {total}"),
-        None => format!("{}%", fmt_percent(item.used_percent)),
+        None => format!("{}%", fmt_percent(percent)),
     };
-    let line = match item.next_reset_time {
+    let line = match reset_ms {
         Some(reset) => format!("{value} · {}", fmt_stamp_utc(reset)),
         None => value,
     };
@@ -201,7 +221,7 @@ fn quota_row(theme: &Theme, item: &protocol::quota::QuotaItem) -> AnyElement {
                         .font_family(theme.mono_font_family.clone())
                         .text_size(px(11.))
                         .text_color(theme.muted_foreground)
-                        .child(item.label.clone()),
+                        .child(label.to_string()),
                 )
                 .child(
                     div()

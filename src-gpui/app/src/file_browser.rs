@@ -9,8 +9,11 @@
 //!   loopback hub, where the bridge's paths name real local files;
 //! - a simplified read-only TEXT viewer: one whole-file load (`fs/file`,
 //!   single line window at the mobile MAX_LINES budget), max-h scroll.
-//!   Line-window paging, image preview, and the download fallback are
-//!   later milestones (milestone 2), so those kinds explain themselves.
+//!   Line-window paging and image preview are later milestones
+//!   (milestone 2). The mobile viewer's DOWNLOAD fallback is deliberately
+//!   not ported: a desktop already has "open with the default
+//!   application" and Finder — a copy-to-downloads affordance would be a
+//!   worse detour, so binary and oversized kinds explain themselves.
 //!
 //! All wire I/O lives in `runtime` (the driver's FilesPanel); this module
 //! only holds the pure classification/formatting helpers and the painters.
@@ -18,6 +21,7 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{AnyElement, App, Entity, div, px, SharedString};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::text::TextView;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, Theme};
 // The kit glob also brings gpui's self-alias `gpui` into scope — the
 // established import shape (workbench.rs, system_status.rs).
@@ -41,6 +45,17 @@ pub(crate) const SERVER_LINE_WINDOW: u64 = 5_000;
 /// A display row longer than this is chopped (the TS TextViewer's
 /// MAX_LINE_CHARS): a single mega-line must not lay out unbounded.
 const MAX_LINE_CHARS: usize = 2_000;
+
+/// The TS viewer's MARKDOWN_EXT (FileViewer.tsx:206-214): markdown-shaped
+/// text files get the rendered preview by default, the plain source one
+/// toggle away.
+pub(crate) fn is_markdown(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower
+        .rsplit_once('.')
+        .map(|(_, ext)| matches!(ext, "md" | "markdown" | "mdx"))
+        .unwrap_or(false)
+}
 
 /// The window to request for a load starting at `start` (1-based): the
 /// server cap, or whatever is left of the whole-viewer budget.
@@ -562,10 +577,14 @@ pub(crate) fn render_file_viewer(
     runtime: &ProtocolRuntime,
     wb: &gpui::WeakEntity<crate::workbench::Workbench>,
     local_abs: Option<String>,
+    md_source: bool,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     let mut column = div().flex().flex_col().h_full();
+    // Markdown-shaped text files preview rendered by default (TS
+    // FileViewer:206); `md_source` is the workbench-side one-toggle flip.
+    let md = view.kind == FileKind::Text && is_markdown(&view.name);
 
     // Header: close, name, the size meta (TS viewer header), then the two
     // local affordances the mobile viewer carries (FileViewer.tsx:679-696):
@@ -607,6 +626,24 @@ pub(crate) fn render_file_viewer(
                 .text_color(theme.muted_foreground)
                 .child(format!("{} · {}", fmt_size(view.size), kind_label(view.kind))),
         );
+    if md {
+        let wb_toggle = wb.clone();
+        let path = view.path.clone();
+        let next = !md_source;
+        header = header.child(
+            Button::new("file-viewer-md-toggle")
+                .ghost()
+                .xsmall()
+                .label(if md_source { "Preview" } else { "Source" })
+                .tooltip("Toggle markdown preview / source")
+                .on_click(move |_, _, cx| {
+                    let _ = wb_toggle.update(cx, |wb, cx| {
+                        wb.file_md_source = Some((path.clone(), next));
+                        cx.notify();
+                    });
+                }),
+        );
+    }
     if let Some(abs) = local_abs {
         for (id, icon, tooltip, reveal) in [
             (
@@ -632,7 +669,7 @@ pub(crate) fn render_file_viewer(
                     .tooltip(tooltip)
                     .on_click(move |_, _, cx| {
                         if let Err(e) = open_local_path(&abs, reveal) {
-                            wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
+                            let _ = wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
                         }
                     }),
             );
@@ -725,41 +762,56 @@ pub(crate) fn render_file_viewer(
                     div()
                         .text_size(px(11.))
                         .text_color(theme.muted_foreground)
-                        .child("binary file — the download fallback lands in a later milestone"),
+                        .child("binary file — open it with the default application instead"),
                 );
             }
             FileKind::Text => {
                 if let Some(text) = &view.text {
-                    let first = view.first_line.unwrap_or(1);
-                    for (i, line) in text.split('\n').enumerate() {
+                    if md && !md_source {
+                        // The rendered preview (the workflow-artifact viewer's
+                        // own markdown path — same kit TextView).
                         body = body.child(
                             div()
-                                .id(SharedString::from(format!(
-                                    "file-viewer-line-{}",
-                                    first.saturating_add(i as u64)
-                                )))
+                                .id("file-viewer-markdown")
                                 .test_support()
-                                .flex()
-                                .items_start()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .w(px(44.))
-                                        .text_right()
-                                        .text_size(px(10.))
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("{}", first.saturating_add(i as u64))),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .text_size(px(11.))
-                                        .font_family(theme.mono_font_family.clone())
-                                        .text_color(theme.foreground)
-                                        .child(display_line(line)),
-                                ),
+                                .px_1()
+                                .child(TextView::markdown(
+                                    "file-viewer-markdown",
+                                    text.clone(),
+                                )),
                         );
+                    } else {
+                        let first = view.first_line.unwrap_or(1);
+                        for (i, line) in text.split('\n').enumerate() {
+                            body = body.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "file-viewer-line-{}",
+                                        first.saturating_add(i as u64)
+                                    )))
+                                    .test_support()
+                                    .flex()
+                                    .items_start()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .w(px(44.))
+                                            .text_right()
+                                            .text_size(px(10.))
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("{}", first.saturating_add(i as u64))),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_size(px(11.))
+                                            .font_family(theme.mono_font_family.clone())
+                                            .text_color(theme.foreground)
+                                            .child(display_line(line)),
+                                    ),
+                            );
+                        }
                     }
                 }
             }
@@ -833,8 +885,9 @@ mod tests {
     // Explicit imports only — the file-root kit glob would shadow the
     // built-in #[test] with gpui's macro (see gpui-kit-notes.md).
     use super::{
-        absolute_dir, display_line, file_kind_of, fmt_size, is_loopback_hub, join_dir, root_name,
-        viewer_next_window, viewer_window, FileKind, SERVER_LINE_WINDOW, VIEWER_LINE_BUDGET,
+        absolute_dir, display_line, file_kind_of, fmt_size, is_loopback_hub, is_markdown, join_dir,
+        root_name, viewer_next_window, viewer_window, FileKind, SERVER_LINE_WINDOW,
+        VIEWER_LINE_BUDGET,
     };
 
     #[test]
@@ -848,6 +901,20 @@ mod tests {
         assert_eq!(file_kind_of("archive.tar.gz"), FileKind::Binary);
         assert_eq!(file_kind_of("app.dmg"), FileKind::Binary);
         assert_eq!(file_kind_of("unknown"), FileKind::Binary);
+    }
+
+    /// TS MARKDOWN_EXT (FileViewer.tsx:208): md/markdown/mdx by LAST dot
+    /// segment, case-insensitive; dotfiles and no-extension names don't.
+    #[test]
+    fn markdown_ladder_matches_the_ts_viewer() {
+        assert!(is_markdown("README.md"));
+        assert!(is_markdown("notes.MARKDOWN"));
+        assert!(is_markdown("doc.mdx"));
+        assert!(is_markdown("a.b.md"));
+        assert!(!is_markdown("main.rs"));
+        assert!(!is_markdown(".gitignore"));
+        assert!(!is_markdown("Dockerfile"));
+        assert!(!is_markdown("md"));
     }
 
     #[test]

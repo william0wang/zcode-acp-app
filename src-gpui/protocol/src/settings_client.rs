@@ -25,7 +25,7 @@ use std::future::Future;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::hub::ConnectionProfile;
+use crate::hub::{ConnectionProfile, HubUpgradeResult};
 use crate::settings::{
     AgentUpsert, BackendRestartResult, HookEntryPatch, McpServerUpsert, ModelUpsert,
     PendingRestartStatus, ResetCardStatus, ResetOpportunityRequest, ResetOpportunityResponse,
@@ -440,6 +440,16 @@ impl<T: HttpTransport> HubHttpClient<T> {
             None => "/api/settings/app-update".to_string(),
         };
         self.fetch_json(Method::Get, &path, None, FetchOptions::default())
+            .await
+    }
+
+    /// The hub's own staleness check (bridge 0.11.7, `POST /api/upgrade`):
+    /// the hub alone decides whether the on-disk code is newer and restarts
+    /// onto it — `restarting` means it exits ~500ms after answering and
+    /// re-spawns; callers ride that out with their normal health/discovery
+    /// polling (TS `upgradeHub`).
+    pub async fn upgrade_hub(&self) -> Result<HubUpgradeResult, HubApiError> {
+        self.fetch_json(Method::Post, "/api/upgrade", None, FetchOptions::default())
             .await
     }
 

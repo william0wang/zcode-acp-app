@@ -27,14 +27,6 @@ rustls.workspace = true
 rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
 
-[target.'cfg(target_os = "macos")'.dependencies]
-# Golden pixel stage (macOS only): encode the self-captured window (the
-# `image` pin protocol already uses — png codec included) and walk the
-# CoreGraphics window list for our own window.
-image.workspace = true
-objc2-core-graphics.workspace = true
-objc2-core-foundation.workspace = true
-
 [dev-dependencies]
 # UI integration tests (gpui-kit TESTING.md / website test guide): test-support
 # under dev-dependencies only — features unify for tests, production builds

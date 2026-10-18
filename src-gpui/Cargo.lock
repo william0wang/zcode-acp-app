@@ -192,9 +192,6 @@ name = "app"
 version = "0.33.0"
 dependencies = [
  "gpui-kit",
- "image",
- "objc2-core-foundation",
- "objc2-core-graphics",
  "protocol",
  "rust-i18n",
  "rustls",

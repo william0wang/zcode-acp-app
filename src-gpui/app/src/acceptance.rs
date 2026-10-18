@@ -12,9 +12,10 @@
 //! is the feature inventory.
 
 use crate::runtime::{
-    FsBrowseView, HistoryProjectRow, ModelsPageView, NewSessionView, Phase, ProtocolRuntime,
-    QuotaPageView, RuntimeEvent, TabPhase, TabSummary, TabView, UsagePageView, UsageTab,
-    UiCommand, WorkbenchSnapshot, WorkflowDetailView, WorkflowsPageView,
+    ConfigPageKind, ConfigSectionPageView, FsBrowseView, HistoryProjectRow, ModelsPageView,
+    NewSessionView, Phase, ProtocolRuntime, QuotaCardView, QuotaPageView, RuntimeEvent, TabPhase,
+    TabSummary, TabView, UsagePageView, UsageTab, UiCommand, WorkbenchSnapshot, WorkflowDetailView,
+    WorkflowsPageView,
 };
 use crate::workbench::{StopTurn, Workbench};
 use gpui_kit::test::TestWindowExt;
@@ -103,6 +104,61 @@ fn advance(cx: &mut TestAppContext, wb: &Entity<Workbench>, snap: WorkbenchSnaps
 
 fn sent(runtime: &ProtocolRuntime, predicate: impl Fn(&UiCommand) -> bool) -> bool {
     runtime.recorded_commands().iter().any(predicate)
+}
+
+fn count(runtime: &ProtocolRuntime, predicate: impl Fn(&UiCommand) -> bool) -> usize {
+    runtime
+        .recorded_commands()
+        .iter()
+        .filter(|c| predicate(c))
+        .count()
+}
+
+/// The side panels' quota card fixture: every provider section the hub
+/// reports (GLM success with a level, Go success, Ollama auth-expired, the
+/// CLIProxy pool the server added after the TS card was written).
+fn quota_usage_fixture() -> protocol::quota::AccountUsageStats {
+    use protocol::quota::*;
+    AccountUsageStats {
+        glm: GlmUsageStats {
+            kind: "success".to_string(),
+            level: Some("max".to_string()),
+            items: Some(vec![QuotaItem {
+                key: "token_5h".to_string(),
+                label: "5h".to_string(),
+                used_percent: 42.0,
+                left_percent: Some(58.0),
+                used_count: None,
+                total_count: None,
+                next_reset_time: Some(1_700_000_000_000),
+                detail: None,
+            }]),
+        },
+        opencode: GoUsageStats {
+            kind: "success".to_string(),
+            windows: Some(vec![GoWindowEntry {
+                key: GoWindowKey::Rolling,
+                label: "5h".to_string(),
+                usage_percent: 10.0,
+                resets_at: 1_700_000_000_000,
+            }]),
+        },
+        ollama: Some(OllamaUsageStats {
+            kind: "auth_error".to_string(),
+            windows: None,
+            usage: None,
+        }),
+        cliproxy: Some(CpUsageStats {
+            kind: "success".to_string(),
+            accounts: None,
+            combined: Some(vec![CpWindowEntry {
+                window: "5h".to_string(),
+                used_percent: 5.0,
+                resets_at: None,
+            }]),
+            other_accounts: None,
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +520,11 @@ fn accept_settings_servers_entries_and_gate(cx: &mut TestAppContext) {
         source: "remote".to_string(),
         r#override: None,
     });
+    snap.quota_card = QuotaCardView {
+        usage: Some(quota_usage_fixture()),
+        quota_unavailable: false,
+        usage_stats_at: Some(1),
+    };
     // Tall window: the config panel scrolls and only painted rows register
     // ids — the whole entry list must fit one frame.
     let (handle, wb, runtime) = cx.update(|cx| open(cx, snap, 2400.));
@@ -476,6 +537,25 @@ fn accept_settings_servers_entries_and_gate(cx: &mut TestAppContext) {
         // the local row offers its switch back.
         assert!(window.find("server-remove-srv-1").visible());
         assert!(window.find("server-local-switch").visible());
+
+        // Edit (TS saveServer): the row's Edit prefills the shared form with
+        // its own values; Save writes them back through UpdateServer and
+        // drops back to the add form.
+        window.click("server-edit-srv-1", cx);
+        window.draw(cx).clear(cx);
+        assert!(window.find("server-save").visible());
+        assert!(window.find("server-edit-cancel").visible());
+        window.click("server-save", cx);
+        assert!(sent(&runtime, |c| matches!(
+            c,
+            UiCommand::UpdateServer { id, name, hub_url, token }
+                if id == "srv-1"
+                    && name == "Remote dev box"
+                    && hub_url == "https://hub.example:8377"
+                    && token == "tok"
+        )));
+        window.draw(cx).clear(cx);
+
         window.click("server-remove-srv-1", cx);
         window.draw(cx).clear(cx);
         assert_eq!(
@@ -504,6 +584,7 @@ fn accept_settings_servers_entries_and_gate(cx: &mut TestAppContext) {
             "config-entry-Hooks",
             "config-entry-Agents",
             "config-entry-Backups",
+            "config-entry-App update",
         ] {
             assert!(
                 window.find(entry).visible(),
@@ -512,6 +593,26 @@ fn accept_settings_servers_entries_and_gate(cx: &mut TestAppContext) {
         }
         window.click("config-entry-Models", cx);
         assert!(sent(&runtime, |c| matches!(c, UiCommand::OpenModels)));
+
+        // The hub staleness check: one POST /api/upgrade behind the button.
+        window.click("hub-upgrade-check", cx);
+        assert!(sent(&runtime, |c| matches!(c, UiCommand::UpgradeHub)));
+
+        // The account quota card (TS SettingsPanel's QuotaSection): docking
+        // the panel refreshed it once (the mount effect); every reported
+        // provider section paints, and the refresh button re-reads.
+        let refreshes = count(&runtime, |c| matches!(c, UiCommand::RefreshQuota));
+        assert!(refreshes >= 1, "docking the config panel must refresh the quota card");
+        assert!(window.find("quota-card").visible());
+        assert!(window.find("quota-card-glm").visible());
+        assert!(window.find("quota-card-go").visible());
+        assert!(window.find("quota-card-ollama").visible());
+        assert!(window.find("quota-card-cliproxy").visible());
+        window.click("quota-card-refresh", cx);
+        assert_eq!(
+            count(&runtime, |c| matches!(c, UiCommand::RefreshQuota)),
+            refreshes + 1
+        );
 
         // Gate off: the Workflows ENTRY hides, the gate SWITCH row never does
         // (the override is the way in).
@@ -534,6 +635,133 @@ fn accept_settings_servers_entries_and_gate(cx: &mut TestAppContext) {
         assert!(window.find("config-entry-Workflows").visible());
         window.click("config-entry-Workflows", cx);
         assert!(sent(&runtime, |c| matches!(c, UiCommand::OpenWorkflows)));
+        sweep_geometry(window);
+    })
+    .unwrap();
+}
+
+/// C: Esc on an open config page is the settings screen's back button — the
+/// page closes and the running turn is NOT cancelled; with the page gone the
+/// next Esc is ChatView's cancel.
+#[gpui_kit::test]
+fn accept_config_page_esc_closes_before_cancel(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    let skills_page = || ConfigSectionPageView {
+        kind: ConfigPageKind::Skills,
+        supported: Some(true),
+        loading: false,
+        error: None,
+        payload: Some(serde_json::json!({ "ok": true, "skills": [] })),
+        busy: false,
+        models: None,
+        update_channel: "stable".to_string(),
+        install: None,
+    };
+    let mut snap = connected_snapshot(Some(tab_view(true)));
+    snap.config_section_page = Some(skills_page());
+    let (handle, wb, runtime) = cx.update(|cx| open(cx, snap, 600.));
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
+        assert!(sent(&runtime, |c| matches!(
+            c,
+            UiCommand::CloseConfigPage { page: ConfigPageKind::Skills }
+        )));
+        assert!(
+            !sent(&runtime, |c| matches!(c, UiCommand::CancelTurn)),
+            "Esc must close the page, not cancel the running turn"
+        );
+    })
+    .unwrap();
+
+    // Page closed: the same Esc is the turn's cancel.
+    advance(cx, &wb, connected_snapshot(Some(tab_view(true))));
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
+        assert!(sent(&runtime, |c| matches!(c, UiCommand::CancelTurn)));
+    })
+    .unwrap();
+}
+
+/// The right session panel (TS SessionPanel): the toggle in the tab strip
+/// opens it and refreshes the quota card (the mount effect); the session's
+/// config options render as pickers, its turn readouts (context / cache /
+/// speed) spell out the title bar's segments, the gated workflows entry
+/// opens the page, and close takes the panel away again.
+#[gpui_kit::test]
+fn accept_session_panel_stats_config_and_quota(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+    use protocol::acp::{ConfigOption, ConfigOptionChoice};
+    let mut tab = tab_view(false);
+    tab.usage = Some(protocol::acp::ContextUsage { used: 35_000, size: 200_000 });
+    tab.cache_hit = Some(82);
+    tab.turn_stats = Some(protocol::chat::TurnStats {
+        tps: 41.0,
+        output_tokens: 820,
+        seconds: 20.0,
+    });
+    tab.config_options = vec![ConfigOption {
+        id: "model".to_string(),
+        name: Some("Model".to_string()),
+        category: None,
+        current_value: Some("glm-4.7".to_string()),
+        options: Some(vec![
+            ConfigOptionChoice {
+                value: "glm-4.7".to_string(),
+                name: "GLM-4.7".to_string(),
+            },
+            ConfigOptionChoice {
+                value: "glm-4-air".to_string(),
+                name: "GLM-4-Air".to_string(),
+            },
+        ]),
+    }];
+    let mut snap = connected_snapshot(Some(tab));
+    snap.workflow_gate = Some(protocol::settings::WorkflowGateBlock {
+        enabled: true,
+        mode: "env".to_string(),
+        source: "remote".to_string(),
+        r#override: None,
+    });
+    snap.quota_card = QuotaCardView {
+        usage: Some(quota_usage_fixture()),
+        quota_unavailable: false,
+        usage_stats_at: Some(1),
+    };
+    let (handle, _wb, runtime) = cx.update(|cx| open(cx, snap, 900.));
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(
+            window.try_find("session-panel").is_none(),
+            "the panel starts closed"
+        );
+        window.click("session-panel-toggle", cx);
+        window.draw(cx).clear(cx);
+        assert!(window.find("session-panel").visible());
+        // Opening refreshed the quota card (the TS mount effect).
+        assert!(count(&runtime, |c| matches!(c, UiCommand::RefreshQuota)) >= 1);
+        // Config picker rows + the spelled-out turn readouts.
+        assert!(window.find("session-cfg-model").visible());
+        assert!(window.find("session-panel-stats").visible());
+        // The quota card rides along.
+        assert!(window.find("quota-card").visible());
+        assert!(window.find("quota-card-glm").visible());
+
+        // The gated workflows entry opens the management page.
+        assert!(window.find("session-panel-workflows").visible());
+        window.click("session-panel-workflows", cx);
+        assert!(sent(&runtime, |c| matches!(c, UiCommand::OpenWorkflows)));
+
+        window.click("session-panel-close", cx);
+        window.draw(cx).clear(cx);
+        assert!(window.try_find("session-panel").is_none());
         sweep_geometry(window);
     })
     .unwrap();

@@ -35,7 +35,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
 };
-use gpui_kit::*;
+use gpui_kit::{assets::IconName as KitIconName, *};
 use protocol::config_decode::{
     agent_rows, backup_lists, decode_subagent_model, encode_subagent_model, find_model_option,
     flatten_hooks, hook_edit_patch, hook_timeout_ok, hooks_enabled, is_agent_read_only,
@@ -44,6 +44,7 @@ use protocol::config_decode::{
 };
 use protocol::settings::{AgentUpsert, HookEntryPatch};
 use rust_i18n::t;
+use serde_json::Value;
 
 use crate::i18n::{fill, t_count};
 use crate::runtime::{ConfigPageKind, ConfigSectionPageView, UiCommand};
@@ -137,6 +138,7 @@ impl ConfigPageKind {
             ConfigPageKind::Hooks => "hooks",
             ConfigPageKind::Agents => "agents",
             ConfigPageKind::Backups => "backups",
+            ConfigPageKind::AppUpdate => "app-update",
         }
     }
 }
@@ -428,6 +430,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
             ConfigPageKind::Hooks => render_hooks_body(wb, &page, cx),
             ConfigPageKind::Agents => render_agents_body(wb, &page, cx),
             ConfigPageKind::Backups => render_backups_body(wb, &page, cx),
+            ConfigPageKind::AppUpdate => render_app_update_body(wb, &page, cx),
         }
     };
     column = column.child(body);
@@ -2167,8 +2170,432 @@ impl Workbench {
     }
 }
 
-
 // ---------------------------------------------------------------------------
+// App Update (ADR-0009) — src/screens/config/AppUpdatePage.tsx, desktop cut
+// ---------------------------------------------------------------------------
+
+/// One label/value line of the versions block (TS `ConfigRow`).
+fn update_row(label: &str, value: &str, theme: &component::Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_4()
+        .py(px(8.))
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .text_size(px(12.))
+                .text_color(theme.foreground)
+                .child(value.to_string()),
+        )
+}
+
+/// App Update's effective stage: the poll-adopted install block wins (TS
+/// `appUpdateInstall`); a busy install POST with no verdict yet is already
+/// downloading; anything else is idle.
+fn app_update_stage(page: &ConfigSectionPageView) -> &str {
+    if let Some(stage) = page
+        .install
+        .as_ref()
+        .and_then(|i| i.get("stage"))
+        .and_then(Value::as_str)
+    {
+        return stage;
+    }
+    if page.busy {
+        return "downloading";
+    }
+    "idle"
+}
+
+fn render_app_update_body(
+    wb: &Workbench,
+    page: &ConfigSectionPageView,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let runtime = wb.runtime.clone();
+    let mut list = section_list("app-update-list");
+    let info = page.payload.as_ref().and_then(|p| p.get("appUpdate"));
+    let str_of = |key: &str| {
+        info.and_then(|i| i.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let current = str_of("currentVersion").unwrap_or_else(|| "—".to_string());
+    let latest = str_of("latestVersion");
+    let available = info
+        .and_then(|i| i.get("updateAvailable"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Versions + the channel segment: the check names the channel, and the
+    // page's Refresh re-checks against the picked one (TS parity — the pick
+    // alone does not auto re-check).
+    let mut head = div().flex().flex_col();
+    head = head.child(update_row(&t!("zconfig.updateInstalled"), &current, theme));
+    head = head.child(update_row(
+        &t!("zconfig.updateLatest"),
+        latest.as_deref().unwrap_or("—"),
+        theme,
+    ));
+    if let Some(platform) = str_of("platform") {
+        head = head.child(update_row(&t!("zconfig.updatePlatform"), &platform, theme));
+    }
+    let stable = page.update_channel != "preview";
+    let rt_channel = runtime.clone();
+    head = head.child(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_4()
+            .py(px(8.))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("zconfig.updateChannel").into_owned()),
+            )
+            .child(
+                ButtonGroup::new("update-channel")
+                    .small()
+                    .child(
+                        Button::new("update-channel-stable")
+                            .label(t!("zconfig.updateChannelStable").into_owned())
+                            .selected(stable),
+                    )
+                    .child(
+                        Button::new("update-channel-preview")
+                            .label(t!("zconfig.updateChannelPreview").into_owned())
+                            .selected(!stable),
+                    )
+                    .on_click(move |clicks, _, _| {
+                        if let Some(&ix) = clicks.first() {
+                            rt_channel.send(UiCommand::SetUpdateChannel {
+                                channel: if ix == 0 { "stable" } else { "preview" }.to_string(),
+                            });
+                        }
+                    }),
+            ),
+    );
+    list = list.child(rows_card(theme).child(head));
+
+    // The verdict card's stage ladder (AppUpdatePage.tsx 134-227). The
+    // install artifact is `files[0]` — the check answers at most one.
+    let stage = app_update_stage(page);
+    let busy = stage == "downloading" || stage == "installing";
+    let artifact = info
+        .and_then(|i| i.get("files"))
+        .and_then(Value::as_array)
+        .and_then(|files| files.first());
+    let artifact_url = || {
+        artifact
+            .and_then(|f| f.get("url"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let body: AnyElement = if !available {
+        empty_card(&t!("zconfig.updateNone"), theme)
+    } else if busy {
+        let pct = page
+            .install
+            .as_ref()
+            .and_then(|i| {
+                let total = i.get("totalBytes").and_then(Value::as_f64);
+                let got = i.get("receivedBytes").and_then(Value::as_f64)?;
+                total.filter(|t| *t > 0.0).map(|t| (got / t * 100.0).min(100.0))
+            })
+            .map(|p| p as u32);
+        rows_card(theme)
+            .id("update-busy")
+            .test_support()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(if stage == "installing" {
+                        t!("zconfig.updateInstalling").into_owned()
+                    } else {
+                        t!("zconfig.updateDownloading").into_owned()
+                    }),
+            )
+            .when_some(pct, |card, pct| {
+                card.child(
+                    div()
+                        .w_full()
+                        .h(px(6.))
+                        .overflow_hidden()
+                        .rounded_full()
+                        .bg(white().opacity(0.08))
+                        .child(
+                            div()
+                                .id("update-progress")
+                                .test_support()
+                                .h_full()
+                                .rounded_full()
+                                .w(relative(pct as f32 / 100.0))
+                                .bg(white().opacity(0.3)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{pct}%")),
+                )
+            })
+            .into_any_element()
+    } else if stage == "done" {
+        rows_card(theme)
+            .id("update-done")
+            .test_support()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(0x6ee7b7))
+                    .child(fill(
+                        &t!("zconfig.updateDone"),
+                        &[("version", latest.as_deref().unwrap_or(""))],
+                    )),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("zconfig.updateRestartApp").into_owned()),
+            )
+            .into_any_element()
+    } else if stage == "needs-user-install" {
+        rows_card(theme)
+            .id("update-needs-user")
+            .test_support()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(0xfcd34d))
+                    .child(t!("zconfig.updateNeedsUser").into_owned()),
+            )
+            .when_some(
+                page.install
+                    .as_ref()
+                    .and_then(|i| i.get("artifactPath"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                |card, path| {
+                    card.child(
+                        div()
+                            .w_full()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(path),
+                    )
+                },
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("zconfig.updateNeedsUserHint").into_owned()),
+            )
+            .into_any_element()
+    } else if stage == "failed" {
+        rows_card(theme)
+            .id("update-failed")
+            .test_support()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(0xfca5a5))
+                    .child(t!("zconfig.updateFailed").into_owned()),
+            )
+            .when_some(
+                page.install
+                    .as_ref()
+                    .and_then(|i| i.get("error"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                |card, error| {
+                    card.child(
+                        div()
+                            .w_full()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(px(11.))
+                            .text_color(theme.muted_foreground)
+                            .child(error),
+                    )
+                },
+            )
+            .into_any_element()
+    } else if wb.update_confirm {
+        let wb_cancel = cx.entity();
+        let wb_fire = wb_cancel.clone();
+        let rt_install = runtime.clone();
+        let version = latest.clone().unwrap_or_default();
+        let url = artifact_url().unwrap_or_default();
+        let channel = page.update_channel.clone();
+        rows_card(theme)
+            .id("update-confirm")
+            .test_support()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.foreground)
+                    .child(fill(
+                        &t!("zconfig.updateConfirm"),
+                        &[("version", latest.as_deref().unwrap_or(""))],
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        Button::new("update-confirm-cancel")
+                            .ghost()
+                            .xsmall()
+                            .flex_1()
+                            .label(t!("common.cancel").into_owned())
+                            .on_click(move |_, _, cx| {
+                                wb_cancel.update(cx, |this, cx| {
+                                    this.update_confirm = false;
+                                    cx.notify();
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("update-confirm-install")
+                            .secondary()
+                            .xsmall()
+                            .flex_1()
+                            .label(t!("zconfig.updateInstall").into_owned())
+                            .on_click(move |_, _, cx| {
+                                wb_fire.update(cx, |this, cx| {
+                                    this.update_confirm = false;
+                                    cx.notify();
+                                });
+                                rt_install.send(UiCommand::InstallAppUpdate {
+                                    version: version.clone(),
+                                    url: url.clone(),
+                                    channel: channel.clone(),
+                                });
+                            }),
+                    ),
+            )
+            .into_any_element()
+    } else {
+        // Idle with an update on offer: the install gesture. Arming needs
+        // both halves (the version and the artifact URL) — a check that
+        // answered "available" without them cannot be installed, and a
+        // dead button that explains nothing is worse than a disabled one.
+        let wb_arm = cx.entity();
+        let armed = latest.is_some() && artifact_url().is_some();
+        rows_card(theme)
+            .id("update-available")
+            .test_support()
+            .px_4()
+            .py_4()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                Button::new("update-install")
+                    .secondary()
+                    .xsmall()
+                    .w_full()
+                    .icon(KitIconName::Download)
+                    .label(t!("zconfig.updateInstall").into_owned())
+                    .disabled(!armed)
+                    .on_click(move |_, _, cx| {
+                        wb_arm.update(cx, |this, cx| {
+                            this.update_confirm = true;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(fill(
+                        &t!("zconfig.updateSize"),
+                        &[(
+                            "size",
+                            artifact
+                                .and_then(|f| f.get("size"))
+                                .and_then(Value::as_f64)
+                                .map(|s| format!("{}MB", (s / 1_000_000.0).round() as u64))
+                                .as_deref()
+                                .unwrap_or("—"),
+                        )],
+                    )),
+            )
+            .into_any_element()
+    };
+    list = list.child(body);
+
+    if let Some(notes) = str_of("releaseNotes").filter(|n| !n.trim().is_empty()) {
+        list = list.child(
+            rows_card(theme)
+                .child(
+                    div()
+                        .px_4()
+                        .pt_3()
+                        .pb_1()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(t!("zconfig.updateNotes").into_owned()),
+                )
+                .child(
+                    div()
+                        .id("update-notes")
+                        .test_support()
+                        .px_4()
+                        .pb_3()
+                        .text_size(px(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(notes),
+                ),
+        );
+    }
+    list.into_any_element()
+}
+
+
 // Tests — the chip_tests paradigm (workbench.rs): explicit imports, an
 // inert runtime, a real Workbench in a headless window, element-id
 // assertions, and real clicks whose UiCommands land in
@@ -2208,6 +2635,8 @@ mod zconfig_page_tests {
             payload: Some(payload),
             busy: false,
             models: None,
+            update_channel: "stable".to_string(),
+            install: None,
         });
         snap
     }
@@ -2574,4 +3003,170 @@ mod zconfig_page_tests {
         .unwrap();
     }
 
+    fn app_update_payload() -> serde_json::Value {
+        serde_json::json!({
+            "ok": true,
+            "appUpdate": {
+                "updateAvailable": true,
+                "currentVersion": "0.32.5",
+                "latestVersion": "0.33.0",
+                "platform": "darwin-arm64",
+                "releaseNotes": "Fixes.",
+                "files": [
+                    { "url": "https://dist/zcode-0.33.0.tgz",
+                      "sha512": "abc", "size": 24_000_000 }
+                ]
+            }
+        })
+    }
+
+    /// F: the App Update page's install gesture is two-step (Install →
+    /// confirm → InstallAppUpdate naming the checked channel), the channel
+    /// segment stores the pick, and the stage ladder paints the poll's
+    /// outcomes (progress / done / failed).
+    #[gpui_kit::test]
+    fn app_update_confirm_channel_and_stages(cx: &mut TestAppContext) {
+        let _windows = window_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let (handle, _content) = cx.update(|cx| {
+            let runtime = runtime.clone();
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size { width: px(800.), height: px(600.) },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        Workbench::new(
+                            window,
+                            cx,
+                            runtime,
+                            section_snapshot(ConfigPageKind::AppUpdate, app_update_payload()),
+                        )
+                    })
+                },
+            )
+            .expect("open test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            // Idle with an update on offer: the install gesture, disabled
+            // never here (the check carries the artifact halves).
+            assert!(window.find("update-install").visible());
+            window.click("update-install", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("update-confirm").visible());
+            assert!(runtime.recorded_commands().is_empty());
+            window.click("update-confirm-install", cx);
+            let sent = runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(
+                    c,
+                    UiCommand::InstallAppUpdate { version, url, channel }
+                        if version == "0.33.0"
+                            && url == "https://dist/zcode-0.33.0.tgz"
+                            && channel == "stable"
+                )),
+                "the confirm must fire the install, got {sent:?}"
+            );
+            // The channel segment stores the pick (no auto re-check).
+            window.click("update-channel-preview", cx);
+            assert!(
+                runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::SetUpdateChannel { channel } if channel == "preview"
+                )),
+                "the segment must dispatch the pick, got {:?}",
+                runtime.recorded_commands()
+            );
+        })
+        .unwrap();
+
+        // The poll's in-flight block: the progress bar replaces the button.
+        let (handle, _content) = cx.update(|cx| {
+            let runtime = runtime.clone();
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size { width: px(800.), height: px(600.) },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        let mut snap =
+                            section_snapshot(ConfigPageKind::AppUpdate, app_update_payload());
+                        snap.config_section_page.as_mut().unwrap().install = Some(
+                            serde_json::json!({
+                                "stage": "downloading",
+                                "receivedBytes": 12_000_000,
+                                "totalBytes": 24_000_000
+                            }),
+                        );
+                        Workbench::new(window, cx, runtime, snap)
+                    })
+                },
+            )
+            .expect("open test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("update-busy").visible());
+            assert!(window.find("update-progress").visible());
+            assert!(window.try_find("update-install").is_none());
+        })
+        .unwrap();
+
+        // done → the emerald card; failed → the red one with its error.
+        for (stage, card) in [
+            ("done", "update-done"),
+            ("failed", "update-failed"),
+        ] {
+            let (handle, _content) = cx.update(|cx| {
+                let runtime = runtime.clone();
+                let stage = stage.to_string();
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds {
+                            origin: Point::default(),
+                            size: Size { width: px(800.), height: px(600.) },
+                        })),
+                        ..Default::default()
+                    },
+                    cx,
+                    |window, cx| {
+                        cx.new(|cx| {
+                            let mut snap = section_snapshot(
+                                ConfigPageKind::AppUpdate,
+                                app_update_payload(),
+                            );
+                            snap.config_section_page.as_mut().unwrap().install = Some(
+                                serde_json::json!({ "stage": stage, "error": "boom" }),
+                            );
+                            Workbench::new(window, cx, runtime, snap)
+                        })
+                    },
+                )
+                .expect("open test window")
+            });
+            cx.update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                assert!(
+                    window.find(card).visible(),
+                    "stage {stage:?} must paint its card"
+                );
+            })
+            .unwrap();
+        }
+    }
 }

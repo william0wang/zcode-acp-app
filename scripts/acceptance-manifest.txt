@@ -15,10 +15,14 @@ hub-bootstrap :: Hub bootstrap (probe/spawn race, token, remote config) :: rust:
 servers-book :: Connection profile book (switch, two-click remove, add form) :: rust:accept_settings_servers_entries_and_gate
 
 # ---- desktop: chat ----
+chat-diff-view :: Tool-card file diffs (unified rows, truncation notice) :: rust:tool_call_diff_blocks_render_unified_view,rust:middle_edit_keeps_context,rust:created_file_is_all_adds,rust:deleted_file_is_all_dels,rust:common_prefix_and_suffix_skip_the_dp,rust:oversized_sides_cap_and_flag
 new-session-chooser :: New-session chooser (projects, filter, browse, create) :: rust:accept_new_session_chooser_browse_and_create,rust:project_filter_narrows_and_shows_no_match
 chat-stop-pending :: Esc stop + pending queue (send now / edit / discard) :: rust:accept_running_turn_stop_and_pending_queue,rust:pending_store
+config-page-esc :: Esc closes an open config page before cancelling the turn :: rust:accept_config_page_esc_closes_before_cancel
+session-badge-ladder :: Activity badge ladder (awaiting > running > finished > idle, REST fallback) :: rust:session_badge_dot_ladder,rust:session_badge_finished_window,rust:session_finished_chip_paints_and_expires
 thought-card :: Thought card folding (auto + manual) :: rust:accept_thought_card_folding
 config-chips :: Model/mode/thought chips :: rust:config_chips_render_and_pick
+session-panel :: Right session panel (config pickers, turn stats, workflows entry, quota card) :: rust:accept_session_panel_stats_config_and_quota
 display-details :: Title stats, tool cards, plan bar, copy, notice chips :: rust:title_stats_render_in_status_bar,rust:tool_call_expands_detail,rust:plan_bar_collapses_and_lists_entries,rust:copy_buttons_write_clipboard_and_notice_chip_has_none,rust:task_notification_parses_status_and_summary,rust:token_formatting_matches_the_tui_dock,rust:context_gauge_clamps_and_formats
 session-mgmt :: Session rename / end / delete tombstone :: rust:session_row_rename_sheet_prefills_and_saves,rust:session_row_menu_ends_session,rust:history_row_menu_deletes_tombstone
 slash-commands :: Slash command menu (filter, keys, dismissal) :: rust:slash_menu_filters_and_click_commits,rust:slash_menu_keys_navigate_commit_and_remember_dismissal,rust:token_scan_takes_the_word_around_the_caret,rust:matcher_strips_the_dollar_on_both_sides,rust:caret_park_counts_lines_and_characters
@@ -26,7 +30,7 @@ media :: Image lightbox + file preview :: rust:message_image_click_opens_lightbo
 
 # ---- desktop: files ----
 files-panel :: Session files browser (listing, hidden toggle, breadcrumb, Finder) :: rust:files_panel_browses_and_toggles_hidden,rust:files_breadcrumb_navigates_to_prefix,rust:files_panel_notes_capability_gap_without_seeding,rust:path_helpers_join_strip_and_name,rust:kind_ladder_matches_the_ts_viewer,rust:size_formatting_matches_the_ts_viewer,rust:loopback_ladder_takes_host_only
-file-viewer :: Text viewer + local open/reveal buttons :: rust:file_viewer_renders_text_and_closes,rust:accept_file_viewer_local_buttons_follow_loopback,rust:display_lines_pad_empty_and_chop_mega_lines,rust:viewer_windows_never_exceed_the_server_cap,rust:stitch_probes_only_while_a_full_window_left_budget
+file-viewer :: Text viewer, markdown preview toggle, local open/reveal buttons :: rust:file_viewer_renders_text_and_closes,rust:markdown_ladder_matches_the_ts_viewer,rust:accept_file_viewer_local_buttons_follow_loopback,rust:display_lines_pad_empty_and_chop_mega_lines,rust:viewer_windows_never_exceed_the_server_cap,rust:stitch_probes_only_while_a_full_window_left_budget
 
 # ---- desktop: settings & config pages ----
 persistence-locale :: Pending queue on disk + language switch + ui prefs :: rust:pending_store,rust:language_segment_switches_chrome,rust:stored_locales_normalize_onto_the_catalogs
@@ -34,6 +38,8 @@ config-five-pages :: Skills / MCP / Hooks / Agents / Backups pages :: rust:skill
 models-page :: Models page (list, context windows, form) :: rust:accept_models_usage_quota_pages,rust:models_builds_picker_options,rust:models_joins_the_context_window,rust:models_labels_models_the_way
 usage-page :: Usage page (platform + local tabs) :: rust:accept_models_usage_quota_pages,rust:usage_treats_a_machine_with_no_agent_database,rust:usage_unwraps_the_section,rust:window_usage_reads_the_cards_own_window
 quota-page :: Plan quota page (windows, reset cards, spend) :: rust:accept_models_usage_quota_pages,rust:quota_page,rust:reset_card,rust:threshold_
+quota-card :: Side panels' quota card (GLM / Go / Ollama / CLIProxy, refresh) :: rust:accept_settings_servers_entries_and_gate,rust:accept_session_panel_stats_config_and_quota
+app-update-page :: App update page (channel, confirm+install, stage ladder) + hub upgrade check :: rust:app_update_confirm_channel_and_stages,rust:accept_settings_servers_entries_and_gate
 system-status :: System status page :: rust:system_status
 
 # ---- desktop: workflows ----
@@ -77,4 +83,3 @@ mobile-workflows-store :: Mobile workflows store :: vitest:workflows-store
 mobile-types :: Mobile typecheck (tsc --noEmit) :: step:tsc
 build-macos :: macOS release build (dist/ZCode-acp.app) :: step:build
 smoke-launch :: Smoke: launch the built app and quit cleanly :: step:smoke
-pixel-golden :: Pixel golden: fixture windows self-captured and diffed vs committed baselines :: step:golden

@@ -65,12 +65,13 @@ use protocol::settings::{
 };
 use protocol::hub::{
     FsBrowseResult, FsEntryKind, FsListing, HubCreateInstanceResult, HubHistoryCursor,
-    HubHistoryPage, HubHistorySession, HubInstance, HubProject,
+    HubHistoryPage, HubHistorySession, HubInstance, HubProject, HubUpgradeResult,
 };
 use protocol::hub_client::{HubApiError, HubClient};
 use protocol::session::{LoadEarlierRequest, PromptRequest, SessionCore, WireRequest};
 use protocol::settings::BackendRestartResult;
 use protocol::settings_client::{HubApiError as SettingsApiError, HubHttpClient};
+use rust_i18n::t;
 use protocol::system_stats::SystemStatsResponse;
 use protocol::toast::{Toast, ToastState};
 use protocol::ws::{TungsteniteWsFactory, WsFactory};
@@ -133,6 +134,13 @@ const WORKFLOW_DETAIL_POLL_MS: u64 = 5_000;
 /// The active-session conversationRuns poll cadence (TS ActiveRunsBlock's
 /// 5s interval): the third session-resolution ladder's map refresh.
 const WORKFLOW_SESSION_RUNS_POLL_MS: u64 = 5_000;
+/// App Update progress poll cadence while the hub downloads (TS
+/// AppUpdatePage's 2s `pollAppUpdate`): the download runs in the hub, and
+/// the only channel back is the same GET that reports the check.
+const APP_UPDATE_POLL_MS: u64 = 2_000;
+/// How long the hub-upgrade verdict note stays (TS SidePanel's 5s
+/// `setTimeout(() => setUpgradeNote(null))`).
+const HUB_UPGRADE_NOTE_MS: u64 = 5_000;
 
 /// Env-gated stderr trace for the driver lifecycle (ZCODE_ACP_TRACE=1) —
 /// the slice's connection story, observable without a debugger.
@@ -187,6 +195,36 @@ pub enum UiCommand {
     },
     /// Remove a saved server; removing the active one falls back to local.
     RemoveServer { id: String },
+    /// Edit a saved server in place (TS `saveServer`, appStore.ts:1696):
+    /// keep the active id; editing the ACTIVE server restarts the dial so
+    /// the new URL/token takes effect immediately.
+    UpdateServer {
+        id: String,
+        name: String,
+        hub_url: String,
+        token: String,
+    },
+    /// The config dock's hub staleness check (TS SettingsPanel
+    /// `checkHubUpgrade`, POST /api/upgrade): the hub alone decides whether
+    /// to restart onto newer on-disk code; discovery's poll and the tabs'
+    /// reconnect ride out the respawn.
+    UpgradeHub,
+    /// The App Update page's channel segment (TS `setUpdateChannel`):
+    /// persisted (the TS `saveUpdateChannel`), and while the page is open
+    /// the check re-runs for the new stream — the stored verdict was read
+    /// for the OTHER channel, and an install must name the stream the
+    /// offered version came from.
+    SetUpdateChannel { channel: String },
+    /// The App Update page's confirmed install (TS `installAppUpdate`, ADR
+    /// 0009): the hub downloads + verifies the artifact itself; this app
+    /// only watches the outcome. The channel travels with the request — the
+    /// route refuses a version that is not the latest on the channel it is
+    /// told.
+    InstallAppUpdate {
+        version: String,
+        url: String,
+        channel: String,
+    },
     /// Empty-composer Enter with a queued follow-up: interrupt the running
     /// turn and send the queue head (ChatView.tsx `forceSendPending`).
     ForceSendPending,
@@ -564,9 +602,10 @@ pub enum RuntimeEvent {
     ComposerPrefill(protocol::chat::PromptDraft),
 }
 
-/// The five ZCode-config section pages (batch I, requirements §7): one
+/// The six ZCode-config section pages (batch I, requirements §7): one
 /// shared panel shape — every one is a section read plus writes through the
-/// applyConfigWrite path (effect class surfaced, section reloaded).
+/// applyConfigWrite path (effect class surfaced, section reloaded). App
+/// Update (ADR-0009) rides the same shape: its "write" is the install.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigPageKind {
     Skills,
@@ -574,10 +613,18 @@ pub enum ConfigPageKind {
     Hooks,
     Agents,
     Backups,
+    AppUpdate,
 }
 
 impl ConfigPageKind {
-    pub const ALL: [Self; 5] = [Self::Skills, Self::Mcp, Self::Hooks, Self::Agents, Self::Backups];
+    pub const ALL: [Self; 6] = [
+        Self::Skills,
+        Self::Mcp,
+        Self::Hooks,
+        Self::Agents,
+        Self::Backups,
+        Self::AppUpdate,
+    ];
 
     fn index(self) -> usize {
         match self {
@@ -586,6 +633,7 @@ impl ConfigPageKind {
             Self::Hooks => 2,
             Self::Agents => 3,
             Self::Backups => 4,
+            Self::AppUpdate => 5,
         }
     }
 
@@ -597,6 +645,7 @@ impl ConfigPageKind {
             Self::Hooks => "zconfig.hooks",
             Self::Agents => "zconfig.agents",
             Self::Backups => "zconfig.backups",
+            Self::AppUpdate => "zconfig.appUpdate",
         }
     }
 }
@@ -677,6 +726,16 @@ pub struct SessionRow {
     /// Session Activity `awaiting confirmation` badge (a pending
     /// permission/elicitation ask on one of the tabs).
     pub awaiting: bool,
+    /// Session Activity `finishedAt` (ms) — the TS badge's just-finished
+    /// window is a 60s freshness check at paint time.
+    pub finished_at: Option<u64>,
+    /// The discovery row's REST `status == "running"` — the heartbeat
+    /// fallback (ADR-0005), shown only when NO broadcast activity entry
+    /// exists for the row.
+    pub rest_running: bool,
+    /// Whether any tab's Session Activity map holds this session (the TS
+    /// `!activity` gate in front of the restRunning fallback).
+    pub activity_known: bool,
     /// The tab already holding this session, if any.
     pub open_tab: Option<u64>,
 }
@@ -939,6 +998,18 @@ pub struct QuotaPageView {
     pub now_ms: u64,
 }
 
+/// The side panels' account quota card (TS QuotaSection): the combined
+/// multi-provider allowance, shared by the config dock and the session
+/// panel. The same driver state the plan-quota page reads (TS keeps ONE
+/// `usageStats` store field for all three surfaces), so the card repaints
+/// whenever a refresh lands from any of them.
+#[derive(Debug, Clone, Default)]
+pub struct QuotaCardView {
+    pub usage: Option<AccountUsageStats>,
+    pub quota_unavailable: bool,
+    pub usage_stats_at: Option<u64>,
+}
+
 /// The Session Files browser's view (batch F, TS FileBrowser): one loaded
 /// directory of the ACTIVE session, plus the open viewer. The listing
 /// survives a panel close; a session switch resets it driver-side.
@@ -995,6 +1066,13 @@ pub struct ConfigSectionPageView {
     /// seeded on open because the agents section does not carry it. `None`
     /// for every other kind.
     pub models: Option<ModelsPayload>,
+    /// App Update only: the release channel the page's check names (TS
+    /// `updateChannel`).
+    pub update_channel: String,
+    /// App Update only (TS `appUpdateInstall`): the install block the
+    /// progress poll adopts; `None` until a poll carries one or an install
+    /// POST fails.
+    pub install: Option<Value>,
 }
 
 /// The Workflows page (batch J): the hub's machine-level overview rendered
@@ -1161,6 +1239,9 @@ pub struct WorkbenchSnapshot {
     /// The plan-quota config page; `None` = closed (a full page of its own,
     /// like every config section — ADR-0009).
     pub quota_page: Option<QuotaPageView>,
+    /// The side panels' quota card (TS QuotaSection): always present — the
+    /// config dock and the session panel both render it while they are up.
+    pub quota_card: QuotaCardView,
     /// Config-screen notice (TS `notice`): a `notice.*` i18n key or plain
     /// failure text, rendered by every config page's frame.
     pub config_notice: Option<String>,
@@ -1193,6 +1274,10 @@ pub struct WorkbenchSnapshot {
     /// the page's own `action_instance` is `None` on every real open (the
     /// TS store writes the active session's instance, page-independent).
     pub active_instance: Option<String>,
+    /// The config dock's hub-upgrade check (TS SettingsPanel): in flight, and
+    /// the last verdict's display text.
+    pub hub_upgrade_busy: bool,
+    pub hub_upgrade_note: Option<String>,
 }
 
 impl WorkbenchSnapshot {
@@ -1213,6 +1298,7 @@ impl WorkbenchSnapshot {
             models_page: None,
             usage_page: None,
             quota_page: None,
+            quota_card: QuotaCardView::default(),
             config_notice: None,
             pending_restart: false,
             servers: Vec::new(),
@@ -1224,6 +1310,8 @@ impl WorkbenchSnapshot {
             workflow_gate: None,
             workflow_gate_busy: false,
             active_instance: None,
+            hub_upgrade_busy: false,
+            hub_upgrade_note: None,
         }
     }
 }
@@ -1420,12 +1508,26 @@ enum LoopEvent {
         reload: &'static [ConfigPageKind],
         result: Result<WriteEffect, SettingsApiError>,
     },
+    /// POST /api/upgrade settled — the hub's own staleness verdict.
+    HubUpgraded(Result<HubUpgradeResult, SettingsApiError>),
+    /// POST …/app-update/install settled: the POST's body is discarded (TS
+    /// does the same), so this only signals completion vs transport failure.
+    AppUpdateInstalled(Result<(), SettingsApiError>),
+    /// The install progress poll settled (TS `pollAppUpdate`): the check
+    /// GET's answer, whose `appUpdate.install` block is the only install
+    /// state there is.
+    AppUpdatePolled(Result<Value, SettingsApiError>),
     // ---- Workflows page + gate (batch J) ----
     /// The overview read settled (the page's poll and manual refresh).
     WorkflowOverview(Result<WorkflowOverviewResponse, SettingsApiError>),
     /// The gate probe settled (`/settings/all`'s workflow block, per the
     /// asking instance). `Ok(None)` = an older bridge without the block.
-    WorkflowGateProbed(Result<Option<WorkflowGateBlock>, SettingsApiError>),
+    /// Carries the instance so a probe from before an instance switch can't
+    /// answer for the current one.
+    WorkflowGateProbed {
+        instance_id: String,
+        result: Result<Option<WorkflowGateBlock>, SettingsApiError>,
+    },
     /// PUT /settings/workflow-gate settled.
     WorkflowGateSet(Result<WorkflowGateSetResponse, SettingsApiError>),
     /// GET …/workflows/{scope}/{name} settled for the open detail page.
@@ -1637,10 +1739,10 @@ impl ProtocolRuntime {
         let _ = self.cmd_tx.send(cmd);
     }
 
-    /// An inert handle with no driver thread (window-layer tests, and the
-    /// golden-fixture screenshot mode): `send` still works but nothing
-    /// consumes it, and `recorded_commands` (tests only) still shows every
-    /// `send`.
+    /// An inert handle with no driver thread (window-layer tests): `send`
+    /// still works but nothing consumes it, and `recorded_commands`
+    /// (tests only) still shows every `send`.
+    #[cfg(test)]
     pub fn inert() -> Self {
         let (cmd_tx, _rx) = unbounded_channel();
         Self {
@@ -2013,6 +2115,10 @@ struct ConfigSectionPanel {
     payload: Option<Value>,
     /// A write from this page is in flight.
     busy: bool,
+    /// App Update only (TS `appUpdateInstall`): the install POST's outcome
+    /// block. Wins over the payload's in-flight `install` block while set;
+    /// cleared when a new install starts so the poll's progress shows.
+    install: Option<Value>,
 }
 
 impl ConfigSectionPanel {
@@ -2025,6 +2131,7 @@ impl ConfigSectionPanel {
         self.error = None;
         self.payload = None;
         self.busy = false;
+        self.install = None;
     }
 }
 
@@ -2298,9 +2405,22 @@ struct Driver {
     quota: QuotaPanel,
     /// The Usage config page (see [`UsagePanel`]).
     usage: UsagePanel,
-    /// The five ZCode-config section pages (batch I, see
+    /// The six ZCode-config section pages (batch I, see
     /// [`ConfigSectionPanel`]), indexed by [`ConfigPageKind::index`]).
-    sections: [ConfigSectionPanel; 5],
+    sections: [ConfigSectionPanel; 6],
+    /// The App Update page's release channel (TS `updateChannel`): the
+    /// persisted pick (ui-prefs), stable by default — the check names it.
+    update_channel: String,
+    /// POST /api/upgrade in flight (the config dock's check button).
+    hub_upgrade_busy: bool,
+    /// The last hub-upgrade verdict as display text (TS `upgradeNote`);
+    /// cleared by the next check or by its 5s timer (the TS effect).
+    hub_upgrade_note: Option<String>,
+    /// Epoch-ms when the hub-upgrade note auto-clears.
+    hub_upgrade_note_until: u64,
+    /// Epoch-ms when the App Update progress poll fires next while an
+    /// install runs (TS AppUpdatePage's 2s `pollAppUpdate` interval).
+    next_app_update_poll_at: u64,
     /// The Workflows page + gate (batch J, see [`WorkflowsPanel`]).
     workflows: WorkflowsPanel,
     /// Config-screen notice (TS `notice`): `notice.*` i18n key or plain text.
@@ -2372,6 +2492,13 @@ impl Driver {
             },
             usage: UsagePanel::new(),
             sections: Default::default(),
+            update_channel: crate::ui_prefs::load_update_channel()
+                .unwrap_or(crate::ui_prefs::CHANNEL_STABLE)
+                .to_string(),
+            hub_upgrade_busy: false,
+            hub_upgrade_note: None,
+            hub_upgrade_note_until: 0,
+            next_app_update_poll_at: 0,
             workflows: WorkflowsPanel::default(),
             config_notice: None,
             pending_restart: false,
@@ -3225,6 +3352,7 @@ impl Driver {
         panel.error = None;
         let hub = self.settings_client();
         let tx = self.loop_tx.clone();
+        let channel = self.update_channel.clone();
         tokio::spawn(async move {
             let result = match page {
                 ConfigPageKind::Skills => hub.settings_skills().await,
@@ -3232,6 +3360,9 @@ impl Driver {
                 ConfigPageKind::Hooks => hub.settings_hooks().await,
                 ConfigPageKind::Agents => hub.settings_agents().await,
                 ConfigPageKind::Backups => hub.settings_backups().await,
+                // The check names the channel (TS `settingsAppUpdate(
+                // updateChannel)`).
+                ConfigPageKind::AppUpdate => hub.settings_app_update(Some(&channel)).await,
             };
             let _ = tx.send(LoopEvent::ConfigSectionLoaded { page, result });
         });
@@ -3282,6 +3413,77 @@ impl Driver {
             Err(e) => {
                 panel.error = Some(e.to_string());
             }
+        }
+    }
+
+    /// POST /api/upgrade settled — the TS SettingsPanel note: restarted onto
+    /// the disk version, or already the latest; a failure shows its message.
+    /// The respawn itself needs no handling here: discovery's poll and the
+    /// tabs' reconnect ride it out.
+    fn on_hub_upgraded(&mut self, result: Result<HubUpgradeResult, SettingsApiError>) {
+        self.hub_upgrade_busy = false;
+        self.hub_upgrade_note_until = self.clock.now_ms() + HUB_UPGRADE_NOTE_MS;
+        self.hub_upgrade_note = Some(match result {
+            Ok(r) if r.restarting => crate::i18n::fill(
+                &t!("panel.upgradeRestarted"),
+                &[("version", r.disk_version.as_deref().unwrap_or(""))],
+            ),
+            Ok(r) => crate::i18n::fill(
+                &t!("panel.upgradeLatest"),
+                &[("version", r.running_version.as_str())],
+            ),
+            Err(e) => e.to_string(),
+        });
+    }
+
+    /// POST …/app-update/install settled (ADR 0009). The POST's body is
+    /// discarded — the install state lives in the check GET's
+    /// `appUpdate.install` block, so the settle immediately polls (a
+    /// blocking-POST bridge answers with the final stage already in place;
+    /// a background-download one shows progress the tick then refreshes).
+    /// A transport failure becomes the failed stage: the screen must show
+    /// WHICH step gave up.
+    fn on_app_update_installed(&mut self, result: Result<(), SettingsApiError>) {
+        self.sections[ConfigPageKind::AppUpdate.index()].busy = false;
+        match result {
+            Ok(()) => self.spawn_app_update_poll(),
+            Err(e) => {
+                self.sections[ConfigPageKind::AppUpdate.index()].install =
+                    Some(json!({ "stage": "failed", "error": e.to_string() }));
+            }
+        }
+    }
+
+    /// The App Update progress poll (TS `pollAppUpdate`): the same GET the
+    /// check runs, named for the same channel. Silent by design — it never
+    /// touches the section payload or its loading/error story; a failure
+    /// waits for the next tick.
+    fn spawn_app_update_poll(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        let channel = self.update_channel.clone();
+        tokio::spawn(async move {
+            let result = hub.settings_app_update(Some(&channel)).await;
+            let _ = tx.send(LoopEvent::AppUpdatePolled(result));
+        });
+    }
+
+    /// The install poll settled: adopt the `appUpdate.install` block when
+    /// the answer carries one (TS sets `appUpdateInstall` only then), leave
+    /// the last verdict otherwise.
+    fn on_app_update_polled(&mut self, result: Result<Value, SettingsApiError>) {
+        let block = result
+            .ok()
+            .and_then(|v| v.get("appUpdate").and_then(|a| a.get("install")).cloned())
+            .filter(|b| b.is_object());
+        if let Some(block) = block {
+            self.sections[ConfigPageKind::AppUpdate.index()].install = Some(block);
         }
     }
 
@@ -3513,7 +3715,7 @@ impl Driver {
                 .instance_settings_all(&instance_id)
                 .await
                 .map(|all| all.workflow);
-            let _ = tx.send(LoopEvent::WorkflowGateProbed(result));
+            let _ = tx.send(LoopEvent::WorkflowGateProbed { instance_id, result });
         });
     }
 
@@ -3555,13 +3757,20 @@ impl Driver {
         }
     }
 
-    /// The probe settled: the block lands; a missing block (an older
+    /// The probe settled: only the current active instance's answer may
+    /// land — an in-flight probe from a pre-switch instance would pin a
+    /// wrong verdict, and every re-probe path requires `gate.is_none()`,
+    /// so a wrong answer would stick for good. A missing block (an older
     /// bridge) or a failure keeps the verdict unknown (fail-closed reads
     /// "auto" in the switch row).
     fn on_workflow_gate_probed(
         &mut self,
+        instance_id: String,
         result: Result<Option<WorkflowGateBlock>, SettingsApiError>,
     ) {
+        if self.active_instance_id().as_deref() != Some(instance_id.as_str()) {
+            return;
+        }
         if let Ok(Some(gate)) = result {
             self.workflows.gate = Some(gate);
         }
@@ -3876,8 +4085,14 @@ impl Driver {
         self.workflows.busy = false;
         match result {
             Ok(_) => {
+                // Resume success leaves the workflows surface entirely (TS
+                // closes the config page and opens the session) — drop the
+                // run sub-page too, or reopening Workflows would render the
+                // stale run instead of the overview (CloseWorkflows parity).
                 self.workflows.open = false;
                 self.workflows.detail = None;
+                self.workflows.run = None;
+                self.workflows.workflow_seq += 1;
                 self.open_session_by_id(session_id, instance_id);
             }
             Err(e) => {
@@ -4967,10 +5182,32 @@ impl Driver {
         }
         // Toast auto-clear (the notify timer's body).
         self.toast.expire(now);
+        // The hub-upgrade note's 5s timer (TS SidePanel's effect).
+        if self.hub_upgrade_note.is_some() && now >= self.hub_upgrade_note_until {
+            self.hub_upgrade_note = None;
+        }
         // The System Status page's 5s poll (TS `setInterval(loadSystemStats,
         // POLL_MS)`) — live only while the page is open.
         if self.system.open && now >= self.system.next_poll_at {
             self.spawn_system_stats(now);
+        }
+        // The App Update progress poll (TS AppUpdatePage's 2s interval —
+        // live while the install flies). Wider than TS's `busy`-derived
+        // interval on purpose: the POST itself can block for the whole
+        // download, so the poll also runs while it is in flight, and a page
+        // re-opened mid-download resumes polling instead of showing a
+        // frozen verdict.
+        let au = &self.sections[ConfigPageKind::AppUpdate.index()];
+        let au_flying = au.open
+            && (au.busy
+                || au.install
+                    .as_ref()
+                    .and_then(|i| i.get("stage"))
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| s == "downloading" || s == "installing"));
+        if au_flying && now >= self.next_app_update_poll_at {
+            self.next_app_update_poll_at = now + APP_UPDATE_POLL_MS;
+            self.spawn_app_update_poll();
         }
         // The Workflows page's adaptive overview poll (TS WorkflowsPage
         // 5s-live / 30s-idle): a journal row can be terminal-and-wrong, so
@@ -5729,9 +5966,14 @@ impl Driver {
                 reload,
                 result,
             } => self.on_config_write_settled(page, label, reload, result),
+            LoopEvent::HubUpgraded(result) => self.on_hub_upgraded(result),
+            LoopEvent::AppUpdateInstalled(result) => self.on_app_update_installed(result),
+            LoopEvent::AppUpdatePolled(result) => self.on_app_update_polled(result),
             // ---- Workflows page + gate (batch J) ----
             LoopEvent::WorkflowOverview(result) => self.on_workflow_overview(result),
-            LoopEvent::WorkflowGateProbed(result) => self.on_workflow_gate_probed(result),
+            LoopEvent::WorkflowGateProbed { instance_id, result } => {
+                self.on_workflow_gate_probed(instance_id, result)
+            }
             LoopEvent::WorkflowGateSet(result) => self.on_workflow_gate_set(result),
             LoopEvent::WorkflowDetailLoaded { seq, result } => {
                 self.on_workflow_detail_loaded(seq, result);
@@ -5941,6 +6183,94 @@ impl Driver {
                     // same (TS deleteServer's `savePending({})`).
                     self.pending.reset();
                     return Flow::Restart;
+                }
+            }
+            UiCommand::UpdateServer {
+                id,
+                name,
+                hub_url,
+                token,
+            } => {
+                // TS saveServer: replace by id without touching active_id;
+                // only an edit of the ACTIVE server reconnects.
+                let was_active = self.book.active_id.as_deref() == Some(id.as_str());
+                if let Some(i) = self.book.servers.iter().position(|s| s.id == id) {
+                    let hub_url = hub_url.trim().trim_end_matches('/').to_string();
+                    self.book.servers[i] = protocol::hub::SavedServer {
+                        id,
+                        name: name.trim().to_string(),
+                        hub_url,
+                        token,
+                    };
+                    if let Err(e) = self.book.save(&protocol::profiles::servers_path()) {
+                        traceln!("[driver] server book save failed: {e}");
+                    }
+                    if was_active {
+                        // The live dial still points at the old URL/token —
+                        // restart so the edit takes effect now (TS routes
+                        // through switchServer for the same reason).
+                        self.pending.reset();
+                        return Flow::Restart;
+                    }
+                }
+            }
+            UiCommand::UpgradeHub => {
+                if !self.hub_upgrade_busy
+                    && matches!(
+                        self.phase,
+                        Phase::Discovering | Phase::Connected | Phase::Reconnecting
+                    )
+                {
+                    self.hub_upgrade_busy = true;
+                    self.hub_upgrade_note = None;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.upgrade_hub().await;
+                        let _ = tx.send(LoopEvent::HubUpgraded(result));
+                    });
+                }
+            }
+            UiCommand::SetUpdateChannel { channel } => {
+                if self.update_channel != channel {
+                    crate::ui_prefs::store_update_channel(&channel);
+                    self.update_channel = channel;
+                    // TS configSlice `setUpdateChannel`: the open page
+                    // refetches so it never shows the other stream's verdict
+                    // (and an install never pairs stable's version with
+                    // `channel: preview`, which the route refuses).
+                    if self.sections[ConfigPageKind::AppUpdate.index()].open {
+                        self.spawn_config_section_load(ConfigPageKind::AppUpdate);
+                    }
+                }
+            }
+            UiCommand::InstallAppUpdate {
+                version,
+                url,
+                channel,
+            } => {
+                let panel = &mut self.sections[ConfigPageKind::AppUpdate.index()];
+                if !panel.busy
+                    && matches!(
+                        self.phase,
+                        Phase::Discovering | Phase::Connected | Phase::Reconnecting
+                    )
+                {
+                    panel.busy = true;
+                    // A fresh install clears the last outcome so the poll's
+                    // in-flight progress (the payload's `install` block)
+                    // paints instead of a stale verdict.
+                    panel.install = None;
+                    self.next_app_update_poll_at = now + APP_UPDATE_POLL_MS;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub
+                            .install_app_update(&version, &url, Some(&channel))
+                            .await
+                            .map(|_| ());
+                        let _ = tx.send(LoopEvent::AppUpdateInstalled(result));
+                    });
                 }
             }
             UiCommand::SendPrompt { text, images } => {
@@ -6860,6 +7190,19 @@ impl Driver {
     }
 
     fn session_rows(&self, running: &HashSet<String>, awaiting: &HashSet<String>) -> Vec<SessionRow> {
+        // The just-finished join (TS SessionList's finishedAt rung) and the
+        // "has any broadcast activity" marker (the restRunning fallback only
+        // paints rows with NO entry at all — a known-idle broadcast wins).
+        let mut finished_at: HashMap<&str, u64> = HashMap::new();
+        let mut activity_known: HashSet<&str> = HashSet::new();
+        for tab in &self.tabs {
+            for (sid, act) in &tab.core.session_states {
+                activity_known.insert(sid.as_str());
+                if let Some(at) = act.finished_at {
+                    finished_at.insert(sid.as_str(), at);
+                }
+            }
+        }
         let mut rows = Vec::new();
         for inst in &self.instances {
             for sess in &inst.sessions {
@@ -6871,6 +7214,9 @@ impl Driver {
                     updated_at: sess.updated_at,
                     running: running.contains(&sess.session_id),
                     awaiting: awaiting.contains(&sess.session_id),
+                    finished_at: finished_at.get(sess.session_id.as_str()).copied(),
+                    rest_running: sess.status.as_deref() == Some("running"),
+                    activity_known: activity_known.contains(sess.session_id.as_str()),
                     open_tab: self.tabs.iter().find_map(|t| {
                         (t.core.active_session_id.as_deref() == Some(sess.session_id.as_str())
                             || t.target.as_deref() == Some(sess.session_id.as_str()))
@@ -6955,6 +7301,9 @@ impl Driver {
             mix(row.updated_at.unwrap_or(0), &mut sig);
             mix(row.running as u64, &mut sig);
             mix(row.awaiting as u64, &mut sig);
+            mix(row.finished_at.unwrap_or(0), &mut sig);
+            mix(row.rest_running as u64, &mut sig);
+            mix(row.activity_known as u64, &mut sig);
             mix(row.open_tab.unwrap_or(0), &mut sig);
         }
         for tab in &self.tabs {
@@ -7257,7 +7606,26 @@ impl Driver {
                     .unwrap_or(u64::MAX),
                 &mut sig,
             );
+            // App Update's install block (progress bytes + stage moves).
+            mix(
+                panel
+                    .install
+                    .as_ref()
+                    .map(|i| fold_str(&i.to_string()))
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
         }
+        // App Update's channel + the config dock's hub-upgrade check.
+        mix(fold_str(&self.update_channel), &mut sig);
+        mix(self.hub_upgrade_busy as u64, &mut sig);
+        mix(
+            self.hub_upgrade_note
+                .as_ref()
+                .map(|n| fold_str(n))
+                .unwrap_or(u64::MAX),
+            &mut sig,
+        );
         // The Workflows page + gate (batch J): open/close, the state flags,
         // the gate verdict's identity (position + mode), and content
         // signatures of the overview / detail / run payloads — every field
@@ -7574,8 +7942,7 @@ impl Driver {
                 platform_supported: self.usage.platform_supported,
                 platform_error: self.usage.platform_error.clone(),
             }),
-            quota_page: self.quota.open.then(|| QuotaPageView {
-                supported: self.quota.supported,
+            quota_page: self.quota.open.then(|| QuotaPageView {                supported: self.quota.supported,
                 loading: self.quota.loading,
                 error: self.quota.error.clone(),
                 quota_unavailable: self.quota.quota_unavailable,
@@ -7596,6 +7963,11 @@ impl Driver {
                 next_try_at: self.quota.next_try_at,
                 now_ms: self.clock.now_ms(),
             }),
+            quota_card: QuotaCardView {
+                usage: self.quota.usage.clone(),
+                quota_unavailable: self.quota.quota_unavailable,
+                usage_stats_at: self.quota.usage_stats_at,
+            },
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
             workflows_page: self.workflows.open.then(|| WorkflowsPageView {
@@ -7665,8 +8037,12 @@ impl Driver {
                         models: (*page == ConfigPageKind::Agents)
                             .then(|| self.models.models.clone())
                             .flatten(),
+                        update_channel: self.update_channel.clone(),
+                        install: panel.install.clone(),
                     }
                 }),
+            hub_upgrade_busy: self.hub_upgrade_busy,
+            hub_upgrade_note: self.hub_upgrade_note.clone(),
         }));
     }
 }
@@ -7982,13 +8358,14 @@ fn quota_str_sig(text: &str) -> u64 {
     })
 }
 
-/// Content signature of the quota payload: the GLM section the page
-/// renders (a same-count reload with a changed percent must re-emit).
+/// Content signature of the quota payload: every provider section (the plan
+/// page paints GLM, the side panels' card paints all of them — a same-count
+/// reload with a changed percent in any section must re-emit).
 fn quota_payload_signature(usage: &Option<AccountUsageStats>) -> u64 {
     let Some(u) = usage else {
         return u64::MAX;
     };
-    quota_str_sig(&serde_json::to_string(&u.glm).unwrap_or_default())
+    quota_str_sig(&serde_json::to_string(u).unwrap_or_default())
 }
 
 /// Content signature of the card inventory: counts, each expiry, the
@@ -8092,6 +8469,10 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
             d.sections[page.index()].reset_data();
         }
         d.workflows.reset_data();
+        // The hub-upgrade verdict names the OLD hub (TS: component state
+        // that dies with the panel) — it must not greet the next one.
+        d.hub_upgrade_busy = false;
+        d.hub_upgrade_note = None;
         // Session Files belong to a (hub, instance, session) triple — a new
         // lifecycle means a new machine's paths; nothing survives.
         d.files.reset();
