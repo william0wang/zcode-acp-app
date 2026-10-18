@@ -877,7 +877,7 @@ impl Workbench {
 
     /// Rail toggle semantics: the docked panel's own icon collapses the
     /// dock; any other icon docks that panel (and opens the dock).
-    fn toggle_dock_panel(&mut self, panel: DockPanel, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_dock_panel(&mut self, panel: DockPanel, cx: &mut Context<Self>) {
         if self.dock_open && self.dock_panel == panel {
             self.dock_open = false;
         } else {

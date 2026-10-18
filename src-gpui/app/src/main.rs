@@ -18,6 +18,9 @@ mod approval_card;
 #[cfg(test)]
 mod acceptance;
 mod file_browser;
+mod golden_fixtures;
+#[cfg(target_os = "macos")]
+mod golden_capture;
 mod http_transport;
 mod i18n;
 mod models_page;
@@ -81,6 +84,40 @@ fn apply_quiet_dark(cx: &mut App) {
 }
 
 fn main() {
+    // Golden-fixture mode (the acceptance script's pixel stage): render one
+    // canned snapshot in a PINNED window with an inert runtime — no driver,
+    // no network — self-capture the window (TCC-exempt), write the PNG, and
+    // exit. Args are checked before the app boots.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let flag = |name: &str| args.iter().position(|a| a == name);
+    let golden_fixture = if args.is_empty() {
+        None
+    } else if let Some(i) = flag("--golden-fixture") {
+        Some(
+            args.get(i + 1)
+                .cloned()
+                .unwrap_or_else(|| {
+                    eprintln!("--golden-fixture needs a name");
+                    std::process::exit(2);
+                })
+                .to_string(),
+        )
+    } else {
+        eprintln!("unknown arguments: {args:?}");
+        std::process::exit(2);
+    };
+    let golden_out = flag("--golden-out").and_then(|i| args.get(i + 1).cloned());
+    let golden = golden_fixture.as_deref().map(|name| {
+        let Some(snap) = golden_fixtures::snapshot(name) else {
+            eprintln!(
+                "unknown golden fixture {name:?} — pick one of {:?}",
+                golden_fixtures::NAMES
+            );
+            std::process::exit(2);
+        };
+        (name.to_string(), snap)
+    });
+
     // Full Lucide catalog: the composer's attachment controls (ImagePlus)
     // live outside the default icon subset.
     gpui_kit::application()
@@ -88,14 +125,17 @@ fn main() {
         // Closing the last window quits (macOS defaults to Explicit — a
         // closed-window app with a live menu bar is not a workbench shape).
         .with_quit_mode(QuitMode::LastWindowClosed)
-        .run(|cx| {
+        .run(move |cx| {
             gpui_kit::init(cx);
             // Locale: the persisted settings-panel pick (batch H3) wins;
             // with no stored preference the system decides (the shared
-            // rust-i18n global also drives gpui-kit's own strings).
-            rust_i18n::set_locale(
-                ui_prefs::load_locale().unwrap_or_else(i18n::detect_locale),
-            );
+            // rust-i18n global also drives gpui-kit's own strings). The
+            // golden mode pins English — captures must not follow the
+            // user's locale.
+            rust_i18n::set_locale(match &golden {
+                Some(_) => "en",
+                None => &ui_prefs::load_locale().unwrap_or_else(i18n::detect_locale),
+            });
             // Dark theme only in P0 (requirements §2), polished onto the
             // product's quiet-dark palette (see apply_quiet_dark).
             Theme::change(ThemeMode::Dark, None, cx);
@@ -131,28 +171,82 @@ fn main() {
                 QuitApp,
             )])]);
 
-            let (runtime, mut event_rx) = ProtocolRuntime::start();
+            let (runtime, event_rx) = match &golden {
+                Some(_) => (ProtocolRuntime::inert(), None),
+                None => {
+                    let (runtime, event_rx) = ProtocolRuntime::start();
+                    (runtime, Some(event_rx))
+                }
+            };
 
             let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                    None,
-                    size(px(1080.), px(760.)),
-                    cx,
-                ))),
+                window_bounds: Some(match &golden {
+                    // Pinned frame: the capture script's screencapture
+                    // region must match exactly (golden_fixtures'
+                    // GOLDEN_WINDOW).
+                    Some(_) => WindowBounds::Windowed(golden_fixtures::GOLDEN_WINDOW),
+                    None => WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1080.), px(760.)),
+                        cx,
+                    )),
+                }),
                 titlebar: Some(TitlebarOptions {
                     title: Some("zcode-acp-remote".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             };
+            let initial_snapshot = golden
+                .as_ref()
+                .map(|(_, snap)| snap.clone())
+                .unwrap_or_else(runtime::WorkbenchSnapshot::initial);
             let (window_handle, workbench) =
                 gpui_kit::open_window(options, cx, |window, cx| {
                     let runtime = runtime.clone();
-                    cx.new(|cx| {
-                        Workbench::new(window, cx, runtime, runtime::WorkbenchSnapshot::initial())
-                    })
+                    cx.new(|cx| Workbench::new(window, cx, runtime, initial_snapshot))
                 })
                 .expect("open the workbench window");
+
+            // The settings fixture paints the config dock open — drive the
+            // same toggle the rail button does.
+            if let Some((name, _)) = &golden {
+                if golden_fixtures::wants_config_dock(name) {
+                    workbench.update(cx, |wb, cx| {
+                        wb.toggle_dock_panel(workbench::DockPanel::Config, cx)
+                    });
+                }
+            }
+
+            // The self-capture + exit (golden mode only): a beat for the
+            // first frames to land, then the window PNG and a clean exit —
+            // the acceptance script bounds the wait and falls back to
+            // `screencapture` when the Metal surface refuses readback
+            // (verified empty from both threads: a surface-property
+            // limitation, not a timing one).
+            if let Some(out) = golden_out {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    #[cfg(target_os = "macos")]
+                    match golden_capture::capture_own_window_png(std::path::Path::new(&out)) {
+                        Ok(()) => std::process::exit(0),
+                        Err(golden_capture::CaptureError::Empty) => {
+                            eprintln!("golden capture: empty readback (Metal surface)");
+                            std::process::exit(3);
+                        }
+                        Err(golden_capture::CaptureError::Other(e)) => {
+                            eprintln!("golden capture failed: {e}");
+                            std::process::exit(1);
+                        }
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let _ = out;
+                        eprintln!("golden capture is macOS-only");
+                        std::process::exit(1);
+                    }
+                });
+            }
 
             // The quit guard's ⌘Q half: the action may fire while a dialog
             // layer holds focus, so listen globally rather than only on the
@@ -167,12 +261,17 @@ fn main() {
             });
 
             // The runtime event pump: snapshots from the driver thread flow into
-            // the workbench entity on the main thread.
-            cx.spawn(async move |cx| {
-                while let Some(event) = event_rx.recv().await {
-                    let _ = cx.update_entity(&workbench, |wb, cx| wb.on_runtime_event(event, cx));
-                }
-            })
-            .detach();
+            // the workbench entity on the main thread. The golden mode has no
+            // driver (inert runtime) — nothing to pump.
+            if let Some(mut event_rx) = event_rx {
+                cx.spawn(async move |cx| {
+                    while let Some(event) = event_rx.recv().await {
+                        let _ = cx.update_entity(&workbench, |wb, cx| {
+                            wb.on_runtime_event(event, cx)
+                        });
+                    }
+                })
+                .detach();
+            }
         });
 }

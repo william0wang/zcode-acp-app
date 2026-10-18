@@ -14,13 +14,13 @@
 use crate::runtime::{
     FsBrowseView, HistoryProjectRow, ModelsPageView, NewSessionView, Phase, ProtocolRuntime,
     QuotaPageView, RuntimeEvent, TabPhase, TabSummary, TabView, UsagePageView, UsageTab,
-    UiCommand, WorkbenchSnapshot,
+    UiCommand, WorkbenchSnapshot, WorkflowDetailView, WorkflowsPageView,
 };
 use crate::workbench::{StopTurn, Workbench};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{
     px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
-    WindowBounds, WindowOptions,
+    WindowBounds, WindowOptions, Window,
 };
 use protocol::hub::{FsEntry, FsEntryKind, FsListing};
 
@@ -106,6 +106,66 @@ fn sent(runtime: &ProtocolRuntime, predicate: impl Fn(&UiCommand) -> bool) -> bo
 }
 
 // ---------------------------------------------------------------------------
+// The geometry sweep (paint gate, layer A)
+// ---------------------------------------------------------------------------
+
+/// Every OBSERVED element must lay out non-zero and inside the viewport
+/// after a real frame — the "looks broken" family (zero-size, clipped
+/// off-window) that element-tree visibility assertions cannot see. Plain
+/// divs are only observable with `.id().test_support()`, so the sweep
+/// covers exactly the ids the journeys pin.
+///
+/// Bounds are UNCLIPPED: an `overflow_y_scroll` list still paints its
+/// below-the-fold rows, so a fixture taller than the window would
+/// false-positive by design — every journey keeps its content within one
+/// frame (the settings journey's 2400px window exists for exactly that).
+fn sweep_geometry(window: &Window) {
+    let viewport = window.viewport_size();
+    for snap in gpui_kit::base::test_support::snapshots(window) {
+        let id = format!("{:?}", snap.path().last());
+        let b = snap.bounds();
+        assert!(
+            b.size.width > px(0.) && b.size.height > px(0.),
+            "{id} laid out at a zero size"
+        );
+        assert!(
+            b.origin.x >= px(0.) && b.origin.y >= px(0.),
+            "{id} starts off-window (bounds {b:?})"
+        );
+        assert!(
+            b.right() <= viewport.width && b.bottom() <= viewport.height,
+            "{id} exceeds the viewport {viewport:?} (bounds {b:?})"
+        );
+    }
+}
+
+/// Pairwise-disjoint bounds for every observed id containing `prefix` —
+/// the overlap detector for list rows (edge-touching is legal layout,
+/// strict overlap is not). Returns how many rows matched, so callers can
+/// pin the count the fixture implies.
+fn rows_disjoint(window: &Window, prefix: &str) -> usize {
+    let rows: Vec<(String, Bounds<gpui_kit::Pixels>)> =
+        gpui_kit::base::test_support::snapshots(window)
+    .into_iter()
+    .filter(|s| format!("{:?}", s.path().last()).contains(prefix))
+    .map(|s| (format!("{:?}", s.path().last()), s.bounds()))
+    .collect();
+    for (i, (a_id, a)) in rows.iter().enumerate() {
+        for (b_id, b) in rows.iter().skip(i + 1) {
+            let overlaps = a.origin.x < b.right()
+                && b.origin.x < a.right()
+                && a.origin.y < b.bottom()
+                && b.origin.y < a.bottom();
+            assert!(
+                !overlaps,
+                "{a_id} overlaps {b_id} ({a:?} vs {b:?}) — the layout-trap family"
+            );
+        }
+    }
+    rows.len()
+}
+
+// ---------------------------------------------------------------------------
 // Cold start & landing (the attach-only rule + the empty state)
 // ---------------------------------------------------------------------------
 
@@ -159,6 +219,7 @@ fn accept_cold_start_landing_and_first_session(cx: &mut TestAppContext) {
             "a landed session replaces the empty state"
         );
         assert!(window.find("send").visible(), "the composer is live");
+        sweep_geometry(window);
     })
     .unwrap();
 }
@@ -219,6 +280,7 @@ fn accept_running_turn_stop_and_pending_queue(cx: &mut TestAppContext) {
         // Esc on a running turn: session/cancel (C1).
         wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
         assert!(sent(&runtime, |c| matches!(c, UiCommand::CancelTurn)));
+        sweep_geometry(window);
     })
     .unwrap();
 }
@@ -282,6 +344,7 @@ fn accept_thought_card_folding(cx: &mut TestAppContext) {
         window.click("thought-a1", cx);
         window.draw(cx).clear(cx);
         assert!(window.try_find("thought-body-a1").is_none());
+        sweep_geometry(window);
     })
     .unwrap();
 }
@@ -328,6 +391,7 @@ fn accept_new_session_chooser_browse_and_create(cx: &mut TestAppContext) {
             c,
             UiCommand::NewSessionCreate { workspace_path } if workspace_path == "/w/alpha"
         )));
+        sweep_geometry(window);
     })
     .unwrap();
 
@@ -367,6 +431,7 @@ fn accept_new_session_chooser_browse_and_create(cx: &mut TestAppContext) {
             c,
             UiCommand::NewSessionCreate { workspace_path } if workspace_path == "/w"
         )));
+        sweep_geometry(window);
     })
     .unwrap();
 }
@@ -469,6 +534,7 @@ fn accept_settings_servers_entries_and_gate(cx: &mut TestAppContext) {
         assert!(window.find("config-entry-Workflows").visible());
         window.click("config-entry-Workflows", cx);
         assert!(sent(&runtime, |c| matches!(c, UiCommand::OpenWorkflows)));
+        sweep_geometry(window);
     })
     .unwrap();
 }
@@ -516,6 +582,7 @@ fn accept_models_usage_quota_pages(cx: &mut TestAppContext) {
         window.click("model-row-0-bigmodel/glm-4.7", cx);
         window.draw(cx).clear(cx);
         assert!(window.find("model-form-body").visible(), "a row opens the form");
+        sweep_geometry(window);
     })
     .unwrap();
 
@@ -546,6 +613,7 @@ fn accept_models_usage_quota_pages(cx: &mut TestAppContext) {
             c,
             UiCommand::UsageTab { platform: false }
         )));
+        sweep_geometry(window);
     })
     .unwrap();
 
@@ -581,6 +649,7 @@ fn accept_models_usage_quota_pages(cx: &mut TestAppContext) {
     cx.update_window(handle.into(), |_, window, cx| {
         window.draw(cx).clear(cx);
         assert!(window.find("quota-body").visible());
+        sweep_geometry(window);
     })
     .unwrap();
 }
@@ -638,6 +707,7 @@ fn accept_file_viewer_local_buttons_follow_loopback(cx: &mut TestAppContext) {
         assert!(window.find("file-viewer").visible());
         assert!(window.find("file-viewer-open").visible());
         assert!(window.find("file-viewer-reveal").visible());
+        sweep_geometry(window);
     })
     .unwrap();
 
@@ -651,6 +721,156 @@ fn accept_file_viewer_local_buttons_follow_loopback(cx: &mut TestAppContext) {
         assert!(window.find("file-viewer").visible());
         assert!(window.try_find("file-viewer-open").is_none());
         assert!(window.try_find("file-viewer-reveal").is_none());
+        sweep_geometry(window);
+    })
+    .unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// The geometry walk (paint gate, layer A): the workflows page's densest
+// surfaces under real layout
+// ---------------------------------------------------------------------------
+
+use protocol::workflow::{
+    WorkflowDetailResponse, WorkflowEntry, WorkflowHubGroup, WorkflowOverviewResponse,
+    WorkflowRunRow, WorkflowScope,
+};
+
+fn zone_run(run_id: &str, name: &str, status: &str, session: Option<&str>) -> WorkflowRunRow {
+    WorkflowRunRow {
+        run_id: run_id.to_string(),
+        name: Some(name.to_string()),
+        status: status.to_string(),
+        stop_reason: None,
+        created_at: Some(1),
+        updated_at: Some(1),
+        spent_tokens: Some(1200),
+        parent_session_id: None,
+        acp_session_id: session.map(str::to_string),
+        tool_call_id: None,
+        args: None,
+        cwd: None,
+        artifacts: None,
+        resumed_from: None,
+        superseded_by: None,
+        owner_instance_id: Some("inst-a".to_string()),
+    }
+}
+
+fn zone_page(detail: Option<WorkflowDetailView>) -> WorkflowsPageView {
+    let mut last_runs = std::collections::BTreeMap::new();
+    last_runs.insert(
+        "deploy".to_string(),
+        zone_run("run-r1", "deploy", "completed", Some("s3")),
+    );
+    WorkflowsPageView {
+        loading: false,
+        error: None,
+        overview: Some(WorkflowOverviewResponse {
+            ok: true,
+            groups: vec![WorkflowHubGroup {
+                instance_id: "inst-a".to_string(),
+                scope: WorkflowScope::Global,
+                workspace: String::new(),
+                workflows: vec![WorkflowEntry {
+                    name: "deploy".to_string(),
+                    description: Some("Deploy the app".to_string()),
+                    scope: Some("global".to_string()),
+                }],
+                invalid: Vec::new(),
+                last_runs,
+                error: None,
+            }],
+            active_runs: vec![
+                zone_run("run-a1", "deploy", "running", Some("s1")),
+                zone_run("run-a2", "audit", "pending", Some("s2")),
+            ],
+            recent_runs: vec![
+                zone_run("run-r1", "deploy", "completed", Some("s3")),
+                zone_run("run-r2", "audit", "cancelled", None),
+            ],
+        }),
+        detail,
+        run: None,
+        busy: false,
+        action_instance: Some("inst-a".to_string()),
+        launches: std::collections::HashMap::new(),
+        session_runs: std::collections::HashMap::new(),
+    }
+}
+
+fn zone_detail() -> WorkflowDetailView {
+    WorkflowDetailView {
+        scope: WorkflowScope::Global,
+        name: "deploy".to_string(),
+        instance_id: "inst-a".to_string(),
+        loading: false,
+        detail: Some(WorkflowDetailResponse {
+            ok: true,
+            name: "deploy".to_string(),
+            path: Some("/tmp/deploy.js".to_string()),
+            scope: WorkflowScope::Global,
+            meta: None,
+            script: Some("export default {}".to_string()),
+        }),
+        runs: Some(vec![
+            zone_run("run-r1", "deploy", "completed", Some("s3")),
+            zone_run("run-a1", "deploy", "running", Some("s1")),
+        ]),
+        summaries: std::collections::HashMap::new(),
+    }
+}
+
+/// The zones list first (two live rows, two finished — one sessionless),
+/// then the detail page (runs block + clear-finished): every observed
+/// element lays out non-zero and inside the viewport, zone rows are
+/// strictly disjoint, and the clear-finished control sits ABOVE the first
+/// run row (TS renders it first inside the runs block).
+#[gpui_kit::test]
+fn accept_geometry_sweep_workflow_zones_and_detail(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        cx.set_reduce_motion(true);
+    });
+
+    // The overview: live + finished zones plus a group card.
+    let mut snap = connected_snapshot(None);
+    snap.workflows_page = Some(zone_page(None));
+    let (handle, wb, _runtime) = cx.update(|cx| open(cx, snap, 900.));
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        sweep_geometry(window);
+        let active = rows_disjoint(window, "wf-active-");
+        assert!(
+            active >= 4,
+            "two live rows with Detail+Stop each, got {active} observed"
+        );
+        let recent = rows_disjoint(window, "wf-recent-");
+        assert!(
+            recent >= 3,
+            "finished rows with their controls, got {recent} observed"
+        );
+    })
+    .unwrap();
+
+    // The detail page: the runs block with clear-finished above its rows.
+    let mut detail = connected_snapshot(None);
+    detail.workflows_page = Some(zone_page(Some(zone_detail())));
+    advance(cx, &wb, detail);
+    cx.update_window(handle.into(), |_, window, cx| {
+        window.draw(cx).clear(cx);
+        sweep_geometry(window);
+        let rows = rows_disjoint(window, "wf-detail-");
+        assert!(
+            rows >= 5,
+            "two history rows with open/session/dismiss controls, got {rows} observed"
+        );
+        let clear = window.find("wf-clear-finished").bounds();
+        let first_row = window.find("wf-detail-open-run-r1").bounds();
+        assert!(
+            clear.bottom() <= first_row.origin.y,
+            "clear-finished must sit above the first run row ({clear:?} vs {first_row:?})"
+        );
     })
     .unwrap();
 }

@@ -1637,14 +1637,15 @@ impl ProtocolRuntime {
         let _ = self.cmd_tx.send(cmd);
     }
 
-    /// A driver-less handle for window-layer tests: commands vanish — the
-    /// driver thread (and its hub bootstrap side effects) never starts.
-    /// `recorded_commands` still shows every `send`.
-    #[cfg(test)]
+    /// An inert handle with no driver thread (window-layer tests, and the
+    /// golden-fixture screenshot mode): `send` still works but nothing
+    /// consumes it, and `recorded_commands` (tests only) still shows every
+    /// `send`.
     pub fn inert() -> Self {
         let (cmd_tx, _rx) = unbounded_channel();
         Self {
             cmd_tx,
+            #[cfg(test)]
             recorded: Default::default(),
         }
     }

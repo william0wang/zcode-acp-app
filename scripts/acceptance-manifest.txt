@@ -43,6 +43,7 @@ run-detail-journal :: Run journal redesign (newest-first phases, step folds, dra
 workflow-actions :: Meta edit, move to project, two-step delete, script fold :: rust:workflow_detail_move_and_two_step_delete,rust:workflow_detail_script_folds,rust:workflow_meta_form_merges_rest,rust:merge_workflow_meta_shapes
 launch-memory :: Workflow launch memory (LRU rows, actionable zones) :: rust:launch_memory_makes_zone_rows_actionable,rust:workflow_launches
 workflow-tail :: Clear-finished batch dismiss, sessionRuns third ladder, gate re-probe on instance switch :: rust:clear_finished_dismisses_only_settled_rows,rust:session_runs_join_makes_active_rows_actionable,rust:session_runs_map_replaces_not_merges
+layout-geometry :: Headless geometry sweep (non-zero, in-window, disjoint rows) :: rust:accept_geometry_sweep_workflow_zones_and_detail
 workflow-protocol :: Workflow protocol (start/resume/journal/amend wire, args) :: rust:workflow_args,rust:workflow_start_round_trip,rust:workflow_list_round_trip,rust:workflow_gate_set_round_trip,rust:workflow_detail_round_trip,rust:workflow_overview_round_trip,rust:workflow_arg_declaration_round_trip,rust:workflow_create_prompt_round_trip
 
 # ---- desktop: protocol core ----
@@ -76,3 +77,4 @@ mobile-workflows-store :: Mobile workflows store :: vitest:workflows-store
 mobile-types :: Mobile typecheck (tsc --noEmit) :: step:tsc
 build-macos :: macOS release build (dist/ZCode-acp.app) :: step:build
 smoke-launch :: Smoke: launch the built app and quit cleanly :: step:smoke
+pixel-golden :: Pixel golden: fixture windows self-captured and diffed vs committed baselines :: step:golden

@@ -5,17 +5,20 @@
 # needs >= 1 passing test and zero failures, else FAIL / NO COVERAGE.
 #
 # Stages: 1 cargo test --workspace, 2 vitest, 3 tsc, 4 macOS release build,
-# 5 smoke launch — then scripts/acceptance-report.cjs assembles the report
+# 5 smoke launch, 6 pixel golden (fixture screenshots vs committed
+# baselines) — then scripts/acceptance-report.cjs assembles the report
 # (stdout table + .zcode/scratch/acceptance-report-<date>.md).
 #
-# Env: ACCEPTANCE_SKIP_BUILD=1 skips stages 4-5 (marking them SKIPPED).
+# Env: ACCEPTANCE_SKIP_BUILD=1 skips stages 4-6 (marking them SKIPPED);
+# GOLDEN_UPDATE=1 re-baselines the pixel goldens (after an intended visual
+# change or a macOS upgrade).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-echo "== [1/5] Rust suites (cargo test --workspace)"
+echo "== [1/6] Rust suites (cargo test --workspace)"
 (cd "$ROOT/src-gpui" && RUST_MIN_STACK=16777216 cargo test --workspace) >"$TMP/cargo.log" 2>&1
 CARGO_RC=$?
 if ! grep -q "^test result:" "$TMP/cargo.log"; then
@@ -23,14 +26,14 @@ if ! grep -q "^test result:" "$TMP/cargo.log"; then
 fi
 grep -E "^test result:" "$TMP/cargo.log" | sed 's/^/   /'
 
-echo "== [2/5] Mobile suites (vitest run)"
+echo "== [2/6] Mobile suites (vitest run)"
 pnpm vitest run --reporter=json --outputFile="$TMP/vitest.json" >"$TMP/vitest.log" 2>&1
 VITEST_RC=$?
 if [ ! -s "$TMP/vitest.json" ]; then
   echo "   vitest json missing — tail of the log:" && tail -n 5 "$TMP/vitest.log" | sed 's/^/   /'
 fi
 
-echo "== [3/5] Mobile types (tsc --noEmit)"
+echo "== [3/6] Mobile types (tsc --noEmit)"
 ./node_modules/.bin/tsc --noEmit -p tsconfig.json >"$TMP/tsc.log" 2>&1
 TSC_RC=$?
 [ "$TSC_RC" -ne 0 ] && tail -n 5 "$TMP/tsc.log" | sed 's/^/   /'
@@ -39,11 +42,12 @@ TSC_RC=$?
 if [ "$TSC_RC" -eq 0 ]; then echo "tsc=pass" >>"$TMP/steps.env"; else echo "tsc=fail" >>"$TMP/steps.env"; fi
 
 if [ "${ACCEPTANCE_SKIP_BUILD:-0}" = "1" ]; then
-  echo "== [4-5/5] build + smoke skipped (ACCEPTANCE_SKIP_BUILD=1)"
+  echo "== [4-6/6] build + smoke + pixel golden skipped (ACCEPTANCE_SKIP_BUILD=1)"
   echo "build=skip" >>"$TMP/steps.env"
   echo "smoke=skip" >>"$TMP/steps.env"
+  echo "golden=skip" >>"$TMP/steps.env"
 else
-  echo "== [4/5] macOS release build"
+  echo "== [4/6] macOS release build"
   if bash scripts/build-macos-gpui.sh >"$TMP/build.log" 2>&1; then
     echo "build=pass" >>"$TMP/steps.env"
     tail -n 2 "$TMP/build.log" | sed 's/^/   /'
@@ -52,7 +56,7 @@ else
     tail -n 10 "$TMP/build.log" | sed 's/^/   /'
   fi
 
-  echo "== [5/5] smoke launch (dist/ZCode-acp.app)"
+  echo "== [5/6] smoke launch (dist/ZCode-acp.app)"
   APP="$ROOT/dist/ZCode-acp.app"
   # Pinned to the DIST path: a bare "ZCode-acp.app" pattern would also
   # match an installed /Applications copy the user may be running.
@@ -92,6 +96,100 @@ else
     else
       echo "smoke=fail" >>"$TMP/steps.env"
       echo "   no app process appeared"
+    fi
+  fi
+
+  echo "== [6/6] pixel golden (fixture windows → self-capture → diff)"
+  # The paint gate's pixel layer: each fixture renders a canned snapshot in
+  # a PINNED 1200x800 window at (120,120) (src-gpui golden_fixtures.rs) and
+  # the app SELF-CAPTURES its own window (TCC-exempt — no Screen Recording
+  # permission needed, unlike `screencapture` from a terminal) writing the
+  # PNG to --golden-out, then exits. Baselines live in scripts/golden/ and
+  # are machine/OS-specific — re-baseline deliberately with GOLDEN_UPDATE=1
+  # after a macOS upgrade or an intended visual change.
+  if ! grep -q "^smoke=pass" "$TMP/steps.env"; then
+    echo "golden=fail" >>"$TMP/steps.env"
+    echo "   smoke did not pass — refusing the pixel stage"
+  else
+    GOLDEN_FAIL=0
+    GOLDEN_SKIP=0
+    BIN="$APP/Contents/MacOS/zcode-acp"
+    for name in chat workflows settings; do
+      CAP="$TMP/golden-$name.png"
+      # Bounded run: the fixture self-exits (capture written or refused),
+      # but a hung capture path must never wedge the whole acceptance.
+      "$BIN" --golden-fixture "$name" --golden-out "$CAP" >"$TMP/golden-$name.log" 2>&1 &
+      GOLDEN_PID=$!
+      RC=""
+      for _ in $(seq 1 25); do
+        if ! kill -0 "$GOLDEN_PID" 2>/dev/null; then
+          wait "$GOLDEN_PID"
+          RC=$?
+          break
+        fi
+        sleep 1
+      done
+      if [ -z "$RC" ]; then
+        echo "   $name: fixture did not exit within 25s — killing"
+        kill -9 "$GOLDEN_PID" 2>/dev/null || true
+        wait "$GOLDEN_PID" 2>/dev/null || true
+        RC=1
+      fi
+      if [ "$RC" -eq 3 ]; then
+        # The Metal surface refused readback — fall back to a region shot of
+        # the pinned window frame (1200x800 + the 28pt titlebar). This route
+        # needs the terminal to hold Screen Recording permission; without it
+        # screencapture errors out or strips the windows.
+        "$BIN" --golden-fixture "$name" >>"$TMP/golden-$name.log" 2>&1 &
+        GOLDEN_PID=$!
+        sleep 2
+        screencapture -x -R120,120,1200,828 "$CAP" 2>>"$TMP/golden-$name.log" || true
+        kill -TERM "$GOLDEN_PID" 2>/dev/null || true
+        wait "$GOLDEN_PID" 2>/dev/null || true
+      fi
+      if [ ! -s "$CAP" ]; then
+        if [ "$RC" -eq 3 ]; then
+          echo "   $name: capture unavailable — self-capture came back empty and screencapture produced nothing"
+          echo "     (grant Screen Recording to this terminal in System Settings → Privacy & Security to enable the fallback)"
+          GOLDEN_SKIP=1
+        else
+          echo "   $name: no capture appeared — log:"
+          tail -n 3 "$TMP/golden-$name.log" | sed 's/^/     /'
+          GOLDEN_FAIL=1
+        fi
+        continue
+      fi
+      UPDATE_FLAG=""
+      [ "${GOLDEN_UPDATE:-0}" = "1" ] && UPDATE_FLAG="--update"
+      node scripts/golden-diff.cjs \
+        --baseline "scripts/golden/$name.png" \
+        --capture "$CAP" \
+        --diff "$TMP/golden-$name-diff.png" \
+        $UPDATE_FLAG
+      DIFF_RC=$?
+      if [ "$DIFF_RC" -eq 0 ]; then
+        echo "   $name: ok"
+      elif [ "$DIFF_RC" -eq 3 ]; then
+        echo "   $name: capture unavailable (Metal readback refused and/or no Screen Recording for this terminal) — skipped"
+        GOLDEN_SKIP=1
+      elif [ "$DIFF_RC" -eq 1 ]; then
+        echo "   $name: DIFF — $TMP/golden-$name-diff.png (GOLDEN_UPDATE=1 re-baselines)"
+        GOLDEN_FAIL=1
+      else
+        echo "   $name: diff tool error (rc $DIFF_RC)"
+        tail -n 3 "$TMP/golden-$name.log" | sed 's/^/     /'
+        GOLDEN_FAIL=1
+      fi
+    done
+    if [ "$GOLDEN_FAIL" -eq 1 ]; then
+      echo "golden=fail" >>"$TMP/steps.env"
+    elif [ "${GOLDEN_SKIP:-0}" -eq 1 ]; then
+      # Environment precondition, not a regression: grant Screen Recording
+      # to the terminal (System Settings → Privacy & Security) to turn this
+      # into a real gate on this machine.
+      echo "golden=skip" >>"$TMP/steps.env"
+    else
+      echo "golden=pass" >>"$TMP/steps.env"
     fi
   fi
 fi
