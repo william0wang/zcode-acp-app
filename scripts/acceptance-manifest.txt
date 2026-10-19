@@ -16,14 +16,15 @@ servers-book :: Connection profile book (switch, two-click remove, add form) :: 
 
 # ---- desktop: chat ----
 chat-diff-view :: Tool-card file diffs (unified rows, truncation notice) :: rust:tool_call_diff_blocks_render_unified_view,rust:middle_edit_keeps_context,rust:created_file_is_all_adds,rust:deleted_file_is_all_dels,rust:common_prefix_and_suffix_skip_the_dp,rust:oversized_sides_cap_and_flag
-new-session-chooser :: New-session chooser (projects, filter, browse, create) :: rust:accept_new_session_chooser_browse_and_create,rust:project_filter_narrows_and_shows_no_match
+new-session-chooser :: New-session chooser (projects, filter, browse, create; sidebar + entry) :: rust:accept_new_session_chooser_browse_and_create,rust:project_filter_narrows_and_shows_no_match,rust:sidebar_new_button_dispatches_the_chooser_toggle
 chat-stop-pending :: Esc stop + pending queue (send now / edit / discard) :: rust:accept_running_turn_stop_and_pending_queue,rust:pending_store
 config-page-esc :: Esc closes an open config page before cancelling the turn :: rust:accept_config_page_esc_closes_before_cancel
 session-badge-ladder :: Activity badge ladder (awaiting > running > finished > idle, REST fallback) :: rust:session_badge_dot_ladder,rust:session_badge_finished_window,rust:session_finished_chip_paints_and_expires
 thought-card :: Thought card folding (auto + manual) :: rust:accept_thought_card_folding
-config-chips :: Model/mode/thought chips :: rust:config_chips_render_and_pick
+config-chips :: Model/mode/thought chips over the composer (pick dispatches set_config_option) :: rust:config_chips_render_and_pick
 session-panel :: Right session panel (config pickers, turn stats, workflows entry, quota card) :: rust:accept_session_panel_stats_config_and_quota
-display-details :: Title stats, tool cards, plan bar, copy, notice chips :: rust:chat_stats_render_under_the_composer,rust:tab_title_prefers_the_session_name,rust:tool_call_expands_detail,rust:plan_bar_collapses_and_lists_entries,rust:copy_buttons_write_clipboard_and_notice_chip_has_none,rust:task_notification_parses_status_and_summary,rust:token_formatting_matches_the_tui_dock,rust:context_gauge_clamps_and_formats
+quota-dock :: Top status bar's quota dock line (hub preformatted, sticky on failure) :: rust:status_bar_renders_the_quota_dock_line,rust:quota_dock_line_is_sticky_on_failure_and_clears_on_successful_none
+display-details :: Title stats, tool cards, plan bar, copy, notice chips :: rust:chat_stats_render_under_the_composer,rust:tab_title_prefers_the_session_name,rust:tab_title_caps_long_session_names,rust:tool_call_expands_detail,rust:plan_bar_collapses_and_lists_entries,rust:copy_buttons_write_clipboard_and_notice_chip_has_none,rust:task_notification_parses_status_and_summary,rust:token_formatting_matches_the_tui_dock,rust:context_gauge_clamps_and_formats
 session-mgmt :: Session rename / end / delete tombstone :: rust:session_row_rename_sheet_prefills_and_saves,rust:session_row_menu_ends_session,rust:history_row_menu_deletes_tombstone
 slash-commands :: Slash command menu (filter, keys, dismissal) :: rust:slash_menu_filters_and_click_commits,rust:slash_menu_keys_navigate_commit_and_remember_dismissal,rust:token_scan_takes_the_word_around_the_caret,rust:matcher_strips_the_dollar_on_both_sides,rust:caret_park_counts_lines_and_characters
 media :: Image lightbox + file preview :: rust:message_image_click_opens_lightbox,rust:file_preview_enlarges_with_caption_and_backdrop_click_closes

@@ -580,15 +580,20 @@ fn fmt_tokens(n: u64) -> String {
     }
 }
 
-/// Context gauge as the TUI prints it (ChatScreen.tsx `fmtContext`) —
-/// `17.5%/1.0M`, a one-decimal percent of the model window, clamped at 100.
-fn fmt_context(used: u64, size: u64) -> String {
-    let pct = if size == 0 {
+/// Context gauge percent (ChatScreen.tsx `fmtContext`'s head), clamped at
+/// 100; a zero window reads as full.
+fn context_pct(used: u64, size: u64) -> f64 {
+    if size == 0 {
         100.0
     } else {
         ((used as f64 / size as f64) * 100.0).min(100.0)
-    };
-    format!("{pct:.1}%/{}", fmt_tokens(size))
+    }
+}
+
+/// Context gauge as the TUI prints it (ChatScreen.tsx `fmtContext`) —
+/// `17.5%/1.0M`, a one-decimal percent of the model window, clamped at 100.
+fn fmt_context(used: u64, size: u64) -> String {
+    format!("{:.1}%/{}", context_pct(used, size), fmt_tokens(size))
 }
 
 /// The session row's status dot (the TS ActivityBadge ladder minus the
@@ -620,7 +625,7 @@ pub(crate) fn finished_fresh(sess: &SessionRow, now: u64) -> bool {
         .is_some_and(|at| now < at.saturating_add(60_000))
 }
 
-/// One config option's picker data, shared by the toolbar chip and the
+/// One config option's picker data, shared by the composer's chip and the
 /// session panel's row: the current value's display name (the raw value
 /// when the choices do not list it, `—` when unset) and the menu choices as
 /// `(value, name, active)`.
@@ -1973,6 +1978,23 @@ impl Workbench {
                     .child(format!("bridge {agent}")),
             );
         }
+        // The hub's preformatted quota dock line (ADR-0021) — byte-identical
+        // to the TUI's bottom dock and the mobile title bar's tail segment,
+        // refreshed at connect and each turn end.
+        if let Some(dock) = self.snap.quota_dock.clone() {
+            right = right.child(
+                div()
+                    .id("status-quota-dock")
+                    .test_support()
+                    .min_w_0()
+                    .max_w(px(340.))
+                    .truncate()
+                    .text_size(px(11.))
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground)
+                    .child(dock),
+            );
+        }
         bar = bar.child(right);
         bar.into_any_element()
     }
@@ -3318,8 +3340,11 @@ impl Workbench {
                 ),
         );
 
-        // Section header: sessions + refresh.
+        // Section header: sessions + new + refresh. The `+` mirrors the tab
+        // strip's new-tab (same NewSessionToggle chooser) — the list is the
+        // sessions home, so starting one belongs here too.
         let runtime = self.runtime.clone();
+        let runtime_new = self.runtime.clone();
         column = column.child(
             div()
                 .flex()
@@ -3333,6 +3358,14 @@ impl Workbench {
                         .child(t!("chat.sessions").to_uppercase()),
                 )
                 .child(div().flex_1())
+                .child(
+                    Button::new("sessions-new")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .tooltip("New session — pick the project directory it belongs to")
+                        .on_click(move |_, _, _| runtime_new.send(UiCommand::NewSessionToggle)),
+                )
                 .child(
                     Button::new("refresh-sessions")
                         .ghost()
@@ -3899,30 +3932,12 @@ impl Workbench {
                 .on_click(move |_, _, _| runtime.send(UiCommand::NewSessionToggle)),
         );
 
-        // Config chips (the TS ConfigSheet at desktop distance): the active
-        // tab's model / mode / thought picks, one dropdown each. Only with a
-        // live session — the TS guard (`connState === "open"` + active id).
-        // The manage-workflows entry (batch M, the TS SessionPanel's single
-        // workflow row) rides the same trailing group: shown when the gate
-        // verdict is ON and a session is attached; opens the Workflows page.
-        let chips_row = self.snap.active.as_ref().and_then(|view| {
-            matches!(view.phase, TabPhase::Connected)
-                .then(|| !view.config_options.is_empty())
-                .filter(|has| *has)
-                .map(|_| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .min_w_0()
-                        .children(
-                            view.config_options
-                                .iter()
-                                .map(|opt| self.render_config_chip(opt, cx))
-                                .collect::<Vec<_>>(),
-                        )
-                })
-        });
+        // The tab strip stays global (sessions only): the model/mode/thought
+        // chips moved down to the composer (batch S — the TUI keeps its
+        // switchers at the input). The manage-workflows entry (batch M, the
+        // TS SessionPanel's single workflow row) rides the trailing group:
+        // shown when the gate verdict is ON and a session is attached; opens
+        // the Workflows page.
         let session_live = self
             .snap
             .active
@@ -3962,18 +3977,17 @@ impl Workbench {
                 .gap_1()
                 .min_w_0()
                 .pr_1()
-                .children(chips_row)
                 .children(manage_row)
                 .child(toggle),
         );
         strip.into_any_element()
     }
 
-    /// One model/mode/thought chip (the TS ConfigSheet as a toolbar
-    /// dropdown): the current value's display name labels the button, the
-    /// menu lists every choice with a check on the active row; picking a
-    /// non-active row dispatches `session/set_config_option` and the menu
-    /// dismisses itself (the popover follows its DismissEvent).
+    /// One model/mode/thought chip (the TS ConfigSheet as a composer-side
+    /// dropdown, batch S): the current value's display name labels the
+    /// button, the menu lists every choice with a check on the active row;
+    /// picking a non-active row dispatches `session/set_config_option` and
+    /// the menu dismisses itself (the popover follows its DismissEvent).
     fn render_config_chip(
         &self,
         opt: &protocol::acp::ConfigOption,
@@ -4130,6 +4144,7 @@ impl Workbench {
             .flex()
             .items_center()
             .gap_2()
+            .min_w_0()
             .px_3()
             .pt_1()
             .pb_1()
@@ -4187,6 +4202,10 @@ impl Workbench {
                 .id(("tab-title", tab.id))
                 .test_support()
                 .min_w_0()
+                // A long session name must not stretch its tab unboundedly:
+                // the cap bounds the title so the ellipsis engages (and
+                // crowded strips share the slack — the tab itself min_w_0s).
+                .max_w(px(160.))
                 .truncate()
                 .child(title),
         );
@@ -4525,6 +4544,24 @@ impl Workbench {
                 .with_priority(1),
             );
         }
+        // Quick config switching over the composer (batch S — the TUI keeps
+        // its model/mode switcher at the input, not in a top strip): the
+        // active tab's config chips, current value on the face, the picker
+        // menu on click. The full-width pickers stay in the session panel;
+        // these are the glance-and-switch affordance. Only with a connected
+        // tab — the TS guard (`connState === "open"`).
+        if let Some(view) = self
+            .tab
+            .as_ref()
+            .filter(|t| matches!(t.phase, TabPhase::Connected))
+            .filter(|t| !t.config_options.is_empty())
+        {
+            let mut chips = div().flex().items_center().flex_wrap().gap_2().pb_2();
+            for opt in &view.config_options {
+                chips = chips.child(self.render_config_chip(opt, cx));
+            }
+            column = column.child(chips);
+        }
         let mut controls = div().flex().items_end().gap_2();
         // The gallery pick (ChatView's ImagePlus): native file dialog.
         let wb = cx.entity();
@@ -4621,7 +4658,8 @@ impl Workbench {
         );
         column = column.child(controls);
         // The active session's readouts (E1 — ChatScreen's header line
-        // `context 17.5%/1.0M`, bare cache percent, `tok/s`): per-session
+        // `context 17.5%/1.0M` plus the absolute pair, bare cache percent,
+        // `tok/s`, and the last turn's tokens · wall time): per-session
         // numbers belong to the session they describe, so they ride under
         // THIS composer, not the window's title bar.
         {
@@ -4643,7 +4681,16 @@ impl Workbench {
                         div()
                             .id("stat-context")
                             .flex_none()
-                            .child(format!("ctx {}", fmt_context(usage.used, usage.size)))
+                            // The enriched variant (TUI's `fmtContext` head
+                            // plus the absolute pair) — `fmt_context` itself
+                            // already embeds the denominator, so composing
+                            // would print the window size twice.
+                            .child(format!(
+                                "ctx {:.1}% · {}/{}",
+                                context_pct(usage.used, usage.size),
+                                fmt_tokens(usage.used),
+                                fmt_tokens(usage.size)
+                            ))
                             .test_support(),
                     );
                 }
@@ -4662,6 +4709,17 @@ impl Workbench {
                             .id("stat-tps")
                             .flex_none()
                             .child(format!("{} tok/s", turn.tps))
+                            .test_support(),
+                    );
+                    stats = stats.child(
+                        div()
+                            .id("stat-turn")
+                            .flex_none()
+                            .child(format!(
+                                "{} tok · {:.1}s",
+                                fmt_tokens(turn.output_tokens),
+                                turn.seconds
+                            ))
                             .test_support(),
                     );
                 }
@@ -6407,11 +6465,11 @@ mod chip_tests {
         snap
     }
 
-    /// The tab toolbar's config chips (batch D): all three render right of
-    /// the `+` button inside the strip, the model dropdown lists every
-    /// choice in bridge order, and picking one dispatches the exact
-    /// `SetConfigOption` command. The wire half (config_id/value spelling)
-    /// lives in the protocol tests.
+    /// The composer's config chips (batch D, moved down from the tab strip in
+    /// batch S): all three render inside the composer, above the send
+    /// controls, the model dropdown lists every choice in bridge order, and
+    /// picking one dispatches the exact `SetConfigOption` command. The wire
+    /// half (config_id/value spelling) lives in the protocol tests.
     #[gpui_kit::test]
     fn config_chips_render_and_pick(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -6449,9 +6507,16 @@ mod chip_tests {
             let mode = window.find("cfg-mode");
             let thought = window.find("cfg-thought");
             assert!(model.visible() && mode.visible() && thought.visible());
-            // Cluster sits right of `+` and never spills past the window.
-            assert!(window.find("new-tab").bounds().right() <= model.bounds().left());
-            assert!(thought.bounds().right() <= px(800.));
+            // The chips ride INSIDE the composer now (batch S), above the
+            // send controls — the top tab strip stays global.
+            let composer = window.find("composer").bounds();
+            for id in ["cfg-model", "cfg-mode", "cfg-thought"] {
+                let chip = window.find(id).bounds();
+                assert!(
+                    chip.origin.y >= composer.origin.y && chip.right() <= composer.right() + px(1.),
+                    "{id} must sit inside the composer"
+                );
+            }
             // The chip's label is the CURRENT value's display name.
             assert_eq!(window.find("cfg-model").label().as_deref(), Some("GLM-4.7"));
             // The model menu lists the choices in bridge order; picking the
@@ -6583,7 +6648,7 @@ mod chip_tests {
 mod display_tests {
     use super::Workbench;
     use crate::runtime::{
-        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, WorkbenchSnapshot,
+        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, UiCommand, WorkbenchSnapshot,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -6701,7 +6766,7 @@ mod display_tests {
             // they describe — they must sit inside the composer's bounds,
             // below the send controls, not in the window's status bar.
             let composer = window.find("composer").bounds();
-            for id in ["stat-context", "stat-cache", "stat-tps"] {
+            for id in ["stat-context", "stat-cache", "stat-tps", "stat-turn"] {
                 let stat = window.find(id);
                 assert!(stat.visible());
                 let top = stat.bounds().origin.y;
@@ -6719,6 +6784,30 @@ mod display_tests {
             assert!(
                 (width - expected).abs() < px(8.),
                 "progress fill should be ~{expected:?}, got {width:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The status bar's rightmost segment is the hub's preformatted quota
+    /// dock line (ADR-0021) — global account state, unlike the per-session
+    /// readouts under the composer.
+    #[gpui_kit::test]
+    fn status_bar_renders_the_quota_dock_line(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        snap.quota_dock = Some("GLM coding plan · 45% · resets in 2d".to_string());
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let dock = window.find("status-quota-dock");
+            assert!(dock.visible(), "the quota dock line must render");
+            assert!(
+                dock.bounds().size.width > px(0.),
+                "the dock line has content width"
             );
         })
         .unwrap();
@@ -6754,6 +6843,55 @@ mod display_tests {
             assert!(
                 named_width > fallback_width,
                 "the session name ({named_width:?}) must out-size the short-id fallback ({fallback_width:?})"
+            );
+        })
+        .unwrap();
+    }
+
+    /// A very long session name caps its tab title (batch S): the tab never
+    /// stretches unboundedly — the title clips with an ellipsis at the cap.
+    #[gpui_kit::test]
+    fn tab_title_caps_long_session_names(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        snap.tabs[0].session_title = Some("A".repeat(120));
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let title = window.find(("tab-title", 7u64));
+            assert!(title.visible(), "the capped title must render");
+            let width = title.bounds().size.width;
+            assert!(
+                width <= px(170.),
+                "a 120-char name must not exceed the 160px cap (+slack), got {width:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The sidebar's `+` (batch S): dispatches the same NewSessionToggle the
+    /// tab strip's new-tab button does — the sessions list is the sessions
+    /// home, so starting one belongs there too.
+    #[gpui_kit::test]
+    fn sidebar_new_button_dispatches_the_chooser_toggle(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let snap = base_snapshot();
+        let (handle, content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(window.find("sessions-new").visible());
+            window.click("sessions-new", cx);
+            let sent = content.read(cx).runtime.recorded_commands();
+            assert!(
+                sent.iter().any(|c| matches!(c, UiCommand::NewSessionToggle)),
+                "the sidebar + must open the new-session chooser, got {sent:?}"
             );
         })
         .unwrap();
@@ -8039,7 +8177,7 @@ mod new_session_tests {
 #[cfg(test)]
 mod display_unit_tests {
     // Explicit imports only (the file-root kit glob shadows #[test]).
-    use super::{fmt_context, fmt_tokens, parse_task_notification, PartView, RowModel};
+    use super::{context_pct, fmt_context, fmt_tokens, parse_task_notification, PartView, RowModel};
     use protocol::chat::ChatRole;
 
     fn plain_row(text: &str) -> RowModel {
@@ -8072,6 +8210,10 @@ mod display_unit_tests {
         assert_eq!(fmt_context(1_200_000, 1_000_000), "100.0%/1.0M");
         // size 0 never paints on the TS side; the formatter stays total.
         assert_eq!(fmt_context(0, 0), "100.0%/0");
+        // The composer stat's enriched head (batch S): the percent comes
+        // from the same clamp, the absolute pair rides after it.
+        assert_eq!(context_pct(175_000, 1_000_000), 17.5);
+        assert_eq!(context_pct(1_200_000, 1_000_000), 100.0);
     }
 
     #[test]

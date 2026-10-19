@@ -1246,6 +1246,9 @@ pub struct WorkbenchSnapshot {
     /// The side panels' quota card (TS QuotaSection): always present — the
     /// config dock and the session panel both render it while they are up.
     pub quota_card: QuotaCardView,
+    /// The hub's preformatted quota dock line (ADR-0021) — the top status
+    /// bar's rightmost segment. `None` = no quota data (hide, not an error).
+    pub quota_dock: Option<String>,
     /// Config-screen notice (TS `notice`): a `notice.*` i18n key or plain
     /// failure text, rendered by every config page's frame.
     pub config_notice: Option<String>,
@@ -1316,6 +1319,7 @@ impl WorkbenchSnapshot {
             active_instance: None,
             hub_upgrade_busy: false,
             hub_upgrade_note: None,
+            quota_dock: None,
         }
     }
 }
@@ -1459,6 +1463,14 @@ enum LoopEvent {
     /// 2xx body that did not fit the combined shape.
     QuotaUsage {
         result: Result<Option<AccountUsageStats>, SettingsApiError>,
+    },
+    /// GET /api/quota/dock settled (ADR-0021): the hub's preformatted
+    /// one-line dock string; `Ok(None)` = no quota data (hide, not an error).
+    /// Carries the lifecycle generation it was minted under — a hub switch
+    /// drops results from the OLD hub mid-flight (the TS `profile` guard).
+    QuotaDock {
+        gen: u64,
+        result: Result<Option<String>, HubApiError>,
     },
     /// GET /settings/reset-cards settled for one provider (TS
     /// `loadResetCards`).
@@ -2407,6 +2419,17 @@ struct Driver {
     models: ModelsPanel,
     /// The plan-quota config page (see [`QuotaPanel`]).
     quota: QuotaPanel,
+    /// The hub's preformatted quota dock line (ADR-0021) — the status bar's
+    /// rightmost segment. Sticky last-known on failure (the TUI's refresher
+    /// keeps it the same way); only a successful `None` clears it.
+    quota_dock: Option<String>,
+    /// A dock read is in flight — dedupes the discovery-tick + turn-end
+    /// triggers piling onto the hub (which caches 15s anyway).
+    quota_dock_loading: bool,
+    /// Lifecycle generation (the `history.seq` pattern): bumped on every hub
+    /// switch so a dock read minted for the OLD hub drops on arrival instead
+    /// of painting the wrong account's line over the new hub's.
+    quota_dock_gen: u64,
     /// The Usage config page (see [`UsagePanel`]).
     usage: UsagePanel,
     /// The six ZCode-config section pages (batch I, see
@@ -2494,6 +2517,9 @@ impl Driver {
                 credentials: true,
                 ..Default::default()
             },
+            quota_dock: None,
+            quota_dock_loading: false,
+            quota_dock_gen: 0,
             usage: UsagePanel::new(),
             sections: Default::default(),
             update_channel: crate::ui_prefs::load_update_channel()
@@ -2640,6 +2666,12 @@ impl Driver {
                 self.discovery_probe = false;
                 if self.phase == Phase::Discovering || self.phase == Phase::Reconnecting {
                     self.phase = Phase::Connected;
+                }
+                // The hub just answered — seed the status bar's quota dock
+                // line. Refires on later ticks only while nothing has landed
+                // (a sticky line needs no poll; turn ends refresh it).
+                if self.quota_dock.is_none() {
+                    self.spawn_quota_dock();
                 }
                 // M1 parity auto-attach: while NO tab has ever existed, the
                 // most recently updated session (any instance) opens one.
@@ -5013,6 +5045,45 @@ impl Driver {
         }
     }
 
+    /// The title-bar quota dock line (TS `refreshQuotaDock`, ADR-0021):
+    /// pulled when the hub first answers and at every turn end (usage moved —
+    /// the bridge force-refreshes its cache exactly then, so the read is
+    /// cheap). Failures stay silent and sticky.
+    fn spawn_quota_dock(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        if self.quota_dock_loading {
+            return;
+        }
+        self.quota_dock_loading = true;
+        let gen = self.quota_dock_gen;
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.quota_dock().await;
+            let _ = tx.send(LoopEvent::QuotaDock { gen, result });
+        });
+    }
+
+    /// Sticky-on-failure: a transient hub hiccup must not blank the resident
+    /// line; only a successful `None` (no quota data) clears it. A result
+    /// from the PREVIOUS lifecycle (a hub switch raced the read) drops
+    /// whole — it must neither paint the old hub's line nor disturb the new
+    /// lifecycle's in-flight bookkeeping.
+    fn on_quota_dock(&mut self, gen: u64, result: Result<Option<String>, HubApiError>) {
+        if gen != self.quota_dock_gen {
+            return;
+        }
+        self.quota_dock_loading = false;
+        if let Ok(line) = result {
+            self.quota_dock = line;
+        }
+    }
+
     /// One provider's card inventory (TS `loadResetCards`). The previous
     /// provider's cards drop NOW, not when the read lands: while it is in
     /// flight the screen must not show provider A's cards under a nonce
@@ -5526,6 +5597,11 @@ impl Driver {
                     t.core
                         .on_turn_state(now, &session_id, running, turn_value.as_ref());
                 }
+                // Turn end = quota refresh point (TS runPrompt's finally; the
+                // bridge force-refreshes its dock cache at the same moment).
+                if !running {
+                    self.spawn_quota_dock();
+                }
             }
             LoopEvent::NewSession { tab, result } => match result {
                 Ok(info) => {
@@ -5946,6 +6022,7 @@ impl Driver {
             } => self.on_usage_section(platform, requested, result),
             LoopEvent::QuotaSettingsAll(result) => self.on_quota_settings_all(result),
             LoopEvent::QuotaUsage { result } => self.on_quota_usage(result, now),
+            LoopEvent::QuotaDock { gen, result } => self.on_quota_dock(gen, result),
             LoopEvent::QuotaCards { provider_id, result } => {
                 self.on_quota_cards(provider_id, result);
             }
@@ -7622,6 +7699,11 @@ impl Driver {
         }
         // App Update's channel + the config dock's hub-upgrade check.
         mix(fold_str(&self.update_channel), &mut sig);
+        // The status bar's quota dock line (ADR-0021).
+        mix(
+            self.quota_dock.as_ref().map(|n| fold_str(n)).unwrap_or(u64::MAX),
+            &mut sig,
+        );
         mix(self.hub_upgrade_busy as u64, &mut sig);
         mix(
             self.hub_upgrade_note
@@ -7979,6 +8061,7 @@ impl Driver {
                 quota_unavailable: self.quota.quota_unavailable,
                 usage_stats_at: self.quota.usage_stats_at,
             },
+            quota_dock: self.quota_dock.clone(),
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
             workflows_page: self.workflows.open.then(|| WorkflowsPageView {
@@ -8484,6 +8567,13 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         // that dies with the panel) — it must not greet the next one.
         d.hub_upgrade_busy = false;
         d.hub_upgrade_note = None;
+        // The quota dock line is the OLD hub's account (ADR-0021); the next
+        // hub's discovery re-seeds it. The generation bump drops any read
+        // still in flight for the old hub (the TS mid-flight `profile`
+        // guard).
+        d.quota_dock = None;
+        d.quota_dock_loading = false;
+        d.quota_dock_gen += 1;
         // Session Files belong to a (hub, instance, session) triple — a new
         // lifecycle means a new machine's paths; nothing survives.
         d.files.reset();
@@ -8748,7 +8838,9 @@ mod tests {
     // the sibling test modules' explicit-import shape is the convention.
     use super::{fold_session_runs, max_run_sequence, merge_run_events, pick_target};
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
+    use protocol::hub_client::HubApiError;
     use protocol::workflow::WorkflowRunEvent;
+    use tokio::sync::mpsc::unbounded_channel;
 
     fn run_event(sequence: u64) -> WorkflowRunEvent {
         WorkflowRunEvent {
@@ -8798,6 +8890,49 @@ mod tests {
             sessions,
             extra: Default::default(),
         }
+    }
+
+    /// The status bar's quota dock line (ADR-0021) is sticky on failure — a
+    /// transient hub hiccup must not blank the resident line — and only a
+    /// successful `None` (the hub says "no quota data") clears it. A result
+    /// minted under a PREVIOUS lifecycle generation (a hub switch raced the
+    /// read) drops whole: the old hub's account must not greet the new hub.
+    #[test]
+    fn quota_dock_line_is_sticky_on_failure_and_clears_on_successful_none() {
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, _ev_rx) = unbounded_channel();
+        let mut d = super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        assert_eq!(d.quota_dock, None);
+        d.on_quota_dock(0, Ok(Some("GLM coding plan · 45%".to_string())));
+        assert_eq!(d.quota_dock.as_deref(), Some("GLM coding plan · 45%"));
+        d.on_quota_dock(0, Err(HubApiError {
+            message: "hub hiccup".to_string(),
+            status: None,
+            network: true,
+            instance_dead: false,
+        }));
+        assert_eq!(
+            d.quota_dock.as_deref(),
+            Some("GLM coding plan · 45%"),
+            "a failed refresh keeps the resident line"
+        );
+        // The hub-switch reset: the line clears and the generation bumps, so
+        // the OLD hub's in-flight read (still gen 0) drops on arrival.
+        d.quota_dock = None;
+        d.quota_dock_gen += 1;
+        d.on_quota_dock(0, Ok(Some("OLD HUB · 90%".to_string())));
+        assert_eq!(d.quota_dock, None, "a stale-generation result drops");
+        d.on_quota_dock(1, Ok(None));
+        assert_eq!(d.quota_dock, None, "a successful empty clears");
+        d.on_quota_dock(1, Ok(Some("NEW HUB · 10%".to_string())));
+        assert_eq!(d.quota_dock.as_deref(), Some("NEW HUB · 10%"));
     }
 
     /// Batch H2's attach rule (appStore.ts:1847-1855): the cold-start
