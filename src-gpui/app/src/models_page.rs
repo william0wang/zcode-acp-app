@@ -302,7 +302,7 @@ impl Workbench {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                     .text_color(theme.foreground)
                     .child(notice_text(notice)),
             )
@@ -422,14 +422,14 @@ impl Workbench {
                 .border_color(theme.border)
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.restartPending").into_owned()),
                 )
                 .child(
                     div()
                         .pt_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.restartWarning").into_owned()),
                 )
@@ -445,7 +445,7 @@ impl Workbench {
                 } else {
                     div()
                         .pt_2()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.warning_foreground)
                         .child(t!("zconfig.restartNoInstance").into_owned())
                         .into_any_element()
@@ -512,7 +512,7 @@ impl Workbench {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.foreground)
                             .child(title),
                     )
@@ -600,7 +600,7 @@ impl Workbench {
             body = body.child(
                 div()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(ids),
             );
@@ -659,7 +659,7 @@ impl Workbench {
         if form.candidates.is_empty() {
             body = body.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.modelLevelsNone").into_owned()),
             );
@@ -694,7 +694,7 @@ impl Workbench {
                 .pt_2()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.enabled").into_owned()),
                 )
@@ -753,7 +753,7 @@ fn field_label(label: &str, hint: Option<&str>, theme: &component::Theme) -> gpu
     let mut field = div().flex().flex_col().gap_1().pt_2();
     field = field.child(
         div()
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(theme.foreground)
             .child(label.to_string()),
     );
@@ -784,14 +784,14 @@ fn state_card(title: &str, detail: &str, theme: &component::Theme) -> AnyElement
         .items_center()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.foreground)
                 .child(title.to_string()),
         )
         .child(
             div()
                 .pt_2()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(detail.to_string()),
         )

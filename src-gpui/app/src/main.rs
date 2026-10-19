@@ -73,7 +73,10 @@ fn apply_quiet_dark(cx: &mut App) {
         theme.colors.sidebar_border = hairline;
         theme.colors.foreground = rgb(0xececf1).into(); // --color-ink
         theme.colors.muted_foreground = rgb(0xa6a6b0).into(); // --color-dim
-        theme.colors.accent = rgb(0x34d399).into(); // emerald-400 (TS running dots)
+        // emerald-500: one step down from the TS running-dot emerald-400 —
+        // on this near-black canvas the 400 reads as a glare on every
+        // selected state and filled control that rides the accent.
+        theme.colors.accent = rgb(0x10b981).into();
         // Amber-300/500: the quota page's own amber pair, made theme-wide so
         // the awaiting ring and restart notes match it (kit dark ships
         // yellow-600 as warning foreground — muddy as text on this canvas).

@@ -338,7 +338,7 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.foreground)
                         .child(
                             // A `notice.*` key resolves through the shared
@@ -395,14 +395,14 @@ fn state_card(title: &str, detail: &str, theme: &component::Theme) -> AnyElement
         .items_center()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.foreground)
                 .child(title.to_string()),
         )
         .child(
             div()
                 .pt_2()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(detail.to_string()),
         )
@@ -423,7 +423,7 @@ fn empty_card(text: &str, theme: &component::Theme) -> AnyElement {
         .justify_center()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.muted_foreground)
                 .child(text.to_string()),
         )
@@ -446,7 +446,7 @@ fn block_title(label: &str, theme: &component::Theme) -> gpui::Div {
         .px_4()
         .pt_3()
         .pb_1()
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(theme.foreground)
         .child(label.to_string())
 }
@@ -602,7 +602,7 @@ fn render_run_zone_row(
             .child(
                 div()
                     .min_w_0()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.foreground)
                     .truncate()
                     .child(label.clone()),
@@ -748,7 +748,7 @@ fn render_group_card(
                 div()
                     .px_4()
                     .pb_3()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.workflowInstanceUnavailable").into_owned()),
             )
@@ -796,7 +796,7 @@ fn render_group_card(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.foreground)
                             .truncate()
                             .child(w.name.clone()),
@@ -953,7 +953,7 @@ fn render_detail_body(
                     div()
                         .px_4()
                         .py_2()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(text),
                 )
@@ -1170,7 +1170,7 @@ fn render_detail_body(
                 div()
                     .px_4()
                     .pb_4()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.workflowRunsEmpty").into_owned()),
             );
@@ -1305,7 +1305,7 @@ fn render_detail_run_row(
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.foreground)
                         .truncate()
                         .child(label),
@@ -1487,7 +1487,7 @@ fn render_run_body(
                 .bg(theme.title_bar)
                 .border_1()
                 .border_color(theme.border)
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.warning_foreground)
                 .child(t!("zconfig.workflowSessionLost").into_owned()),
         );
@@ -1670,7 +1670,7 @@ fn render_run_tabs(run: &WorkflowRunView, wb: &Workbench, theme: &component::The
                 .justify_center()
                 .py(px(5.))
                 .rounded_md()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .cursor_pointer()
                 .bg(if active {
                     theme.title_bar
@@ -1971,7 +1971,7 @@ fn render_phase_card(
                 .min_w_0()
                 .flex_1()
                 .font_family(theme.mono_font_family.clone())
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(if head {
                     theme.foreground
                 } else {
@@ -2089,7 +2089,7 @@ fn render_step_row(wb: &Workbench, n: &NodeAgg, cx: &Context<Workbench>) -> AnyE
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(match sub {
@@ -2149,7 +2149,7 @@ fn render_step_row(wb: &Workbench, n: &NodeAgg, cx: &Context<Workbench>) -> AnyE
                     div()
                         .min_w_0()
                         .pb_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(head_text.clone()),
                 );
@@ -2159,7 +2159,7 @@ fn render_step_row(wb: &Workbench, n: &NodeAgg, cx: &Context<Workbench>) -> AnyE
                     div()
                         .min_w_0()
                         .pb_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.danger_foreground.opacity(0.9))
                         .child(error.clone()),
                 );
@@ -2238,7 +2238,7 @@ fn render_event_row(
                         } else {
                             theme.font_family.clone()
                         })
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(label_color)
                         .child(desc.label),
                 )
@@ -2289,7 +2289,7 @@ fn render_raw_body(
                 .items_center()
                 .gap(px(4.))
                 .cursor_pointer()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(if open { "▾" } else { "▸" })
                 .child(t!("zconfig.workflowRawData").into_owned())
@@ -2363,7 +2363,7 @@ fn render_run_artifacts_tab(
                                 .flex_col()
                                 .child(
                                     div()
-                                        .text_size(px(12.))
+                                        .text_size(px(13.))
                                         .text_color(theme.foreground)
                                         .truncate()
                                         .child(a.title.clone().unwrap_or_else(|| a.id.clone())),
@@ -2531,7 +2531,7 @@ fn render_workspace_row(
                         .child(
                             div()
                                 .min_w_0()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.foreground)
                                 .truncate()
                                 .child(what),
@@ -2638,7 +2638,7 @@ fn render_node_result(
         card = card.child(
             div()
                 .pb(px(6.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.danger_foreground)
                 .child(result.status.clone().unwrap_or_default()),
         );
@@ -2660,7 +2660,7 @@ fn render_node_result(
                     div()
                         .pb(px(6.))
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(if code != 0.0 {
                             theme.danger_foreground
                         } else {
@@ -2700,7 +2700,7 @@ fn render_node_result(
                             div()
                                 .flex_none()
                                 .max_w(px(40.))
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .truncate()
                                 .child(k.clone()),
@@ -2710,7 +2710,7 @@ fn render_node_result(
                                 .min_w_0()
                                 .flex_1()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.foreground)
                                 .child(v.clone()),
                         )
@@ -2720,7 +2720,7 @@ fn render_node_result(
             div()
                 .min_w_0()
                 .font_family(theme.mono_font_family.clone())
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(text),
         ),
@@ -2909,7 +2909,7 @@ fn kv_row(k: &str, v: &str, theme: &component::Theme) -> AnyElement {
             div()
                 .flex_none()
                 .max_w(px(120.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .truncate()
                 .child(k.to_owned()),
@@ -2920,7 +2920,7 @@ fn kv_row(k: &str, v: &str, theme: &component::Theme) -> AnyElement {
                 .flex_1()
                 .text_right()
                 .font_family(theme.mono_font_family.clone())
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.foreground)
                 .child(v.to_owned()),
         )
@@ -2962,7 +2962,7 @@ fn render_table_view(
                                     div()
                                         .min_w_0()
                                         .flex_1()
-                                        .text_size(px(11.))
+                                        .text_size(px(12.))
                                         .text_color(theme.foreground)
                                         .truncate()
                                         .child(c.clone())
@@ -2989,7 +2989,7 @@ fn render_table_view(
                                         .min_w_0()
                                         .flex_1()
                                         .truncate()
-                                        .text_size(px(11.))
+                                        .text_size(px(12.))
                                         .text_color(theme.muted_foreground)
                                         .child(cell.clone())
                                         .into_any_element()
@@ -3047,7 +3047,7 @@ fn render_metrics_tiles(
                             .child(
                                 div()
                                     .min_w_0()
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(theme.muted_foreground)
                                     .truncate()
                                     .child(tile.label.clone()),
@@ -3116,7 +3116,7 @@ fn render_board_view(
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .text_color(theme.foreground)
                                     .truncate()
                                     .child(col.name.clone()),
@@ -3132,7 +3132,7 @@ fn render_board_view(
                 if col.cards.is_empty() {
                     section = section.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child(t!("zconfig.workflowBoardEmpty").into_owned()),
                     );
@@ -3158,7 +3158,7 @@ fn render_board_view(
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .text_size(px(11.))
+                                            .text_size(px(12.))
                                             .text_color(theme.foreground)
                                             .truncate()
                                             .child(card.title.clone()),
@@ -3393,7 +3393,7 @@ fn render_chart_view(
                                 div()
                                     .min_w_0()
                                     .flex_1()
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(theme.muted_foreground)
                                     .truncate()
                                     .child(s.label.clone()),
@@ -3402,7 +3402,7 @@ fn render_chart_view(
                                 div()
                                     .flex_none()
                                     .font_family(theme.mono_font_family.clone())
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(theme.foreground)
                                     .child(format!(
                                         "{}{}",
@@ -3463,7 +3463,7 @@ fn render_artifact_meta_card(
             this.child(
                 div()
                     .pt_2()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .min_w_0()
                     .child(description),
@@ -3550,7 +3550,7 @@ fn pre_block(id: &str, text: &str, color: Hsla, theme: &component::Theme) -> Any
             div()
                 .min_w_0()
                 .font_family(theme.mono_font_family.clone())
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(color)
                 .child(line)
         }))
@@ -3910,7 +3910,7 @@ impl Workbench {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.foreground)
                             .child(t!("zconfig.workflowDescription").into_owned()),
                     )
@@ -3923,7 +3923,7 @@ impl Workbench {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.foreground)
                             .child(t!("zconfig.workflowWhenToUse").into_owned()),
                     )
@@ -4244,7 +4244,7 @@ impl Workbench {
             if let Some(error) = report.error {
                 body = body.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.danger_foreground)
                         .child(error),
                 );
@@ -4254,7 +4254,7 @@ impl Workbench {
             body = body.child(
                 div().flex().flex_col().gap_1().child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.workflowStartArgs").into_owned()),
                 )
@@ -4339,7 +4339,7 @@ impl Workbench {
                 div().flex().flex_col().gap_1()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.foreground)
                             .child(t!("zconfig.workflowSubagentModel").into_owned()),
                     )
@@ -4374,7 +4374,7 @@ impl Workbench {
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(t!("zconfig.workflowClearModel").into_owned()),
                         ),
@@ -4385,7 +4385,7 @@ impl Workbench {
                 div().flex().flex_col().gap_1()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.foreground)
                             .child(t!("zconfig.workflowMaxConcurrency").into_owned()),
                     )
@@ -4424,7 +4424,7 @@ impl Workbench {
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(t!("zconfig.workflowClearConcurrency").into_owned()),
                         ),
@@ -4580,7 +4580,7 @@ impl Workbench {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .text_color(if active {
                                         theme.foreground
                                     } else {
@@ -4704,7 +4704,7 @@ fn start_field_row(
     }
     column = column.child(
         div()
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(theme.foreground)
             .child(label),
     );

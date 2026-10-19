@@ -70,7 +70,7 @@ fn section_label(theme: &Theme, title: String, divided: bool) -> AnyElement {
         .pt(px(12.))
         .pb(px(2.))
         .when(divided, |this| this.mt(px(8.)).border_t_1().border_color(theme.border))
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(faint(theme))
         .child(title.to_uppercase())
         .into_any_element()
@@ -81,7 +81,7 @@ fn status_line(theme: &Theme, text: &str) -> AnyElement {
     div()
         .px(px(16.))
         .py(px(4.))
-        .text_size(px(12.))
+        .text_size(px(13.))
         .text_color(faint(theme))
         .child(text.to_string())
         .into_any_element()
@@ -205,7 +205,7 @@ pub(crate) fn render_quota_card(
         .pb(px(2.))
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(faint(theme))
                 .child(t!("quota.title").to_uppercase()),
         );
@@ -245,7 +245,7 @@ pub(crate) fn render_quota_card(
                 .test_support()
                 .px(px(16.))
                 .py(px(4.))
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(faint(theme))
                 .child(t!("quota.unavailable").into_owned()),
         );

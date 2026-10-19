@@ -146,9 +146,10 @@ fn amber_fill(opacity: f32) -> Hsla {
     c.opacity(opacity)
 }
 
-/// emerald-400 (#34D399) at 70% — the card-row check glyph.
+/// emerald-500 (#10B981) at 70% — the card-row check glyph, one step calmer
+/// than the TS emerald-400 (solid 400 glares on the dark canvas).
 fn emerald_check() -> Hsla {
-    let c: Hsla = rgb(0x34D399).into();
+    let c: Hsla = rgb(0x10B981).into();
     c.opacity(0.7)
 }
 
@@ -219,7 +220,7 @@ pub(crate) fn quota_bar_row(
                     div()
                         .flex_none()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(label.to_string()),
                 )
@@ -228,7 +229,7 @@ pub(crate) fn quota_bar_row(
                         .flex_none()
                         .truncate()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(faint(theme))
                         .child(line),
                 ),
@@ -261,7 +262,7 @@ fn config_block(theme: &Theme, title: Option<&str>, divided: bool) -> gpui::Div 
                 .px(px(16.))
                 .pb(px(4.))
                 .pt(px(12.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(faint(theme))
                 .child(title.to_uppercase()),
         )
@@ -300,7 +301,7 @@ fn notice_banner(theme: &Theme, notice: &str, runtime: &ProtocolRuntime) -> AnyE
             div()
                 .min_w_0()
                 .flex_1()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.muted_foreground)
                 .child(notice_text(notice)),
         )
@@ -331,14 +332,14 @@ fn restart_note(theme: &Theme, restart_available: bool, runtime: &ProtocolRuntim
         .py(px(12.))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.restartPending").into_owned()),
         )
         .child(
             div()
                 .pt(px(4.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(faint(theme))
                 .child(t!("zconfig.restartWarning").into_owned()),
         );
@@ -358,7 +359,7 @@ fn restart_note(theme: &Theme, restart_available: bool, runtime: &ProtocolRuntim
         note = note.child(
             div()
                 .pt(px(8.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.warning_foreground)
                 .child(t!("zconfig.restartNoInstance").into_owned()),
         );
@@ -431,7 +432,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(4.))
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(faint(theme))
                 .child(t!("zconfig.resetNone").into_owned()),
         );
@@ -444,7 +445,7 @@ fn card_list(
                     .items_center()
                     .gap(px(8.))
                     .py(px(2.))
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(faint(theme))
                     .child(
                         div()
@@ -476,7 +477,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(4.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(faint(theme))
                 .child(format!("{} {}", t!("zconfig.resetLastUsed"), fmt_stamp_utc(used_at))),
         );
@@ -489,7 +490,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(4.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(amber_text())
                 .child(format!("{} {}", t!("zconfig.resetRetryAt"), fmt_stamp_utc(at))),
         );
@@ -534,7 +535,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(6.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(faint(theme))
                 .child(fill(
                     &t!("zconfig.resetBelowThreshold"),
@@ -568,7 +569,7 @@ fn use_card_button(
         .py(px(8.))
         .flex()
         .justify_center()
-        .text_size(px(12.))
+        .text_size(px(13.))
         .text_color(theme.foreground)
         .when(busy, |this| this.opacity(0.4))
         .when(!busy, |this| {
@@ -595,7 +596,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
         .py(px(10.))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(amber_text())
                 .child(fill(
                     &t!("zconfig.resetBelowWarn"),
@@ -619,7 +620,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(faint(theme))
                         .cursor_pointer()
                         .hover(|h| h.bg(white().opacity(0.06)))
@@ -641,7 +642,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(amber_text())
                         .cursor_pointer()
                         .hover(|h| h.bg(amber_fill(0.3)))
@@ -676,7 +677,7 @@ fn spend_confirm_box(
         .py(px(10.))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.muted_foreground)
                 .child(text),
         )
@@ -697,7 +698,7 @@ fn spend_confirm_box(
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(faint(theme))
                         .cursor_pointer()
                         .hover(|h| h.bg(white().opacity(0.06)))
@@ -719,7 +720,7 @@ fn spend_confirm_box(
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.foreground)
                         .when(busy, |this| this.opacity(0.6))
                         .when(!busy, |this| {
@@ -764,7 +765,7 @@ fn provider_picker(
                 .rounded_lg()
                 .px(px(10.))
                 .py(px(6.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .when(selected, |this| {
                     this.bg(white().opacity(0.12)).text_color(theme.foreground)
                 })
@@ -989,7 +990,7 @@ impl Workbench {
                         .child(
                             div()
                                 .pt(px(6.))
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(faint(&theme))
                                 .child(t!("zconfig.unsupportedHint").into_owned()),
                         ),
@@ -1023,7 +1024,7 @@ impl Workbench {
                         .child(
                             div()
                                 .pt(px(6.))
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(faint(&theme))
                                 .child(error.clone()),
                         ),
@@ -1055,7 +1056,7 @@ impl Workbench {
                         .pb(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(faint(&theme))
                         .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
                 );

@@ -23,6 +23,48 @@ pub(crate) const LOCALE_ZH: &str = "zh-CN";
 pub(crate) const CHANNEL_STABLE: &str = "stable";
 pub(crate) const CHANNEL_PREVIEW: &str = "preview";
 
+/// The chat font ladder (TS `FontSize`): three steps over the reading text.
+/// Medium is the desktop default — the agent prose inherits the window's
+/// 16px default, which is the size the ladder was tuned around.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FontScale {
+    Small,
+    Medium,
+    Large,
+}
+
+impl FontScale {
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            FontScale::Small => "small",
+            FontScale::Medium => "medium",
+            FontScale::Large => "large",
+        }
+    }
+
+    /// The (user, agent) chat text sizes in px. Agent prose rides the kit's
+    /// TextView, which inherits the wrapper's text_size — the wrapper sets it
+    /// so the ladder scales both roles uniformly.
+    pub(crate) fn chat_px(self) -> (f32, f32) {
+        match self {
+            FontScale::Small => (14.0, 15.0),
+            FontScale::Medium => (15.0, 16.0),
+            FontScale::Large => (16.5, 17.5),
+        }
+    }
+}
+
+/// A stored font size, normalized onto the ladder — anything else reads as
+/// "no preference" (medium).
+pub(crate) fn stored_font_size(raw: Option<&str>) -> Option<FontScale> {
+    match raw {
+        Some(size) if size.eq_ignore_ascii_case("small") => Some(FontScale::Small),
+        Some(size) if size.eq_ignore_ascii_case("large") => Some(FontScale::Large),
+        Some(size) if size.eq_ignore_ascii_case("medium") => Some(FontScale::Medium),
+        _ => None,
+    }
+}
+
 /// The prefs file location: `ui-prefs.json` beside the server book.
 pub(crate) fn prefs_path() -> PathBuf {
     protocol::profiles::config_dir().join("ui-prefs.json")
@@ -103,10 +145,22 @@ pub(crate) fn store_update_channel(channel: &str) {
     store_pref("updateChannel", Value::String(channel.to_string()));
 }
 
+/// Read the persisted chat font size, if any.
+pub(crate) fn load_font_size() -> Option<FontScale> {
+    stored_font_size(load_prefs().get("fontSize").and_then(Value::as_str))
+}
+
+/// Persist the chat font size (the settings segment's click; the TS
+/// `saveFontSize`).
+pub(crate) fn store_font_size(size: &str) {
+    store_pref("fontSize", Value::String(size.to_string()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        stored_channel, stored_locale, CHANNEL_PREVIEW, CHANNEL_STABLE, LOCALE_EN, LOCALE_ZH,
+        stored_channel, stored_font_size, stored_locale, FontScale, CHANNEL_PREVIEW,
+        CHANNEL_STABLE, LOCALE_EN, LOCALE_ZH,
     };
 
     #[test]
@@ -129,5 +183,19 @@ mod tests {
         assert_eq!(stored_channel(Some("stable")), Some(CHANNEL_STABLE));
         assert_eq!(stored_channel(Some("nightly")), None);
         assert_eq!(stored_channel(None), None);
+    }
+
+    #[test]
+    fn stored_font_sizes_normalize_onto_the_ladder() {
+        assert_eq!(stored_font_size(Some("small")), Some(FontScale::Small));
+        assert_eq!(stored_font_size(Some("Large")), Some(FontScale::Large));
+        assert_eq!(stored_font_size(Some("medium")), Some(FontScale::Medium));
+        assert_eq!(stored_font_size(Some("huge")), None);
+        assert_eq!(stored_font_size(None), None);
+        // The ladder steps up in both roles.
+        let (su, sa) = FontScale::Small.chat_px();
+        let (mu, ma) = FontScale::Medium.chat_px();
+        let (lu, la) = FontScale::Large.chat_px();
+        assert!(su < mu && mu < lu && sa < ma && ma < la);
     }
 }

@@ -194,14 +194,14 @@ fn state_card(title: &str, detail: &str, theme: &component::Theme) -> AnyElement
         .items_center()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.foreground)
                 .child(title.to_string()),
         )
         .child(
             div()
                 .pt_2()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(detail.to_string()),
         )
@@ -222,7 +222,7 @@ fn empty_card(text: &str, theme: &component::Theme) -> AnyElement {
         .justify_center()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.muted_foreground)
                 .child(text.to_string()),
         )
@@ -234,7 +234,7 @@ fn field_label(label: &str, hint: Option<&str>, theme: &component::Theme) -> gpu
     let mut field = div().flex().flex_col().gap_1().pt_2();
     field = field.child(
         div()
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(theme.foreground)
             .child(label.to_string()),
     );
@@ -270,14 +270,14 @@ fn restart_card(
         .border_color(theme.border)
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.foreground)
                 .child(t!("zconfig.restartPending").into_owned()),
         )
         .child(
             div()
                 .pt_1()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.restartWarning").into_owned()),
         )
@@ -293,7 +293,7 @@ fn restart_card(
         } else {
             div()
                 .pt_2()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.warning_foreground)
                 .child(t!("zconfig.restartNoInstance").into_owned())
                 .into_any_element()
@@ -387,7 +387,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.foreground)
                         .child(notice_text(notice)),
                 )
@@ -531,7 +531,7 @@ fn render_skill_row(
                 .gap(px(2.))
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.foreground)
                         .child(name),
                 )
@@ -664,7 +664,7 @@ fn render_mcp_row(index: usize, server: &McpServerRow, cx: &Context<Workbench>) 
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.foreground)
                         .child(name),
                 )
@@ -737,7 +737,7 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.foreground)
                     .child(t!("zconfig.hooksAll").into_owned()),
             )
@@ -804,7 +804,7 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                         .child(
                             div()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(12.))
+                                .text_size(px(13.))
                                 .text_color(theme.foreground)
                                 .truncate()
                                 .child(event.clone()),
@@ -893,7 +893,7 @@ fn render_hook_entry(
                         .child(
                             div()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.foreground)
                                 .truncate()
                                 .child(matcher),
@@ -1039,7 +1039,7 @@ fn render_agent_row(
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.foreground)
                             .truncate()
                             .child(name.clone()),
@@ -1144,7 +1144,7 @@ fn render_backups_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Contex
                 .px_4()
                 .pt_3()
                 .pb_1()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.foreground)
                 .child(label.to_string()),
         );
@@ -1204,7 +1204,7 @@ fn render_backup_row(
     // First line: the stamp plus the gesture controls.
     let mut line = div().flex().items_center().gap_3().child(
         div()
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(theme.foreground)
             .min_w_0()
             .truncate()
@@ -1778,7 +1778,7 @@ impl Workbench {
             body = body.child(
                 div()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(target.name.clone().unwrap_or_default()),
             );
@@ -1877,7 +1877,7 @@ impl Workbench {
                 .pt_2()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.enabled").into_owned()),
                 )
@@ -1918,7 +1918,7 @@ impl Workbench {
             .child(
                 div()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(format!("{} · {}", form.target.event, matcher)),
             )
@@ -2020,7 +2020,7 @@ impl Workbench {
                 .child(
                     div()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(form.stored_raw.clone().unwrap_or_default()),
@@ -2040,7 +2040,7 @@ impl Workbench {
                 .child(
                     div()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(form.stored_raw.clone().unwrap_or_default()),
@@ -2185,13 +2185,13 @@ fn update_row(label: &str, value: &str, theme: &component::Theme) -> gpui::Div {
         .child(
             div()
                 .flex_1()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.muted_foreground)
                 .child(label.to_string()),
         )
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.foreground)
                 .child(value.to_string()),
         )
@@ -2261,7 +2261,7 @@ fn render_app_update_body(
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.updateChannel").into_owned()),
             )
@@ -2325,7 +2325,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.foreground)
                     .child(if stage == "installing" {
                         t!("zconfig.updateInstalling").into_owned()
@@ -2353,7 +2353,7 @@ fn render_app_update_body(
                 )
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(format!("{pct}%")),
                 )
@@ -2370,7 +2370,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(rgb(0x6ee7b7))
                     .child(fill(
                         &t!("zconfig.updateDone"),
@@ -2379,7 +2379,7 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.updateRestartApp").into_owned()),
             )
@@ -2395,7 +2395,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(rgb(0xfcd34d))
                     .child(t!("zconfig.updateNeedsUser").into_owned()),
             )
@@ -2410,7 +2410,7 @@ fn render_app_update_body(
                         div()
                             .w_full()
                             .font_family(theme.mono_font_family.clone())
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child(path),
                     )
@@ -2418,7 +2418,7 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.updateNeedsUserHint").into_owned()),
             )
@@ -2434,7 +2434,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(rgb(0xfca5a5))
                     .child(t!("zconfig.updateFailed").into_owned()),
             )
@@ -2449,7 +2449,7 @@ fn render_app_update_body(
                         div()
                             .w_full()
                             .font_family(theme.mono_font_family.clone())
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child(error),
                     )
@@ -2473,7 +2473,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.foreground)
                     .child(fill(
                         &t!("zconfig.updateConfirm"),
@@ -2549,7 +2549,7 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(fill(
                         &t!("zconfig.updateSize"),
@@ -2576,7 +2576,7 @@ fn render_app_update_body(
                         .px_4()
                         .pt_3()
                         .pb_1()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.updateNotes").into_owned()),
                 )
@@ -2586,7 +2586,7 @@ fn render_app_update_body(
                         .test_support()
                         .px_4()
                         .pb_3()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(notes),
                 ),
@@ -2618,10 +2618,11 @@ mod zconfig_page_tests {
 
     /// Serializes the module's window tests: the kit's headless platform
     /// keeps process-global mouse state, so parallel windows inside one test
-    /// binary can steal each other's pointer position mid-click.
+    /// binary can steal each other's pointer position mid-click. Delegates
+    /// to the process-wide lock so workbench-side window tests join the
+    /// same queue.
     fn window_lock() -> MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        crate::workbench::window_test_lock()
     }
 
     fn section_snapshot(kind: ConfigPageKind, payload: serde_json::Value) -> WorkbenchSnapshot {
@@ -2818,7 +2819,10 @@ mod zconfig_page_tests {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(Bounds {
                         origin: Point::default(),
-                        size: Size { width: px(800.), height: px(600.) },
+                        // The MCP form is the longest section page — the
+                        // bumped chrome needs the taller window to keep the
+                        // Save control inside the viewport.
+                        size: Size { width: px(800.), height: px(800.) },
                     })),
                     ..Default::default()
                 },

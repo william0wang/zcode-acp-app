@@ -221,7 +221,7 @@ pub fn render_usage_page(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(notice_text(text)),
                 )
@@ -230,7 +230,7 @@ pub fn render_usage_page(
                         .id("usage-notice-dismiss")
                         .flex_none()
                         .cursor_pointer()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground.opacity(0.7))
                         .child("✕")
                         .on_click(move |_, _, _| rt.send(UiCommand::DismissConfigNotice)),
@@ -276,7 +276,7 @@ pub fn render_usage_page(
                 .border_color(theme.border)
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.restartPending").into_owned()),
                 )
@@ -310,14 +310,14 @@ pub fn render_usage_page(
             .border_color(theme.border)
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.unsupported").into_owned()),
             )
             .child(
                 div()
                     .mt_1()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground.opacity(0.7))
                     .child(t!("zconfig.unsupportedHint").into_owned()),
             )
@@ -341,7 +341,7 @@ pub fn render_usage_page(
                 .justify_center()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.muted_foreground.opacity(0.7))
                         .child(t!("zconfig.loading").into_owned()),
                 )
@@ -411,7 +411,7 @@ where
         .justify_center()
         .py(px(6.))
         .rounded_md()
-        .text_size(px(12.))
+        .text_size(px(13.))
         .cursor_pointer()
         .when(active, |this| {
             this.bg(white_alpha(0.10))
@@ -679,7 +679,7 @@ fn metric_row(label: &str, value: String, trend: Option<f64>, theme: &Theme) -> 
         Some(
             div()
                 .pl(px(6.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(if up { emerald_400(0.80) } else { sky_400(0.80) })
                 .child(format!("{} {:.1}%", if up { "↑" } else { "↓" }, t.abs())),
         )
@@ -851,7 +851,7 @@ fn render_local_tab(view: &UsagePageView, runtime: &ProtocolRuntime, theme: &The
                         div()
                             .flex_none()
                             .font_family(theme.mono_font_family.clone())
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground.opacity(0.7))
                             .child(day.date.clone()),
                     )
@@ -859,7 +859,7 @@ fn render_local_tab(view: &UsagePageView, runtime: &ProtocolRuntime, theme: &The
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child(models),
                     ),
@@ -930,7 +930,7 @@ fn config_row(label: &str, value: String, hint: Option<String>, theme: &Theme) -
             this.child(
                 div()
                     .pt_1()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground.opacity(0.7))
                     .child(h),
             )
@@ -943,7 +943,7 @@ fn config_empty(text: &str, theme: &Theme) -> gpui::Div {
         .px_4()
         .py_8()
         .text_center()
-        .text_size(px(12.))
+        .text_size(px(13.))
         .text_color(theme.muted_foreground.opacity(0.7))
         .child(text.to_string())
 }
@@ -954,7 +954,7 @@ fn caption(text: String, theme: &Theme) -> gpui::Div {
         .px_4()
         .pb_3()
         .pt_1()
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(theme.muted_foreground.opacity(0.7))
         .child(text)
 }

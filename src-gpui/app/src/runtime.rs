@@ -745,6 +745,10 @@ pub struct SessionRow {
 pub struct TabSummary {
     pub id: u64,
     pub session_id: Option<String>,
+    /// The session's display name (discovery's title — the rename target,
+    /// or whatever the bridge titled it). The tab strip shows this, falling
+    /// back to the short id while discovery has not named it yet.
+    pub session_title: Option<String>,
     pub phase: TabPhase,
     pub running: bool,
     pub pending: usize,
@@ -7840,6 +7844,13 @@ impl Driver {
             .map(|t| TabSummary {
                 id: t.id,
                 session_id: t.core.active_session_id.clone().or_else(|| t.target.clone()),
+                session_title: t.core.active_session_id.as_deref().and_then(|sid| {
+                    sessions
+                        .iter()
+                        .find(|row| row.session_id == sid)
+                        .and_then(|row| row.title.clone())
+                        .filter(|title| !title.trim().is_empty())
+                }),
                 phase: t.state.clone(),
                 running: t.core.is_running,
                 pending: pending_count(t),

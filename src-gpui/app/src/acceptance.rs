@@ -37,6 +37,7 @@ fn connected_snapshot(active: Option<TabView>) -> WorkbenchSnapshot {
     snap.tabs = vec![TabSummary {
         id: 7,
         session_id: Some("sess_1".to_string()),
+        session_title: None,
         phase: TabPhase::Connected,
         running: false,
         pending: 0,

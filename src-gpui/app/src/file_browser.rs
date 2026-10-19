@@ -262,7 +262,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
             .gap_1()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
                     .child("SESSION FILES"),
@@ -348,7 +348,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                 .id("files-crumb-root")
                 .test_support()
                 .flex_none()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.foreground)
                 .cursor_pointer()
                 .child(root_label)
@@ -366,7 +366,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("/"),
             )
@@ -375,7 +375,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                     .id(SharedString::from(format!("files-crumb-{i}")))
                     .test_support()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(if i + 1 == segments.len() {
                         theme.foreground
                     } else {
@@ -405,7 +405,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
             div()
                 .id("files-unsupported")
                 .test_support()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(
                     "this bridge does not advertise session files — bridge 0.7.0+ required",
@@ -414,7 +414,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
     } else if view.loading {
         body = body.child(
             div()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child("reading…"),
         );
@@ -428,7 +428,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.danger)
                         .child(err.clone()),
                 )
@@ -464,7 +464,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
         if entries.is_empty() {
             body = body.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("empty directory"),
             );
@@ -480,8 +480,6 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
         .flex_none()
         .flex()
         .flex_col()
-        .border_r_1()
-        .border_color(theme.border)
         .bg(theme.title_bar)
         .child(column)
         .child(
@@ -533,7 +531,7 @@ fn render_entry_row(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(12.))
+                .text_size(px(13.))
                 .text_color(theme.foreground)
                 .child(entry.name.clone()),
         )
@@ -550,7 +548,7 @@ fn render_entry_row(
             this.child(
                 div()
                     .flex_none()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("▸"),
             )
@@ -622,7 +620,7 @@ pub(crate) fn render_file_viewer(
                 .id("file-viewer-meta")
                 .test_support()
                 .flex_none()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(format!("{} · {}", fmt_size(view.size), kind_label(view.kind))),
         );
@@ -682,7 +680,7 @@ pub(crate) fn render_file_viewer(
     if view.loading {
         body = body.child(
             div()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child("reading…"),
         );
@@ -696,7 +694,7 @@ pub(crate) fn render_file_viewer(
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.danger)
                         .child(err.clone()),
                 )
@@ -721,7 +719,7 @@ pub(crate) fn render_file_viewer(
                 if view.loading {
                     body = body.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child("loading preview…"),
                     );
@@ -751,7 +749,7 @@ pub(crate) fn render_file_viewer(
                 } else {
                     body = body.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child("no preview available"),
                     );
@@ -760,7 +758,7 @@ pub(crate) fn render_file_viewer(
             FileKind::Binary => {
                 body = body.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child("binary file — open it with the default application instead"),
                 );
@@ -805,7 +803,7 @@ pub(crate) fn render_file_viewer(
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .text_size(px(11.))
+                                            .text_size(px(12.))
                                             .font_family(theme.mono_font_family.clone())
                                             .text_color(theme.foreground)
                                             .child(display_line(line)),

@@ -103,12 +103,12 @@ gpui_kit::actions!(
     ]
 );
 
-/// Which panel the left dock shows (ADR-0009: sessions/files/settings as
-/// dockable panels around the chat area).
+/// Which panel the left dock shows (ADR-0009: sessions/settings as dockable
+/// panels around the chat area). Files is NOT here — session-scoped surfaces
+/// live in the right session panel; the browser opens as a full page.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DockPanel {
     Sessions,
-    Files,
     Config,
 }
 
@@ -117,7 +117,6 @@ impl DockPanel {
     fn key(self) -> &'static str {
         match self {
             DockPanel::Sessions => "sessions",
-            DockPanel::Files => "files",
             DockPanel::Config => "config",
         }
     }
@@ -169,6 +168,22 @@ pub struct Workbench {
     /// view-local like the left dock, with its own splitter.
     session_panel_open: bool,
     session_dock_sizes: Entity<ResizableState>,
+    /// The chat font ladder (TS `fontSize`): scales the reading text — the
+    /// user bubbles and the agent prose/thought bodies. Chrome stays fixed.
+    font_scale: crate::ui_prefs::FontScale,
+    /// The Session Files page (view-local layout): opens from the right
+    /// session panel's row, replaces the chat surfaces, and closes on back
+    /// or Esc. The listing state itself is the driver's (`snap.files`).
+    files_page_open: bool,
+    /// The session the files page was opened FOR — a session switch under
+    /// an open page re-seeds the browser (or closes it with no session),
+    /// never leaves it showing the previous session's stale browse.
+    files_page_session: Option<String>,
+    /// The files page's focus target: the row click that opens the page
+    /// unmounts with the dock it lived in, so without an explicit refocus
+    /// key events (Esc) would dispatch from a detached node and never
+    /// reach the workbench's action handlers.
+    files_page_focus: FocusHandle,
     /// The sessions panel's search field — the ⌘K target (TS SessionList's
     /// "Search sessions": title or workspace base name, substring).
     session_search: Entity<InputState>,
@@ -821,6 +836,16 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
 // Workbench
 // ---------------------------------------------------------------------------
 
+/// Serializes the window-opening UI tests process-wide: the kit's headless
+/// platform keeps process-global mouse state (and some tests also flip
+/// process-global env/locale), so parallel test windows can steal each
+/// other's pointer mid-click. Shared with zconfig_pages' `window_lock`.
+#[cfg(test)]
+pub(crate) fn window_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl Workbench {
     pub fn new(
         window: &mut Window,
@@ -961,6 +986,11 @@ impl Workbench {
             dock_open: true,
             dock_sizes,
             session_panel_open: false,
+            files_page_open: false,
+            files_page_session: None,
+            files_page_focus: cx.focus_handle(),
+            font_scale: crate::ui_prefs::load_font_size()
+                .unwrap_or(crate::ui_prefs::FontScale::Medium),
             session_dock_sizes,
             session_search,
             _search_sub: search_sub,
@@ -1087,17 +1117,6 @@ impl Workbench {
         } else {
             self.dock_open = true;
             self.dock_panel = panel;
-            // Docking the files panel seeds a listing on EVERY dock (the TS
-            // FileBrowser mount effect) — but only where the bridge
-            // advertises the capability; otherwise the panel's note
-            // explains the gap and a request would just 404.
-            if panel == DockPanel::Files
-                && self.tab.as_ref().is_some_and(|t| t.fs_capable)
-            {
-                self.runtime.send(UiCommand::FilesNavigate {
-                    path: String::new(),
-                });
-            }
             // Docking the config panel seeds the gate probe (batch M — TS
             // ZCodeConfigScreen's mount effect): the gated Workflows entry
             // cannot render until the verdict lands, and an unprobed verdict
@@ -1208,6 +1227,13 @@ impl Workbench {
             // The rename sheet is view-local — closing it is purely ours.
         } else if self.snap.new_session.is_some() {
             self.runtime.send(UiCommand::NewSessionToggle);
+        } else if self.snap.files.viewing.is_some() {
+            // The file viewer is the topmost layer (mounted after every
+            // page) — Esc unwinds it before anything it covers.
+            self.runtime.send(UiCommand::FilesCloseView);
+        } else if std::mem::take(&mut self.files_page_open) {
+            // The Session Files page is view-local — closing it is purely
+            // ours (the file viewer above it stays driver-owned).
         } else if let Some(cmd) = self.open_config_page_close() {
             self.runtime.send(cmd);
         } else if self.tab.as_ref().is_some_and(|t| t.running) {
@@ -1356,6 +1382,27 @@ impl Workbench {
                 // page closed under an open confirm dialog drops it.
                 if self.snap.quota_page.is_none() {
                     self.quota_confirm = None;
+                }
+                // The files page belongs to the session it was opened for:
+                // a session switch under an open page re-seeds the browser
+                // for the new target (the TS FileBrowser's mount effect),
+                // and the page closes when there is no session left to
+                // browse (the capability note would otherwise masquerade as
+                // "no session").
+                if self.files_page_open {
+                    let page_session =
+                        self.snap.active.as_ref().and_then(|t| t.session_id.clone());
+                    if page_session != self.files_page_session {
+                        self.files_page_session = page_session.clone();
+                        self.files_page_open = page_session.is_some();
+                        if self.files_page_open
+                            && self.snap.active.as_ref().is_some_and(|t| t.fs_capable)
+                        {
+                            self.runtime.send(UiCommand::FilesNavigate {
+                                path: String::new(),
+                            });
+                        }
+                    }
                 }
                 // Same for the App Update page's install confirm.
                 if !matches!(
@@ -1885,49 +1932,12 @@ impl Workbench {
             );
         }
 
-        // Right cluster: the active tab's title-bar stats (E1 — ChatScreen's
-        // header line: context `17.5%/1.0M`, bare cache percent, `tok/s`),
-        // running-session count (the quit guard's number), the turn state,
-        // and its bridge agent.
+        // Right cluster: window-scoped state only — running-session count
+        // (the quit guard's number), the turn state, and the bridge agent.
+        // The per-session readouts (context/cache/tps) live under the
+        // composer of the session they describe, not here. The bar's rows
+        // stay one step smaller than the panel chrome (a strip, not a page).
         let mut right = div().flex().items_center().gap_3().ml_auto().flex_none();
-        if let Some(tab) = self.tab.as_ref() {
-            if let Some(usage) = tab.usage.filter(|u| u.size > 0) {
-                right = right.child(
-                    div()
-                        .id("stat-context")
-                        .flex_none()
-                        .text_size(px(11.))
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(format!("ctx {}", fmt_context(usage.used, usage.size)))
-                        .test_support(),
-                );
-            }
-            if let Some(hit) = tab.cache_hit {
-                right = right.child(
-                    div()
-                        .id("stat-cache")
-                        .flex_none()
-                        .text_size(px(11.))
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(format!("cache {hit}%"))
-                        .test_support(),
-                );
-            }
-            if let Some(stats) = tab.turn_stats {
-                right = right.child(
-                    div()
-                        .id("stat-tps")
-                        .flex_none()
-                        .text_size(px(11.))
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{} tok/s", stats.tps))
-                        .test_support(),
-                );
-            }
-        }
         if self.snap.running_session_count > 0 {
             right = right.child(
                 div()
@@ -1964,28 +1974,6 @@ impl Workbench {
             );
         }
         bar = bar.child(right);
-        // Context progress hairline (ChatScreen's header-bottom gauge): the
-        // fill sits on the bar's bottom edge, clamped at 100%. Inside the
-        // bar's own bounds, so no later sibling can overpaint it.
-        if let Some(usage) = self
-            .tab
-            .as_ref()
-            .and_then(|t| t.usage)
-            .filter(|u| u.size > 0)
-        {
-            let pct = (((usage.used as f32 / usage.size as f32) * 100.0).min(100.0) / 100.0) as f32;
-            bar = bar.child(
-                div()
-                    .id("context-progress")
-                    .absolute()
-                    .bottom_0()
-                    .left_0()
-                    .h(px(2.))
-                    .w(relative(pct))
-                    .bg(theme.accent)
-                    .test_support(),
-            );
-        }
         bar.into_any_element()
     }
 
@@ -2018,12 +2006,6 @@ impl Workbench {
             cx,
         ));
         rail = rail.child(self.render_rail_button(
-            DockPanel::Files,
-            KitIconName::Folder,
-            "Files — the active session's workspace (Session Files)",
-            cx,
-        ));
-        rail = rail.child(self.render_rail_button(
             DockPanel::Config,
             IconName::Settings2,
             "Configuration — models, usage, quota, system status",
@@ -2042,7 +2024,6 @@ impl Workbench {
         }
         let panel = match self.dock_panel {
             DockPanel::Sessions => self.render_sidebar(cx),
-            DockPanel::Files => self.render_files_dock_panel(cx),
             DockPanel::Config => self.render_config_panel(cx),
         };
         div()
@@ -2173,7 +2154,7 @@ impl Workbench {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     .child(
                         "No hub is running and the config has no access token. Confirming \
@@ -2182,7 +2163,7 @@ impl Workbench {
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.foreground)
                     .child(path.to_string()),
@@ -2196,7 +2177,7 @@ impl Workbench {
                     .p_3()
                     .rounded_md()
                     .bg(theme.border)
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
                     .child(preview.to_string()),
@@ -2204,7 +2185,7 @@ impl Workbench {
         if let Some(err) = error {
             card = card.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.danger)
                     .child(err.to_string()),
             );
@@ -2317,13 +2298,13 @@ impl Workbench {
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.foreground)
                             .child("Local hub"),
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child("Spawned or discovered on this machine"),
                     ),
@@ -2364,13 +2345,13 @@ impl Workbench {
                         .flex_1()
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(px(13.))
                                 .text_color(theme.foreground)
                                 .child(server.name.clone()),
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .font_family(theme.mono_font_family.clone())
                                 .child(server.hub_url.clone()),
@@ -2548,7 +2529,7 @@ impl Workbench {
                 .p_2()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(if editing_id.is_some() {
                             "Edit remote server"
@@ -2595,7 +2576,7 @@ impl Workbench {
             .min_w_0()
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("panel.language").into_owned()),
             )
@@ -2621,6 +2602,74 @@ impl Workbench {
             .into_any_element()
     }
 
+    // -- font size -------------------------------------------------------------
+
+    /// Apply the settings panel's font-size pick: persist (the TS
+    /// `saveFontSize`) and repaint — the chat rows read the ladder at paint
+    /// time, so one notify rescales every bubble.
+    fn set_font_scale(&mut self, scale: crate::ui_prefs::FontScale, cx: &mut Context<Self>) {
+        if self.font_scale == scale {
+            return;
+        }
+        self.font_scale = scale;
+        crate::ui_prefs::store_font_size(scale.key());
+        cx.notify();
+    }
+
+    /// The settings panel's font-size segment (SidePanel.tsx:189-210): the
+    /// three ladder steps in one kit ButtonGroup, the active one selected.
+    /// A global preference, so it sits in the left dock beside the language
+    /// segment — not in the session panel.
+    fn render_font_size_section(&self, cx: &Context<Self>) -> AnyElement {
+        use crate::ui_prefs::FontScale;
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let current = self.font_scale;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_w_0()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("panel.fontSize").into_owned()),
+            )
+            .child(
+                ButtonGroup::new("font-segment")
+                    .small()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        Button::new("font-small")
+                            .label(t!("panel.fontSizeSmall").into_owned())
+                            .selected(current == FontScale::Small),
+                    )
+                    .child(
+                        Button::new("font-medium")
+                            .label(t!("panel.fontSizeMedium").into_owned())
+                            .selected(current == FontScale::Medium),
+                    )
+                    .child(
+                        Button::new("font-large")
+                            .label(t!("panel.fontSizeLarge").into_owned())
+                            .selected(current == FontScale::Large),
+                    )
+                    .on_click(move |clicks, _, cx| {
+                        // Single-select group: the click's index is the pick.
+                        let scale = match clicks.first() {
+                            Some(0) => FontScale::Small,
+                            Some(1) => FontScale::Medium,
+                            Some(2) => FontScale::Large,
+                            _ => return,
+                        };
+                        wb.update(cx, |wb, cx| wb.set_font_scale(scale, cx));
+                    }),
+            )
+            .into_any_element()
+    }
+
     fn render_config_panel(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
@@ -2628,7 +2677,7 @@ impl Workbench {
 
         column = column.child(
             div()
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .font_family(theme.mono_font_family.clone())
                 .text_color(theme.muted_foreground)
                 .child("CONFIGURATION"),
@@ -2641,6 +2690,10 @@ impl Workbench {
         // Both the header and the flip's effect resolve through t!() at
         // paint time, so the pick re-renders the whole chrome at once.
         column = column.child(self.render_language_section(cx));
+
+        // The font-size segment (SidePanel.tsx:189-210): the chat ladder,
+        // beside the language pick — both are appearance preferences.
+        column = column.child(self.render_font_size_section(cx));
 
         // The hub staleness check (TS SettingsPanel `checkHubUpgrade`): one
         // button, busy while POST /api/upgrade flies, the verdict note under
@@ -2670,7 +2723,7 @@ impl Workbench {
                     div()
                         .id("hub-upgrade-note")
                         .test_support()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(note.to_string()),
                 );
@@ -2800,7 +2853,7 @@ impl Workbench {
                             .min_w_0()
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .text_color(theme.foreground)
                                     .child(title.to_string()),
                             )
@@ -2850,7 +2903,7 @@ impl Workbench {
                         .min_w_0()
                         .child(
                             div()
-                                .text_size(px(12.))
+                                .text_size(px(13.))
                                 .text_color(theme.foreground)
                                 .child(t!("zconfig.workflowGate").into_owned()),
                         )
@@ -2923,7 +2976,7 @@ impl Workbench {
                 .border_color(theme.border)
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
                         .child(t!("panel.session").to_uppercase()),
@@ -2950,7 +3003,7 @@ impl Workbench {
                 .px_3()
                 .pt(px(12.))
                 .pb(px(2.))
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground.opacity(0.75))
                 .child(text.to_uppercase())
         };
@@ -2987,7 +3040,7 @@ impl Workbench {
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(px(12.))
+                                .text_size(px(13.))
                                 .text_color(theme.muted_foreground)
                                 .child(label),
                         )
@@ -3041,7 +3094,7 @@ impl Workbench {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .text_color(theme.muted_foreground)
                                     .child(label.to_string()),
                             )
@@ -3049,7 +3102,7 @@ impl Workbench {
                                 div()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .font_family(theme.mono_font_family.clone())
                                     .text_color(theme.foreground)
                                     .child(value),
@@ -3062,9 +3115,11 @@ impl Workbench {
 
         // The single workflow entry (batch M): shown when the gate verdict
         // is ON and a session is attached; everything workflow-specific
-        // lives INSIDE the management page.
+        // lives INSIDE the management page. Opening it also drops the files
+        // page — one full page at a time.
         if session_live && self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled) {
             let runtime = runtime.clone();
+            let wb = cx.entity();
             column = column.child(caption(t!("panel.workflows").into_owned())).child(
                 Button::new("session-panel-workflows")
                     .ghost()
@@ -3072,7 +3127,37 @@ impl Workbench {
                     .w_full()
                     .icon(KitIconName::Workflow)
                     .label(t!("panel.workflowManage").into_owned())
-                    .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows)),
+                    .on_click(move |_, _, cx| {
+                        wb.update(cx, |wb, cx| {
+                            wb.files_page_open = false;
+                            cx.notify();
+                        });
+                        runtime.send(UiCommand::OpenWorkflows);
+                    }),
+            );
+        }
+
+        // Session Files (F1): session-scoped, so its entry lives HERE — the
+        // row opens the browser as a full page (left dock = global things,
+        // right panel = this session's things).
+        if session_live {
+            let wb = cx.entity();
+            column = column.child(caption(t!("files.title").into_owned())).child(
+                Button::new("session-panel-files")
+                    .ghost()
+                    .small()
+                    .w_full()
+                    .icon(KitIconName::Folder)
+                    .label(t!("files.title").into_owned())
+                    .on_click(move |_, window, cx| {
+                        let focus = wb.update(cx, |wb, cx| {
+                            wb.open_files_page(cx);
+                            wb.files_page_focus.clone()
+                        });
+                        // The row unmounts with the dock the page replaces;
+                        // hand focus to the page so Esc still lands.
+                        window.focus(&focus, cx);
+                    }),
             );
         }
 
@@ -3088,7 +3173,7 @@ impl Workbench {
                     .test_support()
                     .px_3()
                     .py_2()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     .child(t!("chat.noSession").into_owned()),
             );
@@ -3110,23 +3195,90 @@ impl Workbench {
             .into_any_element()
     }
 
-    // -- files panel ---------------------------------------------------------
+    // -- files page ----------------------------------------------------------
 
-    /// The docked Session Files panel (F1): the driver's listing state
-    /// painted by `file_browser`, with the view-local dotfile toggle and
-    /// the loopback-gated Finder affordance (F2).
-    fn render_files_dock_panel(&self, cx: &Context<Self>) -> AnyElement {
-        render_files_panel(
-            &self.snap.files,
-            &FilesPanelCtx {
-                runtime: self.runtime.clone(),
-                wb: cx.entity(),
-                show_hidden: self.files_show_hidden,
-                hub_addr: self.snap.hub_addr.as_deref(),
-                fs_capable: self.tab.as_ref().is_some_and(|t| t.fs_capable),
-            },
-            cx,
-        )
+    /// Open the Session Files page from the right panel's row: seed a
+    /// listing where the bridge advertises the capability (the TS
+    /// FileBrowser mount effect — without it a request would just 404) and
+    /// swap the chat surfaces for the page.
+    pub(crate) fn open_files_page(&mut self, cx: &mut Context<Self>) {
+        self.files_page_open = true;
+        self.files_page_session = self.snap.active.as_ref().and_then(|t| t.session_id.clone());
+        if self.tab.as_ref().is_some_and(|t| t.fs_capable) {
+            self.runtime.send(UiCommand::FilesNavigate {
+                path: String::new(),
+            });
+        }
+        cx.notify();
+    }
+
+    fn close_files_page(&mut self, cx: &mut Context<Self>) {
+        self.files_page_open = false;
+        cx.notify();
+    }
+
+    /// The Session Files page (F1): the driver's listing state painted by
+    /// `file_browser` as a full page — session-scoped, so it opens from the
+    /// right session panel, never the left dock. Back returns to the chat;
+    /// the view-local dotfile toggle and the loopback-gated Finder
+    /// affordance (F2) ride the panel's own header.
+    fn render_files_page(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        div()
+            .id("files-page")
+            .test_support()
+            .track_focus(&self.files_page_focus)
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .flex_none()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("files-page-back")
+                            .ghost()
+                            .small()
+                            .icon(KitIconName::ArrowLeft)
+                            .tooltip("Back to the chat")
+                            .on_click(move |_, _, cx| {
+                                wb.update(cx, |wb, cx| wb.close_files_page(cx));
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(14.))
+                            .child(t!("files.title").into_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(render_files_panel(
+                        &self.snap.files,
+                        &FilesPanelCtx {
+                            runtime: self.runtime.clone(),
+                            wb: cx.entity(),
+                            show_hidden: self.files_show_hidden,
+                            hub_addr: self.snap.hub_addr.as_deref(),
+                            fs_capable: self.tab.as_ref().is_some_and(|t| t.fs_capable),
+                        },
+                        cx,
+                    )),
+            )
+            .into_any_element()
     }
 
     // -- sessions panel ------------------------------------------------------
@@ -3175,7 +3327,7 @@ impl Workbench {
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
                         .child(t!("chat.sessions").to_uppercase()),
@@ -3220,7 +3372,7 @@ impl Workbench {
         if rows.is_empty() {
             rows.push(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(if query.is_empty() {
                         "No live sessions — start one from the editor, or browse history below."
@@ -3353,7 +3505,7 @@ impl Workbench {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.foreground)
                     .child(title),
             )
@@ -3404,7 +3556,7 @@ impl Workbench {
                 .mt_2()
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .font_family(theme.mono_font_family.clone())
                         .text_color(theme.muted_foreground)
                         .child(t!("historyDialog.title").to_uppercase()),
@@ -3434,7 +3586,7 @@ impl Workbench {
                 (None, None) => {
                     column = column.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child(t!("historyDialog.loading").into_owned()),
                     );
@@ -3442,7 +3594,7 @@ impl Workbench {
                 (None, Some(err)) => {
                     column = column.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.danger)
                             .child(err.clone()),
                     );
@@ -3461,7 +3613,7 @@ impl Workbench {
                     if shown.is_empty() {
                         column = column.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(if list.is_empty() {
                                     "No known projects yet.".to_string()
@@ -3489,7 +3641,7 @@ impl Workbench {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(12.))
+                                        .text_size(px(13.))
                                         .text_color(theme.foreground)
                                         .child(project_name(&p.workspace_path)),
                                 )
@@ -3548,7 +3700,7 @@ impl Workbench {
         if let Some(err) = &selected.error {
             column = column.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.danger)
                     .child(err.clone()),
             );
@@ -3556,7 +3708,7 @@ impl Workbench {
         if selected.loading_page {
             column = column.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("historyDialog.waking").into_owned()),
             );
@@ -3662,7 +3814,7 @@ impl Workbench {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.foreground)
                     .child(title),
             )
@@ -3731,7 +3883,7 @@ impl Workbench {
                     .px_3()
                     .pt_1()
                     .pb_1()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(theme.muted_foreground)
                     .child("no session open"),
             );
@@ -3893,7 +4045,7 @@ impl Workbench {
                     div()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(format!("{} · {}/{}", t!("chat.plan"), done, entries.len())),
                 )
@@ -3926,14 +4078,14 @@ impl Workbench {
                             .child(
                                 div()
                                     .flex_none()
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(color)
                                     .child(glyph),
                             )
                             .child(
                                 div()
                                     .min_w_0()
-                                    .text_size(px(12.))
+                                    .text_size(px(13.))
                                     .when(status == Some("completed"), |this| {
                                         this.line_through()
                                             .text_color(theme.muted_foreground)
@@ -3953,8 +4105,14 @@ impl Workbench {
     fn render_tab(&self, tab: &TabSummary, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let active = self.snap.active_tab == Some(tab.id);
+        // The strip shows the session's NAME (discovery's title — the rename
+        // target); the short id is only the fallback before discovery names
+        // it, never the steady state.
         let title = match (&tab.session_id, &tab.phase) {
-            (Some(id), _) => short_id(id, "session"),
+            (Some(_), _) => tab
+                .session_title
+                .clone()
+                .unwrap_or_else(|| short_id(tab.session_id.as_deref().unwrap_or("session"), "session")),
             (None, TabPhase::Failed(_)) => "failed".to_string(),
             (None, _) => "new session".to_string(),
         };
@@ -3976,7 +4134,7 @@ impl Workbench {
             .pt_1()
             .pb_1()
             .rounded_t_md()
-            .text_size(px(12.))
+            .text_size(px(13.))
             .font_family(theme.mono_font_family.clone())
             .cursor_pointer()
             .when(active, |this| {
@@ -4024,7 +4182,14 @@ impl Workbench {
             }
             None => {}
         }
-        tab_view = tab_view.child(div().min_w_0().truncate().child(title));
+        tab_view = tab_view.child(
+            div()
+                .id(("tab-title", tab.id))
+                .test_support()
+                .min_w_0()
+                .truncate()
+                .child(title),
+        );
         if tab.pending > 0 {
             tab_view = tab_view.child(
                 div()
@@ -4147,12 +4312,23 @@ impl Workbench {
         let weak_rows = weak.clone();
         let scroller = self.scroller.clone();
         let fade = theme.background;
+        // The (user, agent) chat text sizes off the font ladder — the rows
+        // read them at paint time so the segment's pick rescales everything.
+        let chat_font = self.font_scale.chat_px();
         column
             .child(
                 MessageScroller::new("chat", scroller, move |index, _window, cx| {
                     let is_last_row = index + 1 == rows.len();
                     if let Some(row) = rows.get(index) {
-                        render_row(row, is_last_row, running, copied.as_deref(), &weak_rows, cx)
+                        render_row(
+                            row,
+                            is_last_row,
+                            running,
+                            copied.as_deref(),
+                            &weak_rows,
+                            chat_font,
+                            cx,
+                        )
                     } else if let Some(card) = card.as_ref() {
                         // The trailing approval card row (inline in the stream —
                         // requirements §2).
@@ -4208,7 +4384,7 @@ impl Workbench {
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(px(13.))
                         .text_color(theme.foreground)
                         .child(if draft.text.is_empty() {
                             "(images only)".to_string()
@@ -4271,7 +4447,7 @@ impl Workbench {
         if let Some(notice) = &self.notice {
             column = column.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.danger)
                     .child(notice.clone()),
             );
@@ -4444,24 +4620,89 @@ impl Workbench {
                 }),
         );
         column = column.child(controls);
-        column = column.child(
-            div()
-                .text_size(px(10.))
-                .text_color(theme.muted_foreground)
-                .child(
-                    "Enter send · Shift+Enter newline · follow-ups queue while running · \
-                     paste/drop up to 4 images · / completes commands",
-                ),
-        );
+        // The active session's readouts (E1 — ChatScreen's header line
+        // `context 17.5%/1.0M`, bare cache percent, `tok/s`): per-session
+        // numbers belong to the session they describe, so they ride under
+        // THIS composer, not the window's title bar.
+        {
+            let tab = self.tab.as_ref();
+            let usage = tab.and_then(|t| t.usage).filter(|u| u.size > 0);
+            let has_stats = usage.is_some()
+                || tab.is_some_and(|t| t.cache_hit.is_some() || t.turn_stats.is_some());
+            if has_stats {
+                let mut stats = div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .min_w_0()
+                    .text_size(px(12.))
+                    .font_family(theme.mono_font_family.clone())
+                    .text_color(theme.muted_foreground);
+                if let Some(usage) = usage {
+                    stats = stats.child(
+                        div()
+                            .id("stat-context")
+                            .flex_none()
+                            .child(format!("ctx {}", fmt_context(usage.used, usage.size)))
+                            .test_support(),
+                    );
+                }
+                if let Some(hit) = tab.and_then(|t| t.cache_hit) {
+                    stats = stats.child(
+                        div()
+                            .id("stat-cache")
+                            .flex_none()
+                            .child(format!("cache {hit}%"))
+                            .test_support(),
+                    );
+                }
+                if let Some(turn) = tab.and_then(|t| t.turn_stats) {
+                    stats = stats.child(
+                        div()
+                            .id("stat-tps")
+                            .flex_none()
+                            .child(format!("{} tok/s", turn.tps))
+                            .test_support(),
+                    );
+                }
+                column = column.child(stats);
+            }
+        }
 
-        div()
+        let mut composer = div()
+            .id("composer")
+            .test_support()
             .flex_none()
             .border_t_1()
             .border_color(theme.border)
             .bg(theme.title_bar)
             .p_3()
-            .child(column)
-            .into_any_element()
+            .child(column);
+        // Context progress hairline (ChatScreen's header-bottom gauge,
+        // riding the composer's top edge now): clamped at 100%, inside the
+        // composer's own bounds so no sibling can overpaint it.
+        if let Some(usage) = self
+            .tab
+            .as_ref()
+            .and_then(|t| t.usage)
+            .filter(|u| u.size > 0)
+        {
+            let pct = (((usage.used as f32 / usage.size as f32) * 100.0).min(100.0) / 100.0) as f32;
+            composer = composer
+                .relative()
+                .child(
+                    div()
+                        .id("context-progress")
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .h(px(2.))
+                        .w(relative(pct))
+                        .bg(theme.accent)
+                        .test_support(),
+                );
+        }
+        composer.into_any_element()
     }
 }
 
@@ -4700,7 +4941,7 @@ fn render_slash_menu(
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(px(13.))
                     .text_color(if selected {
                         theme.foreground
                     } else {
@@ -4713,7 +4954,7 @@ fn render_slash_menu(
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child(description),
             );
@@ -4778,13 +5019,17 @@ fn render_row(
     running: bool,
     copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
+    chat_font: (f32, f32),
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
     match row.role {
-        ChatRole::User => render_user_row(row, copied, wb, theme).into_any_element(),
+        ChatRole::User => {
+            render_user_row(row, copied, wb, chat_font, theme).into_any_element()
+        }
         ChatRole::Assistant => {
-            render_assistant_row(row, is_last_row, running, copied, wb, theme).into_any_element()
+            render_assistant_row(row, is_last_row, running, copied, wb, chat_font, theme)
+                .into_any_element()
         }
     }
 }
@@ -4793,7 +5038,7 @@ fn gutter(label: &str, color: gpui::Hsla) -> gpui::Div {
     div()
         .w_12()
         .flex_none()
-        .text_size(px(11.))
+        .text_size(px(12.))
         .text_color(color)
         .child(label.to_string())
 }
@@ -4802,6 +5047,7 @@ fn render_user_row(
     row: &RowModel,
     copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
+    chat_font: (f32, f32),
     theme: &component::Theme,
 ) -> gpui::Div {
     // Harness task lifecycle notices are system plumbing, not user speech
@@ -4822,7 +5068,7 @@ fn render_user_row(
             .border_1()
             .border_color(theme.border)
             .bg(theme.title_bar)
-            .text_size(px(11.))
+            .text_size(px(12.))
             .text_color(theme.muted_foreground)
             .child(
                 Icon::new(KitIconName::Bell)
@@ -4858,7 +5104,7 @@ fn render_user_row(
                 .py_1()
                 .rounded_md()
                 .bg(theme.secondary)
-                .text_size(px(11.))
+                .text_size(px(12.))
                 .text_color(theme.muted_foreground)
                 .child(t!("chat.contextHandoff").into_owned()),
         );
@@ -4868,14 +5114,14 @@ fn render_user_row(
         bubble = match part {
             PartView::Plain { text } => bubble.child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(chat_font.0))
                     .line_height(relative(1.45))
                     .text_color(theme.foreground)
                     .child(text.clone()),
             ),
             PartView::ImageStub => bubble.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("[image attachment]"),
             ),
@@ -4886,8 +5132,11 @@ fn render_user_row(
                 wb,
                 SharedString::from(format!("msg-image-{}-{part_index}", row.id)),
             )),
+            // TextView resolves its body size off the wrapper's text_size —
+            // the ladder rides that inheritance.
             PartView::Markdown { state, .. } => bubble.child(
                 div()
+                    .text_size(px(chat_font.0))
                     .p_2()
                     .rounded_md()
                     .bg(theme.background)
@@ -4922,6 +5171,7 @@ fn render_assistant_row(
     running: bool,
     copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
+    chat_font: (f32, f32),
     theme: &component::Theme,
 ) -> gpui::Div {
     let mut column = div().flex().flex_col().gap_2().min_w_0();
@@ -4987,7 +5237,7 @@ fn render_assistant_row(
                         )
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .child(label),
                         ),
@@ -5010,16 +5260,24 @@ fn render_assistant_row(
                             .overflow_y_scroll()
                             .px_3()
                             .pb_2()
+                            .text_size(px(chat_font.1))
                             .text_color(theme.muted_foreground)
                             .child(TextView::new(state)),
                     );
                 }
                 column.child(card)
             }
-            PartView::Markdown { state, .. } => column.child(TextView::new(state)),
+            // TextView resolves its body size off the wrapper's text_size —
+            // the ladder rides that inheritance (no wrapper = the window's
+            // 16px default, which is the Medium step).
+            PartView::Markdown { state, .. } => column.child(
+                div()
+                    .text_size(px(chat_font.1))
+                    .child(TextView::new(state)),
+            ),
             PartView::Plain { text } => column.child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(px(chat_font.1))
                     .line_height(relative(1.55))
                     .text_color(theme.foreground)
                     .child(text.clone()),
@@ -5087,7 +5345,7 @@ fn render_assistant_row(
                             div()
                                 .flex_none()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(color)
                                 .child(glyph),
                         )
@@ -5095,7 +5353,7 @@ fn render_assistant_row(
                             div()
                                 .flex_none()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(11.))
+                                .text_size(px(12.))
                                 .text_color(theme.foreground)
                                 .child(display),
                         )
@@ -5106,7 +5364,7 @@ fn render_assistant_row(
                                     .flex_1()
                                     .truncate()
                                     .font_family(theme.mono_font_family.clone())
-                                    .text_size(px(11.))
+                                    .text_size(px(12.))
                                     .text_color(theme.muted_foreground)
                                     .child(detail_head.clone()),
                             )
@@ -5138,7 +5396,7 @@ fn render_assistant_row(
                         .border_t_1()
                         .border_color(theme.border)
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .line_height(relative(1.45));
                     for (bi, block) in diffs.iter().enumerate() {
                         body = body.child(render_diff_block(
@@ -5166,7 +5424,7 @@ fn render_assistant_row(
             }
             PartView::ImageStub => column.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("[image attachment]"),
             ),
@@ -5273,6 +5531,16 @@ impl Render for Workbench {
         let toast = self.snap.toast.as_ref().map(|t| t.text.clone());
         let runtime = self.runtime.clone();
         let theme = cx.theme();
+        // A snap page (driver-owned) or the files page replaces the
+        // workbench surfaces below the status bar. A snap page wins over
+        // the files page — its open path closes ours anyway; the guard just
+        // keeps one page on screen if the states ever overlap.
+        let snap_page_open = self.snap.system_status.is_some()
+            || self.snap.models_page.is_some()
+            || self.snap.quota_page.is_some()
+            || self.snap.usage_page.is_some()
+            || self.snap.config_section_page.is_some()
+            || self.snap.workflows_page.is_some();
         div()
             .size_full()
             .flex()
@@ -5319,13 +5587,7 @@ impl Render for Workbench {
             // below the status bar (the TS configuration screens replace the
             // chat/picker screens wholesale).
             .when_some(
-                if self.snap.system_status.is_none()
-                    && self.snap.models_page.is_none()
-                    && self.snap.quota_page.is_none()
-                    && self.snap.usage_page.is_none()
-                    && self.snap.config_section_page.is_none()
-                    && self.snap.workflows_page.is_none()
-                {
+                if !snap_page_open && !self.files_page_open {
                     Some(self.render_dock(cx))
                 } else {
                     None
@@ -5410,6 +5672,12 @@ impl Render for Workbench {
                     })
                 },
             )
+            // The Session Files page (F1): the same replacement contract as
+            // the snap pages, but view-local — the right session panel's
+            // row owns the open, back/Esc own the close.
+            .when(self.files_page_open && !snap_page_open, |this| {
+                this.child(self.render_files_page(cx))
+            })
             // The WorkflowGate sheet (J2) sits above the config surfaces —
             // the TS bottom sheet is the topmost layer while open.
             .when(self.workflow_gate_sheet, |this| {
@@ -5506,7 +5774,7 @@ impl Workbench {
                         .test_support()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.muted_foreground)
                         .child(caption),
                 )
@@ -5576,7 +5844,7 @@ impl Workbench {
             .child(
                 div()
                     .min_w_0()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("The title shows here, in the editor, and in the ZCode app."),
             )
@@ -5738,7 +6006,7 @@ impl Workbench {
             if let Some(err) = &view.error {
                 list = list.child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(12.))
                         .text_color(theme.warning_foreground)
                         .child(err.clone()),
                 );
@@ -5747,7 +6015,7 @@ impl Workbench {
                 None => {
                     list = list.child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.muted_foreground)
                             .child("loading projects…"),
                     );
@@ -5755,7 +6023,7 @@ impl Workbench {
                 Some(projects) if projects.is_empty() => {
                     list = list.child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.muted_foreground)
                             .child("No known projects yet — use Browse to pick a directory."),
                     );
@@ -5776,7 +6044,7 @@ impl Workbench {
                             div()
                                 .id("ns-no-match")
                                 .test_support()
-                                .text_size(px(12.))
+                                .text_size(px(13.))
                                 .text_color(theme.muted_foreground)
                                 .child(format!("no project matches \"{q}\"")),
                         );
@@ -5820,7 +6088,7 @@ impl Workbench {
                                     div()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(12.))
+                                        .text_size(px(13.))
                                         .text_color(theme.foreground)
                                         .child(name),
                                 )
@@ -5905,7 +6173,7 @@ impl Workbench {
         if let Some(err) = &browse.error {
             body = body.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.warning_foreground)
                     .child(err.clone()),
             );
@@ -5938,7 +6206,7 @@ impl Workbench {
                 .when(busy_here, |this| {
                     this.child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.accent)
                             .child("creating…"),
                     )
@@ -5976,7 +6244,7 @@ impl Workbench {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child("↑"),
                     )
@@ -5984,7 +6252,7 @@ impl Workbench {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .font_family(theme.mono_font_family.clone())
                             .text_color(theme.muted_foreground)
                             .child(parent_label),
@@ -5994,7 +6262,7 @@ impl Workbench {
         if !browse.loading && browse.entries.is_empty() && browse.error.is_none() {
             body = body.child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(12.))
                     .text_color(theme.muted_foreground)
                     .child("No subdirectories."),
             );
@@ -6026,7 +6294,7 @@ impl Workbench {
                     .child(
                         div()
                             .flex_none()
-                            .text_size(px(11.))
+                            .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child("▸"),
                     )
@@ -6034,7 +6302,7 @@ impl Workbench {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(12.))
+                            .text_size(px(13.))
                             .text_color(theme.foreground)
                             .child(name.clone()),
                     ),
@@ -6109,6 +6377,7 @@ mod chip_tests {
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
+            session_title: None,
             phase: TabPhase::Connected,
             running: false,
             pending: 0,
@@ -6328,6 +6597,7 @@ mod display_tests {
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
+            session_title: None,
             phase: TabPhase::Connected,
             running: false,
             pending: 0,
@@ -6391,7 +6661,7 @@ mod display_tests {
     /// readouts and the context progress hairline (ChatScreen's header
     /// line, `17.5%/1.0M` formatting included).
     #[gpui_kit::test]
-    fn title_stats_render_in_status_bar(cx: &mut TestAppContext) {
+    fn chat_stats_render_under_the_composer(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_reduce_motion(true);
@@ -6427,16 +6697,63 @@ mod display_tests {
         let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            assert!(window.find("stat-context").visible());
-            assert!(window.find("stat-cache").visible());
-            assert!(window.find("stat-tps").visible());
+            // Per-session readouts ride under the composer of the session
+            // they describe — they must sit inside the composer's bounds,
+            // below the send controls, not in the window's status bar.
+            let composer = window.find("composer").bounds();
+            for id in ["stat-context", "stat-cache", "stat-tps"] {
+                let stat = window.find(id);
+                assert!(stat.visible());
+                let top = stat.bounds().origin.y;
+                assert!(
+                    top > composer.origin.y,
+                    "{id} must render below the composer's top edge"
+                );
+            }
             let progress = window.find("context-progress");
             assert!(progress.visible());
-            // 17.5% of the 800px status bar ≈ 140px (clamped fill).
+            // 17.5% of the composer's width, clamped — the hairline rides
+            // the composer's top edge now.
             let width = progress.bounds().size.width;
+            let expected = composer.size.width * 0.175;
             assert!(
-                (width - px(140.)).abs() < px(8.),
-                "progress fill should be ~140px, got {width:?}"
+                (width - expected).abs() < px(8.),
+                "progress fill should be ~{expected:?}, got {width:?}"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The tab strip shows the session's NAME (discovery's title); the raw
+    /// id is only the pre-discovery fallback.
+    #[gpui_kit::test]
+    fn tab_title_prefers_the_session_name(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        snap.tabs[0].session_title = Some("Fix the login flow".to_string());
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        let named_width = cx
+            .update_window(handle.into(), |_, window, cx| {
+                window.draw(cx).clear(cx);
+                let title = window.find(("tab-title", 7u64));
+                assert!(title.visible(), "the named tab title must render");
+                title.bounds().size.width
+            })
+            .unwrap();
+
+        let mut snap = base_snapshot();
+        snap.tabs[0].session_title = None;
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let fallback_width = window.find(("tab-title", 7u64)).bounds().size.width;
+            assert!(
+                named_width > fallback_width,
+                "the session name ({named_width:?}) must out-size the short-id fallback ({fallback_width:?})"
             );
         })
         .unwrap();
@@ -6660,8 +6977,8 @@ mod files_tests {
     use super::Workbench;
     use crate::file_browser::FileKind;
     use crate::runtime::{
-        FileViewerView, FilesPanelView, Phase, ProtocolRuntime, TabPhase, TabSummary, TabView,
-        UiCommand, WorkbenchSnapshot,
+        FileViewerView, FilesPanelView, Phase, ProtocolRuntime, RuntimeEvent, TabPhase,
+        TabSummary, TabView, UiCommand, WorkbenchSnapshot,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
@@ -6677,6 +6994,28 @@ mod files_tests {
             size,
             mtime: Some(1),
         }
+    }
+
+    /// Open the Session Files page the way a user does: the right session
+    /// panel's Files row (the left dock no longer carries it — session
+    /// surfaces live on the session side). Idempotent: skips the panel
+    /// toggle when the panel is already open (back/Esc close the PAGE, not
+    /// the panel).
+    fn open_files_page(window: &mut gpui_kit::Window, cx: &mut App) {
+        if window.try_find("session-panel-files").is_none() {
+            window.click("session-panel-toggle", cx);
+            window.draw(cx).clear(cx);
+        }
+        assert!(
+            window.find("session-panel-files").visible(),
+            "the session panel's Files row must render for an attached session"
+        );
+        window.click("session-panel-files", cx);
+        window.draw(cx).clear(cx);
+        assert!(
+            window.find("files-page").visible(),
+            "the Files row must open the full page"
+        );
     }
 
     fn listing_fixture() -> FsListing {
@@ -6701,6 +7040,7 @@ mod files_tests {
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
+            session_title: None,
             phase: TabPhase::Connected,
             running: false,
             pending: 0,
@@ -6783,6 +7123,7 @@ mod files_tests {
     /// breadcrumb all dispatch `FilesNavigate` with the exact target path.
     #[gpui_kit::test]
     fn files_panel_browses_and_toggles_hidden(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_reduce_motion(true);
@@ -6790,11 +7131,10 @@ mod files_tests {
         let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            // Dock the files panel (the default dock is sessions).
-            window.click("dock-rail-files", cx);
-            window.draw(cx).clear(cx);
-            assert!(window.find("files-panel").visible(), "the panel must dock");
-            // The dock seeds one listing read at the session root.
+            // Open the files page from the session panel's row.
+            open_files_page(window, cx);
+            assert!(window.find("files-panel").visible(), "the page must mount the browser");
+            // Opening the page seeds one listing read at the session root.
             assert!(
                 sent_files_navigate(&runtime, ""),
                 "docking must seed FilesNavigate at the root, got {:?}",
@@ -6844,6 +7184,7 @@ mod files_tests {
     /// crumb navigates to its prefix.
     #[gpui_kit::test]
     fn files_breadcrumb_navigates_to_prefix(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_reduce_motion(true);
@@ -6852,8 +7193,7 @@ mod files_tests {
             cx.update(|cx| open_test_window(cx, files_snapshot("src/ui", true)));
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            window.click("dock-rail-files", cx);
-            window.draw(cx).clear(cx);
+            open_files_page(window, cx);
             // Root crumb is the session root's last segment; segments follow.
             assert!(window.find("files-crumb-root").visible());
             assert!(window.find("files-crumb-0").visible());
@@ -6932,9 +7272,10 @@ mod files_tests {
     }
 
     /// F1 gating: a bridge without the fs capability gets the explanation
-    /// note, and docking seeds nothing (a request would just 404).
+    /// note, and opening the page seeds nothing (a request would just 404).
     #[gpui_kit::test]
     fn files_panel_notes_capability_gap_without_seeding(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_reduce_motion(true);
@@ -6942,8 +7283,7 @@ mod files_tests {
         let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, files_snapshot("", false)));
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            window.click("dock-rail-files", cx);
-            window.draw(cx).clear(cx);
+            open_files_page(window, cx);
             assert!(window.find("files-unsupported").visible());
             assert!(
                 !runtime
@@ -6953,6 +7293,140 @@ mod files_tests {
                 "an incapable bridge must not be probed, got {:?}",
                 runtime.recorded_commands()
             );
+        })
+        .unwrap();
+    }
+
+    /// The files page's close paths: the back button returns to the chat,
+    /// reopening works, and Esc closes it too (the stop-turn ladder sits
+    /// BEHIND the page — a page up means Esc never cancels a turn).
+    #[gpui_kit::test]
+    fn files_page_back_and_esc_return_to_chat(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb, _runtime) =
+            cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            use super::StopTurn;
+            window.draw(cx).clear(cx);
+            open_files_page(window, cx);
+            // The page replaced the chat surfaces: no composer while up.
+            assert!(window.try_find("composer").is_none());
+            window.click("files-page-back", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.try_find("files-page").is_none(), "back closes the page");
+            assert!(window.find("composer").visible(), "the chat returns");
+            // Reopen, then Esc closes it the same way — driven through the
+            // workbench's Esc handler like the config-page Esc test (the
+            // headless platform has no real key dispatch).
+            open_files_page(window, cx);
+            wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
+            window.draw(cx).clear(cx);
+            assert!(window.try_find("files-page").is_none(), "Esc closes the page");
+            assert!(window.find("composer").visible());
+        })
+        .unwrap();
+    }
+
+    /// Review [88]: with the file viewer stacked on the files page, Esc
+    /// unwinds the viewer FIRST (driver-owned overlay) — the page beneath
+    /// stays up for the next Esc.
+    #[gpui_kit::test]
+    fn esc_closes_the_viewer_before_the_files_page(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = files_snapshot("", true);
+        snap.files.viewing = Some(FileViewerView {
+            image: None,
+            path: "README.md".to_string(),
+            name: "README.md".to_string(),
+            size: 128,
+            kind: FileKind::Text,
+            first_line: Some(1),
+            text: Some("line one".to_string()),
+            loading: false,
+            error: None,
+        });
+        let (handle, wb, runtime) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            use super::StopTurn;
+            window.draw(cx).clear(cx);
+            assert!(window.find("file-viewer").visible());
+            open_files_page(window, cx);
+            wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
+            assert!(
+                runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::FilesCloseView)),
+                "Esc must close the viewer, not the page beneath it"
+            );
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("files-page").visible(),
+                "the files page survives the viewer's Esc"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Review [85]: the page follows the session — a session switch under
+    /// an open page re-seeds the listing for the new target, and a
+    /// sessionless snapshot closes the page outright.
+    #[gpui_kit::test]
+    fn files_page_follows_the_active_session(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb, runtime) =
+            cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            open_files_page(window, cx);
+            assert_eq!(
+                files_navigate_count(&runtime, ""),
+                1,
+                "opening seeds the first listing"
+            );
+            // Switch the tab onto another session: the page stays up but
+            // re-seeds for the new target.
+            let mut switched = files_snapshot("", true);
+            switched.tabs[0].session_id = Some("sess_2".to_string());
+            if let Some(active) = switched.active.as_mut() {
+                active.session_id = Some("sess_2".to_string());
+            }
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::Snapshot(switched), cx)
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("files-page").visible(),
+                "a session switch keeps the page and re-seeds"
+            );
+            assert_eq!(
+                files_navigate_count(&runtime, ""),
+                2,
+                "the switch must re-send the root listing"
+            );
+            // No session left to browse: the page closes (the capability
+            // note would otherwise masquerade as "no session").
+            let mut gone = files_snapshot("", true);
+            gone.active = None;
+            wb.update(cx, |wb, cx| wb.on_runtime_event(RuntimeEvent::Snapshot(gone), cx));
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("files-page").is_none(),
+                "a sessionless snapshot must close the page"
+            );
+            assert!(window.find("composer").visible());
         })
         .unwrap();
     }
@@ -7270,6 +7744,7 @@ mod language_tests {
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
+            session_title: None,
             phase: TabPhase::Connected,
             running: false,
             pending: 0,
@@ -7305,6 +7780,7 @@ mod language_tests {
     #[gpui_kit::test]
     fn language_segment_switches_chrome(cx: &mut TestAppContext) {
         let _locale = crate::i18n::locale_test_lock();
+        let _windows = super::window_test_lock();
         // Redirect the persisted prefs into a scratch dir (store_locale
         // writes the config dir otherwise; no other test reads it).
         let scratch = std::env::temp_dir().join(format!("zcode-lang-test-{}", std::process::id()));
@@ -7370,6 +7846,71 @@ mod language_tests {
 
         // Restore the process-global state for the tests that follow.
         rust_i18n::set_locale("en");
+        match prev_xdg {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// The settings panel's font-size segment (SidePanel.tsx:189-210): the
+    /// three steps render beside the language pick, the pick persists to
+    /// the scratch prefs file (the TS saveFontSize), and the selection
+    /// follows the click.
+    #[gpui_kit::test]
+    fn font_size_segment_persists(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        // Redirect the persisted prefs into a scratch dir, like the language
+        // test above (store_font_size writes the config dir otherwise).
+        let scratch =
+            std::env::temp_dir().join(format!("zcode-font-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        std::env::set_var("XDG_CONFIG_HOME", &scratch);
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let runtime = ProtocolRuntime::inert();
+        let (handle, _wb) = cx.update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds {
+                        origin: Point::default(),
+                        size: Size {
+                            width: px(800.),
+                            height: px(600.),
+                        },
+                    })),
+                    ..Default::default()
+                },
+                cx,
+                |window, cx| {
+                    let runtime = runtime.clone();
+                    cx.new(|cx| Workbench::new(window, cx, runtime.clone(), tabbed_snapshot()))
+                },
+            )
+            .expect("open test window")
+        });
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("dock-rail-config", cx);
+            window.draw(cx).clear(cx);
+            for id in ["font-small", "font-medium", "font-large"] {
+                assert!(window.find(id).visible(), "{id} must render");
+            }
+            // Medium is the default selection; Large takes the pick.
+            window.click("font-large", cx);
+            window.draw(cx).clear(cx);
+            let saved = std::fs::read_to_string(
+                scratch.join("zcode-acp-remote").join("ui-prefs.json"),
+            )
+            .expect("prefs file written");
+            assert!(saved.contains("\"large\""), "saved font size: {saved}");
+        })
+        .unwrap();
+
         match prev_xdg {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
             None => std::env::remove_var("XDG_CONFIG_HOME"),
@@ -7688,6 +8229,7 @@ mod slash_tests {
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
+            session_title: None,
             phase: TabPhase::Connected,
             running: false,
             pending: 0,
@@ -7894,6 +8436,7 @@ mod lightbox_tests {
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
+            session_title: None,
             phase: TabPhase::Connected,
             running: false,
             pending: 0,
