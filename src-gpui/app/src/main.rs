@@ -15,8 +15,6 @@
 #![recursion_limit = "256"]
 
 mod approval_card;
-#[cfg(test)]
-mod acceptance;
 mod diff_view;
 mod file_browser;
 mod http_transport;
@@ -27,6 +25,7 @@ mod quota_card;
 mod quota_page;
 mod readout_store;
 mod runtime;
+mod server_form;
 mod system_status;
 mod ui_prefs;
 mod usage_page;

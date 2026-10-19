@@ -8672,19 +8672,11 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
             }
             let config = match ensure_hub(&env, &EnsureOptions::default()).await {
             Ok((outcome, config)) => {
-                d.note = Some(
-                    match outcome {
-                        protocol::bootstrap::EnsureHubOutcome::AlreadyListening => {
-                            "hub already listening".to_string()
-                        }
-                        protocol::bootstrap::EnsureHubOutcome::SpawnWon => {
-                            "hub daemon spawned".to_string()
-                        }
-                        protocol::bootstrap::EnsureHubOutcome::SpawnLostToExisting => {
-                            "spawn lost the port race; existing hub serves".to_string()
-                        }
-                    },
-                );
+                // The outcome is a bootstrap diagnostic, not a status-bar
+                // fact: it stays in the trace (the bar used to read "hub
+                // already listening" for the whole session with nothing to
+                // act on).
+                traceln!("[driver] hub bootstrap: {outcome:?}");
                 config
             }
             Err(err) => {

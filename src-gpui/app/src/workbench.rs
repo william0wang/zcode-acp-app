@@ -1,5 +1,6 @@
 //! The workbench window view (requirements §6): connection status bar
-//! (bootstrap phase + hub address), the left dock (ADR-0009's dock-style
+//! (bridge version + running-session count on the left, the hub's quota
+//! dock line on the right), the left dock (ADR-0009's dock-style
 //! window — a rail of panel toggles with the sessions / configuration panels
 //! docked beside the chat area, resizable against it), one session's
 //! streaming chat over `MessageScroller` + `TextView`, and the composer.
@@ -68,6 +69,7 @@ use crate::runtime::{
     RuntimeEvent, SessionRow, TabPhase, TabSummary, TabView, UiCommand, WorkbenchSnapshot,
 };
 use crate::quota_page::SpendStage;
+use crate::server_form::ServerForm;
 use crate::system_status::render_system_status_page;
 use crate::usage_page::render_usage_page;
 use crate::workflows_page::{
@@ -196,11 +198,6 @@ pub struct Workbench {
     history_filter: Entity<InputState>,
     _history_filter_sub: Subscription,
     _search_sub: Subscription,
-    /// The Servers section's add-server form (Connection Profile book,
-    /// CONTEXT.md): name / hub URL / bearer token.
-    add_server_name: Entity<InputState>,
-    add_server_url: Entity<InputState>,
-    add_server_token: Entity<InputState>,
     /// The Models config page's add/edit form (TS ModelForm local state):
     /// `None` = closed. Rendered INSTEAD of the page while open (the TS
     /// ConfigFormSheet replaces the section page outright).
@@ -251,9 +248,6 @@ pub struct Workbench {
     /// The servers panel's armed remove (TS two-click delete): the profile
     /// id and when the 3s confirm window opened.
     pub(crate) server_remove_armed: Option<(String, std::time::Instant)>,
-    /// The servers panel's edit target (TS `connect.editServer`): the
-    /// profile id whose values sit prefilled in the shared add/edit form.
-    pub(crate) server_editing: Option<String>,
     /// The file viewer's markdown source toggle (TS FileViewer: preview by
     /// default, one toggle to source) — keyed by the viewed path so a new
     /// file always starts in preview.
@@ -946,12 +940,6 @@ impl Workbench {
             cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
         let history_filter_sub =
             cx.subscribe(&history_filter, |_, _, _: &InputEvent, cx| cx.notify());
-        let add_server_name =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Name (e.g. dev box)"));
-        let add_server_url =
-            cx.new(|cx| InputState::new(window, cx).placeholder("https://hub.example:8377"));
-        let add_server_token =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Bearer token"));
         // The rename sheet's draft (G1) — Enter saves when non-empty (the TS
         // sheet's disabled-Save guard), every keystroke re-renders the button.
         let rename_input =
@@ -1008,9 +996,6 @@ impl Workbench {
             _ns_filter_sub: ns_filter_sub,
             history_filter,
             _history_filter_sub: history_filter_sub,
-            add_server_name,
-            add_server_url,
-            add_server_token,
             models_form: None,
             models_form_subs: Vec::new(),
             zconfig_form: None,
@@ -1030,7 +1015,6 @@ impl Workbench {
             hooks_open_event: None,
             backup_confirm: None,
             server_remove_armed: None,
-            server_editing: None,
             file_md_source: None,
             update_confirm: false,
             quota_confirm: None,
@@ -1985,17 +1969,25 @@ impl Workbench {
         // Right cluster: the hub's preformatted quota dock line (ADR-0021) —
         // byte-identical to the TUI's bottom dock and the mobile title bar's
         // tail segment, refreshed at connect and each turn end. Global account
-        // state, so it sits opposite the bridge/activity cluster. The bar's
-        // rows stay one step smaller than the panel chrome (a strip, not a
-        // page).
-        let mut right = div().flex().items_center().gap_3().ml_auto().flex_none();
+        // state, so it sits opposite the bridge/activity cluster. It takes
+        // whatever width the left cluster leaves free (no pixel cap — the
+        // line used to clip while half the bar stood empty) and only
+        // truncates past 60% of the bar, so an absurd line still cannot
+        // push the left cluster off-screen.
+        let mut right = div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .ml_auto()
+            .flex_none()
+            .min_w_0()
+            .max_w(relative(0.6));
         if let Some(dock) = self.snap.quota_dock.clone() {
             right = right.child(
                 div()
                     .id("status-quota-dock")
                     .test_support()
                     .min_w_0()
-                    .max_w(px(340.))
                     .truncate()
                     .text_size(px(11.))
                     .font_family(theme.mono_font_family.clone())
@@ -2288,17 +2280,42 @@ impl Workbench {
             })
     }
 
-    /// The docked configuration panel: the entry list for the high-frequency
-    /// config pages (requirements §4). The TS app reaches these from the
-    /// settings panel; the workbench's equivalent home is this dock panel —
-    /// the pages themselves stay full pages (ADR-0009).
     /// The Servers section of the config dock — the Connection Profile book
     /// (CONTEXT.md): the implicit local hub, every saved remote hub, and the
-    /// add form. Switching restarts the dial on the new target.
+    /// Add button. Add and Edit open the `ServerForm` dialog, so the section
+    /// stays a list; switching restarts the dial on the new target.
     fn render_servers_section(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
         let mut column = div().flex().flex_col().gap_1();
+
+        {
+            let runtime = runtime.clone();
+            column = column.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child("Servers"),
+                    )
+                    .child(
+                        div().ml_auto().child(
+                            Button::new("server-add")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .tooltip("Add a remote server")
+                                .on_click(move |_, window, cx| {
+                                    ServerForm::open(None, runtime.clone(), window, cx)
+                                }),
+                        ),
+                    ),
+            );
+        }
 
         // The implicit local entry: Hub Bootstrap dials (and spawns when
         // dark). No book record — `active_server_id: None` IS this entry.
@@ -2326,6 +2343,7 @@ impl Workbench {
                     .flex()
                     .flex_col()
                     .min_w_0()
+                    .flex_1()
                     .child(
                         div()
                             .text_size(px(13.))
@@ -2334,6 +2352,8 @@ impl Workbench {
                     )
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(12.))
                             .text_color(theme.muted_foreground)
                             .child("Spawned or discovered on this machine"),
@@ -2343,9 +2363,10 @@ impl Workbench {
             let runtime = runtime.clone();
             local_row = local_row.child(
                 Button::new("server-local-switch")
-                    .secondary()
-                    .small()
-                    .label("Switch")
+                    .ghost()
+                    .xsmall()
+                    .icon(KitIconName::Plug)
+                    .tooltip("Switch to the local hub")
                     .on_click(move |_, _, _| runtime.send(UiCommand::SwitchProfile { id: None })),
             );
         }
@@ -2353,10 +2374,12 @@ impl Workbench {
 
         for server in &self.snap.servers {
             let active = self.snap.active_server_id.as_deref() == Some(server.id.as_str());
+            // Icon-only actions: the dock panel is narrow, and three text
+            // buttons pushed each other out of the row.
             let mut row = div()
                 .flex()
                 .items_center()
-                .gap_2()
+                .gap_1()
                 .px_2()
                 .py_1()
                 .rounded_md()
@@ -2364,6 +2387,7 @@ impl Workbench {
                     div()
                         .size_2()
                         .flex_none()
+                        .mr_1()
                         .rounded_full()
                         .bg(if active { theme.accent } else { theme.border }),
                 )
@@ -2375,12 +2399,16 @@ impl Workbench {
                         .flex_1()
                         .child(
                             div()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(px(13.))
                                 .text_color(theme.foreground)
                                 .child(server.name.clone()),
                         )
                         .child(
                             div()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(px(12.))
                                 .text_color(theme.muted_foreground)
                                 .font_family(theme.mono_font_family.clone())
@@ -2392,42 +2420,32 @@ impl Workbench {
                 let id = server.id.clone();
                 row = row.child(
                     Button::new(SharedString::from(format!("server-switch-{}", server.id)))
-                        .secondary()
-                        .small()
-                        .label("Switch")
+                        .ghost()
+                        .xsmall()
+                        .icon(KitIconName::Plug)
+                        .tooltip("Switch to this hub")
                         .on_click(move |_, _, _| {
                             runtime.send(UiCommand::SwitchProfile { id: Some(id.clone()) })
                         }),
                 );
             }
-            // Edit (TS connect.editServer, ConnectScreen.tsx:75-78): the
-            // shared form below becomes the edit form, prefilled from the
-            // record; Save keeps the active id and only re-dials when the
-            // EDITED server was the active one.
-            let wb_edit = cx.entity();
-            let edit_id = server.id.clone();
-            let (edit_name, edit_url, edit_token) =
-                (server.name.clone(), server.hub_url.clone(), server.token.clone());
-            let (pf_name, pf_url, pf_token) = (
-                self.add_server_name.clone(),
-                self.add_server_url.clone(),
-                self.add_server_token.clone(),
-            );
-            row = row.child(
-                Button::new(SharedString::from(format!("server-edit-{}", server.id)))
-                    .secondary()
-                    .small()
-                    .label("Edit")
-                    .on_click(move |_, window, cx| {
-                        wb_edit.update(cx, |wb, cx| {
-                            wb.server_editing = Some(edit_id.clone());
-                            cx.notify();
-                        });
-                        pf_name.update(cx, |s, cx| s.set_value(edit_name.clone(), window, cx));
-                        pf_url.update(cx, |s, cx| s.set_value(edit_url.clone(), window, cx));
-                        pf_token.update(cx, |s, cx| s.set_value(edit_token.clone(), window, cx));
-                    }),
-            );
+            // Edit (TS connect.editServer): the dialog opens prefilled from
+            // the record; Save keeps the active id and only re-dials when
+            // the EDITED server was the active one (the driver's rule).
+            {
+                let runtime = runtime.clone();
+                let server = server.clone();
+                row = row.child(
+                    Button::new(SharedString::from(format!("server-edit-{}", server.id)))
+                        .ghost()
+                        .xsmall()
+                        .icon(KitIconName::Pencil)
+                        .tooltip("Edit")
+                        .on_click(move |_, window, cx| {
+                            ServerForm::open(Some(&server), runtime.clone(), window, cx)
+                        }),
+                );
+            }
             let runtime_remove = runtime.clone();
             let remove_id = server.id.clone();
             // Two-click delete (TS ConnectScreen:46-54): the first click
@@ -2437,141 +2455,34 @@ impl Workbench {
                 if *id == server.id && at.elapsed() < std::time::Duration::from_secs(3));
             let wb_arm = cx.entity();
             let arm_id = server.id.clone();
-            row = row.child(
-                Button::new(SharedString::from(format!("server-remove-{}", server.id)))
-                    .secondary()
-                    .small()
-                    .label(if armed { "Confirm remove" } else { "Remove" })
-                    .on_click(move |_, _, cx| {
-                        let arm_id = arm_id.clone();
-                        let confirmed = wb_arm.update(cx, |wb, cx| {
-                            let fresh = matches!(&wb.server_remove_armed, Some((id, at))
-                                if *id == arm_id
-                                    && at.elapsed() < std::time::Duration::from_secs(3));
-                            wb.server_remove_armed = if fresh {
-                                None
-                            } else {
-                                Some((arm_id.clone(), std::time::Instant::now()))
-                            };
-                            cx.notify();
-                            fresh
-                        });
-                        if confirmed {
-                            runtime_remove
-                                .send(UiCommand::RemoveServer { id: remove_id.clone() });
-                        }
-                    }),
-            );
+            let remove = Button::new(SharedString::from(format!("server-remove-{}", server.id)))
+                .xsmall();
+            let remove = if armed {
+                remove.danger().label("Confirm remove")
+            } else {
+                remove.ghost().icon(KitIconName::Trash).tooltip("Remove")
+            };
+            row = row.child(remove.on_click(move |_, _, cx| {
+                let arm_id = arm_id.clone();
+                let confirmed = wb_arm.update(cx, |wb, cx| {
+                    let fresh = matches!(&wb.server_remove_armed, Some((id, at))
+                        if *id == arm_id
+                            && at.elapsed() < std::time::Duration::from_secs(3));
+                    wb.server_remove_armed = if fresh {
+                        None
+                    } else {
+                        Some((arm_id.clone(), std::time::Instant::now()))
+                    };
+                    cx.notify();
+                    fresh
+                });
+                if confirmed {
+                    runtime_remove.send(UiCommand::RemoveServer { id: remove_id.clone() });
+                }
+            }));
             column = column.child(row);
         }
 
-        // The shared add/edit form: name / hub URL / token. Add saves
-        // (upsert + activate) and the driver re-dials the new profile;
-        // Edit (server_editing) saves in place through UpdateServer and
-        // only re-dials when the edited server was the active one.
-        let name = self.add_server_name.clone();
-        let url = self.add_server_url.clone();
-        let token = self.add_server_token.clone();
-        let add_runtime = runtime.clone();
-        let editing_id = self.server_editing.clone();
-        let wb_form = cx.entity();
-        let can_submit = !self.add_server_name.read(cx).value().trim().is_empty()
-            && !self.add_server_url.read(cx).value().trim().is_empty()
-            // TS ConnectScreen:147 — the token is required, not optional.
-            && !self.add_server_token.read(cx).value().trim().is_empty();
-        let actions: AnyElement = match &editing_id {
-            Some(id) => {
-                let save_id = id.clone();
-                let (name, url, token, wb_form) =
-                    (name.clone(), url.clone(), token.clone(), wb_form.clone());
-                let (cn, cu, ct, cw) =
-                    (name.clone(), url.clone(), token.clone(), wb_form.clone());
-                div()
-                    .flex()
-                    .gap_1()
-                    .child(
-                        Button::new("server-save")
-                            .primary()
-                            .small()
-                            .label("Save")
-                            .disabled(!can_submit)
-                            .on_click(move |_, window, cx| {
-                                let n = name.read(cx).value().trim().to_string();
-                                let u = url.read(cx).value().trim().to_string();
-                                let t = token.read(cx).value().trim().to_string();
-                                name.update(cx, |s, cx| s.set_value("", window, cx));
-                                url.update(cx, |s, cx| s.set_value("", window, cx));
-                                token.update(cx, |s, cx| s.set_value("", window, cx));
-                                wb_form.update(cx, |wb, cx| {
-                                    wb.server_editing = None;
-                                    cx.notify();
-                                });
-                                add_runtime.send(UiCommand::UpdateServer {
-                                    id: save_id.clone(),
-                                    name: n,
-                                    hub_url: u,
-                                    token: t,
-                                });
-                            }),
-                    )
-                    .child(
-                        Button::new("server-edit-cancel")
-                            .secondary()
-                            .small()
-                            .label("Cancel")
-                            .on_click(move |_, window, cx| {
-                                cn.update(cx, |s, cx| s.set_value("", window, cx));
-                                cu.update(cx, |s, cx| s.set_value("", window, cx));
-                                ct.update(cx, |s, cx| s.set_value("", window, cx));
-                                cw.update(cx, |wb, cx| {
-                                    wb.server_editing = None;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .into_any_element()
-            }
-            None => Button::new("server-add")
-                .primary()
-                .small()
-                .label("Add and connect")
-                .disabled(!can_submit)
-                .on_click(move |_, window, cx| {
-                    let n = name.read(cx).value().trim().to_string();
-                    let u = url.read(cx).value().trim().to_string();
-                    let t = token.read(cx).value().trim().to_string();
-                    name.update(cx, |s, cx| s.set_value("", window, cx));
-                    url.update(cx, |s, cx| s.set_value("", window, cx));
-                    token.update(cx, |s, cx| s.set_value("", window, cx));
-                    add_runtime.send(UiCommand::AddServer {
-                        name: n,
-                        hub_url: u,
-                        token: t,
-                    });
-                })
-                .into_any_element(),
-        };
-        column = column.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .text_color(theme.muted_foreground)
-                        .child(if editing_id.is_some() {
-                            "Edit remote server"
-                        } else {
-                            "Add remote server"
-                        }),
-                )
-                .child(Input::new(&self.add_server_name).small())
-                .child(Input::new(&self.add_server_url).small())
-                .child(Input::new(&self.add_server_token).small())
-                .child(actions),
-        );
         column.into_any_element()
     }
 
@@ -2700,6 +2611,10 @@ impl Workbench {
             .into_any_element()
     }
 
+    /// The docked configuration panel: the entry list for the high-frequency
+    /// config pages (requirements §4). The TS app reaches these from the
+    /// settings panel; the workbench's equivalent home is this dock panel —
+    /// the pages themselves stay full pages (ADR-0009).
     fn render_config_panel(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
@@ -6449,1859 +6364,6 @@ impl Workbench {
     }
 }
 
-#[cfg(test)]
-mod chip_tests {
-    // Explicit imports only — the file-root `use gpui_kit::*` glob would
-    // shadow the built-in `#[test]` with gpui's test macro inside the
-    // `#[gpui_kit::test]` expansion (the testing guide's shadowing note).
-    use super::Workbench;
-    use crate::runtime::{
-        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, UiCommand, WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        px, AppContext as _, Bounds, Point, Size, TestAppContext, WindowBounds, WindowOptions,
-    };
-
-    fn fixture_options() -> Vec<protocol::acp::ConfigOption> {
-        use protocol::acp::{ConfigOption, ConfigOptionChoice};
-        let choice = |v: &str, n: &str| ConfigOptionChoice {
-            value: v.to_string(),
-            name: n.to_string(),
-        };
-        vec![
-            ConfigOption {
-                id: "model".to_string(),
-                name: Some("Model".to_string()),
-                category: None,
-                current_value: Some("glm-4.7".to_string()),
-                options: Some(vec![
-                    choice("glm-4.7", "GLM-4.7"),
-                    choice("glm-4-air", "GLM-4-Air"),
-                ]),
-            },
-            ConfigOption {
-                id: "mode".to_string(),
-                name: Some("Mode".to_string()),
-                category: None,
-                current_value: Some("code".to_string()),
-                options: Some(vec![
-                    choice("code", "Code"),
-                    choice("plan", "Plan"),
-                ]),
-            },
-            ConfigOption {
-                id: "thought".to_string(),
-                name: Some("Thinking".to_string()),
-                category: None,
-                current_value: None,
-                options: None,
-            },
-        ]
-    }
-
-    fn connected_snapshot() -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.tabs = vec![TabSummary {
-            id: 7,
-            session_id: Some("sess_1".to_string()),
-            session_title: None,
-            phase: TabPhase::Connected,
-            running: false,
-            pending: 0,
-            awaiting: false,
-        }];
-        snap.active_tab = Some(7);
-        snap.active = Some(TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: Vec::new(),
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            config_options: fixture_options(),
-            usage: None,
-            cache_hit: None,
-            turn_stats: None,
-            plan_entries: None,
-            fs_capable: true,
-            available_commands: Vec::new(),
-        });
-        snap
-    }
-
-    /// The composer's config chips (batch D, moved down from the tab strip in
-    /// batch S): all three render inside the composer, above the send
-    /// controls, the model dropdown lists every choice in bridge order, and
-    /// picking one dispatches the exact `SetConfigOption` command. The wire
-    /// half (config_id/value spelling) lives in the protocol tests.
-    #[gpui_kit::test]
-    fn config_chips_render_and_pick(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            // The dropdown's 150ms entrance slides its surface (TESTING.md:
-            // wait out the legacy entrance or disable it); reduced motion
-            // adopts the final position on frame one, so clicks land.
-            cx.set_reduce_motion(true);
-        });
-        let runtime = ProtocolRuntime::inert();
-        let (handle, _content) = cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(800.),
-                            height: px(600.),
-                        },
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    cx.new(|cx| {
-                        Workbench::new(window, cx, runtime.clone(), connected_snapshot())
-                    })
-                },
-            )
-            .expect("open test window")
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            let model = window.find("cfg-model");
-            let mode = window.find("cfg-mode");
-            let thought = window.find("cfg-thought");
-            assert!(model.visible() && mode.visible() && thought.visible());
-            // The chips ride INSIDE the composer now (batch S), above the
-            // send controls — the top tab strip stays global.
-            let composer = window.find("composer").bounds();
-            for id in ["cfg-model", "cfg-mode", "cfg-thought"] {
-                let chip = window.find(id).bounds();
-                assert!(
-                    chip.origin.y >= composer.origin.y && chip.right() <= composer.right() + px(1.),
-                    "{id} must sit inside the composer"
-                );
-            }
-            // The chip's label is the CURRENT value's display name.
-            assert_eq!(window.find("cfg-model").label().as_deref(), Some("GLM-4.7"));
-            // The model menu lists the choices in bridge order; picking the
-            // second one dispatches the pick. (The popup's own dismissal is
-            // the kit's deferred DismissEvent — not ours to assert.)
-            window.click("cfg-model", cx);
-            {
-                let mut menu = window.within("popup-menu");
-                assert_eq!(menu.find(0usize).label().as_deref(), Some("GLM-4.7"));
-                assert_eq!(menu.find(1usize).label().as_deref(), Some("GLM-4-Air"));
-                menu.click(1usize, cx);
-            }
-            let sent = runtime.recorded_commands();
-            assert!(
-                sent.iter().any(|c| matches!(
-                    c,
-                    UiCommand::SetConfigOption { config_id, value }
-                        if config_id == "model" && value == "glm-4-air"
-                )),
-                "the pick must reach the runtime, got {sent:?}"
-            );
-        })
-        .unwrap();
-    }
-
-    /// Batch M (M6): the workflow entries follow the gate verdict — the
-    /// session strip's manage row and the config panel's Workflows entry
-    /// render only while the verdict reads ON with a live session; the gate
-    /// SWITCH row itself never hides (the override is the way in).
-    #[gpui_kit::test]
-    fn workflow_entries_follow_gate_and_session(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let open = |cx: &mut TestAppContext, runtime: crate::runtime::ProtocolRuntime, gate_on: bool| {
-            let mut snap = connected_snapshot();
-            snap.workflow_gate = Some(protocol::settings::WorkflowGateBlock {
-                enabled: gate_on,
-                mode: "env".to_string(),
-                source: "remote".to_string(),
-                r#override: None,
-            });
-            // Tall window: the config panel scrolls, and only painted rows
-            // register ids — the whole entry list must fit one frame.
-            let (handle, wb) = cx.update(|cx| {
-                gpui_kit::open_window(
-                    WindowOptions {
-                        window_bounds: Some(WindowBounds::Windowed(Bounds {
-                            origin: Point::default(),
-                            size: Size {
-                                width: px(800.),
-                                height: px(2400.),
-                            },
-                        })),
-                        ..Default::default()
-                    },
-                    cx,
-                    |window, cx| {
-                        let runtime = runtime.clone();
-                        cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
-                    },
-                )
-                .expect("open test window")
-            });
-            (handle, wb)
-        };
-        // Verdict ON + live session: the manage row renders and opens the
-        // Workflows page; the config panel's entry renders too.
-        let runtime = ProtocolRuntime::inert();
-        let (handle, wb) = open(cx, runtime.clone(), true);
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("session-manage-workflows").visible());
-            window.click("session-manage-workflows", cx);
-            let sent = runtime.recorded_commands();
-            assert!(
-                sent.iter().any(|c| matches!(c, UiCommand::OpenWorkflows)),
-                "the manage row must open the workflows page, got {sent:?}"
-            );
-        })
-        .unwrap();
-        // The config panel: dock it and check the entry (still verdict ON).
-        wb.update(cx, |wb, cx| {
-            wb.toggle_dock_panel(super::DockPanel::Config, cx);
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("config-entry-Workflows").visible());
-            assert!(
-                window.find("config-entry-Workflow switch").visible(),
-                "the gate switch row never hides"
-            );
-        })
-        .unwrap();
-
-        // Verdict OFF: the manage row and the gated entry disappear (the
-        // fail-closed rule), the switch row stays. A second window keeps the
-        // two cases' state independent.
-        let runtime = ProtocolRuntime::inert();
-        let (handle, wb) = open(cx, runtime.clone(), false);
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(
-                window.try_find("session-manage-workflows").is_none(),
-                "an off verdict must not surface the manage row"
-            );
-        })
-        .unwrap();
-        wb.update(cx, |wb, cx| {
-            wb.toggle_dock_panel(super::DockPanel::Config, cx);
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.try_find("config-entry-Workflows").is_none());
-            assert!(
-                window.find("config-entry-Workflow switch").visible(),
-                "the switch row is the always-visible way in"
-            );
-        })
-        .unwrap();
-    }
-}
-
-/// Batch E (display details) headless UI integration tests — same paradigm
-/// as `chip_tests`: explicit imports, an inert runtime, a real Workbench in
-/// a test window, element-id assertions and real clicks.
-#[cfg(test)]
-mod display_tests {
-    use super::Workbench;
-    use crate::runtime::{
-        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, UiCommand, WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
-        WindowBounds, WindowOptions,
-    };
-
-    fn base_snapshot() -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.tabs = vec![TabSummary {
-            id: 7,
-            session_id: Some("sess_1".to_string()),
-            session_title: None,
-            phase: TabPhase::Connected,
-            running: false,
-            pending: 0,
-            awaiting: false,
-        }];
-        snap.active_tab = Some(7);
-        snap
-    }
-
-    fn messages_fixture() -> Vec<protocol::chat::ChatMessage> {
-        use protocol::chat::{ChatMessage, ChatPart, ChatRole, ToolCallPart};
-        vec![
-            ChatMessage {
-                id: "u1".to_string(),
-                role: ChatRole::User,
-                parts: vec![ChatPart::Text {
-                    text: "hello desktop".to_string(),
-                }],
-                created_at: 1,
-                collapsed: None,
-            },
-            ChatMessage {
-                id: "a1".to_string(),
-                role: ChatRole::Assistant,
-                parts: vec![
-                    ChatPart::ToolCall(ToolCallPart {
-                        tool_call_id: "t1".to_string(),
-                        tool_name: "Bash: npm test".to_string(),
-                        detail: "first line of output\nsecond line of output\nthird line"
-                            .to_string(),
-                        status: "completed".to_string(),
-                        kind: Some("execute".to_string()),
-                        raw_name: Some("Bash".to_string()),
-                        fold_kind: None,
-                        diffs: None,
-                    }),
-                    ChatPart::Text {
-                        text: "all green".to_string(),
-                    },
-                ],
-                created_at: 2,
-                collapsed: None,
-            },
-            // A harness task-notification user message (E5): renders as the
-            // centered system chip, not a bubble.
-            ChatMessage {
-                id: "n1".to_string(),
-                role: ChatRole::User,
-                parts: vec![ChatPart::Text {
-                    text: "<task-notification>\n  <status>completed</status>\n  \
-                           <summary>nightly build ok</summary>\n</task-notification>"
-                        .to_string(),
-                }],
-                created_at: 3,
-                collapsed: None,
-            },
-        ]
-    }
-
-    /// E1: the status bar carries the active tab's context/cache/tps
-    /// readouts and the context progress hairline (ChatScreen's header
-    /// line, `17.5%/1.0M` formatting included).
-    #[gpui_kit::test]
-    fn chat_stats_render_under_the_composer(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        snap.active = Some(TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: Vec::new(),
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            usage: Some(protocol::acp::ContextUsage {
-                used: 175_000,
-                size: 1_000_000,
-            }),
-            cache_hit: Some(82),
-            turn_stats: Some(protocol::chat::TurnStats {
-                tps: 41.0,
-                output_tokens: 1_234,
-                seconds: 30.1,
-            }),
-            plan_entries: None,
-            fs_capable: true,
-            available_commands: Vec::new(),
-            config_options: vec![protocol::acp::ConfigOption {
-                id: "mode".to_string(),
-                name: Some("Mode".to_string()),
-                category: None,
-                current_value: Some("default".to_string()),
-                options: Some(vec![protocol::acp::ConfigOptionChoice {
-                    value: "default".to_string(),
-                    name: "Default".to_string(),
-                }]),
-            }],
-        });
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            // Per-session readouts ride under the composer of the session
-            // they describe — they must sit inside the composer's bounds,
-            // below the send controls, not in the window's status bar.
-            let composer = window.find("composer").bounds();
-            for id in ["stat-context", "stat-cache", "stat-tps", "stat-turn"] {
-                let stat = window.find(id);
-                assert!(stat.visible());
-                let top = stat.bounds().origin.y;
-                assert!(
-                    top > composer.origin.y,
-                    "{id} must render below the composer's top edge"
-                );
-            }
-            // The config chips share the stats row's right end (batch T —
-            // one footer line, not a dedicated strip): same baseline as the
-            // readouts, tucked to the row's right side.
-            let stat_row_y = window.find("stat-context").bounds().origin.y;
-            let chip = window.find("cfg-mode");
-            assert!(chip.visible(), "the mode chip rides the footer row");
-            assert!(
-                (chip.bounds().origin.y - stat_row_y).abs() < px(6.),
-                "the chip shares the stats row (chip {:?} vs stat {:?})",
-                chip.bounds().origin.y,
-                stat_row_y
-            );
-            assert!(
-                chip.bounds().left() > window.find("stat-turn").bounds().left(),
-                "the chips sit right of the readouts"
-            );
-            let progress = window.find("context-progress");
-            assert!(progress.visible());
-            // 17.5% of the composer's width, clamped — the hairline rides
-            // the composer's top edge now.
-            let width = progress.bounds().size.width;
-            let expected = composer.size.width * 0.175;
-            assert!(
-                (width - expected).abs() < px(8.),
-                "progress fill should be ~{expected:?}, got {width:?}"
-            );
-        })
-        .unwrap();
-    }
-
-    /// The status bar's rightmost segment is the hub's preformatted quota
-    /// dock line (ADR-0021) — global account state, unlike the per-session
-    /// readouts under the composer.
-    #[gpui_kit::test]
-    fn status_bar_renders_the_quota_dock_line(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        snap.quota_dock = Some("GLM coding plan · 45% · resets in 2d".to_string());
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            let dock = window.find("status-quota-dock");
-            assert!(dock.visible(), "the quota dock line must render");
-            assert!(
-                dock.bounds().size.width > px(0.),
-                "the dock line has content width"
-            );
-        })
-        .unwrap();
-    }
-
-    /// The status bar's LEFT cluster (batch U) names the bridge and the
-    /// running-session count — the actionable global facts — in place of the
-    /// phase word and hub address that carried nothing.
-    #[gpui_kit::test]
-    fn status_bar_left_names_the_bridge_and_running_sessions(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        snap.running_session_count = 2;
-        snap.quota_dock = Some("GLM · 45%".to_string());
-        let mut tab = tab_view();
-        tab.agent_version = Some("0.47.2".to_string());
-        snap.active = Some(tab);
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            let bridge = window.find("status-bridge");
-            let activity = window.find("status-activity");
-            let dock = window.find("status-quota-dock");
-            assert!(bridge.visible() && activity.visible() && dock.visible());
-            // Left cluster order: bridge, then activity; the dock stays on
-            // the far right.
-            assert!(bridge.bounds().right() <= activity.bounds().left());
-            assert!(activity.bounds().right() <= dock.bounds().left());
-            assert!(
-                activity.bounds().right() < px(400.),
-                "the activity segment belongs to the left half"
-            );
-        })
-        .unwrap();
-    }
-
-    /// The tab strip shows the session's NAME (discovery's title); the raw
-    /// id is only the pre-discovery fallback.
-    #[gpui_kit::test]
-    fn tab_title_prefers_the_session_name(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        snap.tabs[0].session_title = Some("Fix the login flow".to_string());
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        let named_width = cx
-            .update_window(handle.into(), |_, window, cx| {
-                window.draw(cx).clear(cx);
-                let title = window.find(("tab-title", 7u64));
-                assert!(title.visible(), "the named tab title must render");
-                title.bounds().size.width
-            })
-            .unwrap();
-
-        let mut snap = base_snapshot();
-        snap.tabs[0].session_title = None;
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            let fallback_width = window.find(("tab-title", 7u64)).bounds().size.width;
-            assert!(
-                named_width > fallback_width,
-                "the session name ({named_width:?}) must out-size the short-id fallback ({fallback_width:?})"
-            );
-        })
-        .unwrap();
-    }
-
-    /// A very long session name caps its tab title (batch S): the tab never
-    /// stretches unboundedly — the title clips with an ellipsis at the cap.
-    #[gpui_kit::test]
-    fn tab_title_caps_long_session_names(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        snap.tabs[0].session_title = Some("A".repeat(120));
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            let title = window.find(("tab-title", 7u64));
-            assert!(title.visible(), "the capped title must render");
-            let width = title.bounds().size.width;
-            assert!(
-                width <= px(170.),
-                "a 120-char name must not exceed the 160px cap (+slack), got {width:?}"
-            );
-        })
-        .unwrap();
-    }
-
-    /// The sidebar's `+` (batch S): dispatches the same NewSessionToggle the
-    /// tab strip's new-tab button does — the sessions list is the sessions
-    /// home, so starting one belongs there too.
-    #[gpui_kit::test]
-    fn sidebar_new_button_dispatches_the_chooser_toggle(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let snap = base_snapshot();
-        let (handle, content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("sessions-new").visible());
-            window.click("sessions-new", cx);
-            let sent = content.read(cx).runtime.recorded_commands();
-            assert!(
-                sent.iter().any(|c| matches!(c, UiCommand::NewSessionToggle)),
-                "the sidebar + must open the new-session chooser, got {sent:?}"
-            );
-        })
-        .unwrap();
-    }
-
-    /// E2: a tool-call row expands its full detail (max-h scroll window) on
-    /// click and collapses again — the TS `<details>` ToolCard.
-    #[gpui_kit::test]
-    fn tool_call_expands_detail(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        let mut tab = tab_view();
-        tab.messages = messages_fixture();
-        snap.active = Some(tab);
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            let row = window.find("tool-a1-0");
-            assert!(row.visible(), "the tool summary row must render");
-            assert!(
-                window.try_find("tool-detail-a1-0").is_none(),
-                "detail starts collapsed"
-            );
-            window.click("tool-a1-0", cx);
-            assert!(
-                window.find("tool-detail-a1-0").visible(),
-                "the click must expand the detail body"
-            );
-            window.click("tool-a1-0", cx);
-            assert!(
-                window.try_find("tool-detail-a1-0").is_none(),
-                "a second click collapses it again"
-            );
-        })
-        .unwrap();
-    }
-
-    /// A tool-call carrying ACP diff blocks paints the unified view (path
-    /// header, capped notice when a side is over-budget) above the plain
-    /// detail — the TS DiffBlock port (ChatView.tsx:166).
-    #[gpui_kit::test]
-    fn tool_call_diff_blocks_render_unified_view(cx: &mut TestAppContext) {
-        use protocol::acp::AcpDiffContent;
-        use protocol::chat::{ChatPart, ToolCallPart};
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        let mut tab = tab_view();
-        let mut msgs = messages_fixture();
-        msgs[1].parts.insert(
-            0,
-            ChatPart::ToolCall(ToolCallPart {
-                tool_call_id: "t0".to_string(),
-                tool_name: "Edit: src/main.rs".to_string(),
-                detail: "the file was edited".to_string(),
-                status: "completed".to_string(),
-                kind: Some("edit".to_string()),
-                raw_name: Some("Edit".to_string()),
-                fold_kind: None,
-                diffs: Some(vec![AcpDiffContent {
-                    r#type: "diff".to_string(),
-                    path: "src/main.rs".to_string(),
-                    old_text: Some("fn a() {}".to_string()),
-                    new_text: "fn a() { let x = 1; }".to_string(),
-                }]),
-            }),
-        );
-        tab.messages = msgs;
-        snap.active = Some(tab);
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            window.click("tool-a1-0", cx);
-            window.draw(cx).clear(cx);
-            assert!(
-                window.find("tool-diff-path-a1-0-0").visible(),
-                "the diff block's path header must render"
-            );
-            assert!(
-                window.find("tool-detail-a1-0").visible(),
-                "the plain detail still renders under the diff blocks"
-            );
-        })
-        .unwrap();
-    }
-
-    /// E3: the plan/todo strip renders collapsed with its done/total summary
-    /// and expands to the entry list on click.
-    #[gpui_kit::test]
-    fn plan_bar_collapses_and_lists_entries(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        let mut tab = tab_view();
-        tab.plan_entries = Some(vec![
-            protocol::replay::PlanEntry {
-                content: "scan the code".to_string(),
-                status: Some("completed".to_string()),
-            },
-            protocol::replay::PlanEntry {
-                content: "write the fix".to_string(),
-                status: Some("active".to_string()),
-            },
-        ]);
-        snap.active = Some(tab);
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("plan-toggle").visible());
-            assert!(
-                window.try_find("plan-entry-0").is_none(),
-                "entries start collapsed"
-            );
-            window.click("plan-toggle", cx);
-            assert!(window.find("plan-entry-0").visible());
-            assert!(window.find("plan-entry-1").visible());
-        })
-        .unwrap();
-    }
-
-    /// E4 + E5: the copy affordance writes the row's source text to the
-    /// platform clipboard (user plain text, assistant markdown source), and
-    /// a task-notification renders as the centered chip with no bubble copy
-    /// button.
-    #[gpui_kit::test]
-    fn copy_buttons_write_clipboard_and_notice_chip_has_none(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = base_snapshot();
-        let mut tab = tab_view();
-        tab.messages = messages_fixture();
-        snap.active = Some(tab);
-        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("copy-u1").visible());
-            assert!(window.find("copy-a1").visible());
-            // The notice row is a chip, and chips have no copy affordance.
-            assert!(window.find("notice-n1").visible());
-            assert!(window.try_find("copy-n1").is_none());
-            window.click("copy-u1", cx);
-        })
-        .unwrap();
-        assert_eq!(
-            cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("hello desktop".to_string())
-        );
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.click("copy-a1", cx);
-        })
-        .unwrap();
-        assert_eq!(
-            cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("all green".to_string())
-        );
-    }
-
-    fn tab_view() -> TabView {
-        TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: Vec::new(),
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            config_options: Vec::new(),
-            usage: None,
-            cache_hit: None,
-            turn_stats: None,
-            plan_entries: None,
-            fs_capable: true,
-            available_commands: Vec::new(),
-        }
-    }
-
-    fn open_test_window(
-        cx: &mut App,
-        snap: WorkbenchSnapshot,
-    ) -> (AnyWindowHandle, Entity<Workbench>) {
-        let runtime = ProtocolRuntime::inert();
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: Point::default(),
-                    size: Size {
-                        width: px(800.),
-                        height: px(600.),
-                    },
-                })),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| {
-                cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
-            },
-        )
-        .expect("open test window")
-    }
-}
-
-/// Batch F (Session Files) headless UI integration tests — same paradigm as
-/// `chip_tests`: explicit imports, an inert runtime, a real Workbench in a
-/// test window, element-id assertions and real clicks. The wire half
-/// (fs_list/fs_file_text spellings) lives in the protocol tests.
-#[cfg(test)]
-mod files_tests {
-    use super::Workbench;
-    use crate::file_browser::FileKind;
-    use crate::runtime::{
-        FileViewerView, FilesPanelView, Phase, ProtocolRuntime, RuntimeEvent, TabPhase,
-        TabSummary, TabView, UiCommand, WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
-        WindowBounds, WindowOptions,
-    };
-    use protocol::hub::{FsEntry, FsEntryKind, FsListing};
-
-    fn entry(name: &str, kind: FsEntryKind, size: u64) -> FsEntry {
-        FsEntry {
-            name: name.to_string(),
-            kind,
-            size,
-            mtime: Some(1),
-        }
-    }
-
-    /// Open the Session Files page the way a user does: the right session
-    /// panel's Files row (the left dock no longer carries it — session
-    /// surfaces live on the session side). Idempotent: skips the panel
-    /// toggle when the panel is already open (back/Esc close the PAGE, not
-    /// the panel).
-    fn open_files_page(window: &mut gpui_kit::Window, cx: &mut App) {
-        if window.try_find("session-panel-files").is_none() {
-            window.click("session-panel-toggle", cx);
-            window.draw(cx).clear(cx);
-        }
-        assert!(
-            window.find("session-panel-files").visible(),
-            "the session panel's Files row must render for an attached session"
-        );
-        window.click("session-panel-files", cx);
-        window.draw(cx).clear(cx);
-        assert!(
-            window.find("files-page").visible(),
-            "the Files row must open the full page"
-        );
-    }
-
-    fn listing_fixture() -> FsListing {
-        FsListing {
-            root: "/Users/me/proj".to_string(),
-            entries: vec![
-                entry("src", FsEntryKind::Dir, 0),
-                entry("README.md", FsEntryKind::File, 128),
-                entry(".env", FsEntryKind::File, 12),
-                entry("logo.png", FsEntryKind::File, 4096),
-            ],
-            truncated: false,
-        }
-    }
-
-    /// A connected workbench whose files view holds one loaded listing at
-    /// `path`; the active tab's bridge advertises the fs capability.
-    fn files_snapshot(path: &str, fs_capable: bool) -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.hub_addr = Some("http://127.0.0.1:8377".to_string());
-        snap.tabs = vec![TabSummary {
-            id: 7,
-            session_id: Some("sess_1".to_string()),
-            session_title: None,
-            phase: TabPhase::Connected,
-            running: false,
-            pending: 0,
-            awaiting: false,
-        }];
-        snap.active_tab = Some(7);
-        snap.active = Some(TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: Vec::new(),
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            config_options: Vec::new(),
-            usage: None,
-            cache_hit: None,
-            turn_stats: None,
-            plan_entries: None,
-            fs_capable,
-            available_commands: Vec::new(),
-        });
-        snap.files = FilesPanelView {
-            path: path.to_string(),
-            listing: Some(listing_fixture()),
-            loading: false,
-            error: None,
-            viewing: None,
-        };
-        snap
-    }
-
-    fn open_test_window(
-        cx: &mut App,
-        snap: WorkbenchSnapshot,
-    ) -> (AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
-        let runtime = ProtocolRuntime::inert();
-        let (handle, content) = gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: Point::default(),
-                    size: Size {
-                        width: px(800.),
-                        height: px(600.),
-                    },
-                })),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| {
-                let runtime = runtime.clone();
-                cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
-            },
-        )
-        .expect("open test window");
-        (handle, content, runtime)
-    }
-
-    fn sent_files_navigate(runtime: &ProtocolRuntime, path: &str) -> bool {
-        runtime.recorded_commands().iter().any(|c| matches!(
-            c,
-            UiCommand::FilesNavigate { path: p } if p == path
-        ))
-    }
-
-    fn files_navigate_count(runtime: &ProtocolRuntime, path: &str) -> usize {
-        runtime
-            .recorded_commands()
-            .iter()
-            .filter(|c| matches!(c, UiCommand::FilesNavigate { path: p } if p == path))
-            .count()
-    }
-
-    /// F1: docking the files panel seeds a listing; dotfiles stay hidden
-    /// until the toggle flips; entering a directory, refreshing, and the
-    /// breadcrumb all dispatch `FilesNavigate` with the exact target path.
-    #[gpui_kit::test]
-    fn files_panel_browses_and_toggles_hidden(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            // Open the files page from the session panel's row.
-            open_files_page(window, cx);
-            assert!(window.find("files-panel").visible(), "the page must mount the browser");
-            // Opening the page seeds one listing read at the session root.
-            assert!(
-                sent_files_navigate(&runtime, ""),
-                "docking must seed FilesNavigate at the root, got {:?}",
-                runtime.recorded_commands()
-            );
-            // F2: the Finder affordance exists next to a loopback hub with a
-            // listing (never clicked here — it shells out to `open`).
-            assert!(window.find("files-open-finder").visible());
-            // Rows render; the dotfile is filtered client-side.
-            assert!(window.find("files-entry-src").visible());
-            assert!(window.find("files-entry-README.md").visible());
-            assert!(
-                window.try_find("files-entry-.env").is_none(),
-                "dotfiles start hidden"
-            );
-            // The hidden toggle flips the filter (view-local state).
-            window.click("files-hidden-toggle", cx);
-            window.draw(cx).clear(cx);
-            assert!(window.find("files-entry-.env").visible());
-            // Entering a directory navigates by the joined path.
-            window.click("files-entry-src", cx);
-            assert_eq!(
-                files_navigate_count(&runtime, "src"),
-                1,
-                "the row click must be the only src navigation, got {:?}",
-                runtime.recorded_commands()
-            );
-            // Refresh re-reads the CURRENT directory: the dock seed plus
-            // this click — counting, so the assertion fails if the button
-            // stops dispatching (the seed alone used to satisfy `.any()`).
-            window.click("files-refresh", cx);
-            assert_eq!(
-                files_navigate_count(&runtime, ""),
-                2,
-                "refresh must re-send FilesNavigate for the current path, got {:?}",
-                runtime.recorded_commands()
-            );
-            assert!(matches!(
-                runtime.recorded_commands().last(),
-                Some(UiCommand::FilesNavigate { path }) if path == ""
-            ));
-        })
-        .unwrap();
-    }
-
-    /// F1 (deep path): the breadcrumb renders every segment and a segment
-    /// crumb navigates to its prefix.
-    #[gpui_kit::test]
-    fn files_breadcrumb_navigates_to_prefix(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, _wb, runtime) =
-            cx.update(|cx| open_test_window(cx, files_snapshot("src/ui", true)));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            open_files_page(window, cx);
-            // Root crumb is the session root's last segment; segments follow.
-            assert!(window.find("files-crumb-root").visible());
-            assert!(window.find("files-crumb-0").visible());
-            assert!(window.find("files-crumb-1").visible());
-            window.click("files-crumb-0", cx);
-            assert!(
-                sent_files_navigate(&runtime, "src"),
-                "the first segment crumb navigates to its prefix"
-            );
-            window.click("files-crumb-root", cx);
-            assert!(sent_files_navigate(&runtime, ""));
-        })
-        .unwrap();
-    }
-
-    /// F3: the simplified viewer renders the loaded whole-file text with
-    /// numbered rows and the size meta, and its close dispatches
-    /// `FilesCloseView`. A markdown-shaped name starts in the rendered
-    /// preview (TS FileViewer:206) and the header toggle flips to the
-    /// numbered source rows.
-    #[gpui_kit::test]
-    fn file_viewer_renders_text_and_closes(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = files_snapshot("", true);
-        snap.files.viewing = Some(FileViewerView {
-            image: None,
-            path: "README.md".to_string(),
-            name: "README.md".to_string(),
-            size: 128,
-            kind: FileKind::Text,
-            first_line: Some(1),
-            text: Some("line one\nline two".to_string()),
-            loading: false,
-            error: None,
-        });
-        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("file-viewer").visible());
-            assert!(window.find("file-viewer-meta").visible());
-            assert!(
-                window.find("file-viewer-markdown").visible(),
-                "markdown files start in the rendered preview"
-            );
-            assert!(
-                window.find("file-viewer-md-toggle").visible(),
-                "the preview/source toggle renders for markdown files"
-            );
-            window.click("file-viewer-md-toggle", cx);
-            window.draw(cx).clear(cx);
-            assert!(window.find("file-viewer-line-1").visible());
-            assert!(window.find("file-viewer-line-2").visible());
-            assert!(
-                window.find("file-viewer-foot").visible(),
-                "the footer states the line count"
-            );
-            // The local affordances (mobile viewer header): open with the
-            // default application + reveal in Finder — the fixture's hub is
-            // loopback and the listing names the root. Never clicked here —
-            // both shell out to `open`.
-            assert!(window.find("file-viewer-open").visible());
-            assert!(window.find("file-viewer-reveal").visible());
-            window.click("file-viewer-close", cx);
-            assert!(
-                runtime
-                    .recorded_commands()
-                    .iter()
-                    .any(|c| matches!(c, UiCommand::FilesCloseView)),
-                "close must reach the runtime"
-            );
-        })
-        .unwrap();
-    }
-
-    /// F1 gating: a bridge without the fs capability gets the explanation
-    /// note, and opening the page seeds nothing (a request would just 404).
-    #[gpui_kit::test]
-    fn files_panel_notes_capability_gap_without_seeding(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, files_snapshot("", false)));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            open_files_page(window, cx);
-            assert!(window.find("files-unsupported").visible());
-            assert!(
-                !runtime
-                    .recorded_commands()
-                    .iter()
-                    .any(|c| matches!(c, UiCommand::FilesNavigate { .. })),
-                "an incapable bridge must not be probed, got {:?}",
-                runtime.recorded_commands()
-            );
-        })
-        .unwrap();
-    }
-
-    /// The files page's close paths: the back button returns to the chat,
-    /// reopening works, and Esc closes it too (the stop-turn ladder sits
-    /// BEHIND the page — a page up means Esc never cancels a turn).
-    #[gpui_kit::test]
-    fn files_page_back_and_esc_return_to_chat(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, wb, _runtime) =
-            cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
-        cx.update_window(handle.into(), |_, window, cx| {
-            use super::StopTurn;
-            window.draw(cx).clear(cx);
-            open_files_page(window, cx);
-            // The page replaced the chat surfaces: no composer while up.
-            assert!(window.try_find("composer").is_none());
-            window.click("files-page-back", cx);
-            window.draw(cx).clear(cx);
-            assert!(window.try_find("files-page").is_none(), "back closes the page");
-            assert!(window.find("composer").visible(), "the chat returns");
-            // Reopen, then Esc closes it the same way — driven through the
-            // workbench's Esc handler like the config-page Esc test (the
-            // headless platform has no real key dispatch).
-            open_files_page(window, cx);
-            wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
-            window.draw(cx).clear(cx);
-            assert!(window.try_find("files-page").is_none(), "Esc closes the page");
-            assert!(window.find("composer").visible());
-        })
-        .unwrap();
-    }
-
-    /// Review [88]: with the file viewer stacked on the files page, Esc
-    /// unwinds the viewer FIRST (driver-owned overlay) — the page beneath
-    /// stays up for the next Esc.
-    #[gpui_kit::test]
-    fn esc_closes_the_viewer_before_the_files_page(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = files_snapshot("", true);
-        snap.files.viewing = Some(FileViewerView {
-            image: None,
-            path: "README.md".to_string(),
-            name: "README.md".to_string(),
-            size: 128,
-            kind: FileKind::Text,
-            first_line: Some(1),
-            text: Some("line one".to_string()),
-            loading: false,
-            error: None,
-        });
-        let (handle, wb, runtime) = cx.update(|cx| open_test_window(cx, snap));
-        cx.update_window(handle.into(), |_, window, cx| {
-            use super::StopTurn;
-            window.draw(cx).clear(cx);
-            assert!(window.find("file-viewer").visible());
-            open_files_page(window, cx);
-            wb.update(cx, |wb, cx| wb.on_stop_turn(&StopTurn, window, cx));
-            assert!(
-                runtime
-                    .recorded_commands()
-                    .iter()
-                    .any(|c| matches!(c, UiCommand::FilesCloseView)),
-                "Esc must close the viewer, not the page beneath it"
-            );
-            window.draw(cx).clear(cx);
-            assert!(
-                window.find("files-page").visible(),
-                "the files page survives the viewer's Esc"
-            );
-        })
-        .unwrap();
-    }
-
-    /// Review [85]: the page follows the session — a session switch under
-    /// an open page re-seeds the listing for the new target, and a
-    /// sessionless snapshot closes the page outright.
-    #[gpui_kit::test]
-    fn files_page_follows_the_active_session(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, wb, runtime) =
-            cx.update(|cx| open_test_window(cx, files_snapshot("", true)));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            open_files_page(window, cx);
-            assert_eq!(
-                files_navigate_count(&runtime, ""),
-                1,
-                "opening seeds the first listing"
-            );
-            // Switch the tab onto another session: the page stays up but
-            // re-seeds for the new target.
-            let mut switched = files_snapshot("", true);
-            switched.tabs[0].session_id = Some("sess_2".to_string());
-            if let Some(active) = switched.active.as_mut() {
-                active.session_id = Some("sess_2".to_string());
-            }
-            wb.update(cx, |wb, cx| {
-                wb.on_runtime_event(RuntimeEvent::Snapshot(switched), cx)
-            });
-            window.draw(cx).clear(cx);
-            assert!(
-                window.find("files-page").visible(),
-                "a session switch keeps the page and re-seeds"
-            );
-            assert_eq!(
-                files_navigate_count(&runtime, ""),
-                2,
-                "the switch must re-send the root listing"
-            );
-            // No session left to browse: the page closes (the capability
-            // note would otherwise masquerade as "no session").
-            let mut gone = files_snapshot("", true);
-            gone.active = None;
-            wb.update(cx, |wb, cx| wb.on_runtime_event(RuntimeEvent::Snapshot(gone), cx));
-            window.draw(cx).clear(cx);
-            assert!(
-                window.try_find("files-page").is_none(),
-                "a sessionless snapshot must close the page"
-            );
-            assert!(window.find("composer").visible());
-        })
-        .unwrap();
-    }
-}
-
-/// Batch G-light (session row actions) headless UI integration tests — same
-/// paradigm as `chip_tests`: explicit imports, an inert runtime, a real
-/// Workbench in a test window, element-id assertions and real clicks. The
-/// wire half (rename/close/delete spellings) lives in the protocol tests.
-#[cfg(test)]
-mod session_action_tests {
-    use super::Workbench;
-    use crate::runtime::{
-        HistoryRow, HistorySelected, Phase, ProtocolRuntime, SessionRow, UiCommand,
-        WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
-        WindowBounds, WindowOptions,
-    };
-
-    fn session_row(session_id: &str, title: Option<&str>) -> SessionRow {
-        SessionRow {
-            instance_id: "inst-1".to_string(),
-            workspace: "/w/proj".to_string(),
-            session_id: session_id.to_string(),
-            title: title.map(str::to_string),
-            updated_at: Some(1),
-            running: false,
-            awaiting: false,
-            finished_at: None,
-            rest_running: false,
-            activity_known: false,
-            open_tab: None,
-        }
-    }
-
-    fn sessions_snapshot() -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.hub_addr = Some("http://127.0.0.1:8377".to_string());
-        snap.sessions = vec![session_row("sess_1", Some("First chat"))];
-        snap
-    }
-
-    fn history_snapshot() -> WorkbenchSnapshot {
-        let mut snap = sessions_snapshot();
-        snap.history.open = true;
-        snap.history.selected = Some(HistorySelected {
-            workspace_path: "/w/proj".to_string(),
-            rows: vec![HistoryRow {
-                session_id: "hist_1".to_string(),
-                title: Some("Old conversation".to_string()),
-                updated_at: Some("2026-10-01T10:00:00Z".to_string()),
-                live: false,
-            }],
-            next_cursor: None,
-            loading_page: false,
-            loading_more: false,
-            error: None,
-            resuming: None,
-            deleting: None,
-        });
-        snap
-    }
-
-    fn open_test_window(
-        cx: &mut App,
-        snap: WorkbenchSnapshot,
-    ) -> (AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
-        let runtime = ProtocolRuntime::inert();
-        let (handle, content) = gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    origin: Point::default(),
-                    size: Size {
-                        width: px(800.),
-                        height: px(600.),
-                    },
-                })),
-                ..Default::default()
-            },
-            cx,
-            |window, cx| {
-                let runtime = runtime.clone();
-                cx.new(|cx| Workbench::new(window, cx, runtime.clone(), snap))
-            },
-        )
-        .expect("open test window");
-        (handle, content, runtime)
-    }
-
-    fn sent_close(runtime: &ProtocolRuntime, session_id: &str) -> bool {
-        runtime.recorded_commands().iter().any(|c| matches!(
-            c,
-            UiCommand::CloseSession { instance_id, session_id: sid }
-                if instance_id == "inst-1" && sid == session_id
-        ))
-    }
-
-    /// G1 + G2 (the End half): the sidebar session row's "…" menu carries
-    /// Rename and End session in that order; End dispatches the exact
-    /// `CloseSession` command, and the trigger click never opens the session.
-    /// One menu interaction per window — a dismissal rides a deferred
-    /// DismissEvent, so re-opening immediately after a pick toggles the
-    /// still-open state closed (TESTING.md's wait-for note).
-    #[gpui_kit::test]
-    fn session_row_menu_ends_session(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, sessions_snapshot()));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("session-row-sess_1").visible());
-            assert!(window.find("session-menu-sess_1").visible());
-            // Opening the actions menu must not ALSO open the session (the
-            // row's own click sits above in the bubble path).
-            window.click("session-menu-sess_1", cx);
-            {
-                let mut menu = window.within("popup-menu");
-                assert_eq!(menu.find(0usize).label().as_deref(), Some("Rename…"));
-                assert_eq!(menu.find(1usize).label().as_deref(), Some("End session"));
-                menu.click(1usize, cx);
-            }
-            window.draw(cx).clear(cx);
-            assert!(
-                sent_close(&runtime, "sess_1"),
-                "End session must reach the runtime, got {:?}",
-                runtime.recorded_commands()
-            );
-            assert!(
-                !runtime.recorded_commands().iter().any(|c| matches!(
-                    c,
-                    UiCommand::OpenSession { .. }
-                )),
-                "the menu trigger click must not open the session"
-            );
-        })
-        .unwrap();
-    }
-
-    /// G1 (the Rename half): picking Rename opens the sheet with the row's
-    /// title prefilled, and Save dispatches `RenameSession` with that
-    /// prefill, closing the sheet.
-    #[gpui_kit::test]
-    fn session_row_rename_sheet_prefills_and_saves(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, sessions_snapshot()));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            window.click("session-menu-sess_1", cx);
-            {
-                let mut menu = window.within("popup-menu");
-                menu.click(0usize, cx);
-            }
-            window.draw(cx).clear(cx);
-            assert!(window.find("rename-sheet").visible(), "the sheet must open");
-        })
-        .unwrap();
-        // The prefill rides a deferred set_value (App effects, not the
-        // frame) — flush, then one frame shows the value and enables Save.
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            window.click("rename-save", cx);
-            window.draw(cx).clear(cx);
-            assert!(
-                window.try_find("rename-sheet").is_none(),
-                "Save closes the sheet"
-            );
-            assert!(
-                runtime.recorded_commands().iter().any(|c| matches!(
-                    c,
-                    UiCommand::RenameSession { instance_id, session_id, title }
-                        if instance_id == "inst-1"
-                            && session_id == "sess_1"
-                            && title == "First chat"
-                )),
-                "Save must dispatch the prefilled rename, got {:?}",
-                runtime.recorded_commands()
-            );
-        })
-        .unwrap();
-    }
-
-    /// G3: the history row's "…" menu carries the tombstone delete, and
-    /// picking it dispatches `DeleteHistorySession` for that row — never a
-    /// resume (the row's own click still owns that).
-    #[gpui_kit::test]
-    fn history_row_menu_deletes_tombstone(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, _wb, runtime) = cx.update(|cx| open_test_window(cx, history_snapshot()));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("history-row-hist_1").visible());
-            assert!(window.find("history-menu-hist_1").visible());
-            window.click("history-menu-hist_1", cx);
-            {
-                let mut menu = window.within("popup-menu");
-                assert_eq!(
-                    menu.find(0usize).label().as_deref(),
-                    Some("Delete from history")
-                );
-                menu.click(0usize, cx);
-            }
-            window.draw(cx).clear(cx);
-            assert!(
-                runtime.recorded_commands().iter().any(|c| matches!(
-                    c,
-                    UiCommand::DeleteHistorySession { session_id } if session_id == "hist_1"
-                )),
-                "the tombstone delete must reach the runtime, got {:?}",
-                runtime.recorded_commands()
-            );
-            assert!(
-                !runtime.recorded_commands().iter().any(|c| matches!(
-                    c,
-                    UiCommand::OpenHistorySession { .. }
-                )),
-                "the menu trigger click must not resume the row"
-            );
-        })
-        .unwrap();
-    }
-
-    /// D: the ActivityBadge ladder's dot (SessionList.tsx:29-87) — awaiting
-    /// beats running, and discovery's REST `running` heartbeat is the
-    /// fallback ONLY for rows without a broadcast activity entry.
-    #[test]
-    fn session_badge_dot_ladder() {
-        use super::{activity_dot, ActivityDot};
-        let mut row = session_row("sess_1", None);
-        assert_eq!(activity_dot(&row), ActivityDot::Idle);
-        row.rest_running = true;
-        assert_eq!(activity_dot(&row), ActivityDot::Running, "no activity entry: the REST heartbeat is the fallback");
-        row.activity_known = true;
-        assert_eq!(activity_dot(&row), ActivityDot::Idle, "a known activity entry must not be overridden by a stale REST flag");
-        row.running = true;
-        assert_eq!(activity_dot(&row), ActivityDot::Running);
-        row.awaiting = true;
-        assert_eq!(activity_dot(&row), ActivityDot::Awaiting);
-    }
-
-    /// D: the just-finished chip's 60s window.
-    #[test]
-    fn session_badge_finished_window() {
-        use super::finished_fresh;
-        let mut row = session_row("sess_1", None);
-        assert!(!finished_fresh(&row, 10_000));
-        row.finished_at = Some(10_000);
-        assert!(finished_fresh(&row, 69_999));
-        assert!(!finished_fresh(&row, 70_000), "the window lapses at exactly +60s");
-    }
-
-    /// D (window): the finished chip paints inside the window and is gone
-    /// once discovery repaints past it.
-    #[gpui_kit::test]
-    fn session_finished_chip_paints_and_expires(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut fresh = sessions_snapshot();
-        fresh.sessions[0].finished_at = Some(super::now_ms());
-        let (handle, _wb, _runtime) = cx.update(|cx| open_test_window(cx, fresh));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(window.find("session-finished-sess_1").visible());
-        })
-        .unwrap();
-
-        let mut stale = sessions_snapshot();
-        stale.sessions[0].finished_at = Some(super::now_ms() - 61_000);
-        let (handle, _wb, _runtime) = cx.update(|cx| open_test_window(cx, stale));
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert!(
-                window.try_find("session-finished-sess_1").is_none(),
-                "the chip must lapse with the window"
-            );
-        })
-        .unwrap();
-    }
-}
-
-/// Batch H3 (language switch) headless UI integration tests — same paradigm
-/// as `chip_tests`. The locale is PROCESS-GLOBAL state: these tests hold
-/// `i18n::locale_test_lock` (shared with the i18n catalog tests) so a flip
-/// can never race a bare `t!()` assertion, and they redirect the prefs file
-/// into a scratch XDG_CONFIG_HOME — a test must never write the user's real
-/// config directory.
-#[cfg(test)]
-mod language_tests {
-    use super::Workbench;
-    use crate::runtime::{
-        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        px, AppContext as _, Bounds, Point, Size, TestAppContext, WindowBounds, WindowOptions,
-    };
-
-    fn tabbed_snapshot() -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.tabs = vec![TabSummary {
-            id: 7,
-            session_id: Some("sess_1".to_string()),
-            session_title: None,
-            phase: TabPhase::Connected,
-            running: false,
-            pending: 0,
-            awaiting: false,
-        }];
-        snap.active_tab = Some(7);
-        snap.active = Some(TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: Vec::new(),
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            config_options: Vec::new(),
-            usage: None,
-            cache_hit: None,
-            turn_stats: None,
-            plan_entries: None,
-            fs_capable: true,
-            available_commands: Vec::new(),
-        });
-        snap
-    }
-
-    /// The settings panel's language segment: both options render, and the
-    /// pick re-renders the chrome IMMEDIATELY — the composer's Send control
-    /// (`t!("chat.send")`) relabels on the very next frame, both ways.
-    #[gpui_kit::test]
-    fn language_segment_switches_chrome(cx: &mut TestAppContext) {
-        let _locale = crate::i18n::locale_test_lock();
-        let _windows = super::window_test_lock();
-        // Redirect the persisted prefs into a scratch dir (store_locale
-        // writes the config dir otherwise; no other test reads it).
-        let scratch = std::env::temp_dir().join(format!("zcode-lang-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::set_var("XDG_CONFIG_HOME", &scratch);
-
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-            // A known starting locale regardless of the machine's catalogs.
-            rust_i18n::set_locale("en");
-        });
-        let runtime = ProtocolRuntime::inert();
-        let (handle, _wb) = cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(800.),
-                            height: px(600.),
-                        },
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    let runtime = runtime.clone();
-                    cx.new(|cx| Workbench::new(window, cx, runtime.clone(), tabbed_snapshot()))
-                },
-            )
-            .expect("open test window")
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            // Dock the config panel (the settings home of the segment).
-            window.click("dock-rail-config", cx);
-            window.draw(cx).clear(cx);
-            assert!(
-                window.find("lang-en").visible() && window.find("lang-zh").visible(),
-                "both language options must render in the settings panel"
-            );
-            // English chrome before the switch.
-            assert_eq!(window.find("send").label().as_deref(), Some("Send"));
-            // Pick 中文: the same frame's chrome relabels — no restart, no
-            // remount (the mobile panel's instant i18next changeLanguage).
-            window.click("lang-zh", cx);
-            window.draw(cx).clear(cx);
-            assert_eq!(window.find("send").label().as_deref(), Some("发送"));
-            // And back: the segment is a toggle, not a one-way door.
-            window.click("lang-en", cx);
-            window.draw(cx).clear(cx);
-            assert_eq!(window.find("send").label().as_deref(), Some("Send"));
-            // The pick persisted (the scratch prefs file, H3's saveLang).
-            let saved = std::fs::read_to_string(
-                scratch.join("zcode-acp-remote").join("ui-prefs.json"),
-            )
-            .expect("prefs file written");
-            assert!(saved.contains("\"en\""), "saved locale: {saved}");
-        })
-        .unwrap();
-
-        // Restore the process-global state for the tests that follow.
-        rust_i18n::set_locale("en");
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&scratch);
-    }
-
-    /// The settings panel's font-size segment (SidePanel.tsx:189-210): the
-    /// three steps render beside the language pick, the pick persists to
-    /// the scratch prefs file (the TS saveFontSize), and the selection
-    /// follows the click.
-    #[gpui_kit::test]
-    fn font_size_segment_persists(cx: &mut TestAppContext) {
-        let _windows = super::window_test_lock();
-        // Redirect the persisted prefs into a scratch dir, like the language
-        // test above (store_font_size writes the config dir otherwise).
-        let scratch =
-            std::env::temp_dir().join(format!("zcode-font-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&scratch);
-        let prev_xdg = std::env::var("XDG_CONFIG_HOME").ok();
-        std::env::set_var("XDG_CONFIG_HOME", &scratch);
-
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let runtime = ProtocolRuntime::inert();
-        let (handle, _wb) = cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(800.),
-                            height: px(600.),
-                        },
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    let runtime = runtime.clone();
-                    cx.new(|cx| Workbench::new(window, cx, runtime.clone(), tabbed_snapshot()))
-                },
-            )
-            .expect("open test window")
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            window.click("dock-rail-config", cx);
-            window.draw(cx).clear(cx);
-            for id in ["font-small", "font-medium", "font-large"] {
-                assert!(window.find(id).visible(), "{id} must render");
-            }
-            // Medium is the default selection; Large takes the pick.
-            window.click("font-large", cx);
-            window.draw(cx).clear(cx);
-            let saved = std::fs::read_to_string(
-                scratch.join("zcode-acp-remote").join("ui-prefs.json"),
-            )
-            .expect("prefs file written");
-            assert!(saved.contains("\"large\""), "saved font size: {saved}");
-        })
-        .unwrap();
-
-        match prev_xdg {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        let _ = std::fs::remove_dir_all(&scratch);
-    }
-}
-
-/// Batch H4 — the new-session chooser's project filter (B2/D2): the known-
-/// projects list narrows case-insensitively against the workspace path, and
-/// an over-narrow query shows the no-match hint instead of an empty panel.
-#[cfg(test)]
-mod new_session_tests {
-    use super::Workbench;
-    use crate::runtime::{
-        HistoryProjectRow, NewSessionView, Phase, ProtocolRuntime, WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        px, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext, WindowBounds,
-        WindowOptions,
-    };
-
-    fn project(workspace_path: &str, sessions: u64) -> HistoryProjectRow {
-        HistoryProjectRow {
-            workspace_path: workspace_path.to_string(),
-            sessions,
-            last_active: 1,
-        }
-    }
-
-    fn chooser_snapshot() -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.new_session = Some(NewSessionView {
-            projects: Some(vec![
-                project("/Users/william/Develop/tools/zcode-acp-app", 2),
-                project("/Users/william/Develop/tools/martty", 1),
-            ]),
-            error: None,
-            browse: None,
-            creating: None,
-        });
-        snap
-    }
-
-    /// Type into the filter the way the subscription path would (set the
-    /// input's value, then notify — a keystroke fires InputEvent and the
-    /// workbench re-renders; set_value itself emits nothing by design).
-    fn set_filter(
-        wb: &Entity<Workbench>,
-        text: &str,
-        window: &mut gpui_kit::Window,
-        cx: &mut App,
-    ) {
-        wb.update(cx, |wb, cx| {
-            wb.new_session_filter
-                .update(cx, |state, cx| state.set_value(text, window, cx));
-            cx.notify();
-        });
-    }
-
-    #[gpui_kit::test]
-    fn project_filter_narrows_and_shows_no_match(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let runtime = ProtocolRuntime::inert();
-        let (handle, wb) = cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(800.),
-                            height: px(600.),
-                        },
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    let runtime = runtime.clone();
-                    cx.new(|cx| Workbench::new(window, cx, runtime.clone(), chooser_snapshot()))
-                },
-            )
-            .expect("open test window")
-        });
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            // Unfiltered: both known projects list.
-            assert!(window.find("ns-project-/Users/william/Develop/tools/zcode-acp-app").visible());
-            assert!(window.find("ns-project-/Users/william/Develop/tools/martty").visible());
-            assert!(window.try_find("ns-no-match").is_none());
-
-            // A case-insensitive path substring narrows to its hit.
-            set_filter(&wb, "ZCODE", window, cx);
-            window.render_frame(cx);
-            assert!(window.find("ns-project-/Users/william/Develop/tools/zcode-acp-app").visible());
-            assert!(
-                window.try_find("ns-project-/Users/william/Develop/tools/martty").is_none(),
-                "a non-matching project must not list under the filter"
-            );
-            assert!(window.try_find("ns-no-match").is_none());
-
-            // An over-narrow query: no rows, the no-match hint instead.
-            set_filter(&wb, "does-not-exist", window, cx);
-            window.render_frame(cx);
-            assert!(window.try_find("ns-project-/Users/william/Develop/tools/zcode-acp-app").is_none());
-            assert!(window.find("ns-no-match").visible());
-
-            // Clearing the filter restores the full list (TS dialog's
-            // empty-query-means-all rule).
-            set_filter(&wb, "", window, cx);
-            window.render_frame(cx);
-            assert!(window.find("ns-project-/Users/william/Develop/tools/zcode-acp-app").visible());
-            assert!(window.find("ns-project-/Users/william/Develop/tools/martty").visible());
-        })
-        .unwrap();
-    }
-}
-
 /// Pure-logic units of batch E: the TUI-parity formatters and the
 /// task-notification parser.
 #[cfg(test)]
@@ -8458,42 +6520,21 @@ mod slash_unit_tests {
     }
 }
 
-/// Batch K headless UI: the composer's "/" completion menu — matching,
-/// keyboard navigation (↑/Enter/Tab), Escape memory, and click commits.
+/// Headless UI checks for the newest chrome — the only window tests kept
+/// (the rest of the surface is judged by hand): the status bar's quota line
+/// and the servers dialog.
 #[cfg(test)]
-mod slash_tests {
-    // Explicit imports only — the file-root kit glob shadows #[test].
+mod ui_tests {
+    // Explicit imports only — the file-root kit glob would shadow #[test].
     use super::Workbench;
     use crate::runtime::{
-        Phase, ProtocolRuntime, TabPhase, TabSummary, TabView, WorkbenchSnapshot,
+        Phase, ProtocolRuntime, TabPhase, TabSummary, UiCommand, WorkbenchSnapshot,
     };
     use gpui_kit::test::TestWindowExt;
     use gpui_kit::{
-        px, AppContext as _, Bounds, Entity, Point, Size, TestAppContext, WindowBounds, WindowOptions,
+        px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
+        WindowBounds, WindowOptions,
     };
-
-    fn commands_fixture() -> Vec<protocol::acp::SlashCommand> {
-        use protocol::acp::{SlashCommand, SlashCommandInput};
-        vec![
-            SlashCommand {
-                name: "plan".to_string(),
-                description: Some("Plan mode".to_string()),
-                input: None,
-            },
-            SlashCommand {
-                name: "prompt".to_string(),
-                description: Some("Raw prompt".to_string()),
-                input: Some(SlashCommandInput {
-                    hint: Some("text".to_string()),
-                }),
-            },
-            SlashCommand {
-                name: "$tdd".to_string(),
-                description: Some("TDD skill".to_string()),
-                input: None,
-            },
-        ]
-    }
 
     fn connected_snapshot() -> WorkbenchSnapshot {
         let mut snap = WorkbenchSnapshot::initial();
@@ -8508,351 +6549,150 @@ mod slash_tests {
             awaiting: false,
         }];
         snap.active_tab = Some(7);
-        snap.active = Some(TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: Vec::new(),
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            config_options: Vec::new(),
-            usage: None,
-            cache_hit: None,
-            turn_stats: None,
-            plan_entries: None,
-            fs_capable: true,
-            available_commands: commands_fixture(),
-        });
         snap
     }
 
     fn open(
-        cx: &mut TestAppContext,
-    ) -> (gpui_kit::AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
+        cx: &mut App,
+        snap: WorkbenchSnapshot,
+        width: f32,
+    ) -> (AnyWindowHandle, Entity<Workbench>, ProtocolRuntime) {
         let runtime = ProtocolRuntime::inert();
-        let rt = runtime.clone();
-        let (handle, wb) = cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(800.),
-                            height: px(600.),
-                        },
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    let rt = rt.clone();
-                    cx.new(|cx| Workbench::new(window, cx, rt, connected_snapshot()))
-                },
-            )
-            .expect("open test window")
-        });
+        let (handle, wb) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: Point::default(),
+                    size: Size {
+                        width: px(width),
+                        height: px(700.),
+                    },
+                })),
+                ..Default::default()
+            },
+            cx,
+            {
+                let runtime = runtime.clone();
+                move |window, cx| cx.new(|cx| Workbench::new(window, cx, runtime, snap))
+            },
+        )
+        .expect("open test window");
         (handle, wb, runtime)
     }
 
-    /// Filtering ("$"-aware) and a click commit — the wire name keeps its
-    /// "$" prefix verbatim.
+    /// The quota line takes the width the left cluster leaves free instead
+    /// of clipping at a fixed cap — and still stops at 60% of the bar, so
+    /// an absurd line cannot squeeze the bridge label out.
     #[gpui_kit::test]
-    fn slash_menu_filters_and_click_commits(cx: &mut TestAppContext) {
+    fn status_bar_quota_line_uses_the_free_width(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_reduce_motion(true);
         });
-        let (handle, wb, runtime) = open(cx);
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            // Bare "/": every command rows in bridge order.
-            window.input("/", cx);
-            window.render_frame(cx);
-            assert!(window.find("slash-menu").visible());
-            assert!(window.find("slash-row-0").visible());
-            assert!(window.find("slash-row-1").visible());
-            assert!(window.find("slash-row-2").visible());
-
-            // "/td": only "$tdd" matches (the marker stripped on both sides).
-            window.input("td", cx);
-            window.render_frame(cx);
-            assert!(window.find("slash-row-0").visible());
-            assert!(window.try_find("slash-row-1").is_none());
-
-            // A click commits: the draft becomes "/$tdd " (wire name kept).
-            // The insert rides a deferred set_value (App effects, not the
-            // frame) — flush outside, then read it in a fresh frame.
-            window.click("slash-row-0", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
+        let mut snap = connected_snapshot();
+        snap.quota_dock = Some(
+            "GLM coding plan · 5h 42% ↻ 2h13m · week 12% ↻ 3d 4h · month 61% · $3.50"
+                .to_string(),
+        );
+        let (handle, _wb, _runtime) = cx.update(|cx| open(cx, snap, 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            assert_eq!(wb.read(cx).composer.read(cx).value().as_ref(), "/$tdd ");
-            // The committed token stays dismissed — the menu does not
-            // instantly reopen over the inserted "/$tdd " (TS `select` sets
-            // dismissedToken to the inserted command).
+            let dock = window.find("status-quota-dock").bounds();
             assert!(
-                window.try_find("slash-menu").is_none(),
-                "the menu must not reopen for the committed token"
+                dock.size.width > px(400.),
+                "a long line must run past the old 340px cap, got {:?}",
+                dock.size.width
             );
-            // (Enter-to-send after the commit is the batch-C composer path;
-            // the headless harness's press(enter) does not drive the kit
-            // textarea's Enter binding — verified with an isolated probe —
-            // so that half stays covered by its existing shipped behavior.)
-            let _ = runtime;
+            assert!(window.find("status-bridge").visible());
+        })
+        .unwrap();
+
+        let mut snap = connected_snapshot();
+        snap.quota_dock = Some("x".repeat(400));
+        let (handle, _wb, _runtime) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let dock = window.find("status-quota-dock").bounds();
+            assert!(
+                dock.size.width <= px(610.),
+                "the line must stop at 60% of the bar, got {:?}",
+                dock.size.width
+            );
+            let bridge = window.find("status-bridge").bounds();
+            assert!(bridge.right() <= dock.left(), "the bridge label keeps its place");
         })
         .unwrap();
     }
 
-    /// ↑ moves the highlight, Tab and Enter both commit it, and Escape keeps
-    /// the menu closed only until the query changes (TS `dismissedToken`).
+    /// Add and Edit open the servers dialog: Edit prefills the record and
+    /// Save dispatches `UpdateServer` for it (then closes); the Add form
+    /// refuses to submit while empty.
     #[gpui_kit::test]
-    fn slash_menu_keys_navigate_commit_and_remember_dismissal(cx: &mut TestAppContext) {
+    fn servers_dialog_edits_and_adds(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
             cx.set_reduce_motion(true);
         });
-        let (handle, wb, _runtime) = open(cx);
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            window.input("/p", cx);
-            window.render_frame(cx);
-            assert!(window.find("slash-row-0").visible());
-            assert!(window.find("slash-row-1").visible());
-
-            // ↓ moves to the second row; Tab commits it.
-            window.press("down", cx);
-            window.press("tab", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert_eq!(wb.read(cx).composer.read(cx).value().as_ref(), "/prompt ");
-
-            // Escape dismisses for THIS query only ("/p").
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.press("backspace", cx);
-            window.render_frame(cx);
-            window.input("/p", cx);
-            window.render_frame(cx);
-            assert!(
-                window.find("slash-menu").visible(),
-                "the menu must list before any dismissal"
-            );
-            window.press("escape", cx);
-            window.render_frame(cx);
-            assert!(
-                window.try_find("slash-menu").is_none(),
-                "Escape must close the menu"
-            );
-            // Any query change reopens it — and Enter commits the top row.
-            window.input("l", cx);
-            window.render_frame(cx);
-            assert!(window.find("slash-menu").visible());
-            window.press("enter", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
-        cx.update_window(handle.into(), |_, window, cx| {
-            window.draw(cx).clear(cx);
-            assert_eq!(wb.read(cx).composer.read(cx).value().as_ref(), "/plan ");
-        })
-        .unwrap();
-    }
-}
-
-/// Batch K headless UI: the image lightbox — a message echo click opens it,
-/// Esc closes; a file preview's image enlarges with its path caption and a
-/// backdrop click closes.
-#[cfg(test)]
-mod lightbox_tests {
-    // Explicit imports only — the file-root kit glob shadows #[test].
-    use super::Workbench;
-    use crate::file_browser::FileKind;
-    use crate::runtime::{
-        FileViewerView, FilesPanelView, Phase, ProtocolRuntime, TabPhase, TabSummary, TabView,
-        WorkbenchSnapshot,
-    };
-    use gpui_kit::test::TestWindowExt;
-    use gpui_kit::{
-        point, px, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
-        WindowBounds, WindowOptions,
-    };
-    use protocol::chat::{ChatMessage, ChatPart, ChatRole};
-
-    /// 1x1 transparent PNG — decodes through the attachment echo path.
-    const PNG_DATA_URL: &str =
-        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-
-    fn png_image() -> std::sync::Arc<gpui_kit::Image> {
-        let draft = protocol::image::parse_data_url(PNG_DATA_URL).expect("fixture parses");
-        super::render_image_of(&draft).expect("fixture rasterizes")
-    }
-
-    fn snapshot_with_image_message() -> WorkbenchSnapshot {
-        let mut snap = WorkbenchSnapshot::initial();
-        snap.phase = Phase::Connected;
-        snap.tabs = vec![TabSummary {
-            id: 7,
-            session_id: Some("sess_1".to_string()),
-            session_title: None,
-            phase: TabPhase::Connected,
-            running: false,
-            pending: 0,
-            awaiting: false,
+        let mut snap = connected_snapshot();
+        snap.servers = vec![protocol::hub::SavedServer {
+            id: "srv-1".to_string(),
+            name: "Remote dev box".to_string(),
+            hub_url: "https://hub.example:8377".to_string(),
+            token: "tok".to_string(),
         }];
-        snap.active_tab = Some(7);
-        snap.active = Some(TabView {
-            session_id: Some("sess_1".to_string()),
-            agent_version: None,
-            phase: TabPhase::Connected,
-            running: false,
-            loading_session: false,
-            messages: vec![ChatMessage {
-                id: "m1".to_string(),
-                role: ChatRole::User,
-                parts: vec![
-                    ChatPart::Text {
-                        text: "look".to_string(),
-                    },
-                    ChatPart::Image {
-                        image: PNG_DATA_URL.to_string(),
-                    },
-                ],
-                created_at: 1,
-                collapsed: None,
-            }],
-            pending: Vec::new(),
-            has_more: false,
-            total_messages: None,
-            loading_earlier: false,
-            approval: None,
-            config_options: Vec::new(),
-            usage: None,
-            cache_hit: None,
-            turn_stats: None,
-            plan_entries: None,
-            fs_capable: true,
-            available_commands: Vec::new(),
-        });
-        snap
-    }
-
-    fn open(
-        cx: &mut TestAppContext,
-        snap: WorkbenchSnapshot,
-    ) -> (gpui_kit::AnyWindowHandle, Entity<Workbench>) {
-        let (handle, wb) = cx.update(|cx| {
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: Point::default(),
-                        size: Size {
-                            width: px(800.),
-                            height: px(600.),
-                        },
-                    })),
-                    ..Default::default()
-                },
-                cx,
-                |window, cx| {
-                    let runtime = ProtocolRuntime::inert();
-                    cx.new(|cx| Workbench::new(window, cx, runtime, snap))
-                },
-            )
-            .expect("open test window")
-        });
-        (handle, wb)
-    }
-
-    #[gpui_kit::test]
-    fn message_image_click_opens_lightbox_and_escape_closes(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let (handle, wb) = open(cx, snapshot_with_image_message());
+        snap.active_server_id = Some("srv-1".to_string());
+        let (handle, _wb, runtime) = cx.update(|cx| open(cx, snap, 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
-            window.render_frame(cx);
-            let echo = window.find("msg-image-m1-1");
-            assert!(echo.visible(), "the attachment echo must render");
+            window.draw(cx).clear(cx);
+            window.click("dock-rail-config", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.try_find("server-form").is_none(), "no form until asked");
 
-            // Click to enlarge: the deferred overlay appears above the tree.
-            window.click("msg-image-m1-1", cx);
-            window.render_frame(cx);
-            assert!(window.find("lightbox-backdrop").visible());
-
-            // Esc closes (the on_stop_turn layer stack's topmost). The
-            // headless harness drives neither press() nor dispatch_action
-            // through the workbench's on_action chain (verified with an
-            // isolated probe), so the bound handler fires directly here.
-            wb.update(cx, |this, cx| {
-                this.on_stop_turn(&super::StopTurn, window, cx)
-            });
-            window.render_frame(cx);
-            assert!(
-                window.try_find("lightbox-backdrop").is_none(),
-                "Escape must close the lightbox"
+            window.click("server-edit-srv-1", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("server-form").visible(), "Edit opens the dialog");
+            assert_eq!(
+                window.find("server-form-save").label().as_deref(),
+                Some("Save")
             );
-        })
-        .unwrap();
-    }
-
-    #[gpui_kit::test]
-    fn file_preview_enlarges_with_caption_and_backdrop_click_closes(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            cx.set_reduce_motion(true);
-        });
-        let mut snap = snapshot_with_image_message();
-        snap.files = FilesPanelView {
-            path: String::new(),
-            listing: None,
-            loading: false,
-            error: None,
-            viewing: Some(FileViewerView {
-                path: "/shots/screen.png".to_string(),
-                name: "screen.png".to_string(),
-                size: 90,
-                kind: FileKind::Image,
-                first_line: None,
-                text: None,
-                image: Some(png_image()),
-                loading: false,
-                error: None,
-            }),
-        };
-        let (handle, _wb) = open(cx, snap);
-        cx.update_window(handle.into(), |_, window: &mut gpui_kit::Window, cx: &mut App| {
-            window.render_frame(cx);
-            assert!(window.find("file-viewer-image").visible());
-
-            // Enlarge: the path rides along as the caption.
-            window.click("file-viewer-image", cx);
-            window.render_frame(cx);
-            assert!(window.find("lightbox-backdrop").visible());
-            assert!(window.find("lightbox-caption").visible());
-
-            // A click on the backdrop (away from the centered card) closes.
-            window.click_at("lightbox-backdrop", point(px(6.), px(6.)), cx);
-            window.render_frame(cx);
+            window.click("server-form-save", cx);
+            window.draw(cx).clear(cx);
             assert!(
-                window.try_find("lightbox-backdrop").is_none(),
-                "a backdrop click must close the lightbox"
+                runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::UpdateServer { id, name, hub_url, token }
+                        if id == "srv-1"
+                            && name == "Remote dev box"
+                            && hub_url == "https://hub.example:8377"
+                            && token == "tok"
+                )),
+                "Save writes the prefilled record back"
             );
+            assert!(
+                window.try_find("server-form").is_none(),
+                "Save closes the dialog"
+            );
+
+            window.click("server-add", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("server-form").visible(), "Add opens the dialog");
+            assert_eq!(
+                window.find("server-form-save").label().as_deref(),
+                Some("Add and connect")
+            );
+            window.click("server-form-save", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                !runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::AddServer { .. })),
+                "an empty form never submits"
+            );
+            window.click("server-form-cancel", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.try_find("server-form").is_none(), "Cancel closes");
         })
         .unwrap();
     }
