@@ -2,6 +2,7 @@ node_modules/
 dist/
 *.local
 src-tauri/target/
+src-gpui/target/
 .DS_Store
 .zcode
 *.jks
