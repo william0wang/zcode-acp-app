@@ -74,11 +74,11 @@ fn apply_quiet_dark(cx: &mut App) {
         theme.colors.sidebar_border = hairline;
         theme.colors.foreground = rgb(0xececf1).into(); // --color-ink
         theme.colors.muted_foreground = rgb(0xa6a6b0).into(); // --color-dim
-        // emerald-600 — the TS app's primary-button green. The 400/500 steps
-        // kept reading as a glare here (user feedback, twice): on this
-        // near-black canvas every selected state and filled control rides
-        // the accent, and 600 is the calmest step that still reads green.
-        theme.colors.accent = rgb(0x059669).into();
+        // emerald-700 — the third step down (user feedback, three rounds:
+        // 400 → 500 → 600 still read as a glare on every selected state and
+        // filled control that rides the accent; 700 is the deepest step that
+        // still reads unmistakably green against the near-black canvas).
+        theme.colors.accent = rgb(0x047857).into();
         // Amber-300/500: the quota page's own amber pair, made theme-wide so
         // the awaiting ring and restart notes match it (kit dark ships
         // yellow-600 as warning foreground — muddy as text on this canvas).

@@ -356,12 +356,14 @@ fn accept_thought_card_folding(cx: &mut TestAppContext) {
         cx.set_reduce_motion(true);
     });
     use protocol::chat::{ChatMessage, ChatPart, ChatRole};
+    // Thirty paragraphs: tall enough that the settled card's preview cap
+    // (208px) engages — the expand toggle below needs something to lift.
     let messages = || {
         vec![ChatMessage {
             id: "a1".to_string(),
             role: ChatRole::Assistant,
             parts: vec![ChatPart::Thought {
-                text: "weighing the options".to_string(),
+                text: "weighing the options\n\n".repeat(30),
             }],
             created_at: 1,
             collapsed: None,
@@ -398,6 +400,27 @@ fn accept_thought_card_folding(cx: &mut TestAppContext) {
         window.click("thought-a1", cx);
         window.draw(cx).clear(cx);
         assert!(window.find("thought-body-a1").visible());
+        // Batch U: a SETTLED card has no nested scroller (the chat list's
+        // ScrollableMask would eat the wheel) — it clips at the cap and the
+        // "Show all" toggle lifts it inline; a second press restores the cap.
+        let capped = window.find("thought-body-a1").bounds().size.height;
+        assert!(
+            capped <= px(212.),
+            "a settled thought previews at the 208px cap, got {capped:?}"
+        );
+        window.click("thought-more-a1", cx);
+        window.draw(cx).clear(cx);
+        let full = window.find("thought-body-a1").bounds().size.height;
+        assert!(
+            full > px(300.),
+            "Show all must lift the cap (got {full:?} from {capped:?})"
+        );
+        window.click("thought-more-a1", cx);
+        window.draw(cx).clear(cx);
+        assert!(
+            window.find("thought-body-a1").bounds().size.height <= px(212.),
+            "Collapse restores the cap"
+        );
         window.click("thought-a1", cx);
         window.draw(cx).clear(cx);
         assert!(window.try_find("thought-body-a1").is_none());

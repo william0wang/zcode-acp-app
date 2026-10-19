@@ -241,6 +241,33 @@ fn epoch_ms_fields_accept_fractional_numbers() {
     .is_err());
 }
 
+/// The per-session /fs/list ships Node's raw `stat().mtimeMs` — fractional
+/// on APFS — and a strict u64 rejected the WHOLE listing on the first such
+/// stamp (the files panel showed "expected u64" for every real directory,
+/// 2026-10-19). Fractions floor; the TS client never noticed because a JS
+/// number is a JS number.
+#[test]
+fn fs_list_entries_accept_fractional_mtime_and_size() {
+    let listing: protocol::hub::FsListing = serde_json::from_str(
+        r#"{
+            "root": "/w",
+            "entries": [
+                { "name": "src", "kind": "dir", "size": 96, "mtime": 1760000000000.456 },
+                { "name": "a.rs", "kind": "file", "size": 1234.0, "mtime": 1760000000001 },
+                { "name": "lnk", "kind": "symlink", "size": 0, "mtime": 0 },
+                { "name": "old", "kind": "file", "size": 1 }
+            ],
+            "truncated": false
+        }"#,
+    )
+    .expect("fractional mtime must not reject the listing");
+    assert_eq!(listing.entries[0].mtime, Some(1760000000000));
+    assert_eq!(listing.entries[1].size, 1234);
+    assert_eq!(listing.entries[1].mtime, Some(1760000000001));
+    assert_eq!(listing.entries[2].mtime, Some(0));
+    assert_eq!(listing.entries[3].mtime, None, "older bridges omit mtime");
+}
+
 #[test]
 fn projects_round_trip() {
     assert_round_trip::<Vec<HubProject>>("projects.json");

@@ -273,6 +273,11 @@ pub struct Workbench {
     /// `<details>`): collapsed by default, reset on a session switch like
     /// the TS remount.
     plan_open: bool,
+    /// The settled thought cards expanded past the preview cap (batch U),
+    /// keyed by (row id, part index). The list's ScrollableMask owns the
+    /// wheel while it can move, so a nested inner scroller is unreliable —
+    /// a settled card clips at the cap instead and this flag lifts the cap.
+    thought_full: std::collections::HashSet<(String, usize)>,
     /// The files panel's dotfile toggle (F1, TS FileBrowser `showHidden`):
     /// view-local like the TS component state — the entries always arrive
     /// whole from the driver, filtered here.
@@ -1031,6 +1036,7 @@ impl Workbench {
             quota_confirm: None,
             copied_row: None,
             plan_open: false,
+            thought_full: std::collections::HashSet::new(),
             files_show_hidden: false,
             rename_target: None,
             rename_prefill: None,
@@ -1808,6 +1814,16 @@ impl Workbench {
         }
     }
 
+    /// A settled thought card's "show all" toggle (batch U): lifts (or
+    /// restores) the preview cap for that one card.
+    fn toggle_thought_full(&mut self, row_id: &str, part_index: usize, cx: &mut Context<Self>) {
+        let key = (row_id.to_string(), part_index);
+        if !self.thought_full.remove(&key) {
+            self.thought_full.insert(key);
+        }
+        cx.notify();
+    }
+
     /// One tool card's expand toggle (E2 — the TS `<details>` summary click):
     /// flips the part's manual fold.
     fn set_tool_expanded(
@@ -1863,6 +1879,33 @@ impl Workbench {
             Phase::Failed(_) => (theme.danger, self.snap.phase.label()),
         };
 
+        // Left cluster (batch U — user: "the left side carried nothing
+        // actionable"): the bridge's version while connected (the phase label
+        // only while there is no bridge to name), the running-session count
+        // (the quit guard's number) or the active turn, then any transient
+        // note. The hub address left the bar — it lives in the config dock's
+        // server book, where it can be acted on.
+        let bridge = self
+            .tab
+            .as_ref()
+            .and_then(|t| t.agent_version.as_deref())
+            .filter(|_| matches!(self.snap.phase, Phase::Connected))
+            .map(|agent| format!("bridge {agent}"));
+        let activity = if self.snap.running_session_count > 0 {
+            Some(format!(
+                "{} session{} running",
+                self.snap.running_session_count,
+                if self.snap.running_session_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ))
+        } else if self.tab.as_ref().is_some_and(|t| t.running) {
+            Some("turn running".to_string())
+        } else {
+            None
+        };
         let mut bar = div()
             .flex()
             .items_center()
@@ -1876,7 +1919,7 @@ impl Workbench {
             .bg(theme.title_bar)
             .child(div().size_2().flex_none().rounded_full().bg(dot_color))
             // The left cluster owns the slack: every segment truncates so a
-            // long address/note can never push the right cluster off-screen.
+            // long note can never push the right cluster off-screen.
             .child(
                 div()
                     .flex()
@@ -1886,21 +1929,23 @@ impl Workbench {
                     .min_w_0()
                     .child(
                         div()
+                            .id("status-bridge")
+                            .test_support()
                             .min_w_0()
                             .truncate()
                             .text_size(px(11.))
                             .text_color(theme.foreground)
-                            .child(label),
+                            .child(bridge.unwrap_or_else(|| label.to_string())),
                     )
-                    .when_some(self.snap.hub_addr.clone(), |this, addr| {
+                    .when_some(activity, |this, text| {
                         this.child(
                             div()
-                                .min_w_0()
-                                .truncate()
+                                .id("status-activity")
+                                .test_support()
+                                .flex_none()
                                 .text_size(px(11.))
-                                .font_family(theme.mono_font_family.clone())
-                                .text_color(theme.muted_foreground)
-                                .child(addr),
+                                .text_color(theme.accent)
+                                .child(text),
                         )
                     })
                     .when_some(self.snap.bootstrap_note.clone(), |this, note| {
@@ -1937,50 +1982,13 @@ impl Workbench {
             );
         }
 
-        // Right cluster: window-scoped state only — running-session count
-        // (the quit guard's number), the turn state, and the bridge agent.
-        // The per-session readouts (context/cache/tps) live under the
-        // composer of the session they describe, not here. The bar's rows
-        // stay one step smaller than the panel chrome (a strip, not a page).
+        // Right cluster: the hub's preformatted quota dock line (ADR-0021) —
+        // byte-identical to the TUI's bottom dock and the mobile title bar's
+        // tail segment, refreshed at connect and each turn end. Global account
+        // state, so it sits opposite the bridge/activity cluster. The bar's
+        // rows stay one step smaller than the panel chrome (a strip, not a
+        // page).
         let mut right = div().flex().items_center().gap_3().ml_auto().flex_none();
-        if self.snap.running_session_count > 0 {
-            right = right.child(
-                div()
-                    .flex_none()
-                    .text_size(px(11.))
-                    .text_color(theme.accent)
-                    .child(format!(
-                        "{} session{} running",
-                        self.snap.running_session_count,
-                        if self.snap.running_session_count == 1 {
-                            ""
-                        } else {
-                            "s"
-                        }
-                    )),
-            );
-        } else if self.tab.as_ref().is_some_and(|t| t.running) {
-            right = right.child(
-                div()
-                    .flex_none()
-                    .text_size(px(11.))
-                    .text_color(theme.accent)
-                    .child("turn running"),
-            );
-        }
-        if let Some(agent) = self.tab.as_ref().and_then(|t| t.agent_version.as_deref()) {
-            right = right.child(
-                div()
-                    .flex_none()
-                    .truncate()
-                    .text_size(px(11.))
-                    .text_color(theme.muted_foreground)
-                    .child(format!("bridge {agent}")),
-            );
-        }
-        // The hub's preformatted quota dock line (ADR-0021) — byte-identical
-        // to the TUI's bottom dock and the mobile title bar's tail segment,
-        // refreshed at connect and each turn end.
         if let Some(dock) = self.snap.quota_dock.clone() {
             right = right.child(
                 div()
@@ -4334,6 +4342,7 @@ impl Workbench {
         // The (user, agent) chat text sizes off the font ladder — the rows
         // read them at paint time so the segment's pick rescales everything.
         let chat_font = self.font_scale.chat_px();
+        let thought_full = self.thought_full.clone();
         column
             .child(
                 MessageScroller::new("chat", scroller, move |index, _window, cx| {
@@ -4346,6 +4355,7 @@ impl Workbench {
                             copied.as_deref(),
                             &weak_rows,
                             chat_font,
+                            &thought_full,
                             cx,
                         )
                     } else if let Some(card) = card.as_ref() {
@@ -5093,6 +5103,7 @@ fn render_row(
     copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
+    thought_full: &std::collections::HashSet<(String, usize)>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -5100,10 +5111,17 @@ fn render_row(
         ChatRole::User => {
             render_user_row(row, copied, wb, chat_font, theme).into_any_element()
         }
-        ChatRole::Assistant => {
-            render_assistant_row(row, is_last_row, running, copied, wb, chat_font, theme)
-                .into_any_element()
-        }
+        ChatRole::Assistant => render_assistant_row(
+            row,
+            is_last_row,
+            running,
+            copied,
+            wb,
+            chat_font,
+            thought_full,
+            theme,
+        )
+        .into_any_element(),
     }
 }
 
@@ -5245,6 +5263,7 @@ fn render_assistant_row(
     copied: Option<&str>,
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
+    thought_full: &std::collections::HashSet<(String, usize)>,
     theme: &component::Theme,
 ) -> gpui::Div {
     let mut column = div().flex().flex_col().gap_2().min_w_0();
@@ -5315,15 +5334,14 @@ fn render_assistant_row(
                                 .child(label),
                         ),
                 );
-                if open {
+                if open && streaming {
                     // TS ChatView:282-287 — while streaming AND open, pin
                     // the capped body to its bottom every render so the
                     // newest tokens stay in view. The handle carries the
                     // previous frame's extent (one-frame lag, like the TS
-                    // post-render effect).
-                    if streaming {
-                        scroll.scroll_to_bottom();
-                    }
+                    // post-render effect). The inner scroller is fine HERE:
+                    // the pin owns the viewport anyway.
+                    scroll.scroll_to_bottom();
                     card = card.child(
                         div()
                             .id(SharedString::from(format!("thought-body-{}", row.id)))
@@ -5336,6 +5354,44 @@ fn render_assistant_row(
                             .text_size(px(chat_font.1))
                             .text_color(theme.muted_foreground)
                             .child(TextView::new(state)),
+                    );
+                } else if open {
+                    // A SETTLED card gets no nested scroller (batch U): the
+                    // chat list's ScrollableMask takes the wheel in the
+                    // capture phase whenever the list can still move, so an
+                    // inner scroll window only worked at the list's edges
+                    // ("sometimes the session scrolls, sometimes the
+                    // thought"). The body clips at the TS max-h-52 cap and
+                    // expands inline on demand; the session scroll owns
+                    // navigation.
+                    let full = thought_full.contains(&(row.id.clone(), part_index));
+                    card = card.child(
+                        div()
+                            .id(SharedString::from(format!("thought-body-{}", row.id)))
+                            .test_support()
+                            .when(!full, |this| this.max_h(px(208.)).overflow_hidden())
+                            .px_3()
+                            .pb_1()
+                            .text_size(px(chat_font.1))
+                            .text_color(theme.muted_foreground)
+                            .child(TextView::new(state)),
+                    );
+                    let row_id = row.id.clone();
+                    let wb = wb.clone();
+                    card = card.child(
+                        div().flex().justify_end().px_2().pb_1().child(
+                            Button::new(SharedString::from(format!("thought-more-{}", row.id)))
+                                .ghost()
+                                .xsmall()
+                                .label(if full { "Collapse" } else { "Show all" })
+                                .on_click(move |_, _window, cx| {
+                                    if let Some(wb) = wb.upgrade() {
+                                        wb.update(cx, |wb, cx| {
+                                            wb.toggle_thought_full(&row_id, part_index, cx)
+                                        });
+                                    }
+                                }),
+                        ),
                     );
                 }
                 column.child(card)
@@ -6848,6 +6904,40 @@ mod display_tests {
             assert!(
                 dock.bounds().size.width > px(0.),
                 "the dock line has content width"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The status bar's LEFT cluster (batch U) names the bridge and the
+    /// running-session count — the actionable global facts — in place of the
+    /// phase word and hub address that carried nothing.
+    #[gpui_kit::test]
+    fn status_bar_left_names_the_bridge_and_running_sessions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = base_snapshot();
+        snap.running_session_count = 2;
+        snap.quota_dock = Some("GLM · 45%".to_string());
+        let mut tab = tab_view();
+        tab.agent_version = Some("0.47.2".to_string());
+        snap.active = Some(tab);
+        let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            let bridge = window.find("status-bridge");
+            let activity = window.find("status-activity");
+            let dock = window.find("status-quota-dock");
+            assert!(bridge.visible() && activity.visible() && dock.visible());
+            // Left cluster order: bridge, then activity; the dock stays on
+            // the far right.
+            assert!(bridge.bounds().right() <= activity.bounds().left());
+            assert!(activity.bounds().right() <= dock.bounds().left());
+            assert!(
+                activity.bounds().right() < px(400.),
+                "the activity segment belongs to the left half"
             );
         })
         .unwrap();

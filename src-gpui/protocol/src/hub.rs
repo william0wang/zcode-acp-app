@@ -297,13 +297,25 @@ pub enum FsEntryKind {
 /// number — 0 placeholder for symlinks and raced deletions
 /// (file-endpoint.ts `ListEntry`); the TS type keeps it optional for older
 /// bridges. Kept optional here for the same tolerance.
+///
+/// Both numbers ride the tolerant epoch-ms decoders: `mtime` is Node's raw
+/// `stat().mtimeMs`, which carries sub-millisecond FRACTIONS on APFS (the
+/// bridge floors it for its own comparisons but ships the list raw), and a
+/// strict `u64` rejected the WHOLE listing on the first fractional stamp —
+/// the files panel read "invalid type: floating point, expected u64" for
+/// every real directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FsEntry {
     pub name: String,
     pub kind: FsEntryKind,
+    #[serde(deserialize_with = "deserialize_epoch_ms")]
     pub size: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_epoch_ms_opt"
+    )]
     pub mtime: Option<u64>,
 }
 
