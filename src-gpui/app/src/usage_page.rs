@@ -58,7 +58,10 @@ fn heatmap_level_color(level: u64) -> Hsla {
         1 => emerald_500(0.25),
         2 => emerald_500(0.45),
         3 => emerald_500(0.70),
-        _ => emerald_400(0.90),
+        // The accent stepped down to emerald-600 (batch T), so the hottest
+        // square rides 500 at full strength — bright enough to top the
+        // ladder without reintroducing the glare.
+        _ => emerald_500(0.95),
     }
 }
 
@@ -76,15 +79,6 @@ fn emerald_500(a: f32) -> Hsla {
         h: 160.0 / 360.0,
         s: 0.84,
         l: 0.40,
-        a,
-    }
-}
-
-fn emerald_400(a: f32) -> Hsla {
-    Hsla {
-        h: 158.0 / 360.0,
-        s: 0.64,
-        l: 0.52,
         a,
     }
 }
@@ -680,7 +674,7 @@ fn metric_row(label: &str, value: String, trend: Option<f64>, theme: &Theme) -> 
             div()
                 .pl(px(6.))
                 .text_size(px(12.))
-                .text_color(if up { emerald_400(0.80) } else { sky_400(0.80) })
+                .text_color(if up { emerald_500(0.80) } else { sky_400(0.80) })
                 .child(format!("{} {:.1}%", if up { "↑" } else { "↓" }, t.abs())),
         )
     });

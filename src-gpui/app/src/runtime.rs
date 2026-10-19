@@ -94,6 +94,7 @@ use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use crate::file_browser::{file_kind_of, viewer_next_window, viewer_window, FileKind};
 use crate::http_transport::{LocalHttpTransport, SettingsApiTransport};
 use crate::pending_store::{merge_pending_queues, pending_path, PendingStore};
+use crate::readout_store::{readouts_path, ReadoutStore, SessionReadout};
 use crate::workflow_launches::{launches_path, WorkflowLaunchStore};
 
 /// The 120ms update-coalescing batch the TS store runs (appStore.ts
@@ -2381,6 +2382,10 @@ struct Driver {
     /// back on every queue change (the TS localStorage map's port —
     /// `pending_prompts` in `SessionCore` stays the in-memory truth).
     pending: PendingStore,
+    /// The persisted per-session turn readouts (batch T): the first-open
+    /// seed for ctx/cache/tps — the in-memory snapshot LRU dies with the
+    /// process, this map does not.
+    readouts: ReadoutStore,
     /// The persisted workflow-launch memory (batch M): run id → the
     /// session/instance `POST …/start` minted — the TS
     /// `zcode.workflowLaunches` table's port. The driver is the single
@@ -2493,6 +2498,7 @@ impl Driver {
             )
             .unwrap_or_default(),
             pending: PendingStore::load(&pending_path()),
+            readouts: ReadoutStore::load(&readouts_path()),
             launches: WorkflowLaunchStore::load(&launches_path()),
             instances: Vec::new(),
             discovery_note: None,
@@ -5084,6 +5090,29 @@ impl Driver {
         }
     }
 
+    /// Persist one session's readouts after its turn settled (batch T — the
+    /// first-open seed source, the TS `writeSessionCache` readout half). A
+    /// failed write logs and keeps the in-memory map; the next settle
+    /// retries.
+    fn record_readouts(&mut self, session_id: &str) {
+        let readout = self
+            .tabs
+            .iter()
+            .find(|t| t.core.active_session_id.as_deref() == Some(session_id))
+            .map(|t| SessionReadout {
+                usage: t.core.usage,
+                cache_hit: t.core.cache_hit,
+                turn_stats: t.core.turn_stats,
+            });
+        let Some(readout) = readout else {
+            return;
+        };
+        self.readouts.record(session_id, readout);
+        if let Err(e) = self.readouts.save(&readouts_path()) {
+            traceln!("[driver] readout store write failed: {e}");
+        }
+    }
+
     /// One provider's card inventory (TS `loadResetCards`). The previous
     /// provider's cards drop NOW, not when the read lands: while it is in
     /// flight the screen must not show provider A's cards under a nonce
@@ -5601,6 +5630,10 @@ impl Driver {
                 // bridge force-refreshes its dock cache at the same moment).
                 if !running {
                     self.spawn_quota_dock();
+                    // And the readout persistence point (batch T): the
+                    // just-folded usage/cache/tps become the next first-open
+                    // seed for this session.
+                    self.record_readouts(&session_id);
                 }
             }
             LoopEvent::NewSession { tab, result } => match result {
@@ -5648,7 +5681,14 @@ impl Driver {
             LoopEvent::PromptResult { tab, req, result } => {
                 if let Some(t) = self.tab_mut(tab) {
                     match result {
-                        Ok(value) => t.core.on_prompt_result(now, &req, &value),
+                        Ok(value) => {
+                            t.core.on_prompt_result(now, &req, &value);
+                            // The desktop-driven settle path folds the turn
+                            // usage here (the turnState end may have ridden
+                            // its own broadcast earlier) — persist whichever
+                            // landed last.
+                            self.record_readouts(&req.session_id);
+                        }
                         Err(_) => t.core.on_prompt_failed(now),
                     }
                 }
@@ -6136,6 +6176,13 @@ impl Driver {
         let attach_sid = self.tab(tab).and_then(|t| {
             t.core.active_session_id.clone().or_else(|| t.target.clone())
         });
+        // Batch T readout restore: a cold process holds no in-memory
+        // snapshot for the session, so load_session below just blanked the
+        // readouts — the persisted last-known values re-seed them (read
+        // before the mutable tab borrow, like the queue seed below).
+        let readout_seed = attach_sid
+            .as_deref()
+            .and_then(|sid| self.readouts.get(sid));
         let seed: Option<(String, Vec<PromptDraft>)> = attach_sid
             .filter(|sid| {
                 self.tab(tab)
@@ -6179,6 +6226,25 @@ impl Driver {
                                 );
                             }
                             t.core.load_session(&sid);
+                            // None-gated seeding: a warm in-memory snapshot
+                            // already restored fresher readouts inside
+                            // load_session, and the load result's usage
+                            // still lands on top of whatever this painted.
+                            if let Some(r) = readout_seed {
+                                let core = &mut t.core;
+                                if core.usage.is_none() {
+                                    core.usage = r.usage;
+                                }
+                                if core.cache_hit.is_none() {
+                                    core.cache_hit = r.cache_hit;
+                                }
+                                if core.turn_stats.is_none() {
+                                    core.turn_stats = r.turn_stats;
+                                }
+                                traceln!(
+                                    "[driver] tab {tab} restored persisted readouts for {sid}"
+                                );
+                            }
                         }
                         None => {
                             let conn =
@@ -6539,6 +6605,13 @@ impl Driver {
                 }
                 sel.deleting = Some(session_id.clone());
                 sel.error = None;
+                // The tombstoned session's persisted readouts go with it —
+                // a deleted id never re-attaches, but a stale file entry
+                // outlives the session it described (batch T).
+                self.readouts.remove(&session_id);
+                if let Err(e) = self.readouts.save(&readouts_path()) {
+                    traceln!("[driver] readout store write failed: {e}");
+                }
                 let instance = sel.instance_id.clone();
                 self.spawn_history_delete(instance, session_id);
             }

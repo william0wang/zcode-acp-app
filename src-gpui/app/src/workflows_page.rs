@@ -106,7 +106,9 @@ pub(crate) fn run_is_active(status: &str) -> bool {
 /// stopped run is not an error. Unknown tokens fall back neutral.
 fn status_dot(status: &str) -> Rgba {
     match status {
-        "completed" | "ok" | "settled" => rgb(0x34d399),
+        // emerald-500 — the accent itself dropped to 600 (batch T), so the
+        // success dot rides one step above it, visible but not glaring.
+        "completed" | "ok" | "settled" => rgb(0x10b981),
         "errored" | "failed" => rgb(0xf87171),
         "running" | "dispatched" | "executing" => rgb(0x38bdf8),
         "pending" | "queued" | "waiting" => rgb(0x6b7280),

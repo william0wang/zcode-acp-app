@@ -146,11 +146,12 @@ fn amber_fill(opacity: f32) -> Hsla {
     c.opacity(opacity)
 }
 
-/// emerald-500 (#10B981) at 70% — the card-row check glyph, one step calmer
-/// than the TS emerald-400 (solid 400 glares on the dark canvas).
+/// emerald-600 (#059669) at 75% — the card-row check glyph, following the
+/// accent's step down (batch T; solid bright emeralds glare on the dark
+/// canvas).
 fn emerald_check() -> Hsla {
-    let c: Hsla = rgb(0x10B981).into();
-    c.opacity(0.7)
+    let c: Hsla = rgb(0x059669).into();
+    c.opacity(0.75)
 }
 
 /// TS text-faint — one step dimmer than text-dim (muted_foreground).

@@ -25,6 +25,7 @@ mod models_page;
 mod pending_store;
 mod quota_card;
 mod quota_page;
+mod readout_store;
 mod runtime;
 mod system_status;
 mod ui_prefs;
@@ -73,10 +74,11 @@ fn apply_quiet_dark(cx: &mut App) {
         theme.colors.sidebar_border = hairline;
         theme.colors.foreground = rgb(0xececf1).into(); // --color-ink
         theme.colors.muted_foreground = rgb(0xa6a6b0).into(); // --color-dim
-        // emerald-500: one step down from the TS running-dot emerald-400 —
-        // on this near-black canvas the 400 reads as a glare on every
-        // selected state and filled control that rides the accent.
-        theme.colors.accent = rgb(0x10b981).into();
+        // emerald-600 — the TS app's primary-button green. The 400/500 steps
+        // kept reading as a glare here (user feedback, twice): on this
+        // near-black canvas every selected state and filled control rides
+        // the accent, and 600 is the calmest step that still reads green.
+        theme.colors.accent = rgb(0x059669).into();
         // Amber-300/500: the quota page's own amber pair, made theme-wide so
         // the awaiting ring and restart notes match it (kit dark ships
         // yellow-600 as warning foreground — muddy as text on this canvas).

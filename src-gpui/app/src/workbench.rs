@@ -4544,24 +4544,6 @@ impl Workbench {
                 .with_priority(1),
             );
         }
-        // Quick config switching over the composer (batch S — the TUI keeps
-        // its model/mode switcher at the input, not in a top strip): the
-        // active tab's config chips, current value on the face, the picker
-        // menu on click. The full-width pickers stay in the session panel;
-        // these are the glance-and-switch affordance. Only with a connected
-        // tab — the TS guard (`connState === "open"`).
-        if let Some(view) = self
-            .tab
-            .as_ref()
-            .filter(|t| matches!(t.phase, TabPhase::Connected))
-            .filter(|t| !t.config_options.is_empty())
-        {
-            let mut chips = div().flex().items_center().flex_wrap().gap_2().pb_2();
-            for opt in &view.config_options {
-                chips = chips.child(self.render_config_chip(opt, cx));
-            }
-            column = column.child(chips);
-        }
         let mut controls = div().flex().items_end().gap_2();
         // The gallery pick (ChatView's ImagePlus): native file dialog.
         let wb = cx.entity();
@@ -4657,22 +4639,34 @@ impl Workbench {
                 }),
         );
         column = column.child(controls);
-        // The active session's readouts (E1 — ChatScreen's header line
-        // `context 17.5%/1.0M` plus the absolute pair, bare cache percent,
-        // `tok/s`, and the last turn's tokens · wall time): per-session
-        // numbers belong to the session they describe, so they ride under
-        // THIS composer, not the window's title bar.
+        // The composer's footer line (batch T): the session's readouts on the
+        // left (E1 — ChatScreen's header line `context 17.5%/1.0M` plus the
+        // absolute pair, bare cache percent, `tok/s`, and the last turn's
+        // tokens · wall time), and the config chips tucked into the SAME
+        // row's right end — one line for both beats a dedicated chips row
+        // (the TUI keeps its switchers at the input; a separate strip above
+        // the textarea cost vertical space for a glance-level affordance).
+        // The full-width pickers stay in the session panel.
         {
             let tab = self.tab.as_ref();
             let usage = tab.and_then(|t| t.usage).filter(|u| u.size > 0);
             let has_stats = usage.is_some()
                 || tab.is_some_and(|t| t.cache_hit.is_some() || t.turn_stats.is_some());
-            if has_stats {
+            let chip_opts: &[protocol::acp::ConfigOption] = tab
+                .filter(|t| matches!(t.phase, TabPhase::Connected))
+                .map(|t| t.config_options.as_slice())
+                .filter(|opts| !opts.is_empty())
+                .unwrap_or(&[]);
+            if has_stats || !chip_opts.is_empty() {
+                // Left group first: the readouts clip (never wrap — the
+                // whole point of the shared line is saving the vertical
+                // space) when a narrow composer cannot hold everything.
                 let mut stats = div()
                     .flex()
                     .items_center()
                     .gap_3()
                     .min_w_0()
+                    .overflow_hidden()
                     .text_size(px(12.))
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground);
@@ -4723,7 +4717,28 @@ impl Workbench {
                             .test_support(),
                     );
                 }
-                column = column.child(stats);
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .min_w_0()
+                    .child(stats)
+                    .child(
+                        div()
+                            .id("composer-chips")
+                            .test_support()
+                            .ml_auto()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .children(
+                                chip_opts
+                                    .iter()
+                                    .map(|opt| self.render_config_chip(opt, cx))
+                                    .collect::<Vec<_>>(),
+                            ),
+                    );
+                column = column.child(row);
             }
         }
 
@@ -6744,7 +6759,6 @@ mod display_tests {
             total_messages: None,
             loading_earlier: false,
             approval: None,
-            config_options: Vec::new(),
             usage: Some(protocol::acp::ContextUsage {
                 used: 175_000,
                 size: 1_000_000,
@@ -6758,6 +6772,16 @@ mod display_tests {
             plan_entries: None,
             fs_capable: true,
             available_commands: Vec::new(),
+            config_options: vec![protocol::acp::ConfigOption {
+                id: "mode".to_string(),
+                name: Some("Mode".to_string()),
+                category: None,
+                current_value: Some("default".to_string()),
+                options: Some(vec![protocol::acp::ConfigOptionChoice {
+                    value: "default".to_string(),
+                    name: "Default".to_string(),
+                }]),
+            }],
         });
         let (handle, _content) = cx.update(|cx| open_test_window(cx, snap));
         cx.update_window(handle.into(), |_, window, cx| {
@@ -6775,6 +6799,22 @@ mod display_tests {
                     "{id} must render below the composer's top edge"
                 );
             }
+            // The config chips share the stats row's right end (batch T —
+            // one footer line, not a dedicated strip): same baseline as the
+            // readouts, tucked to the row's right side.
+            let stat_row_y = window.find("stat-context").bounds().origin.y;
+            let chip = window.find("cfg-mode");
+            assert!(chip.visible(), "the mode chip rides the footer row");
+            assert!(
+                (chip.bounds().origin.y - stat_row_y).abs() < px(6.),
+                "the chip shares the stats row (chip {:?} vs stat {:?})",
+                chip.bounds().origin.y,
+                stat_row_y
+            );
+            assert!(
+                chip.bounds().left() > window.find("stat-turn").bounds().left(),
+                "the chips sit right of the readouts"
+            );
             let progress = window.find("context-progress");
             assert!(progress.visible());
             // 17.5% of the composer's width, clamped — the hairline rides

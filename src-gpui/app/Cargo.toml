@@ -14,6 +14,9 @@ protocol.workspace = true
 # Same workspace pins as protocol — no new external crates.
 tokio.workspace = true
 serde_json.workspace = true
+# readout_store's SessionReadout needs the derives (serde_json alone has
+# none); the pin already sits in the workspace tree via protocol.
+serde.workspace = true
 # The shared mobile/web catalogs (requirements §2) — src/i18n is loaded at
 # compile time straight from the TS app's directory, no forked copy. Both
 # pins already sit in the workspace tree via gpui-kit's own dependencies.
