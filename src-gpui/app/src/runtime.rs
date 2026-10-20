@@ -65,7 +65,7 @@ use protocol::settings::{
 };
 use protocol::hub::{
     FsBrowseResult, FsEntryKind, FsListing, HubCreateInstanceResult, HubHistoryCursor,
-    HubHistoryPage, HubHistorySession, HubInstance, HubProject, HubUpgradeResult,
+    HubHistoryPage, HubHistorySession, HubInstance, HubProject, HubUpgradeResult, InstanceOrigin,
 };
 use protocol::hub_client::{HubApiError, HubClient};
 use protocol::session::{LoadEarlierRequest, PromptRequest, SessionCore, WireRequest};
@@ -5914,6 +5914,20 @@ impl Driver {
                     for id in holders {
                         self.close_tab(id);
                     }
+                    // A serve bridge whose LAST advertised session just closed
+                    // self-exits (~1.5s, ADR-0006/0016): drop the instance row
+                    // now so no surface dials a corpse — the discovery poll
+                    // would otherwise keep it until the hub's prune, and every
+                    // attach in that window fails. Editor bridges stay (no
+                    // self-exit; the heartbeat list keeps them honest).
+                    let last_session_gone = self.instances.iter().any(|i| {
+                        i.id == instance_id
+                            && i.origin == InstanceOrigin::Serve
+                            && i.sessions.is_empty()
+                    });
+                    if last_session_gone {
+                        self.instances.retain(|i| i.id != instance_id);
+                    }
                     self.toast.notify(
                         now,
                         // The TS store sets the notice KEY (appStore.ts:2011)
@@ -8905,7 +8919,7 @@ type _TabViewMap = HashMap<u64, ()>;
 mod tests {
     // Plain #[test] with explicit imports — this file has no kit glob, but
     // the sibling test modules' explicit-import shape is the convention.
-    use super::{fold_session_runs, max_run_sequence, merge_run_events, pick_target};
+    use super::{fold_session_runs, max_run_sequence, merge_run_events, pick_target, LoopEvent};
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
     use protocol::hub_client::HubApiError;
     use protocol::workflow::WorkflowRunEvent;
@@ -8959,6 +8973,55 @@ mod tests {
             sessions,
             extra: Default::default(),
         }
+    }
+
+    fn driver() -> super::Driver {
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, _ev_rx) = unbounded_channel();
+        super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        )
+    }
+
+    /// A serve bridge self-exits (~1.5s) once its LAST advertised session is
+    /// closed (ADR-0006/0016): the instance row must drop at once so no
+    /// surface dials a corpse until the hub's prune. An editor bridge (no
+    /// self-exit) keeps its row and lets the heartbeat list realign.
+    #[test]
+    fn closing_the_last_session_drops_a_serve_instance_but_keeps_an_editor_one() {
+        let mut d = driver();
+        let mut serve = instance("i-serve", Some("/w"), vec![session("s1", None)]);
+        serve.origin = InstanceOrigin::Serve;
+        d.instances.push(serve);
+        d.instances.push(instance("i-edit", Some("/e"), vec![session("s2", None)]));
+
+        d.handle_loop_event(
+            LoopEvent::SessionClosed {
+                instance_id: "i-serve".to_string(),
+                session_id: "s1".to_string(),
+                result: Ok(()),
+            },
+            0,
+        );
+        assert!(!d.instances.iter().any(|i| i.id == "i-serve"));
+
+        d.handle_loop_event(
+            LoopEvent::SessionClosed {
+                instance_id: "i-edit".to_string(),
+                session_id: "s2".to_string(),
+                result: Ok(()),
+            },
+            0,
+        );
+        assert!(
+            d.instances.iter().any(|i| i.id == "i-edit" && i.sessions.is_empty()),
+            "editor bridges stay for the heartbeat realign"
+        );
     }
 
     /// The status bar's quota dock line (ADR-0021) is sticky on failure — a
