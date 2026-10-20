@@ -60,7 +60,8 @@ use protocol::image::{
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
 use crate::diff_view::{blocks_of, DiffBlock, DiffLineKind};
 use crate::file_browser::{
-    absolute_dir, is_loopback_hub, render_file_viewer, render_files_panel, FilesPanelCtx,
+    absolute_dir, is_loopback_hub, render_file_viewer, render_files_header, render_files_panel,
+    FilesPanelCtx,
 };
 use crate::i18n::{fill, fmt_relative, now_ms, parse_iso_ms, t_count};
 use crate::models_page::ModelsForm;
@@ -106,8 +107,8 @@ gpui_kit::actions!(
 );
 
 /// Which panel the left dock shows (ADR-0009: sessions/settings as dockable
-/// panels around the chat area). Files is NOT here — session-scoped surfaces
-/// live in the right session panel; the browser opens as a full page.
+/// panels around the chat area). Files is NOT here — the session's files are
+/// the whole right panel, so this dock stays global-only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DockPanel {
     Sessions,
@@ -166,26 +167,17 @@ pub struct Workbench {
     dock_panel: DockPanel,
     dock_open: bool,
     dock_sizes: Entity<ResizableState>,
-    /// The right session panel (TS SessionPanel — the chat-side sheet):
-    /// view-local like the left dock, with its own splitter.
+    /// The right session panel: the active session's file browser. View-local
+    /// like the left dock, with its own splitter.
     session_panel_open: bool,
     session_dock_sizes: Entity<ResizableState>,
     /// The chat font ladder (TS `fontSize`): scales the reading text — the
     /// user bubbles and the agent prose/thought bodies. Chrome stays fixed.
     font_scale: crate::ui_prefs::FontScale,
-    /// The Session Files page (view-local layout): opens from the right
-    /// session panel's row, replaces the chat surfaces, and closes on back
-    /// or Esc. The listing state itself is the driver's (`snap.files`).
-    files_page_open: bool,
-    /// The session the files page was opened FOR — a session switch under
-    /// an open page re-seeds the browser (or closes it with no session),
-    /// never leaves it showing the previous session's stale browse.
-    files_page_session: Option<String>,
-    /// The files page's focus target: the row click that opens the page
-    /// unmounts with the dock it lived in, so without an explicit refocus
-    /// key events (Esc) would dispatch from a detached node and never
-    /// reach the workbench's action handlers.
-    files_page_focus: FocusHandle,
+    /// The session the open panel's listing was seeded FOR — a session
+    /// switch under an open panel re-reads the new session's root instead of
+    /// leaving the previous session's browse on screen.
+    files_panel_session: Option<String>,
     /// The sessions panel's search field — the ⌘K target (TS SessionList's
     /// "Search sessions": title or workspace base name, substring).
     session_search: Entity<InputState>,
@@ -272,11 +264,12 @@ pub struct Workbench {
     /// wheel while it can move, so a nested inner scroller is unreliable —
     /// a settled card clips at the cap instead and this flag lifts the cap.
     thought_full: std::collections::HashSet<(String, usize)>,
-    /// The expanded adjacent tool-call RUNS, keyed by (row id, index of the
-    /// run's first part). Collapsed by default like the single ToolCard; a
-    /// run is the aggregated card that replaces a wall of context-free
-    /// per-call rows.
-    tool_run_open: std::collections::HashSet<(String, usize)>,
+    /// Manual fold verdicts for adjacent tool-call RUNS, keyed by (row id,
+    /// index of the run's first part). Absent = never toggled, so the run
+    /// follows its own state: open while a call is still in flight
+    /// (watchable as it happens), folded once every call settled. A present
+    /// entry is the user's permanent verdict (the ThoughtCard rule).
+    tool_run_open: std::collections::HashMap<(String, usize), bool>,
     /// The files panel's dotfile toggle (F1, TS FileBrowser `showHidden`):
     /// view-local like the TS component state — the entries always arrive
     /// whole from the driver, filtered here.
@@ -631,6 +624,9 @@ fn context_pct(used: u64, size: u64) -> f64 {
 
 /// Context gauge as the TUI prints it (ChatScreen.tsx `fmtContext`) —
 /// `17.5%/1.0M`, a one-decimal percent of the model window, clamped at 100.
+/// The composer stat composes its own enriched variant from [`context_pct`],
+/// so this spelling has no caller — kept only for the clamp's TS parity test.
+#[cfg(test)]
 fn fmt_context(used: u64, size: u64) -> String {
     format!("{:.1}%/{}", context_pct(used, size), fmt_tokens(size))
 }
@@ -1024,9 +1020,7 @@ impl Workbench {
             dock_open: true,
             dock_sizes,
             session_panel_open: false,
-            files_page_open: false,
-            files_page_session: None,
-            files_page_focus: cx.focus_handle(),
+            files_panel_session: None,
             font_scale: crate::ui_prefs::load_font_size()
                 .unwrap_or(crate::ui_prefs::FontScale::Medium),
             session_dock_sizes,
@@ -1061,7 +1055,7 @@ impl Workbench {
             copied_row: None,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
-            tool_run_open: std::collections::HashSet::new(),
+            tool_run_open: std::collections::HashMap::new(),
             files_show_hidden: false,
             rename_target: None,
             rename_prefill: None,
@@ -1170,18 +1164,42 @@ impl Workbench {
     }
 
     /// The right session panel's toggle (TS ChatScreen's panel button).
-    /// Opening refreshes the quota card (the TS QuotaSection mount effect)
-    /// and probes the gate while unknown (the TS SessionPanel effect) — the
-    /// workflows row cannot render until the verdict lands.
+    /// Opening seeds the file listing — the browser's mount effect: without
+    /// a read the panel would show an empty body where the bridge
+    /// advertises the capability.
     pub(crate) fn toggle_session_panel(&mut self, cx: &mut Context<Self>) {
         self.session_panel_open = !self.session_panel_open;
         if self.session_panel_open {
-            self.runtime.send(UiCommand::RefreshQuota);
-            if self.snap.workflow_gate.is_none() {
-                self.runtime.send(UiCommand::ProbeWorkflowGate);
-            }
+            self.seed_files_panel();
         }
         cx.notify();
+    }
+
+    /// Read the active session's directory into the panel unless the listing
+    /// on screen already belongs to it: a reopen keeps the directory the
+    /// user browsed to (the listing survives a panel close), while a switch
+    /// to another session starts back at that session's root.
+    fn seed_files_panel(&mut self) {
+        let Some(session) = self.snap.active.as_ref().and_then(|t| t.session_id.clone()) else {
+            // Nothing to browse — the panel paints its no-session note.
+            self.files_panel_session = None;
+            return;
+        };
+        if !self.tab.as_ref().is_some_and(|t| t.fs_capable) {
+            self.files_panel_session = Some(session);
+            return;
+        }
+        let same = self.files_panel_session.as_deref() == Some(session.as_str());
+        self.files_panel_session = Some(session);
+        if same && self.snap.files.listing.is_some() {
+            return;
+        }
+        let path = if same {
+            self.snap.files.path.clone()
+        } else {
+            String::new()
+        };
+        self.runtime.send(UiCommand::FilesNavigate { path });
     }
 
     /// The files panel's dotfile toggle (F1): the TS `showHidden` flip.
@@ -1267,9 +1285,6 @@ impl Workbench {
             // The file viewer is the topmost layer (mounted after every
             // page) — Esc unwinds it before anything it covers.
             self.runtime.send(UiCommand::FilesCloseView);
-        } else if std::mem::take(&mut self.files_page_open) {
-            // The Session Files page is view-local — closing it is purely
-            // ours (the file viewer above it stays driver-owned).
         } else if let Some(cmd) = self.open_config_page_close() {
             self.runtime.send(cmd);
         } else if self.tab.as_ref().is_some_and(|t| t.running) {
@@ -1419,25 +1434,17 @@ impl Workbench {
                 if self.snap.quota_page.is_none() {
                     self.quota_confirm = None;
                 }
-                // The files page belongs to the session it was opened for:
-                // a session switch under an open page re-seeds the browser
-                // for the new target (the TS FileBrowser's mount effect),
-                // and the page closes when there is no session left to
-                // browse (the capability note would otherwise masquerade as
-                // "no session").
-                if self.files_page_open {
-                    let page_session =
+                // The files panel belongs to the session it was seeded for:
+                // a session switch under the open panel re-reads the new
+                // session's root (the TS FileBrowser's mount effect); with
+                // no session left there is nothing to browse, so the panel
+                // closes.
+                if self.session_panel_open {
+                    let panel_session =
                         self.snap.active.as_ref().and_then(|t| t.session_id.clone());
-                    if page_session != self.files_page_session {
-                        self.files_page_session = page_session.clone();
-                        self.files_page_open = page_session.is_some();
-                        if self.files_page_open
-                            && self.snap.active.as_ref().is_some_and(|t| t.fs_capable)
-                        {
-                            self.runtime.send(UiCommand::FilesNavigate {
-                                path: String::new(),
-                            });
-                        }
+                    if panel_session != self.files_panel_session {
+                        self.session_panel_open = panel_session.is_some();
+                        self.seed_files_panel();
                     }
                 }
                 // Same for the App Update page's install confirm.
@@ -1867,8 +1874,9 @@ impl Workbench {
         }
     }
 
-    /// One aggregated tool-run card's expand toggle: flips the run's fold
-    /// (the TS ToolRunCard's `open` state).
+    /// Pin one aggregated tool-run card open or shut. Records the MANUAL
+    /// verdict only — from here on the run stops following its own state
+    /// (the TS ToolRunCard's `manual`).
     fn set_tool_run_open(
         &mut self,
         row_id: &str,
@@ -1876,12 +1884,8 @@ impl Workbench {
         open_now: bool,
         cx: &mut Context<Self>,
     ) {
-        let key = (row_id.to_string(), start_index);
-        if open_now {
-            self.tool_run_open.remove(&key);
-        } else {
-            self.tool_run_open.insert(key);
-        }
+        self.tool_run_open
+            .insert((row_id.to_string(), start_index), open_now);
         cx.notify();
     }
 
@@ -2090,6 +2094,17 @@ impl Workbench {
             DockPanel::Config,
             IconName::Settings2,
             "Configuration — models, usage, quota, system status",
+            cx,
+        ));
+        // A rail ACTION, not a dock panel: the plan quota opens its own full
+        // page (the same one the config list reaches), so a dedicated icon
+        // keeps the allowance one click away. The page replaces the
+        // workbench surfaces like every config page, back arrow included.
+        rail = rail.child(self.render_rail_action(
+            "quota",
+            KitIconName::Gauge,
+            "Plan quota — allowance windows and reset cards",
+            UiCommand::OpenQuota,
             cx,
         ));
 
@@ -2337,6 +2352,36 @@ impl Workbench {
             .on_click(move |_, _, cx| {
                 wb.update(cx, |wb, cx| wb.toggle_dock_panel(panel, cx));
             })
+    }
+
+    /// A rail icon that OPENS A FULL PAGE rather than docking a panel (the
+    /// quota page). It is never painted as "selected": the page it opens
+    /// replaces the whole dock, so there is no state in which the rail is
+    /// visible while that page is up.
+    fn render_rail_action(
+        &self,
+        key: &'static str,
+        icon: impl Into<gpui_kit::component::Icon> + Clone,
+        tooltip: &str,
+        command: UiCommand,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let runtime = self.runtime.clone();
+        let label = tooltip.to_string();
+        div()
+            .id(SharedString::from(format!("dock-rail-{key}")))
+            .flex()
+            .items_center()
+            .justify_center()
+            .size_8()
+            .rounded_md()
+            .cursor_pointer()
+            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .child(Icon::new(icon).size_4().text_color(theme.muted_foreground))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .test_support()
+            .on_click(move |_, _, _| runtime.send(command.clone()))
     }
 
     /// The Servers section of the config dock — the Connection Profile book
@@ -2957,232 +3002,21 @@ impl Workbench {
 
     // -- session panel (right) ----------------------------------------------
 
-    /// The right session panel (TS SessionPanel): the active session's
-    /// config options as full-width pickers, its turn stats (context,
-    /// cache hit, speed — the title bar's readouts at reading distance),
-    /// the gated workflows entry, and the shared quota card. Global settings
-    /// stay in the config dock.
+    /// The right panel IS the active session's file browser: a header strip
+    /// (dotfiles / Finder / refresh) plus the breadcrumb and one directory
+    /// level. Session config, turn stats, the workflow entry and the quota
+    /// card all live elsewhere (composer chips, tab strip, config dock,
+    /// status bar), so this panel carries nothing else.
     fn render_session_panel(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let runtime = self.runtime.clone();
         let wb_close = cx.entity();
-        let mut column = div().flex().flex_col().min_w_0();
-
-        column = column.child(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .h_9()
-                .px_3()
-                .flex_none()
-                .border_b_1()
-                .border_color(theme.border)
-                .child(
-                    div()
-                        .text_size(px(12.))
-                        .font_family(theme.mono_font_family.clone())
-                        .text_color(theme.muted_foreground)
-                        .child(t!("panel.session").to_uppercase()),
-                )
-                .child(
-                    Button::new("session-panel-close")
-                        .ghost()
-                        .xsmall()
-                        .icon(KitIconName::X)
-                        .on_click(move |_, _, cx| {
-                            wb_close.update(cx, |this, cx| this.toggle_session_panel(cx));
-                        }),
-                ),
-        );
-
-        let session_live = self
-            .snap
-            .active
-            .as_ref()
-            .and_then(|t| t.session_id.clone())
-            .is_some();
-        let caption = |text: String| {
-            div()
-                .px_3()
-                .pt(px(12.))
-                .pb(px(2.))
-                .text_size(px(12.))
-                .text_color(theme.muted_foreground.opacity(0.75))
-                .child(text.to_uppercase())
+        let files_ctx = FilesPanelCtx {
+            runtime: self.runtime.clone(),
+            wb: cx.entity(),
+            show_hidden: self.files_show_hidden,
+            hub_addr: self.snap.hub_addr.as_deref(),
+            fs_capable: self.tab.as_ref().is_some_and(|t| t.fs_capable),
         };
-
-        // Session-scoped config — meaningless until a session is attached
-        // (the TS guard), and the TS label fallback: a catalog miss shows
-        // the bridge's own option name, never the raw key.
-        if let Some(view) = self
-            .snap
-            .active
-            .as_ref()
-            .filter(|v| session_live && !v.config_options.is_empty())
-        {
-            column = column.child(caption(t!("config.title").into_owned()));
-            for opt in &view.config_options {
-                let key = format!("config.{}", opt.id);
-                let translated = t!(&key);
-                let label = if translated.as_ref() == key {
-                    opt.name.clone().unwrap_or_else(|| opt.id.clone())
-                } else {
-                    translated.into_owned()
-                };
-                let (current, choices) = config_option_view(opt);
-                let runtime = runtime.clone();
-                let config_id = opt.id.clone();
-                column = column.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_3()
-                        .px_3()
-                        .py(px(4.))
-                        .child(
-                            div()
-                                .flex_none()
-                                .text_size(px(13.))
-                                .text_color(theme.muted_foreground)
-                                .child(label),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!("session-cfg-{}", opt.id)))
-                                .ghost()
-                                .xsmall()
-                                .min_w_0()
-                                .label(current)
-                                .dropdown_menu(move |menu, _, _| {
-                                    config_option_menu(menu, &runtime, &config_id, &choices)
-                                }),
-                        ),
-                );
-            }
-        }
-
-        // The turn readouts (the title bar's segments, spelled out): only
-        // the ones the session has reported.
-        if let Some(tab) = self.tab.as_ref().filter(|_| session_live) {
-            let mut rows: Vec<(&str, String)> = Vec::new();
-            if let Some(usage) = tab.usage.filter(|u| u.size > 0) {
-                rows.push(("Context", fmt_context(usage.used, usage.size)));
-            }
-            if let Some(hit) = tab.cache_hit {
-                rows.push(("Cache hit", format!("{hit}%")));
-            }
-            if let Some(stats) = tab.turn_stats {
-                rows.push(("Speed", format!("{} tok/s", stats.tps)));
-                rows.push((
-                    "Last turn",
-                    format!("{} tok · {:.1}s", stats.output_tokens, stats.seconds),
-                ));
-            }
-            if !rows.is_empty() {
-                column = column.child(caption("Session stats".to_string()));
-                let mut block = div()
-                    .id("session-panel-stats")
-                    .test_support()
-                    .flex()
-                    .flex_col();
-                for (label, value) in rows {
-                    block = block.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_3()
-                            .px_3()
-                            .py(px(4.))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(13.))
-                                    .text_color(theme.muted_foreground)
-                                    .child(label.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(px(13.))
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_color(theme.foreground)
-                                    .child(value),
-                            ),
-                    );
-                }
-                column = column.child(block);
-            }
-        }
-
-        // The single workflow entry (batch M): shown when the gate verdict
-        // is ON and a session is attached; everything workflow-specific
-        // lives INSIDE the management page. Opening it also drops the files
-        // page — one full page at a time.
-        if session_live && self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled) {
-            let runtime = runtime.clone();
-            let wb = cx.entity();
-            column = column.child(caption(t!("panel.workflows").into_owned())).child(
-                Button::new("session-panel-workflows")
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .icon(KitIconName::Workflow)
-                    .label(t!("panel.workflowManage").into_owned())
-                    .on_click(move |_, _, cx| {
-                        wb.update(cx, |wb, cx| {
-                            wb.files_page_open = false;
-                            cx.notify();
-                        });
-                        runtime.send(UiCommand::OpenWorkflows);
-                    }),
-            );
-        }
-
-        // Session Files (F1): session-scoped, so its entry lives HERE — the
-        // row opens the browser as a full page (left dock = global things,
-        // right panel = this session's things).
-        if session_live {
-            let wb = cx.entity();
-            column = column.child(caption(t!("files.title").into_owned())).child(
-                Button::new("session-panel-files")
-                    .ghost()
-                    .small()
-                    .w_full()
-                    .icon(KitIconName::Folder)
-                    .label(t!("files.title").into_owned())
-                    .on_click(move |_, window, cx| {
-                        let focus = wb.update(cx, |wb, cx| {
-                            wb.open_files_page(cx);
-                            wb.files_page_focus.clone()
-                        });
-                        // The row unmounts with the dock the page replaces;
-                        // hand focus to the page so Esc still lands.
-                        window.focus(&focus, cx);
-                    }),
-            );
-        }
-
-        let quota = crate::quota_card::render_quota_card(&self.snap.quota_card, &self.runtime, theme);
-        let quota_present = quota.is_some();
-        if let Some(card) = quota {
-            column = column.child(card);
-        }
-        if !session_live && !quota_present {
-            column = column.child(
-                div()
-                    .id("session-panel-empty")
-                    .test_support()
-                    .px_3()
-                    .py_2()
-                    .text_size(px(13.))
-                    .text_color(theme.muted_foreground)
-                    .child(t!("chat.noSession").into_owned()),
-            );
-        }
-
         div()
             .id("session-panel")
             .test_support()
@@ -3190,78 +3024,31 @@ impl Workbench {
             .w_full()
             .min_w_0()
             .flex_none()
+            .flex()
+            .flex_col()
             .border_l_1()
             .border_color(theme.border)
             .bg(theme.title_bar)
-            .overflow_y_scroll()
-            .overflow_x_hidden()
-            .child(column)
-            .into_any_element()
-    }
-
-    // -- files page ----------------------------------------------------------
-
-    /// Open the Session Files page from the right panel's row: seed a
-    /// listing where the bridge advertises the capability (the TS
-    /// FileBrowser mount effect — without it a request would just 404) and
-    /// swap the chat surfaces for the page.
-    pub(crate) fn open_files_page(&mut self, cx: &mut Context<Self>) {
-        self.files_page_open = true;
-        self.files_page_session = self.snap.active.as_ref().and_then(|t| t.session_id.clone());
-        if self.tab.as_ref().is_some_and(|t| t.fs_capable) {
-            self.runtime.send(UiCommand::FilesNavigate {
-                path: String::new(),
-            });
-        }
-        cx.notify();
-    }
-
-    fn close_files_page(&mut self, cx: &mut Context<Self>) {
-        self.files_page_open = false;
-        cx.notify();
-    }
-
-    /// The Session Files page (F1): the driver's listing state painted by
-    /// `file_browser` as a full page — session-scoped, so it opens from the
-    /// right session panel, never the left dock. Back returns to the chat;
-    /// the view-local dotfile toggle and the loopback-gated Finder
-    /// affordance (F2) ride the panel's own header.
-    fn render_files_page(&self, cx: &Context<Self>) -> AnyElement {
-        let theme = cx.theme();
-        let wb = cx.entity();
-        div()
-            .id("files-page")
-            .test_support()
-            .track_focus(&self.files_page_focus)
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .gap_2()
+                    .gap_1()
+                    .h_9()
+                    .px_2()
                     .flex_none()
-                    .px_3()
-                    .py_2()
                     .border_b_1()
                     .border_color(theme.border)
+                    .child(render_files_header(&self.snap.files, &files_ctx, cx))
                     .child(
-                        Button::new("files-page-back")
+                        Button::new("session-panel-close")
                             .ghost()
-                            .small()
-                            .icon(KitIconName::ArrowLeft)
-                            .tooltip("Back to the chat")
+                            .xsmall()
+                            .icon(KitIconName::X)
+                            .tooltip("Close the files panel")
                             .on_click(move |_, _, cx| {
-                                wb.update(cx, |wb, cx| wb.close_files_page(cx));
+                                wb_close.update(cx, |this, cx| this.toggle_session_panel(cx));
                             }),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(14.))
-                            .child(t!("files.title").into_owned()),
                     ),
             )
             .child(
@@ -3270,17 +3057,34 @@ impl Workbench {
                     .flex_1()
                     .min_h_0()
                     .min_w_0()
-                    .child(render_files_panel(
-                        &self.snap.files,
-                        &FilesPanelCtx {
-                            runtime: self.runtime.clone(),
-                            wb: cx.entity(),
-                            show_hidden: self.files_show_hidden,
-                            hub_addr: self.snap.hub_addr.as_deref(),
-                            fs_capable: self.tab.as_ref().is_some_and(|t| t.fs_capable),
+                    .when(
+                        // No session, nothing to browse: the capability note
+                        // would otherwise read as "bridge too old".
+                        self.snap
+                            .active
+                            .as_ref()
+                            .is_none_or(|t| t.session_id.is_none()),
+                        |this| {
+                            this.child(
+                                div()
+                                    .id("session-panel-empty")
+                                    .test_support()
+                                    .p_3()
+                                    .text_size(px(13.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(t!("chat.noSession").into_owned()),
+                            )
                         },
-                        cx,
-                    )),
+                    )
+                    .when(
+                        self.snap
+                            .active
+                            .as_ref()
+                            .is_some_and(|t| t.session_id.is_some()),
+                        |this| {
+                            this.child(render_files_panel(&self.snap.files, &files_ctx, cx))
+                        },
+                    ),
             )
             .into_any_element()
     }
@@ -3938,16 +3742,15 @@ impl Workbench {
                     .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows))
                     .into_any_element()
             });
-        // The right session panel's toggle (TS ChatScreen's header button):
-        // always present — the panel also carries the hub-level quota card,
-        // which needs no session.
+        // The right side panel's toggle (TS ChatScreen's files button): the
+        // panel is the session's file browser, so it needs a session.
         let wb_toggle = cx.entity();
         let toggle = Button::new("session-panel-toggle")
             .ghost()
             .xsmall()
             .icon(KitIconName::PanelRight)
             .selected(self.session_panel_open)
-            .tooltip(t!("panel.session").into_owned())
+            .tooltip(t!("files.title").into_owned())
             .on_click(move |_, _, cx| {
                 wb_toggle.update(cx, |this, cx| this.toggle_session_panel(cx));
             });
@@ -5080,7 +4883,7 @@ fn render_row(
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
-    tool_run_open: &std::collections::HashSet<(String, usize)>,
+    tool_run_open: &std::collections::HashMap<(String, usize), bool>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -5242,7 +5045,7 @@ fn render_assistant_row(
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
-    tool_run_open: &std::collections::HashSet<(String, usize)>,
+    tool_run_open: &std::collections::HashMap<(String, usize), bool>,
     theme: &component::Theme,
 ) -> gpui::Div {
     let mut column = div().flex().flex_col().gap_2().min_w_0();
@@ -5264,7 +5067,12 @@ fn render_assistant_row(
             }
             let run = &row.parts[start..part_index];
             column = column.child(if run.len() > 1 {
-                let open = tool_run_open.contains(&(row.id.clone(), start));
+                // Absent = never toggled: a live run stays open so its calls
+                // are watchable, a settled one folds away.
+                let open = tool_run_open
+                    .get(&(row.id.clone(), start))
+                    .copied()
+                    .unwrap_or_else(|| tool_run_summary(run).1);
                 render_tool_run(&row.id, start, run, open, wb, theme)
             } else {
                 render_tool_card(&row.id, start, &run[0], wb, theme)
@@ -5687,7 +5495,7 @@ fn render_tool_run(
                 move |_, _window, cx| {
                     if let Some(wb) = wb.upgrade() {
                         wb.update(cx, |wb, cx| {
-                            wb.set_tool_run_open(&row_id_owned, start_index, open, cx)
+                            wb.set_tool_run_open(&row_id_owned, start_index, !open, cx)
                         });
                     }
                 }
@@ -5817,10 +5625,8 @@ impl Render for Workbench {
         let toast = self.snap.toast.as_ref().map(|t| t.text.clone());
         let runtime = self.runtime.clone();
         let theme = cx.theme();
-        // A snap page (driver-owned) or the files page replaces the
-        // workbench surfaces below the status bar. A snap page wins over
-        // the files page — its open path closes ours anyway; the guard just
-        // keeps one page on screen if the states ever overlap.
+        // A snap page (driver-owned) replaces the workbench surfaces below
+        // the status bar.
         let snap_page_open = self.snap.system_status.is_some()
             || self.snap.models_page.is_some()
             || self.snap.quota_page.is_some()
@@ -5873,7 +5679,7 @@ impl Render for Workbench {
             // below the status bar (the TS configuration screens replace the
             // chat/picker screens wholesale).
             .when_some(
-                if !snap_page_open && !self.files_page_open {
+                if !snap_page_open {
                     Some(self.render_dock(cx))
                 } else {
                     None
@@ -5958,12 +5764,6 @@ impl Render for Workbench {
                     })
                 },
             )
-            // The Session Files page (F1): the same replacement contract as
-            // the snap pages, but view-local — the right session panel's
-            // row owns the open, back/Esc own the close.
-            .when(self.files_page_open && !snap_page_open, |this| {
-                this.child(self.render_files_page(cx))
-            })
             // The WorkflowGate sheet (J2) sits above the config surfaces —
             // the TS bottom sheet is the topmost layer while open.
             .when(self.workflow_gate_sheet, |this| {

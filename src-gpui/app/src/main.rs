@@ -1,7 +1,8 @@
 //! Desktop Workbench entry point (requirements §6): one window with the
 //! connection status bar, the left dock (sessions / configuration panels),
-//! the one-connection-per-tab session tabs, and the composer. The protocol
-//! driver thread (`runtime`) owns every wire concern; this layer only paints.
+//! the one-connection-per-tab session tabs, the composer, and the right
+//! panel (the active session's file browser). The protocol driver thread
+//! (`runtime`) owns every wire concern; this layer only paints.
 //!
 //! Quit wiring: ⌘Q is bound to the workbench's `QuitApp` action and carried
 //! by a minimal native app menu; the window close rides

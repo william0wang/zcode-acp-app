@@ -1,5 +1,6 @@
 //! Session Files (batch F, CONTEXT.md "Session Files" / "File Viewer"):
-//! the read-only, hub-proxied view of the ACTIVE session's files.
+//! the read-only, hub-proxied view of the ACTIVE session's files — the whole
+//! right side panel (the panel has no other content).
 //!
 //! Port of `src/components/FileBrowser.tsx` + the TextViewer half of
 //! `src/components/FileViewer.tsx`, at workbench density:
@@ -33,6 +34,7 @@ use gpui_kit::TestSupportExt as _;
 use crate::runtime::{FileViewerView, FilesPanelView, ProtocolRuntime, UiCommand};
 use crate::workbench::Workbench;
 use protocol::hub::{FsEntry, FsEntryKind};
+use rust_i18n::t;
 
 /// The whole-viewer line budget (the TS viewer's MAX_LINES cap). The load
 /// stitches server windows until this many lines or the file ends.
@@ -198,6 +200,57 @@ pub fn absolute_dir(root: &str, path: &str) -> String {
     }
 }
 
+/// Whether Zed is installed on THIS machine — the "Open in Zed" affordances
+/// exist only when it is (the user asked for the entry to disappear, never
+/// to error). Probed once and cached: the answer cannot change while the app
+/// runs, and a LaunchServices query is a subprocess.
+pub fn zed_installed() -> bool {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        if !cfg!(target_os = "macos") {
+            return false;
+        }
+        let mut dirs = vec![
+            std::path::PathBuf::from("/Applications"),
+            std::path::PathBuf::from("/System/Applications"),
+        ];
+        if let Some(home) = std::env::var_os("HOME") {
+            dirs.push(std::path::PathBuf::from(home).join("Applications"));
+        }
+        if zed_bundle_present(dirs) {
+            return true;
+        }
+        // LaunchServices may know a bundle outside those folders (a moved
+        // install, a Homebrew cask target); `open -Ra` resolves a name.
+        std::process::Command::new("open")
+            .args(["-Ra", "Zed"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+/// `true` when any of `dirs` holds a `Zed.app` bundle (the cheap half of
+/// [`zed_installed`], split out so it is testable).
+fn zed_bundle_present(dirs: impl IntoIterator<Item = std::path::PathBuf>) -> bool {
+    dirs.into_iter().any(|dir| dir.join("Zed.app").exists())
+}
+
+/// Open one local path — a FILE or a DIRECTORY — in Zed. `open -a Zed`
+/// asks LaunchServices to hand the path to Zed, which opens a directory as a
+/// workspace and a file as the buffer, so the two affordances share one
+/// call. argv only, never a shell.
+pub fn open_in_zed(abs: &str) -> Result<(), String> {
+    std::process::Command::new("open")
+        .args(["-a", "Zed"])
+        .arg(abs)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Zed: {e}"))
+}
+
 /// The session root's display name for the breadcrumb's first crumb (TS
 /// `rootName`): the root's last path segment, `"/"` for the filesystem root.
 pub fn root_name(root: &str) -> String {
@@ -242,63 +295,36 @@ pub(crate) struct FilesPanelCtx<'a> {
     pub fs_capable: bool,
 }
 
-/// The docked session-files panel: header (hidden toggle / refresh / Finder),
-/// breadcrumb, and one directory level of rows.
-pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx: &App) -> AnyElement {
+/// The right panel's header strip: title on the left, the panel's
+/// affordances on the right (dotfiles, Finder where the files are local, and
+/// Refresh). The workbench paints this as the panel's top bar; the body
+/// below is [`render_files_panel`].
+pub(crate) fn render_files_header(
+    view: &FilesPanelView,
+    ctx: &FilesPanelCtx,
+    cx: &App,
+) -> AnyElement {
     let theme = cx.theme();
     let runtime = ctx.runtime.clone();
-
-    let mut column = div().flex().flex_col().gap_2().p_2();
-
-    // Header: title + the three affordances.
     let wb_toggle = ctx.wb.clone();
     let show_hidden = ctx.show_hidden;
     let current_path = view.path.clone();
     let refresh_runtime = runtime.clone();
-    column = column.child(
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .child(
-                div()
-                    .text_size(px(12.))
-                    .font_family(theme.mono_font_family.clone())
-                    .text_color(theme.muted_foreground)
-                    .child("SESSION FILES"),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("files-hidden-toggle")
-                    .ghost()
-                    .xsmall()
-                    .icon(if show_hidden {
-                        KitIconName::Eye
-                    } else {
-                        KitIconName::EyeOff
-                    })
-                    .tooltip(if show_hidden {
-                        "Hide dotfiles"
-                    } else {
-                        "Show dotfiles"
-                    })
-                    .on_click(move |_, _, cx| {
-                        wb_toggle.update(cx, |wb, cx| wb.toggle_files_hidden(cx));
-                    }),
-            )
-            .child(
-                Button::new("files-refresh")
-                    .ghost()
-                    .xsmall()
-                    .icon(KitIconName::RefreshCw)
-                    .tooltip("Re-read this directory")
-                    .on_click(move |_, _, _| {
-                        refresh_runtime.send(UiCommand::FilesNavigate {
-                            path: current_path.clone(),
-                        })
-                    }),
-            ),
-    );
+
+    let mut row = div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .flex_1()
+        .min_w_0()
+        .child(
+            div()
+                .text_size(px(12.))
+                .font_family(theme.mono_font_family.clone())
+                .text_color(theme.muted_foreground)
+                .child(t!("files.title").to_uppercase()),
+        )
+        .child(div().flex_1());
 
     // The Finder affordance (F2): only where the hub is loopback AND a
     // listing names a real local directory (the TS `canLocal` pair).
@@ -308,29 +334,87 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
         && view.listing.is_some();
     if can_local {
         let wb_open = ctx.wb.clone();
+        let wb_zed = ctx.wb.clone();
         let root = view
             .listing
             .as_ref()
             .map(|l| l.root.clone())
             .unwrap_or_default();
         let path = view.path.clone();
-        column = column.child(
-            div().child(
-                Button::new("files-open-finder")
+        // Open the current directory as a Zed workspace. Only where the
+        // bridge's paths name real local files AND Zed is installed — the
+        // user asked for the entry to vanish, not to fail, otherwise.
+        if zed_installed() {
+            let root = root.clone();
+            let path = path.clone();
+            row = row.child(
+                Button::new("files-open-zed")
                     .ghost()
                     .xsmall()
-                    .icon(KitIconName::FolderOpen)
-                    .label("Show in Finder")
-                    .tooltip("Open the current directory in the platform file manager")
+                    .icon(KitIconName::CodeXml)
+                    .tooltip("Open this directory in Zed")
                     .on_click(move |_, _, cx| {
                         let abs = absolute_dir(&root, &path);
-                        if let Err(e) = open_in_file_manager(&abs) {
-                            wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
+                        if let Err(e) = open_in_zed(&abs) {
+                            wb_zed.update(cx, |wb, cx| wb.files_notice(&e, cx));
                         }
                     }),
-            ),
+            );
+        }
+        row = row.child(
+            Button::new("files-open-finder")
+                .ghost()
+                .xsmall()
+                .icon(KitIconName::FolderOpen)
+                .tooltip("Show this directory in the platform file manager")
+                .on_click(move |_, _, cx| {
+                    let abs = absolute_dir(&root, &path);
+                    if let Err(e) = open_in_file_manager(&abs) {
+                        wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
+                    }
+                }),
         );
     }
+
+    row.child(
+        Button::new("files-hidden-toggle")
+            .ghost()
+            .xsmall()
+            .icon(if show_hidden {
+                KitIconName::Eye
+            } else {
+                KitIconName::EyeOff
+            })
+            .tooltip(if show_hidden {
+                "Hide dotfiles"
+            } else {
+                "Show dotfiles"
+            })
+            .on_click(move |_, _, cx| {
+                wb_toggle.update(cx, |wb, cx| wb.toggle_files_hidden(cx));
+            }),
+    )
+    .child(
+        Button::new("files-refresh")
+            .ghost()
+            .xsmall()
+            .icon(KitIconName::RefreshCw)
+            .tooltip("Re-read this directory")
+            .on_click(move |_, _, _| {
+                refresh_runtime.send(UiCommand::FilesNavigate {
+                    path: current_path.clone(),
+                })
+            }),
+    )
+    .into_any_element()
+}
+
+/// The session-files body: breadcrumb plus one directory level of rows.
+pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx: &App) -> AnyElement {
+    let theme = cx.theme();
+    let runtime = ctx.runtime.clone();
+
+    let mut column = div().flex().flex_col().gap_2().p_2();
 
     // Breadcrumb over the relative path (the TS nav): the root crumb resets;
     // each segment crumb navigates to its prefix.
@@ -643,6 +727,24 @@ pub(crate) fn render_file_viewer(
         );
     }
     if let Some(abs) = local_abs {
+        // Zed first: it is the one editor-aware action, and it disappears
+        // entirely when Zed is not installed.
+        if zed_installed() {
+            let wb_open = wb.clone();
+            let abs = abs.clone();
+            header = header.child(
+                Button::new("file-viewer-open-zed")
+                    .ghost()
+                    .xsmall()
+                    .icon(KitIconName::CodeXml)
+                    .tooltip("Open this file in Zed")
+                    .on_click(move |_, _, cx| {
+                        if let Err(e) = open_in_zed(&abs) {
+                            let _ = wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
+                        }
+                    }),
+            );
+        }
         for (id, icon, tooltip, reveal) in [
             (
                 "file-viewer-open",
@@ -884,9 +986,35 @@ mod tests {
     // built-in #[test] with gpui's macro (see gpui-kit-notes.md).
     use super::{
         absolute_dir, display_line, file_kind_of, fmt_size, is_loopback_hub, is_markdown, join_dir,
-        root_name, viewer_next_window, viewer_window, FileKind, SERVER_LINE_WINDOW,
-        VIEWER_LINE_BUDGET,
+        root_name, viewer_next_window, viewer_window, zed_bundle_present, FileKind,
+        SERVER_LINE_WINDOW, VIEWER_LINE_BUDGET,
     };
+
+    /// Zed's presence gate: the affordance is a filesystem probe over the
+    /// standard install folders, so an empty set reads as "not installed".
+    #[test]
+    fn zed_bundle_probe_scans_every_candidate_dir() {
+        let tmp = std::env::temp_dir().join(format!(
+            "zed-probe-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let empty = tmp.join("empty");
+        let with_zed = tmp.join("with-zed");
+        std::fs::create_dir_all(empty.join("Zed.app")).unwrap();
+        std::fs::create_dir_all(&with_zed).unwrap();
+
+        assert!(!zed_bundle_present(vec![with_zed.clone()]));
+        assert!(zed_bundle_present(vec![
+            with_zed.clone(),
+            empty.clone(),
+        ]));
+        // The bundle must sit directly in the dir — a deeper copy is not an
+        // install the LaunchServices name would resolve.
+        assert!(!zed_bundle_present(vec![empty.join("Zed.app")]));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn kind_ladder_matches_the_ts_viewer() {

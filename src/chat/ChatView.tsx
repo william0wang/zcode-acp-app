@@ -280,7 +280,10 @@ function ToolRunCard({
   children: ReactNode;
 }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
+  // `null` = never toggled: follow the run's own state. A live run stays open
+  // so its calls are watchable as they happen; once settled it folds away. A
+  // manual toggle wins permanently (the ThoughtCard rule).
+  const [manual, setManual] = useState<boolean | null>(null);
   // The message's parts give the summary its names/status; the group node
   // itself carries only indices. `indices` is a fresh array per render, so
   // the memo keys on its joined identity instead of the reference.
@@ -298,10 +301,11 @@ function ToolRunCard({
       ),
     [indexKey, parts],
   );
+  const open = manual ?? summary.running;
   return (
     <div className="my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04]">
       <button
-        onClick={() => setOpen((o) => !o)}
+        onClick={() => setManual(!open)}
         className="flex w-full min-w-0 items-center gap-1.5 px-3 py-2 text-left"
       >
         <Wrench
