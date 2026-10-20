@@ -45,9 +45,11 @@ import {
   type AttachmentDraft,
   type ChatMessage,
   type ChatPart,
+  type CliproxyUsageStats,
   type ConfigOption,
   type ConnectionProfile,
   type ContextUsage,
+  type CpWindowEntry,
   type FsListing,
   type GoUsageStats,
   type GoWindowEntry,
@@ -105,6 +107,7 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
     glm?: unknown;
     opencode?: unknown;
     ollama?: unknown;
+    cliproxy?: unknown;
   };
   if (typeof r.glm !== "object" || r.glm === null) return null;
   if (typeof r.opencode !== "object" || r.opencode === null) return null;
@@ -114,6 +117,10 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
   const oc =
     typeof r.ollama === "object" && r.ollama !== null
       ? (r.ollama as Partial<OllamaUsageStats>)
+      : undefined;
+  const cp =
+    typeof r.cliproxy === "object" && r.cliproxy !== null
+      ? (r.cliproxy as Partial<CliproxyUsageStats>)
       : undefined;
   const items = Array.isArray(glm.items)
     ? glm.items.filter((it) => it && typeof it.usedPercent === "number")
@@ -155,6 +162,30 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
                     (w) => w && typeof w.usagePercent === "number",
                   ) as OcWindowEntry[],
                 }
+              : {}),
+          },
+        }
+      : {}),
+    // CLIProxy section is optional — pre-0.66.0 bridges don't send it. The
+    // pool-wide `combined` rows are what the card renders; the per-account
+    // breakdown stays on the CLI like GLM's per-model detail.
+    ...(cp
+      ? {
+          cliproxy: {
+            kind: (["success", "not_configured", "auth_error", "unavailable"] as const).includes(
+              cp.kind as CliproxyUsageStats["kind"],
+            )
+              ? (cp.kind as CliproxyUsageStats["kind"])
+              : "unavailable",
+            ...(Array.isArray(cp.combined)
+              ? {
+                  combined: cp.combined.filter(
+                    (w) => w && typeof w.usedPercent === "number",
+                  ) as CpWindowEntry[],
+                }
+              : {}),
+            ...(typeof cp.otherAccounts === "number"
+              ? { otherAccounts: cp.otherAccounts }
               : {}),
           },
         }
