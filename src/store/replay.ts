@@ -402,10 +402,32 @@ export function applyOne(
         ],
       };
     }
-    const ensured = ensureMessage(msgs, "assistant");
+    // A message-id-less tool_call is a live-stream card: the model's own
+    // call, or sub-agent/background activity rolled up into this session's
+    // event stream (arbitrary timing vs the host's streaming text). Splicing
+    // a trailing message that is mid-text splits the sentence in two — the
+    // next chunk of that message opens a new part AFTER the card. A dedicated
+    // card message keeps the text whole (id'd chunks keep appending to their
+    // own message, above the cards).
+    const last = msgs[msgs.length - 1];
+    const lastPart = last?.parts[last.parts.length - 1];
+    const endsText =
+      last?.role === "assistant" &&
+      (lastPart?.type === "text" || lastPart?.type === "thought");
+    let messages = msgs;
+    let targetId: string;
+    if (endsText) {
+      const fresh = newMessage("assistant");
+      targetId = fresh.id;
+      messages = [...msgs, fresh];
+    } else {
+      const ensured = ensureMessage(msgs, "assistant");
+      targetId = ensured.message.id;
+      messages = ensured.messages;
+    }
     return {
-      messages: ensured.messages.map((m) =>
-        m.id === ensured.message.id ? { ...m, parts: [...m.parts, part] } : m,
+      messages: messages.map((m) =>
+        m.id === targetId ? { ...m, parts: [...m.parts, part] } : m,
       ),
     };
   }

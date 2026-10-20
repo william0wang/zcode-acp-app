@@ -2768,11 +2768,15 @@ impl Driver {
     }
 
     /// appStore `closeRemoteSession`: retire one conversation from discovery.
+    /// The desktop's End session is an explicit terminate gesture, so the
+    /// close is forced — a running turn is cancelled (stop pair + bounded
+    /// settle) instead of refusing with 409 (ADR-0006 amendment; the TS
+    /// client's plain close keeps the refuse-when-running contract).
     fn spawn_session_close(&mut self, instance_id: String, session_id: String) {
         let hub = self.hub_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
-            let result = hub.close_session(&instance_id, &session_id).await;
+            let result = hub.close_session(&instance_id, &session_id, true).await;
             let _ = tx.send(LoopEvent::SessionClosed {
                 instance_id,
                 session_id,

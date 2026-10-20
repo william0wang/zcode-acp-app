@@ -268,13 +268,33 @@ async fn close_session_posts_the_retire_route() {
     let http = Arc::new(ScriptedHttp::default());
     let clock = Arc::new(MockClock::new());
     http.push(res_text(200, "ok", &[]));
-    client(http.clone(), clock).close_session("inst 1", "sess/a").await.unwrap();
+    client(http.clone(), clock).close_session("inst 1", "sess/a", false).await.unwrap();
     let calls = http.requested.lock().unwrap().clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].url, "http://hub/api/instances/inst 1/sessions/sess%2Fa/close");
     assert_eq!(calls[0].method, HttpMethod::Post);
-    // A retire carries no body — the route is addressed by path alone.
-    assert_eq!(calls[0].body, None);
+    // A plain retire carries force:false — the bridge keeps the
+    // refuse-when-running contract (ADR-0006).
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[0].body.clone().unwrap()).unwrap(),
+        json!({ "force": false })
+    );
+}
+
+#[tokio::test]
+async fn forced_close_session_carries_force_true() {
+    // The desktop's End session: an explicit terminate gesture, so a running
+    // turn is cancelled instead of the close being refused with 409.
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push(res_text(200, "ok", &[]));
+    client(http.clone(), clock).close_session("inst 1", "sess/a", true).await.unwrap();
+    let calls = http.requested.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[0].body.clone().unwrap()).unwrap(),
+        json!({ "force": true })
+    );
 }
 
 #[tokio::test]
@@ -585,6 +605,8 @@ async fn refused_write_body_becomes_the_error_message() {
 
 /// The Authorization header is the desktop client's bearer auth (the TS app
 /// had to put the token in the query for WS; REST always used the header).
+/// Every call also stamps the Desktop Presence identity header the hub reads
+/// for headless incubation (server ADR-0016 amendment).
 #[tokio::test]
 async fn every_request_carries_the_bearer_authorization_header() {
     let http = Arc::new(ScriptedHttp::default());
@@ -593,6 +615,10 @@ async fn every_request_carries_the_bearer_authorization_header() {
     client(http.clone(), clock.clone()).instances(false).await.unwrap();
     let calls = http.requested.lock().unwrap().clone();
     assert_eq!(calls[0].headers[0], ("authorization".to_string(), "Bearer tok".to_string()));
+    assert!(calls[0].headers.contains(&(
+        "x-zcode-client".to_string(),
+        "zcode-acp-remote-desktop".to_string()
+    )));
     // Content-Type rides only on writes.
     http.push(res_json(200, json!({ "ok": true })));
     client(http.clone(), clock).delete_project("/w").await.unwrap();

@@ -28,7 +28,9 @@ mkdir -p "${OUT}/Contents/MacOS" "${OUT}/Contents/Resources"
 # ditto, not cp: preserves bundle permissions/metadata the app needs.
 # The cargo binary is plain `app`; the bundle renames it to the product name.
 ditto "${BIN}" "${OUT}/Contents/MacOS/zcode-acp"
-ditto src-tauri/icons/icon.icns "${OUT}/Contents/Resources/AppIcon.icns"
+# icon-macos.icns (gen-icon.mjs): the padded macOS variant — full-bleed
+# icon.icns renders a ring larger than every neighbor in the Dock.
+ditto src-tauri/icons/icon-macos.icns "${OUT}/Contents/Resources/AppIcon.icns"
 cat > "${OUT}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

@@ -530,7 +530,30 @@ pub fn apply_one(
             }
             return ApplyPatch::Messages;
         }
-        let target = ensure_message(msgs, ChatRole::Assistant, ids, now_ms);
+        // A message-id-less tool_call is a live-stream card: the model's own
+        // call, or sub-agent/background activity the backend rolls up into
+        // this session's event stream (those arrive at arbitrary points of
+        // the host's streaming text). Splicing a trailing message that is
+        // mid-text splits the sentence in two — the next chunk of that
+        // message would open a new part AFTER the card. A dedicated card
+        // message keeps the text whole: id'd chunks keep appending to their
+        // own message, which sits above the cards.
+        let target = match msgs.last().filter(|m| m.role == ChatRole::Assistant) {
+            Some(m)
+                if !matches!(
+                    m.parts.last(),
+                    Some(ChatPart::Text { .. }) | Some(ChatPart::Thought { .. })
+                ) =>
+            {
+                m.id.clone()
+            }
+            _ => {
+                let message = ids.new_message(ChatRole::Assistant, now_ms);
+                let id = message.id.clone();
+                msgs.push(message);
+                id
+            }
+        };
         if let Some(m) = msgs.iter_mut().find(|m| m.id == target) {
             m.parts.push(ChatPart::ToolCall(part));
         }
@@ -853,6 +876,80 @@ mod tests {
         let mut msgs2 = Vec::new();
         apply_one(&mut msgs2, &u, None, &mut ids, 2);
         assert_eq!(msgs2[0].collapsed, None);
+    }
+
+    #[test]
+    fn id_less_tool_cards_never_split_a_streaming_text_message() {
+        // The live stream rolls sub-agent/background tool cards into this
+        // session at arbitrary points of the host's streaming text. An
+        // id-less card must take its own message, and the id'd text chunks
+        // keep appending to THEIR message — the sentence stays whole.
+        let mut msgs = Vec::new();
+        let mut ids = factory();
+        apply_one(
+            &mut msgs,
+            &chunk("agent_message_chunk", Some("m_a"), "we can "),
+            None,
+            &mut ids,
+            1,
+        );
+        let card = |id: &str| {
+            let mut rest = serde_json::Map::new();
+            rest.insert("toolCallId".to_owned(), json!(id));
+            rest.insert("title".to_owned(), json!("Bash: research"));
+            SessionUpdate::with_rest("tool_call", rest)
+        };
+        apply_one(&mut msgs, &card("tc_1"), None, &mut ids, 2);
+        apply_one(&mut msgs, &card("tc_2"), None, &mut ids, 3);
+        // Two messages: the text message, then a cards-only message holding
+        // BOTH cards (a card-run continues in the same card message).
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].id, "m_a");
+        assert_eq!(msgs[0].parts.len(), 1);
+        assert!(matches!(&msgs[0].parts[0], ChatPart::Text { text } if text == "we can "));
+        assert_eq!(msgs[1].parts.len(), 2);
+        assert!(msgs[1].parts.iter().all(|p| matches!(p, ChatPart::ToolCall(_))));
+        // The text continues into its own message — healed, one part.
+        apply_one(
+            &mut msgs,
+            &chunk("agent_message_chunk", Some("m_a"), "identify"),
+            None,
+            &mut ids,
+            4,
+        );
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(
+            &msgs[0].parts[0],
+            ChatPart::Text { text } if text == "we can identify"
+        ));
+    }
+
+    #[test]
+    fn id_less_tool_cards_join_a_trailing_card_run() {
+        // Turn start: cards first (no text yet) — one card message, and the
+        // text that follows lands in its own message above nothing, i.e. the
+        // order cards→text stays.
+        let mut msgs = Vec::new();
+        let mut ids = factory();
+        let card = |id: &str| {
+            let mut rest = serde_json::Map::new();
+            rest.insert("toolCallId".to_owned(), json!(id));
+            rest.insert("title".to_owned(), json!("Read"));
+            SessionUpdate::with_rest("tool_call", rest)
+        };
+        apply_one(&mut msgs, &card("tc_1"), None, &mut ids, 1);
+        apply_one(&mut msgs, &card("tc_2"), None, &mut ids, 2);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[1 - 1].parts.len(), 2);
+        apply_one(
+            &mut msgs,
+            &chunk("agent_message_chunk", Some("m_1"), "done"),
+            None,
+            &mut ids,
+            3,
+        );
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(&msgs[1].parts[0], ChatPart::Text { text } if text == "done"));
     }
 
     #[test]

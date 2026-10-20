@@ -127,7 +127,19 @@ impl HubClient {
         body: Option<&Value>,
         opts: &FetchOpts,
     ) -> Result<HttpResponse, HubApiError> {
-        let mut headers = vec![("authorization".to_string(), format!("Bearer {}", self.token))];
+        let mut headers = vec![
+            ("authorization".to_string(), format!("Bearer {}", self.token)),
+            // Desktop Presence request identity (server ADR-0016 amendment):
+            // the hub keys headless incubation on this header too — connection
+            // presence needs a proxied bridge, which a cold hub (instances: 0)
+            // cannot offer yet, so the stamped request is what keeps the very
+            // first create/resume windowless. Mirrors the WS initialize's
+            // clientInfo (`acp_client::DESKTOP_CLIENT_NAME`).
+            (
+                "x-zcode-client".to_string(),
+                crate::acp_client::DESKTOP_CLIENT_NAME.to_string(),
+            ),
+        ];
         let body_str = body.map(|v| v.to_string());
         if body_str.is_some() {
             headers.push(("content-type".to_string(), "application/json".to_string()));
@@ -334,14 +346,23 @@ impl HubClient {
     /// Retires a session from remote discovery (ADR-0006 — the "end session"
     /// action). Close, not delete: backend store and editor storage are
     /// untouched; an editor-side-still-open conversation self-heals back into
-    /// discovery on its next use. Refused with 409 while a turn is running.
+    /// discovery on its next use. Refused with 409 while a turn is running
+    /// unless `force` is set — then the bridge applies ESC semantics (cancel
+    /// the in-flight turn, stop pair, bounded settle) before closing, which
+    /// is what an explicit terminate gesture wants (ADR-0006 amendment).
     /// Id encoding matches delete_session (instance ids are hub-numeric).
-    pub async fn close_session(&self, instance_id: &str, session_id: &str) -> Result<(), HubApiError> {
+    pub async fn close_session(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        force: bool,
+    ) -> Result<(), HubApiError> {
         let path = format!(
             "/api/instances/{instance_id}/sessions/{}/close",
             encode_query_component(session_id)
         );
-        self.fetch(&path, HttpMethod::Post, None, &FetchOpts::default())
+        let body = serde_json::json!({ "force": force });
+        self.fetch(&path, HttpMethod::Post, Some(&body), &FetchOpts::default())
             .await?;
         Ok(())
     }
