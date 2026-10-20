@@ -40,6 +40,7 @@
     "untitled": "未命名会话",
     "thinking": "思考中…",
     "thought": "思考过程",
+    "toolRun": "{{count}} 个工具调用",
     "contextHandoff": "前序会话摘要",
     "taskNotice": "后台任务通知",
     "pending": "待发送",

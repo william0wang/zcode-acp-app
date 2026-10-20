@@ -272,6 +272,11 @@ pub struct Workbench {
     /// wheel while it can move, so a nested inner scroller is unreliable —
     /// a settled card clips at the cap instead and this flag lifts the cap.
     thought_full: std::collections::HashSet<(String, usize)>,
+    /// The expanded adjacent tool-call RUNS, keyed by (row id, index of the
+    /// run's first part). Collapsed by default like the single ToolCard; a
+    /// run is the aggregated card that replaces a wall of context-free
+    /// per-call rows.
+    tool_run_open: std::collections::HashSet<(String, usize)>,
     /// The files panel's dotfile toggle (F1, TS FileBrowser `showHidden`):
     /// view-local like the TS component state — the entries always arrive
     /// whole from the driver, filtered here.
@@ -482,6 +487,41 @@ fn tool_detail_head(detail: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// The card summary's display name, forced onto ONE line: the wire title is
+/// the raw command and a heredoc/`&&` chain carries real newlines — rendered
+/// as-is it turns the summary into a multi-line wall. Whitespace runs collapse
+/// to single spaces and the result is capped for measure cost; the row's
+/// `truncate` handles the remaining width.
+fn tool_display_name(tool_name: &str) -> String {
+    let mut out = String::with_capacity(tool_name.len().min(240));
+    let mut pending_space = false;
+    for ch in tool_name.chars() {
+        if ch.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(ch);
+        if out.chars().count() >= 240 {
+            out.push('…');
+            break;
+        }
+    }
+    out
+}
+
+/// The name shown in the aggregated tool-run summary: raw backend tool name
+/// when present, else the segment before the first colon ("Bash: npm test" →
+/// "Bash") — the TS `toolNameOf`, so a group reads like its rows.
+fn tool_short_name(label: &str) -> String {
+    let head = label.split(':').next().unwrap_or(label).trim();
+    let name = if head.is_empty() { label.trim() } else { head };
+    tool_display_name(name)
 }
 
 /// One ACP diff block's unified view — the TS `DiffBlock`
@@ -1021,6 +1061,7 @@ impl Workbench {
             copied_row: None,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
+            tool_run_open: std::collections::HashSet::new(),
             files_show_hidden: false,
             rename_target: None,
             rename_prefill: None,
@@ -1824,6 +1865,24 @@ impl Workbench {
             *expanded = !expanded_now;
             cx.notify();
         }
+    }
+
+    /// One aggregated tool-run card's expand toggle: flips the run's fold
+    /// (the TS ToolRunCard's `open` state).
+    fn set_tool_run_open(
+        &mut self,
+        row_id: &str,
+        start_index: usize,
+        open_now: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (row_id.to_string(), start_index);
+        if open_now {
+            self.tool_run_open.remove(&key);
+        } else {
+            self.tool_run_open.insert(key);
+        }
+        cx.notify();
     }
 
     /// A row copy landed (E4 — ActionBarPrimitive.Copy): hold the row's
@@ -4258,6 +4317,7 @@ impl Workbench {
         // read them at paint time so the segment's pick rescales everything.
         let chat_font = self.font_scale.chat_px();
         let thought_full = self.thought_full.clone();
+        let tool_run_open = self.tool_run_open.clone();
         column
             .child(
                 MessageScroller::new("chat", scroller, move |index, _window, cx| {
@@ -4271,6 +4331,7 @@ impl Workbench {
                             &weak_rows,
                             chat_font,
                             &thought_full,
+                            &tool_run_open,
                             cx,
                         )
                     } else if let Some(card) = card.as_ref() {
@@ -5019,6 +5080,7 @@ fn render_row(
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
+    tool_run_open: &std::collections::HashSet<(String, usize)>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -5034,6 +5096,7 @@ fn render_row(
             wb,
             chat_font,
             thought_full,
+            tool_run_open,
             theme,
         )
         .into_any_element(),
@@ -5179,11 +5242,35 @@ fn render_assistant_row(
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
+    tool_run_open: &std::collections::HashSet<(String, usize)>,
     theme: &component::Theme,
 ) -> gpui::Div {
     let mut column = div().flex().flex_col().gap_2().min_w_0();
     let last_part = row.parts.len().saturating_sub(1);
-    for (part_index, part) in row.parts.iter().enumerate() {
+    let mut part_index = 0;
+    while part_index < row.parts.len() {
+        let part = &row.parts[part_index];
+        // Adjacent tool calls with no text between them are one unit of agent
+        // work. A long turn produces dozens of context-free cards (name +
+        // output head, nothing to read them against), so the run folds into
+        // ONE collapsed summary card — the TS `group-tools` case. A lone call
+        // keeps its own card: a one-item wrapper would be pure chrome.
+        if matches!(part, PartView::ToolCall { .. }) {
+            let start = part_index;
+            while part_index < row.parts.len()
+                && matches!(row.parts[part_index], PartView::ToolCall { .. })
+            {
+                part_index += 1;
+            }
+            let run = &row.parts[start..part_index];
+            column = column.child(if run.len() > 1 {
+                let open = tool_run_open.contains(&(row.id.clone(), start));
+                render_tool_run(&row.id, start, run, open, wb, theme)
+            } else {
+                render_tool_card(&row.id, start, &run[0], wb, theme)
+            });
+            continue;
+        }
         column = match part {
             PartView::Markdown {
                 state,
@@ -5326,146 +5413,8 @@ fn render_assistant_row(
                     .text_color(theme.foreground)
                     .child(text.clone()),
             ),
-            PartView::ToolCall {
-                label,
-                status,
-                detail_head,
-                detail,
-                fold_kind,
-                expanded,
-                diff_src: _,
-                diffs,
-            } => {
-                // ToolCard (E2 — ChatView.tsx:226 `<details>`): the summary
-                // row (glyph, name, detail head) is the toggle; the body is
-                // the FULL detail in a capped, scrollable window. Replay
-                // folds (`context-handoff` / `tool-transcript`) keep the
-                // summary clean — a handoff shows the localized label (the
-                // wire title is English-only plumbing), the body text
-                // behind the expand.
-                let done = status == "completed";
-                let glyph = if done { "✓" } else { "…" };
-                let color = if done {
-                    theme.muted_foreground
-                } else {
-                    theme.accent
-                };
-                let display: SharedString =
-                    match fold_kind.as_deref() {
-                        Some("context-handoff") => t!("chat.contextHandoff").into_owned().into(),
-                        _ => label.clone(),
-                    };
-                let open_now = *expanded;
-                let row_id = row.id.clone();
-                let mut card = div()
-                    .flex()
-                    .flex_col()
-                    .my_1()
-                    .min_w_0()
-                    .rounded_lg()
-                    .bg(theme.secondary)
-                    .overflow_hidden();
-                card = card.child(
-                    div()
-                        .id(SharedString::from(format!("tool-{}-{}", row.id, part_index)))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_2()
-                        .py_1()
-                        .cursor_pointer()
-                        .hover(|h| h.bg(theme.title_bar))
-                        .on_click({
-                            let wb = wb.clone();
-                            move |_, _window, cx| {
-                                if let Some(wb) = wb.upgrade() {
-                                    wb.update(cx, |wb, cx| {
-                                        wb.set_tool_expanded(&row_id, part_index, open_now, cx)
-                                    });
-                                }
-                            }
-                        })
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_size(px(12.))
-                                .text_color(color)
-                                .child(glyph),
-                        )
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_size(px(12.))
-                                .text_color(theme.foreground)
-                                .child(display),
-                        )
-                        .when(fold_kind.is_none() && !detail_head.is_empty(), |this| {
-                            this.child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .truncate()
-                                    .font_family(theme.mono_font_family.clone())
-                                    .text_size(px(12.))
-                                    .text_color(theme.muted_foreground)
-                                    .child(detail_head.clone()),
-                            )
-                        })
-                        .child(
-                            div().ml_auto().flex_none().child(
-                                Icon::new(IconName::ChevronDown)
-                                    .small()
-                                    .flex_none()
-                                    .when(!*expanded, |icon| {
-                                        icon.rotate(radians(-std::f32::consts::FRAC_PI_2))
-                                    })
-                                    .text_color(theme.muted_foreground),
-                            ),
-                        )
-                        .test_support(),
-                );
-                if *expanded {
-                    // TS ToolCard body order: the diff blocks first, then the
-                    // plain detail <pre> under them (ChatView.tsx:240-255).
-                    let mut body = div()
-                        .id(SharedString::from(format!(
-                            "tool-detail-{}-{}",
-                            row.id, part_index
-                        )))
-                        .max_h(px(256.))
-                        .overflow_y_scroll()
-                        .min_w_0()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
-                        .line_height(relative(1.45));
-                    for (bi, block) in diffs.iter().enumerate() {
-                        body = body.child(render_diff_block(
-                            block,
-                            &row.id,
-                            part_index,
-                            bi,
-                            theme,
-                        ));
-                    }
-                    body = body.child(
-                        div()
-                            .px_2()
-                            .py(px(6.))
-                            .text_color(theme.muted_foreground)
-                            .child(if detail.is_empty() {
-                                "…".to_string()
-                            } else {
-                                detail.clone()
-                            }),
-                    );
-                    card = card.child(body.test_support());
-                }
-                column.child(card)
-            }
+            // Tool calls are handled by the run branch above.
+            PartView::ToolCall { .. } => column,
             PartView::ImageStub => column.child(
                 div()
                     .text_size(px(12.))
@@ -5479,6 +5428,7 @@ fn render_assistant_row(
                 SharedString::from(format!("msg-image-{}-{part_index}", row.id)),
             )),
         };
+        part_index += 1;
     }
     // The trailing copy affordance (E4): the message's markdown source —
     // text parts only, thoughts and tool cards stay out (the TS ActionBar
@@ -5504,6 +5454,298 @@ fn render_assistant_row(
         .when(!text.trim().is_empty(), |this| {
             this.child(copy_button(row, text, copied == Some(row.id.as_str()), wb))
         })
+}
+
+/// One tool call's card (the TS ToolCard `<details>`): the summary row
+/// (glyph, name, detail head) is the toggle; the body is the FULL detail in
+/// a capped, scrollable window. Replay folds (`context-handoff` /
+/// `tool-transcript`) keep the summary clean — a handoff shows the localized
+/// label (the wire title is English-only plumbing), the body behind expand.
+fn render_tool_card(
+    row_id: &str,
+    part_index: usize,
+    view: &PartView,
+    wb: &WeakEntity<Workbench>,
+    theme: &component::Theme,
+) -> gpui::Div {
+    let PartView::ToolCall {
+        label,
+        status,
+        detail_head,
+        detail,
+        fold_kind,
+        expanded,
+        diff_src: _,
+        diffs,
+    } = view
+    else {
+        return div();
+    };
+    let done = status == "completed";
+    let glyph = if done { "✓" } else { "…" };
+    let color = if done {
+        theme.muted_foreground
+    } else if status == "failed" {
+        theme.danger
+    } else {
+        theme.accent
+    };
+    // The wire title is the raw command: a heredoc/`&&` chain carries real
+    // newlines, which rendered as-is turned the one-line summary into a wall.
+    let display: SharedString = match fold_kind.as_deref() {
+        Some("context-handoff") => t!("chat.contextHandoff").into_owned().into(),
+        _ => tool_display_name(label).into(),
+    };
+    let open_now = *expanded;
+    let row_id_owned = row_id.to_string();
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .my_1()
+        .min_w_0()
+        .rounded_lg()
+        .bg(theme.secondary)
+        .overflow_hidden();
+    card = card.child(
+        div()
+            .id(SharedString::from(format!(
+                "tool-{}-{}",
+                row_id, part_index
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .cursor_pointer()
+            .overflow_hidden()
+            .hover(|h| h.bg(theme.title_bar))
+            .on_click({
+                let wb = wb.clone();
+                move |_, _window, cx| {
+                    if let Some(wb) = wb.upgrade() {
+                        wb.update(cx, |wb, cx| {
+                            wb.set_tool_expanded(&row_id_owned, part_index, open_now, cx)
+                        });
+                    }
+                }
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(px(12.))
+                    .text_color(color)
+                    .child(glyph),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .truncate()
+                    .font_family(theme.mono_font_family.clone())
+                    .text_size(px(12.))
+                    .text_color(theme.foreground)
+                    .child(display),
+            )
+            .when(fold_kind.is_none() && !detail_head.is_empty(), |this| {
+                this.child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(detail_head.clone()),
+                )
+            })
+            .child(
+                div().ml_auto().flex_none().child(
+                    Icon::new(IconName::ChevronDown)
+                        .small()
+                        .flex_none()
+                        .when(!*expanded, |icon| {
+                            icon.rotate(radians(-std::f32::consts::FRAC_PI_2))
+                        })
+                        .text_color(theme.muted_foreground),
+                ),
+            )
+            .test_support(),
+    );
+    if *expanded {
+        // TS ToolCard body order: the diff blocks first, then the plain
+        // detail under them (ChatView.tsx DiffBlock → detail).
+        let mut body = div()
+            .id(SharedString::from(format!(
+                "tool-detail-{}-{}",
+                row_id, part_index
+            )))
+            .max_h(px(256.))
+            .overflow_y_scroll()
+            .min_w_0()
+            .border_t_1()
+            .border_color(theme.border)
+            .font_family(theme.mono_font_family.clone())
+            .text_size(px(12.))
+            .line_height(relative(1.45));
+        for (bi, block) in diffs.iter().enumerate() {
+            body = body.child(render_diff_block(block, row_id, part_index, bi, theme));
+        }
+        body = body.child(
+            div()
+                .px_2()
+                .py(px(6.))
+                .text_color(theme.muted_foreground)
+                .whitespace_normal()
+                .child(if detail.is_empty() {
+                    "…".to_string()
+                } else {
+                    detail.clone()
+                }),
+        );
+        card = card.child(body.test_support());
+    }
+    card
+}
+
+/// The aggregated summary of an adjacent tool run (the TS `summarizeToolRun`):
+/// distinct short names in first-seen order, plus the running/failed fold. A
+/// call still pending or in flight keeps the whole run live; a failed call
+/// marks it failed without pretending it is live.
+fn tool_run_summary(run: &[PartView]) -> (Vec<String>, bool, bool) {
+    let mut names: Vec<String> = Vec::new();
+    let mut running = false;
+    let mut failed = false;
+    for view in run {
+        if let PartView::ToolCall { label, status, .. } = view {
+            let name = tool_short_name(label);
+            if !name.is_empty() && !names.contains(&name) {
+                names.push(name);
+            }
+            if status == "pending" || status == "in_progress" {
+                running = true;
+            } else if status == "failed" {
+                failed = true;
+            }
+        }
+    }
+    (names, running, failed)
+}
+
+/// A run of ADJACENT tool calls folds into one collapsed card (the TS
+/// ToolRunCard): without surrounding text each row is context-free noise,
+/// and a long turn produces dozens — the wall this card replaces. The
+/// individual cards stay inside, each still expandable.
+fn render_tool_run(
+    row_id: &str,
+    start_index: usize,
+    run: &[PartView],
+    open: bool,
+    wb: &WeakEntity<Workbench>,
+    theme: &component::Theme,
+) -> gpui::Div {
+    let (names, running, failed) = tool_run_summary(run);
+    // Same palette as the single card's glyph: accent while live, danger on
+    // failure, muted once settled.
+    let color = if running {
+        theme.accent
+    } else if failed {
+        theme.danger
+    } else {
+        theme.muted_foreground
+    };
+    let label = fill(
+        &t_count("chat.toolRun", run.len() as u64),
+        &[("count", &run.len().to_string())],
+    );
+    let row_id_owned = row_id.to_string();
+    let mut card = div()
+        .flex()
+        .flex_col()
+        .my_1()
+        .min_w_0()
+        .rounded_lg()
+        .bg(theme.secondary)
+        .overflow_hidden();
+    card = card.child(
+        div()
+            .id(SharedString::from(format!(
+                "tool-run-{}-{}",
+                row_id, start_index
+            )))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .cursor_pointer()
+            .overflow_hidden()
+            .hover(|h| h.bg(theme.title_bar))
+            .on_click({
+                let wb = wb.clone();
+                move |_, _window, cx| {
+                    if let Some(wb) = wb.upgrade() {
+                        wb.update(cx, |wb, cx| {
+                            wb.set_tool_run_open(&row_id_owned, start_index, open, cx)
+                        });
+                    }
+                }
+            })
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.))
+                    .text_color(color)
+                    .child(if running { "◆" } else { "◇" }),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.foreground)
+                    .child(label),
+            )
+            .when(!names.is_empty(), |this| {
+                this.child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(names.join(" · ")),
+                )
+            })
+            .child(
+                div().ml_auto().flex_none().child(
+                    Icon::new(IconName::ChevronDown)
+                        .small()
+                        .flex_none()
+                        .when(!open, |icon| {
+                            icon.rotate(radians(-std::f32::consts::FRAC_PI_2))
+                        })
+                        .text_color(theme.muted_foreground),
+                ),
+            )
+            .test_support(),
+    );
+    if open {
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_t_1()
+            .border_color(theme.border);
+        for (i, view) in run.iter().enumerate() {
+            body = body.child(render_tool_card(row_id, start_index + i, view, wb, theme));
+        }
+        card = card.child(body);
+    }
+    card
 }
 
 impl Render for Workbench {
@@ -6369,7 +6611,9 @@ impl Workbench {
 #[cfg(test)]
 mod display_unit_tests {
     // Explicit imports only (the file-root kit glob shadows #[test]).
-    use super::{context_pct, fmt_context, fmt_tokens, parse_task_notification, PartView, RowModel};
+    use super::{
+        context_pct, fmt_context, fmt_tokens, parse_task_notification, PartView, RowModel,
+    };
     use protocol::chat::ChatRole;
 
     fn plain_row(text: &str) -> RowModel {
@@ -6450,6 +6694,53 @@ mod display_unit_tests {
         });
         // The TS join("") has no separator.
         assert_eq!(super::row_plain_text(&row), "onetwo");
+    }
+
+    #[test]
+    fn tool_display_name_flattens_newlines_and_caps() {
+        // A heredoc command's title carries real newlines — the summary row
+        // is one line, so whitespace runs collapse.
+        let flat = super::tool_display_name("Bash: cat <<'EOF'\nimport json\nEOF");
+        assert!(!flat.contains('\n'));
+        assert_eq!(flat, "Bash: cat <<'EOF' import json EOF");
+        // Long titles cap with an ellipsis instead of measuring/rendering
+        // thousands of chars every frame.
+        let long = "x".repeat(400);
+        let capped = super::tool_display_name(&long);
+        assert!(capped.chars().count() <= 241);
+        assert!(capped.ends_with('…'));
+    }
+
+    #[test]
+    fn tool_run_summary_dedupes_names_and_folds_status() {
+        let part = |label: &str, status: &str| PartView::ToolCall {
+            label: label.into(),
+            status: status.to_string(),
+            detail_head: String::new(),
+            detail: String::new(),
+            fold_kind: None,
+            expanded: false,
+            diff_src: Vec::new(),
+            diffs: Vec::new(),
+        };
+        let run = vec![
+            part("Bash: npm test", "completed"),
+            part("Read: /tmp/a.ts", "completed"),
+            part("Bash: ls", "completed"),
+        ];
+        let (names, running, failed) = super::tool_run_summary(&run);
+        assert_eq!(names, vec!["Bash", "Read"]);
+        assert!(!running && !failed);
+
+        // A pending or in-flight call keeps the run live.
+        let live = vec![part("Bash: x", "completed"), part("Read: y", "in_progress")];
+        let (_, running, failed) = super::tool_run_summary(&live);
+        assert!(running && !failed);
+
+        // A failed call marks the run failed without faking liveness.
+        let broken = vec![part("Bash: x", "completed"), part("Read: y", "failed")];
+        let (_, running, failed) = super::tool_run_summary(&broken);
+        assert!(!running && failed);
     }
 }
 

@@ -17,6 +17,7 @@ import {
   unstable_useComposerInput,
   useExternalStoreRuntime,
   useThreadViewportAutoScroll,
+  useAuiState,
   groupPartByType,
   type ThreadMessageLike,
 } from "@assistant-ui/react";
@@ -55,6 +56,7 @@ import { useAppStore } from "../store/appStore";
 import { MarkdownText } from "../components/Markdown";
 import { Spinner } from "../components/Spinner";
 import { MAX_IMAGES, attachmentDataUrl, prepareImage } from "../lib/image";
+import { summarizeToolRun, toolNameOf, oneLine } from "./toolRun";
 import type {
   AcpDiffContent,
   AttachmentDraft,
@@ -97,6 +99,9 @@ const convertMessage = (m: ChatMessage): ThreadMessageLike => {
         args: {
           detail: p.detail,
           title: p.toolName,
+          // ACP status, for the aggregated tool-run summary (the assistant-ui
+          // part status says nothing about a call the app marked failed).
+          status: p.status,
           ...(p.kind ? { kind: p.kind } : {}),
           ...(p.rawName ? { rawName: p.rawName } : {}),
           ...(p.foldKind ? { foldKind: p.foldKind } : {}),
@@ -145,6 +150,7 @@ interface ToolCardArgs {
   kind?: string;
   rawName?: string;
   title?: string;
+  status?: string;
   foldKind?: string;
   diffs?: string;
 }
@@ -215,13 +221,17 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
   const Icon = meta.icon;
   // `toolName` holds the wire title "Bash: npm test"; prefer the raw backend
   // name, else the segment before the first colon. Handoff folds use the
-  // localized label — the wire title is English-only plumbing.
+  // localized label — the wire title is English-only plumbing. The title is
+  // the RAW command, so a heredoc carries newlines: flatten it to one line or
+  // the summary row turns into a wall of script.
   const name =
     foldKind === "context-handoff"
       ? t("chat.contextHandoff")
-      : a.rawName ||
-        (a.title ?? part.toolName).split(":")[0]?.trim() ||
-        part.toolName;
+      : oneLine(
+          a.rawName ||
+            (a.title ?? part.toolName).split(":")[0]?.trim() ||
+            part.toolName,
+        );
   return (
     <details className="group my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04] text-xs">
       <summary className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-dim">
@@ -254,6 +264,73 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
         </pre>
       )}
     </details>
+  );
+}
+
+// One run of ADJACENT tool calls folds into a single collapsed card. Without
+// surrounding text each row is context-free noise (name + output head), and a
+// long agent turn produces dozens — the wall the aggregated card replaces.
+// Individual ToolCards stay inside, each still expandable; the caller renders
+// a lone call as a plain card (no wrapper for a single row).
+function ToolRunCard({
+  indices,
+  children,
+}: {
+  indices: readonly number[];
+  children: ReactNode;
+}) {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  // The message's parts give the summary its names/status; the group node
+  // itself carries only indices. `indices` is a fresh array per render, so
+  // the memo keys on its joined identity instead of the reference.
+  const parts = useAuiState((s) => s.message.parts);
+  const indexKey = indices.join(",");
+  const summary = useMemo(
+    () =>
+      summarizeToolRun(
+        indexKey.split(",").flatMap((raw) => {
+          const p = parts[Number(raw)];
+          if (p?.type !== "tool-call") return [];
+          const a = (p.args ?? {}) as ToolCardArgs;
+          return [{ name: toolNameOf(a, p.toolName), status: a.status ?? "" }];
+        }),
+      ),
+    [indexKey, parts],
+  );
+  return (
+    <div className="my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04]">
+      <button
+        onClick={() => setOpen((o) => !o)}
+        className="flex w-full min-w-0 items-center gap-1.5 px-3 py-2 text-left"
+      >
+        <Wrench
+          className={`size-3.5 shrink-0 ${
+            summary.running
+              ? "animate-pulse text-emerald-400"
+              : summary.failed
+                ? "text-red-400"
+                : "text-faint"
+          }`}
+        />
+        <span className="shrink-0 text-xs font-medium text-dim">
+          {t("chat.toolRun", { count: summary.count })}
+        </span>
+        <span className="min-w-0 flex-1 truncate text-xs text-faint">
+          {summary.names.join(" · ")}
+        </span>
+        <ChevronDown
+          className={`ml-auto size-3.5 shrink-0 text-faint transition-transform duration-200 ${
+            open ? "rotate-180" : ""
+          }`}
+        />
+      </button>
+      {open && (
+        <div className="flex flex-col gap-1 border-t border-hairline px-2 py-1.5">
+          {children}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -467,7 +544,13 @@ const AssistantMessage = memo(function AssistantMessage() {
     <MessagePrimitive.Root className="min-w-0">
       <div className="w-full text-[15px] leading-relaxed text-ink">
         <MessagePrimitive.GroupedParts
-          groupBy={groupPartByType({ reasoning: ["group-reasoning"] })}
+          groupBy={groupPartByType({
+            reasoning: ["group-reasoning"],
+            // Adjacent tool calls with no text between them read as one unit
+            // of agent work: collapse the run into a single summary card.
+            // Text parts are ungrouped, so they end the run naturally.
+            "tool-call": ["group-tools"],
+          })}
         >
           {({ part, children }) => {
             switch (part.type) {
@@ -476,6 +559,14 @@ const AssistantMessage = memo(function AssistantMessage() {
                   <ThoughtCard streaming={part.status.type === "running"}>
                     {children}
                   </ThoughtCard>
+                );
+              case "group-tools":
+                // A single call renders bare — its own ToolCard already is
+                // the summary, and a one-item wrapper would be pure chrome.
+                return part.indices.length > 1 ? (
+                  <ToolRunCard indices={part.indices}>{children}</ToolRunCard>
+                ) : (
+                  <>{children}</>
                 );
               case "reasoning":
                 return part.text ? (

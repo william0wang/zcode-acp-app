@@ -40,6 +40,8 @@
     "untitled": "Untitled session",
     "thinking": "Thinking…",
     "thought": "Thought",
+    "toolRun_one": "{{count}} tool call",
+    "toolRun_other": "{{count}} tool calls",
     "contextHandoff": "Previous context summary",
     "taskNotice": "Task notification",
     "pending": "Pending",
