@@ -205,11 +205,41 @@ export interface OllamaUsageStats {
   windows?: OcWindowEntry[];
 }
 
+// CLIProxy Gemini section (bridge 0.66, server handlers/account.ts
+// `CpUsageStats`): one pool of subscriptions behind CLIProxyAPI. `accounts`
+// carries the per-subscription, per-model detail; `combined` is the pool-wide
+// per-window row set the side-panel card renders.
+export interface CpWindowEntry {
+  /** "5h" | "week" — permissive like the other vocab fields. */
+  window: string;
+  usedPercent: number;
+  resetsAt?: number;
+}
+
+export interface CpModelEntry {
+  name: string;
+  windows: CpWindowEntry[];
+}
+
+export interface CpAccountEntry {
+  label: string;
+  models: CpModelEntry[];
+}
+
+export interface CliproxyUsageStats {
+  kind: "success" | "not_configured" | "auth_error" | "unavailable";
+  accounts?: CpAccountEntry[];
+  combined?: CpWindowEntry[];
+  otherAccounts?: number;
+}
+
 export interface AccountUsageStats {
   glm: GlmUsageStats;
   opencode: GoUsageStats;
   // Optional: hub payloads before bridge 0.41.0 carry no ollama section.
   ollama?: OllamaUsageStats;
+  // Optional: hub payloads before bridge 0.66 carry no cliproxy section.
+  cliproxy?: CliproxyUsageStats;
 }
 
 // available_commands_update entry (ACP AvailableCommand shape): the bridge's

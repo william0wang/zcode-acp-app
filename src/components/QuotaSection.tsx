@@ -236,6 +236,31 @@ export function QuotaSection() {
                 )}
               </>
             )}
+
+            {/* CLIProxy pool (bridge 0.66): the combined per-window rows — the
+                per-account breakdown stays with the CLI, like GLM's per-model
+                detail. Parity with the desktop card's section. */}
+            {usageStats.cliproxy &&
+              usageStats.cliproxy.kind !== "not_configured" && (
+                <>
+                  <SectionLabel title="CLIProxy Gemini" divided />
+                  {usageStats.cliproxy.kind === "success" ? (
+                    usageStats.cliproxy.combined?.map((w) => (
+                      <QuotaRow
+                        key={w.window}
+                        label={w.window}
+                        percent={w.usedPercent}
+                        resetMs={w.resetsAt}
+                      />
+                    ))
+                  ) : (
+                    <p className="px-4 py-1 text-xs text-faint">
+                      {GO_STATUS[usageStats.cliproxy.kind] ??
+                        GO_STATUS.unavailable}
+                    </p>
+                  )}
+                </>
+              )}
           </>
         )
       )}
