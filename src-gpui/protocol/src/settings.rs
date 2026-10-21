@@ -38,6 +38,27 @@ pub struct WriteEffect {
     pub error: Option<String>,
 }
 
+/// The answer to `POST /settings/models/test` (server
+/// `settings/model-connectivity.ts` `ConnectivityResult`).
+///
+/// A failed probe is a normal answer: the provider's own message rides
+/// `message`, and the `reason` field is set only when no request could be sent
+/// at all (an unfinished form is the usual cause), which the UI words
+/// differently from "the provider said no".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectivityResult {
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+}
+
 /// Body of `POST /settings/models` — an upsert: it adds a model to a provider
 /// or edits its personal rule. Only the fields present change; the route maps
 /// `contextWindow` into `properties` and `reasoningLevels` into `optionSpecs`.
@@ -196,6 +217,55 @@ pub struct AgentUpsert {
     pub model_id: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_level: Option<String>,
+    /// The system-prompt body; `Some(None)` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub system_prompt: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub tools: Option<Option<Vec<String>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub disallowed_tools: Option<Option<Vec<String>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub skills: Option<Option<Vec<String>>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub permission_mode: Option<Option<String>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub max_turns: Option<Option<u32>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub background: Option<Option<bool>>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "double_option"
+    )]
+    pub inject_agents_md: Option<Option<bool>>,
 }
 
 /// The two card windows the reset API sells (server `ResetType`).

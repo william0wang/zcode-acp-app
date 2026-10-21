@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 
 use crate::acp::{ConfigOption, ContextUsage, SessionUpdate, SlashCommand};
-use crate::chat::{ChatMessage, ChatPart, ChatRole, PromptDraft, TurnStats};
+use crate::chat::{AttachmentDraft, ChatMessage, ChatPart, ChatRole, PromptDraft, TurnStats};
 use crate::replay::{
     apply_one, bridge_supports_page_marker, is_earlier_page_meta, is_local_message_id,
     read_replay_meta, snapshot_tail_id, ApplyPatch, MessageFactory, PlanEntry, ReplayMeta,
@@ -85,6 +85,10 @@ pub struct PromptRequest {
     /// The wire prompt content blocks (text + image attachments).
     pub prompt: Vec<Value>,
     pub started_at_ms: u64,
+    /// The optimistic user bubble `run_prompt` inserted for this request, so
+    /// a server-side rejection (the turn never ran) can retract it when the
+    /// draft goes back to the queue.
+    pub bubble_id: String,
 }
 
 /// Per-session display state (session-list badges). Not persisted: after a
@@ -111,10 +115,12 @@ pub enum SendOutcome {
 /// What `force_send_pending` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForceSendOutcome {
-    /// Target moved to the front and the running turn was cancelled — the
-    /// settle-flush then sends the reordered head.
+    /// Target moved to the front and our own running turn was cancelled —
+    /// the cancelled prompt's settle-flush then sends the reordered head.
     ReorderedAndCancelled,
-    /// Target sent immediately (no turn was running).
+    /// Target sent immediately: no turn was running, or the running turn
+    /// was foreign/restored (cancelled first, never waited on — its settle
+    /// does not come back to this connection).
     Sent,
     /// Refused: no session, empty queue, replay in flight, or disconnected
     /// (run_prompt would silently swallow the draft).
@@ -197,8 +203,9 @@ pub struct SessionCore {
     /// True while a session/prompt WE sent is in flight. Turn-end
     /// notifications ($/zcode/turnState) arrive before the prompt response;
     /// those turns settle in the prompt's own finally, so the notification
-    /// path must not double-settle.
-    local_prompt_active: bool,
+    /// path must not double-settle. The quit dialog reads it to tell turns
+    /// this client started from other clients' turns.
+    pub local_prompt_active: bool,
     factory: MessageFactory,
     cache: SessionCache,
     /// The 120ms update-coalescing batch (drained by flush_update_batch).
@@ -617,6 +624,7 @@ impl SessionCore {
             return;
         }
         let mut msg = self.factory.new_message(ChatRole::User, now_ms);
+        let bubble_id = msg.id.clone();
         if !draft.text.is_empty() {
             append_text(&mut msg, &draft.text);
         }
@@ -645,6 +653,7 @@ impl SessionCore {
             session_id: sid,
             prompt,
             started_at_ms: now_ms,
+            bubble_id,
         }));
     }
 
@@ -658,10 +667,28 @@ impl SessionCore {
         self.settle_prompt(now_ms);
     }
 
-    /// The prompt request failed. A dropped connection kills the in-flight
-    /// prompt, but the reconnect replay rebuilds the truth — the caller's
-    /// transient/not distinction only shaped notices (not ported).
-    pub fn on_prompt_failed(&mut self, now_ms: u64) {
+    /// The prompt request failed. Transport failures ("connection closed" /
+    /// "connection not open") keep the drop-and-replay behavior — the turn
+    /// may have run, and re-sending could duplicate it. Any OTHER failure is
+    /// the server explicitly rejecting the prompt (compaction busy window,
+    /// "a prompt is already running"): the turn definitely never ran, so the
+    /// optimistic bubble is retracted and the draft goes back to the HEAD of
+    /// the queue instead of vanishing — the next settle (the compaction's
+    /// running:false, the next turn end) or a force-send flushes it. The
+    /// rejected settle does NOT flush: a still-rejecting bridge would
+    /// livelock the queue into a reject-resend loop.
+    pub fn on_prompt_failed(&mut self, now_ms: u64, req: Option<&PromptRequest>, error: &str) {
+        if let Some(req) = req.filter(|_| !is_transport_error(error)) {
+            let sid = req.session_id.clone();
+            self.messages.retain(|m| m.id != req.bubble_id);
+            let mut queue = self.pending_prompts.remove(&sid).unwrap_or_default();
+            queue.insert(0, draft_from_prompt(&req.prompt));
+            self.set_queue(&sid, queue);
+            self.local_prompt_active = false;
+            self.is_running = false;
+            self.cache_active_snapshot();
+            return;
+        }
         self.settle_prompt(now_ms);
     }
 
@@ -706,7 +733,23 @@ impl SessionCore {
             self.outbox.push(WireRequest::CancelTurn {
                 session_id: sid.clone(),
             });
-            ForceSendOutcome::ReorderedAndCancelled
+            if self.local_prompt_active {
+                // Own turn: the cancelled prompt's response settles here and
+                // the settle-flush sends the reordered head.
+                ForceSendOutcome::ReorderedAndCancelled
+            } else {
+                // Foreign/restored turn: its prompt response goes to the
+                // connection that prompted it, and a turn-end broadcast may
+                // never arrive here either — waiting for a settle dead-ends
+                // the queue (force-send from an attached client never sent).
+                // The cancel stops the turn; if it is still draining when the
+                // prompt lands, the bridge preempts in-flight turns on
+                // session/prompt anyway, so send the head immediately.
+                self.is_running = false;
+                self.cache_active_snapshot();
+                self.flush_pending(now_ms);
+                ForceSendOutcome::Sent
+            }
         } else {
             let head = reordered.remove(0);
             self.set_queue(&sid, reordered);
@@ -1202,6 +1245,47 @@ fn append_text(msg: &mut crate::chat::ChatMessage, text: &str) {
     crate::replay::append_text_part(msg, text, TextPartKind::Text);
 }
 
+/// Transport-level prompt failures: the request never got a server answer,
+/// so the turn may or may not have run — replay decides, never a re-send.
+/// The strings are AcpRequestError's two non-server shapes (acp_client.rs).
+fn is_transport_error(error: &str) -> bool {
+    error == "connection closed" || error == "connection not open"
+}
+
+/// Rebuild the queue draft from the wire prompt blocks `run_prompt` sent
+/// (one text block, then image attachments).
+fn draft_from_prompt(prompt: &[Value]) -> PromptDraft {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in prompt {
+        match block.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+            Some("image") => {
+                let data = block.get("data").and_then(Value::as_str).unwrap_or_default();
+                let mime_type = block
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if !data.is_empty() {
+                    images.push(AttachmentDraft {
+                        mime_type: mime_type.to_owned(),
+                        data: data.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    PromptDraft { text, images }
+}
+
 fn parse_config_options(result: &Value) -> Vec<ConfigOption> {
     result
         .get("configOptions")
@@ -1514,6 +1598,82 @@ mod tests {
         let req_c = find_prompt(&mut core);
         assert!(serde_json::to_string(&req_c.prompt).unwrap().contains("C"));
         assert_eq!(queue_texts(&core, "sess_1"), vec!["B"]);
+    }
+
+    #[test]
+    fn force_send_pending_flushes_now_under_a_foreign_turn() {
+        let mut core = connected_core();
+
+        // A restored/attached turn runs on ANOTHER connection: running flag
+        // up, but no prompt of ours in flight — its settle (prompt response
+        // or a cx-targeted turnState end) never reaches this client.
+        core.is_running = true;
+        assert_eq!(core.send_prompt(2100, "B", vec![]), SendOutcome::Queued);
+        assert_eq!(core.send_prompt(2200, "C", vec![]), SendOutcome::Queued);
+
+        // Force-send B: cancel the foreign turn AND put B on the wire now —
+        // waiting for a settle that cannot arrive here dead-ended the queue.
+        assert_eq!(core.force_send_pending(2300, None), ForceSendOutcome::Sent);
+        let wire = core.take_wire();
+        assert!(matches!(
+            wire.as_slice(),
+            [WireRequest::CancelTurn { .. }, WireRequest::Prompt(_)]
+        ));
+        let req_b = match wire.into_iter().nth(1) {
+            Some(WireRequest::Prompt(p)) => p,
+            other => panic!("expected B's prompt after the cancel, got {other:?}"),
+        };
+        assert!(core.is_running && core.local_prompt_active);
+        assert_eq!(queue_texts(&core, "sess_1"), vec!["C"]);
+
+        // The new turn is ours: its own settle flushes C and the queue
+        // drains without any foreign signal.
+        core.on_prompt_result(2400, &req_b, &json!({}));
+        let req_c = find_prompt(&mut core);
+        assert!(serde_json::to_string(&req_c.prompt).unwrap().contains("C"));
+        assert!(core.pending_prompts.get("sess_1").is_none());
+    }
+
+    #[test]
+    fn rejected_prompt_requeues_the_draft_instead_of_dropping_it() {
+        let mut core = connected_core();
+
+        // The prompt goes out (compaction busy window answers with a server
+        // error — the turn never ran); B queues behind it.
+        assert_eq!(core.send_prompt(2000, "keep me", vec![]), SendOutcome::Ran);
+        let req = find_prompt(&mut core);
+        let bubble_id = req.bubble_id.clone();
+        core.send_prompt(2100, "queued behind", vec![]);
+
+        core.on_prompt_failed(2200, Some(&req), "auto-compact busy");
+
+        // The optimistic bubble is retracted, the draft back at the HEAD
+        // (ahead of the queued follow-up), and NOTHING re-sent yet — the
+        // next settle flushes it.
+        assert!(core.messages.iter().all(|m| m.id != bubble_id));
+        assert_eq!(queue_texts(&core, "sess_1"), vec!["keep me", "queued behind"]);
+        assert!(!core.is_running && !core.local_prompt_active);
+        assert!(core.take_wire().is_empty());
+
+        // The compaction settles: the turn-end broadcast flushes the head.
+        core.on_turn_state(2300, "sess_1", false, None);
+        let req_retry = find_prompt(&mut core);
+        assert!(serde_json::to_string(&req_retry.prompt).unwrap().contains("keep me"));
+        assert_eq!(queue_texts(&core, "sess_1"), vec!["queued behind"]);
+    }
+
+    #[test]
+    fn transport_failed_prompt_keeps_the_drop_and_replay_behavior() {
+        let mut core = connected_core();
+
+        assert_eq!(core.send_prompt(2000, "maybe ran", vec![]), SendOutcome::Ran);
+        let req = find_prompt(&mut core);
+        core.on_prompt_failed(2100, Some(&req), "connection closed");
+
+        // No re-queue: the turn may have run — the reconnect replay rebuilds
+        // the truth, a re-send could duplicate it.
+        assert!(core.pending_prompts.get("sess_1").is_none());
+        assert!(!core.is_running);
     }
 
     #[test]

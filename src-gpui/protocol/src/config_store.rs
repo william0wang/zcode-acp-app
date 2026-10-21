@@ -648,7 +648,7 @@ impl<T: HttpTransport> ConfigStore<T> {
     /// Combined quota via the hub's /api/quota — pull-only, errors land in
     /// `quota_unavailable` (hide data, retry later), never in a toast.
     pub async fn refresh_usage_stats(&self) {
-        match self.client.settings_quota().await {
+        match self.client.quota().await {
             Ok(result) => {
                 // parseUsageStats: a payload that does not fit the combined
                 // GLM + Opencode Go (+ optional Ollama) shape nulls the data

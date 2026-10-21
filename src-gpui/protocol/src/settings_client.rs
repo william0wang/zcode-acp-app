@@ -27,9 +27,10 @@ use serde_json::Value;
 
 use crate::hub::{ConnectionProfile, HubUpgradeResult};
 use crate::settings::{
-    AgentUpsert, BackendRestartResult, HookEntryPatch, McpServerUpsert, ModelUpsert,
-    PendingRestartStatus, ResetCardStatus, ResetOpportunityRequest, ResetOpportunityResponse,
-    SettingsAll, SpendResetCard, WorkflowGateModeSetting, WorkflowGateSetResponse, WriteEffect,
+    AgentUpsert, BackendRestartResult, ConnectivityResult, HookEntryPatch, McpServerUpsert,
+    ModelUpsert, PendingRestartStatus, ResetCardStatus, ResetOpportunityRequest,
+    ResetOpportunityResponse, SettingsAll, SpendResetCard, WorkflowGateModeSetting,
+    WorkflowGateSetResponse, WriteEffect,
 };
 use crate::system_stats::SystemStatsResponse;
 use crate::workflow::{
@@ -351,9 +352,14 @@ impl<T: HttpTransport> HubHttpClient<T> {
     }
 
     /// Account quota (bridge 0.8.0, ADR-0005): the `account/usage_stats`
-    /// payload without an instance connection.
-    pub async fn settings_quota(&self) -> Result<Value, HubApiError> {
-        self.fetch_json(Method::Get, "/api/settings/quota", None, FetchOptions::default())
+    /// payload without an instance connection. Reads the hub's `/api/quota`
+    /// — the route the TS app's `client.quota()` uses — whose body is the
+    /// RAW combined payload. The settings mount's `/settings/quota` wraps
+    /// the same data in a `{ok, quota}` envelope; reading that route and
+    /// parsing it bare silently yields "no data" on every successful fetch,
+    /// so this client sticks to the hub route.
+    pub async fn quota(&self) -> Result<Value, HubApiError> {
+        self.fetch_json(Method::Get, "/api/quota", None, FetchOptions::default())
             .await
     }
 
@@ -494,12 +500,32 @@ impl<T: HttpTransport> HubHttpClient<T> {
             .await
     }
 
+    /// POST /settings/models/test — one minimal request against the provider.
+    ///
+    /// The answer is always `Ok` for a provider-side failure: a refused key or
+    /// an unreachable host is the RESULT of the probe, not an error of it, and
+    /// the UI paints it next to the row.
+    pub async fn test_model_connectivity(
+        &self,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<ConnectivityResult, HubApiError> {
+        let body = serde_json::json!({
+            "providerId": provider_id,
+            "modelId": model_id,
+        });
+        let value: Value = self
+            .fetch_json(Method::Post, "/api/settings/models/test", Some(body), FetchOptions::default())
+            .await?;
+        serde_json::from_value(value.get("result").cloned().unwrap_or(Value::Null))
+            .map_err(|e| HubApiError::Unexpected(format!("decode connectivity result: {e}")))
+    }
+
     pub async fn remove_model(
         &self,
         provider_id: &str,
         model_id: &str,
-    ) -> Result<WriteEffect, HubApiError> {
-        let path = format!(
+    ) -> Result<WriteEffect, HubApiError> {        let path = format!(
             "/api/settings/models/{}/{}",
             encode_uri_component(provider_id),
             encode_uri_component(model_id)

@@ -59,6 +59,21 @@ pub struct ProviderRef {
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The endpoint the provider dials. Editable only for a provider declared
+    /// in this machine's `provider_config.json` (a bundled or account-managed
+    /// one has no rule there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// The API protocol: `anthropic-messages`, `openai-chat-completions`, or
+    /// `openai-responses`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_type: Option<String>,
+    /// Whether an API key is on file. The key itself never travels — the
+    /// settings payload crosses a WebSocket and the client has no use for it.
+    #[serde(default)]
+    pub has_api_key: bool,
 }
 
 /// The GET /settings/models payload: an OBJECT with `available` +
@@ -608,6 +623,11 @@ pub struct SkillRow {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// The server's verdict (skills.ts `deletable`): user/agents-tree skills
+    /// only — plugin skills belong to the plugin install, project skills to
+    /// the workspace, and the delete route refuses both anyway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
 }
@@ -623,6 +643,11 @@ impl SkillRow {
     /// is switched off.
     pub fn is_enabled(&self) -> bool {
         self.enabled != Some(false)
+    }
+
+    /// Only the server's `deletable: true` rows offer the delete control.
+    pub fn is_deletable(&self) -> bool {
+        self.deletable == Some(true)
     }
 }
 
@@ -659,6 +684,10 @@ pub struct AgentRow {
     /// The resolved model override (a built-in's), when one is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_selection: Option<AgentModelSelection>,
+    /// The markdown body below the frontmatter — the agent's system prompt.
+    /// Empty for a built-in (it has no file).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
 }
 
 /// The frontmatter fields the write route patches (a personal agent's own
@@ -677,6 +706,20 @@ pub struct AgentFrontmatter {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thought_level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disallowed_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_agents_md: Option<bool>,
 }
 
 /// The resolved override a built-in carries (server `modelSelection`).
