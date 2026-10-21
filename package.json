@@ -23,7 +23,7 @@
     "tauri": "tauri",
     "build:android": "bash scripts/build-android.sh",
     "build:android:debug": "bash scripts/build-android.sh --debug",
-    "build:macos": "bash scripts/build-macos.sh",
+    "build:macos": "bash scripts/build-macos-gpui.sh",
     "deploy:web": "bash scripts/deploy-web.sh",
     "release": "bash scripts/release.sh"
   },
