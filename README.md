@@ -21,11 +21,13 @@ directory (`~/.config/zcode-acp-remote`).
 | **Android** (`src/` + `src-tauri/`) | Tauri 2 + React + TypeScript | Android APK |
 | **Web** (same `src/`) | Plain SPA, no Tauri APIs | Any browser |
 
-The desktop workbench is a dock-style window: a rail of panel toggles, the
-sessions and configuration panels docked beside a tabbed chat area, and the
-active session's file browser on the right. The Android and web clients share
-one React codebase; the desktop client is its own product line, not a port of
-it (ADR-0009). Both compile the same i18n catalogs.
+The desktop workbench is a dock-style window: a rail of toggles, the sessions
+panel docked beside a tabbed chat area, the active session's file browser on
+the right, and a left overlay drawer — opened from the rail — for settings
+and the full quota display, floating above the layout without displacing it.
+The Android and web clients share one React codebase; the desktop client is
+its own product line, not a port of it (ADR-0009). Both compile the same
+i18n catalogs.
 
 ## Features
 
@@ -124,13 +126,11 @@ after changing the design.
 ## Desktop workbench
 
 ```bash
-./scripts/build-macos-gpui.sh   # native gpui build -> dist/ZCode-acp.app
-pnpm build:macos                # WebView shell build -> dist/ZCode-acp.app
+./scripts/build-macos-gpui.sh   # or: pnpm build:macos -> dist/ZCode-acp.app
 ```
 
-Two different macOS builds write the same bundle path and replace each other by
-design: the native workbench (gpui, the desktop product line) and the Tauri
-WebView shell (the same React UI the phone runs). Neither is signed (no
+The native gpui workbench is the one desktop client — the old Tauri WebView
+shell build is retired (the Tauri tree builds the Android app). Unsigned (no
 Developer ID, no notarization): it runs as built on your machine; on another
 machine Gatekeeper needs a one-time right-click → Open.
 

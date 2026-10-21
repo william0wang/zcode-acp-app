@@ -19,8 +19,9 @@
 | **Android**（`src/` + `src-tauri/`） | Tauri 2 + React + TypeScript | Android APK |
 | **Web**（同一份 `src/`） | 纯 SPA，不使用 Tauri API | 任意浏览器 |
 
-桌面工作台是停靠式窗口：左侧图标栏切换面板，会话面板和配置面板停靠在带标签页的
-聊天区旁边，右侧是当前会话的文件浏览器。Android 和 Web 共用同一套 React 代码；
+桌面工作台是停靠式窗口：左侧图标栏切换面板，会话面板停靠在带标签页的聊天区旁边，
+右侧是当前会话的文件浏览器；设置与全部配额展示是左侧浮层抽屉——从图标栏打开，
+悬浮在界面之上，不挤占原有布局。Android 和 Web 共用同一套 React 代码；
 桌面端是独立的产品线，不是它的移植（ADR-0009）。两端编译同一套 i18n 词表。
 
 ## 功能
@@ -107,14 +108,12 @@ Release 构建使用 `.signing/` 目录下的密钥签名（已 gitignore；请�
 ## 桌面工作台
 
 ```bash
-./scripts/build-macos-gpui.sh   # 原生 gpui 构建 -> dist/ZCode-acp.app
-pnpm build:macos                # WebView 外壳构建 -> dist/ZCode-acp.app
+./scripts/build-macos-gpui.sh   # 或：pnpm build:macos -> dist/ZCode-acp.app
 ```
 
-两种 macOS 构建写入同一个产物路径，按设计互相覆盖：原生工作台（gpui，桌面产品线）
-和 Tauri WebView 外壳（手机端运行的那套 React 界面）。两者都未签名
-（无 Developer ID / 公证）：在构建机上直接可用；拷到其他机器需绕过
-Gatekeeper（右键 → 打开）。
+原生 gpui 工作台是唯一的桌面客户端——旧的 Tauri WebView 外壳构建已移除
+（Tauri 树只构建 Android 应用）。未签名（无 Developer ID / 公证）：在构建机上
+直接可用；拷到其他机器需绕过 Gatekeeper（右键 → 打开）。
 
 ## 独立 Web 部署
 

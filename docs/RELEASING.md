@@ -53,6 +53,24 @@ from the CURRENT version string in `src-tauri/tauri.conf.json` and copies it
 to `dist/ZCode-ACP-v<version>-release.apk`. No commits, no tag — for
 on-device verification before cutting a release.
 
+### Gradle and Kotlin daemons
+
+Gradle normally keeps a daemon alive after the build, and the Kotlin compiler
+starts a second one; together they hold well over a gigabyte until the
+machine reboots. This project is built from the CLI only, never from an IDE,
+so the daemon's reuse benefit does not apply:
+
+- `src-tauri/gen/android/gradle.properties` sets `org.gradle.daemon=false` and
+  `kotlin.compiler.execution.strategy=in-process`, so a build does not leave a
+  daemon behind in the first place.
+- `scripts/build-android.sh` additionally stops both on exit — success or
+  failure — via `./gradlew --stop` plus a `KotlinCompileDaemon` sweep. That
+  trap is the backstop for a leftover from an earlier run, or for an IDE build
+  that overrides the properties.
+
+If a build is interrupted hard (SIGKILL, machine sleep), stop the stragglers
+with `cd src-tauri/gen/android && ./gradlew --stop && pkill -f KotlinCompileDaemon`.
+
 ## Official release
 
 `scripts/release.sh <version>` from a clean `main`:
