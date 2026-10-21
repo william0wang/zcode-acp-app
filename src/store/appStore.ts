@@ -1957,9 +1957,10 @@ export const useAppStore = create<AppState>((set, get) => {
     // Resume a closed session from the project history listing (bridge
     // 0.19.0, ADR-0015): the store id (`sess_…`) rides the POST body so the
     // hub incubates a resume TUI that boots straight into the session
-    // (ADR-0017) — always a NEW instance, never the listing's live serve
-    // bridge. The attach below then session/loads the same id on that
-    // instance, sharing the bridge (and backend process) with the window.
+    // (ADR-0017) — a NEW instance, never the listing's live serve bridge,
+    // unless the desktop app is present (app ADR-0010): then the hub answers
+    // with the live bridge (`reused: true`) and no window opens. The attach
+    // below session/loads the same id on whichever instance came back.
     resumeProjectSession: async (workspacePath, sessionId) => {
       const client = hub();
       if (!client) return false;
@@ -2628,28 +2629,32 @@ export const useAppStore = create<AppState>((set, get) => {
       // flushed (response racing the trailing chunks, or a failed turn) —
       // appending to the previous user bubble merged them into one and
       // garbled the transcript.
-      set((state) => {
-        let msg = newMessage("user");
-        if (draft.text) msg = appendTextPart(msg, draft.text, "text");
-        for (const img of draft.images) {
-          // Display form is the data URL; the wire block stays base64.
-          msg = {
-            ...msg,
-            parts: [
-              ...msg.parts,
-              {
-                type: "image",
-                image: `data:${img.mimeType};base64,${img.data}`,
-              } as ChatPart,
-            ],
-          };
-        }
-        return { messages: [...state.messages, msg] };
-      });
+      let msg = newMessage("user");
+      if (draft.text) msg = appendTextPart(msg, draft.text, "text");
+      for (const img of draft.images) {
+        // Display form is the data URL; the wire block stays base64.
+        msg = {
+          ...msg,
+          parts: [
+            ...msg.parts,
+            {
+              type: "image",
+              image: `data:${img.mimeType};base64,${img.data}`,
+            } as ChatPart,
+          ],
+        };
+      }
+      set((state) => ({ messages: [...state.messages, msg] }));
       const sessionId = s.activeSessionId;
       const startedAt = Date.now();
       set({ isRunning: true });
       localPromptActive = true;
+      // A server-rejected prompt (compaction busy window, "a prompt is
+      // already running") never ran: the bubble is retracted and the draft
+      // goes back to the HEAD of the queue — the next settle or a
+      // force-send flushes it. No auto-flush below: a still-rejecting
+      // bridge would livelock the queue into a reject-resend loop.
+      let rejected = false;
       try {
         const result = (await acp.request("session/prompt", {
           sessionId,
@@ -2672,9 +2677,19 @@ export const useAppStore = create<AppState>((set, get) => {
           Math.max((Date.now() - startedAt) / 1000, 0.1),
         );
       } catch (e) {
-        // A dropped connection kills the in-flight prompt, but the reconnect
-        // replay rebuilds the truth — stay quiet and let the banner speak.
-        if (!isTransientConnError(e)) set({ notice: `prompt failed: ${(e as Error).message}` });
+        if (isTransientConnError(e)) {
+          // A dropped connection kills the in-flight prompt, but the
+          // reconnect replay rebuilds the truth — stay quiet and let the
+          // banner speak. The turn may have run, so the draft is NOT
+          // re-queued (a re-send could duplicate it).
+        } else {
+          rejected = true;
+          set((state) => ({
+            messages: state.messages.filter((m) => m.id !== msg.id),
+          }));
+          setQueue(sessionId, [draft, ...(get().pendingPrompts[sessionId] ?? [])]);
+          set({ notice: `prompt failed: ${(e as Error).message}` });
+        }
       } finally {
         localPromptActive = false;
         set({ isRunning: false });
@@ -2684,7 +2699,8 @@ export const useAppStore = create<AppState>((set, get) => {
         void get().refreshQuotaDock();
         // Auto-flush: the queue is FIFO, and each settled turn sends the next.
         // A concurrent re-attach defers to loadSession's own flush instead.
-        flushPending();
+        // A rejected prompt skips it — its draft just went back to the head.
+        if (!rejected) flushPending();
       }
     },
 
@@ -2700,9 +2716,9 @@ export const useAppStore = create<AppState>((set, get) => {
       // post-reconnect flush owns the queue until the socket is back.
       if (s.connState !== "open") return;
       // Any bubble's button sends THAT draft, not the head: move it to the
-      // front (order of the rest is untouched) and let the settle-flush pick
-      // it up — cancelling settles the running turn, whose finally-flush then
-      // sends the reordered head.
+      // front (order of the rest is untouched). Own running turn: cancel and
+      // let the settle-flush pick it up. Foreign/restored turn: cancel AND
+      // flush now — its settle goes to the connection that prompted it.
       const i = Math.min(Math.max(index ?? 0, 0), queue.length - 1);
       const reordered = [
         queue[i],
@@ -2711,6 +2727,16 @@ export const useAppStore = create<AppState>((set, get) => {
       if (s.isRunning) {
         setQueue(sid, reordered);
         get().cancelTurn();
+        if (!localPromptActive) {
+          // Foreign/restored turn: the prompt response goes to the prompting
+          // connection and a turn-end broadcast may never arrive here either
+          // — waiting for the settle-flush dead-ends the queue. The cancel
+          // stops the turn; anything still draining is preempted by the
+          // prompt itself, so flush the head immediately.
+          set({ isRunning: false });
+          cacheActiveSnapshot();
+          flushPending();
+        }
       } else {
         setQueue(sid, reordered.slice(1));
         void get().runPrompt(reordered[0]);

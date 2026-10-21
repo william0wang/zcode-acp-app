@@ -222,9 +222,14 @@ export class HubClient {
    * ~20s — let the fetch run, no client-side timeout. 403 = path not on the
    * projects list; 502 = spawn failed or the bridge never registered.
    *
+   * Desktop Presence (app ADR-0010) changes both halves: while the desktop
+   * app is present the spawn is headless, and the workspace's live serve
+   * bridge answers instead (`reused: true`, no spawn).
+   *
    * `sessionId` (ADR-0017, bridge-side resume) makes the spawned TUI boot
-   * straight into that session instead of a fresh conversation; the answer is
-   * always the NEW instance (resume never reuses a live serve bridge).
+   * straight into that session instead of a fresh conversation; without
+   * Desktop Presence the answer is always the NEW instance (resume never
+   * reuses a live serve bridge).
    */
   async createInstance(
     workspacePath: string,

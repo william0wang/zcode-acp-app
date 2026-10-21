@@ -27,7 +27,9 @@ class FakeWebSocket {
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
   prompts: unknown[][] = [];
+  notifications: string[] = [];
   private promptIds: number[] = [];
+  private failNext: string | null = null;
 
   constructor(_url: string) {
     FakeWebSocket.current = this;
@@ -36,6 +38,9 @@ class FakeWebSocket {
 
   send(data: string): void {
     const frame = JSON.parse(data) as Frame;
+    if (frame.id == null && frame.method) {
+      this.notifications.push(frame.method);
+    }
     if (frame.method === "initialize") {
       this.reply(frame.id, { protocolVersion: 1, agentCapabilities: {} });
     } else if (frame.method === "session/load") {
@@ -43,7 +48,33 @@ class FakeWebSocket {
     } else if (frame.method === "session/prompt") {
       this.promptIds.push(frame.id as number);
       this.prompts.push(frame.params?.prompt ?? []);
+      if (this.failNext) {
+        const message = this.failNext;
+        this.failNext = null;
+        this.onmessage?.({
+          data: JSON.stringify({
+            jsonrpc: "2.0",
+            id: frame.id,
+            error: { code: -32000, message },
+          }),
+        });
+      }
     }
+  }
+
+  failNextPrompt(message: string): void {
+    this.failNext = message;
+  }
+
+  /** Push a `$/zcode/turnState` notification like the bridge would. */
+  turnState(sessionId: string, running: boolean): void {
+    this.onmessage?.({
+      data: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "$/zcode/turnState",
+        params: { sessionId, running },
+      }),
+    });
   }
 
   settleAll(): void {
@@ -193,6 +224,69 @@ test("forceSendPending(index) sends THAT bubble, not the queue head", async () =
   expect(
     store.getState().pendingPrompts["sess_1"]?.map((d) => d.text),
   ).toEqual(["B"]);
+});
+
+test("forceSendPending under a foreign turn sends the head without waiting for a settle", async () => {
+  const store = await connectedStore();
+
+  // A restored/attached turn runs on ANOTHER connection: running flag up,
+  // but no prompt of ours is in flight — its settle (the prompt response or
+  // a turn-end broadcast) never comes back to this client.
+  store.setState({ isRunning: true });
+  void store.getState().sendPrompt("B");
+  void store.getState().sendPrompt("C");
+
+  // Force-send B: the foreign turn cancels AND B goes out immediately —
+  // waiting for a settle-flush that cannot arrive here dead-ended the queue.
+  store.getState().forceSendPending(0);
+  expect(FakeWebSocket.current?.notifications).toContain("session/cancel");
+  await vi.waitFor(() =>
+    expect(FakeWebSocket.current?.prompts).toHaveLength(1),
+  );
+  expect(JSON.stringify(FakeWebSocket.current!.prompts[0])).toContain("B");
+  expect(store.getState().isRunning).toBe(true);
+  expect(
+    store.getState().pendingPrompts["sess_1"]?.map((d) => d.text),
+  ).toEqual(["C"]);
+
+  // B is OURS: its own settle flushes C — the queue drains on signals that
+  // do come back to this connection.
+  FakeWebSocket.current!.settleAll();
+  await vi.waitFor(() =>
+    expect(FakeWebSocket.current?.prompts).toHaveLength(2),
+  );
+  expect(JSON.stringify(FakeWebSocket.current!.prompts[1])).toContain("C");
+  expect(store.getState().pendingPrompts["sess_1"]).toBeUndefined();
+});
+
+test("a server-rejected prompt requeues the draft instead of dropping it", async () => {
+  const store = await connectedStore();
+  const ws = FakeWebSocket.current!;
+
+  // The bridge's compaction busy window answers the prompt with a server
+  // error — the turn never ran (a transport drop, by contrast, keeps the
+  // drop-and-replay behavior).
+  ws.failNextPrompt("auto-compact busy");
+  void store.getState().sendPrompt("keep me");
+  await vi.waitFor(() => expect(store.getState().isRunning).toBe(false));
+  await vi.waitFor(() =>
+    expect(store.getState().pendingPrompts["sess_1"]?.[0]?.text).toBe("keep me"),
+  );
+
+  // The optimistic bubble retracted, draft at the head, nothing re-sent —
+  // a still-rejecting bridge must not be hammered.
+  expect(
+    store.getState().messages.some(
+      (m) => m.role === "user" && JSON.stringify(m.parts).includes("keep me"),
+    ),
+  ).toBe(false);
+  expect(ws.prompts).toHaveLength(1);
+
+  // The compaction settles (turn-end broadcast) — the flush sends the head.
+  ws.turnState("sess_1", false);
+  await vi.waitFor(() => expect(ws.prompts).toHaveLength(2));
+  expect(JSON.stringify(ws.prompts[1])).toContain("keep me");
+  expect(store.getState().pendingPrompts["sess_1"]).toBeUndefined();
 });
 
 test("back-to-back prompts stay separate bubbles even with no assistant turn between", async () => {
