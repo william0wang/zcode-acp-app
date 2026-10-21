@@ -16,6 +16,23 @@ VERSION=$(node -e "console.log(require('./src-tauri/tauri.conf.json').version)")
 APK="src-tauri/gen/android/app/build/outputs/apk/universal/${BUILD_TYPE}/app-universal-${BUILD_TYPE}.apk"
 OUT="dist/ZCode-ACP-v${VERSION}-${BUILD_TYPE}.apk"
 
+# Gradle and the Kotlin compiler start Daemon processes that outlive the
+# build and sit on hundreds of MB. `gradle.properties` turns both off
+# (`org.gradle.daemon=false`, in-process Kotlin compilation) because this
+# project is only ever built from the CLI; this trap is the belt-and-braces
+# for a run made before those settings landed, or by an IDE that overrides
+# them. `--stop` talks to a running Gradle daemon; the pkill sweep covers the
+# Kotlin daemon, which `--stop` does not.
+ANDROID_DIR="src-tauri/gen/android"
+stop_daemons() {
+  local status=$?
+  echo "==> stopping Gradle / Kotlin daemons"
+  (cd "${ANDROID_DIR}" && ./gradlew --stop >/dev/null 2>&1) || true
+  pkill -f "KotlinCompileDaemon" 2>/dev/null || true
+  return $status
+}
+trap stop_daemons EXIT
+
 echo "==> building ${BUILD_TYPE} APK (v${VERSION})"
 # arm64-only: real devices running this app are all aarch64; the other ABIs
 # (armv7/x86/x86_64) only tripled the APK size (36M -> 12M).

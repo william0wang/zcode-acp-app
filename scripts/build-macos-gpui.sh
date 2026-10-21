@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 # Build the Desktop Workbench (src-gpui) macOS app bundle into dist/.
-# Usage: scripts/build-macos-gpui.sh
-# Unsigned (no Developer ID, no notarization), same as build-macos.sh: runs
-# as built on the build machine; elsewhere Gatekeeper needs a one-time
-# right-click -> Open. Bundles the .app only: dmg wrapping adds nothing over
-# the .app and breaks in headless/sandboxed shells.
+# Usage: scripts/build-macos-gpui.sh   (also `pnpm build:macos`)
+# Unsigned (no Developer ID, no notarization): runs as built on the build
+# machine; elsewhere Gatekeeper needs a one-time right-click -> Open.
+# Bundles the .app only: dmg wrapping adds nothing over the .app and breaks
+# in headless/sandboxed shells.
 # Product name: ZCode-acp.app, no desktop suffix — the gpui workbench IS the
-# desktop product line now (requirements .zcode/docs/desktop-parity-requirements.md).
-# The Tauri line still builds dist/ZCode-acp.app too (build-macos.sh wipes
-# dist/*.app first), so the two builds replace one another by design.
+# desktop product line (requirements .zcode/docs/desktop-parity-requirements.md);
+# the old Tauri WebView shell build is retired (Android is the Tauri target).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
