@@ -11,7 +11,9 @@
 //! read-modify-written so one preference's save never drops another's.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 
+use gpui_kit::gpui::{px, Pixels};
 use serde_json::{Map, Value};
 
 /// The two catalog locales (`src/i18n/`), as the prefs file and the segment
@@ -23,9 +25,11 @@ pub(crate) const LOCALE_ZH: &str = "zh-CN";
 pub(crate) const CHANNEL_STABLE: &str = "stable";
 pub(crate) const CHANNEL_PREVIEW: &str = "preview";
 
-/// The chat font ladder (TS `FontSize`): three steps over the reading text.
-/// Medium is the desktop default — the agent prose inherits the window's
-/// 16px default, which is the size the ladder was tuned around.
+/// The font ladder (TS `FontSize`): three steps over the whole window, not
+/// just the chat reading text. The reading text steps through `chat_px`;
+/// every other UI role (labels, values, captions) scales through
+/// `ui_factor`, read at paint time via [`ui_text`]. Medium is the desktop
+/// default — the ladder was tuned around it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FontScale {
     Small,
@@ -52,6 +56,51 @@ impl FontScale {
             FontScale::Large => (16.5, 17.5),
         }
     }
+
+    /// The chrome text factor — everything outside the chat reading text:
+    /// the ladder's relative steps applied to the fixed 9..15px UI roles.
+    /// Small is exactly today's sizes (compact), the default Medium lifts
+    /// the workbench density a step. Kit-internal control text (Button and
+    /// Input labels) keeps its own sizes — that seam is accepted.
+    pub(crate) fn ui_factor(self) -> f32 {
+        match self {
+            FontScale::Small => 1.00,
+            FontScale::Medium => 1.10,
+            FontScale::Large => 1.20,
+        }
+    }
+}
+
+/// The run's current ladder step (index; 1 = medium, the default): set at
+/// startup and on the settings panel's pick, read by every paint's
+/// [`ui_text`] — a process global because text sizes are set deep in render
+/// trees that do not carry the workbench handle. One window, one scale
+/// (ADR-0009's single-window workbench); the value never varies mid-paint.
+static UI_SCALE: AtomicU8 = AtomicU8::new(1);
+
+/// Publish the current ladder step for [`ui_text`].
+pub(crate) fn set_current_ui_scale(scale: FontScale) {
+    let index = match scale {
+        FontScale::Small => 0,
+        FontScale::Medium => 1,
+        FontScale::Large => 2,
+    };
+    UI_SCALE.store(index, Ordering::Relaxed);
+}
+
+fn current_scale() -> FontScale {
+    match UI_SCALE.load(Ordering::Relaxed) {
+        0 => FontScale::Small,
+        2 => FontScale::Large,
+        _ => FontScale::Medium,
+    }
+}
+
+/// One UI text size: the fixed px role scaled by the current ladder step.
+/// Call sites pass the unscaled role (`ui_text(12.)`); a settings pick
+/// republishes the step and the next paint rescales every role at once.
+pub(crate) fn ui_text(base: f32) -> Pixels {
+    px(base * current_scale().ui_factor())
 }
 
 /// A stored font size, normalized onto the ladder — anything else reads as
@@ -145,12 +194,12 @@ pub(crate) fn store_update_channel(channel: &str) {
     store_pref("updateChannel", Value::String(channel.to_string()));
 }
 
-/// Read the persisted chat font size, if any.
+/// Read the persisted font size, if any.
 pub(crate) fn load_font_size() -> Option<FontScale> {
     stored_font_size(load_prefs().get("fontSize").and_then(Value::as_str))
 }
 
-/// Persist the chat font size (the settings segment's click; the TS
+/// Persist the font size (the settings segment's click; the TS
 /// `saveFontSize`).
 pub(crate) fn store_font_size(size: &str) {
     store_pref("fontSize", Value::String(size.to_string()));
@@ -159,8 +208,8 @@ pub(crate) fn store_font_size(size: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        stored_channel, stored_font_size, stored_locale, FontScale, CHANNEL_PREVIEW,
-        CHANNEL_STABLE, LOCALE_EN, LOCALE_ZH,
+        set_current_ui_scale, stored_channel, stored_font_size, stored_locale, ui_text,
+        FontScale, CHANNEL_PREVIEW, CHANNEL_STABLE, LOCALE_EN, LOCALE_ZH,
     };
 
     #[test]
@@ -197,5 +246,26 @@ mod tests {
         let (mu, ma) = FontScale::Medium.chat_px();
         let (lu, la) = FontScale::Large.chat_px();
         assert!(su < mu && mu < lu && sa < ma && ma < la);
+    }
+
+    #[test]
+    fn ui_factors_step_up_the_ladder() {
+        assert_eq!(FontScale::Small.ui_factor(), 1.0);
+        assert!(FontScale::Small.ui_factor() < FontScale::Medium.ui_factor());
+        assert!(FontScale::Medium.ui_factor() < FontScale::Large.ui_factor());
+    }
+
+    #[test]
+    fn ui_text_follows_the_published_step() {
+        use gpui_kit::gpui::px;
+        set_current_ui_scale(FontScale::Small);
+        let small = ui_text(12.);
+        set_current_ui_scale(FontScale::Large);
+        let large = ui_text(12.);
+        // Restore the default so later tests in this binary paint unscaled.
+        set_current_ui_scale(FontScale::Medium);
+        assert!(small == px(12.0));
+        assert!(ui_text(12.) == px(12.0 * FontScale::Medium.ui_factor()));
+        assert!(large == px(12.0 * FontScale::Large.ui_factor()));
     }
 }

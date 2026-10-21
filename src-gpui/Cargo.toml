@@ -15,7 +15,7 @@ members = ["app", "protocol"]
 
 [workspace.package]
 # Follows the repo's main version (package.json / tauri.conf.json).
-version = "0.33.1"
+version = "0.33.2"
 edition = "2021"
 license = "MIT"
 

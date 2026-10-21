@@ -58,9 +58,9 @@ use protocol::config_store::{
 };
 use protocol::quota::{AccountUsageStats, QuotaItem};
 use protocol::settings::{
-    AgentUpsert, Effect, HookEntryPatch, McpServerUpsert, ModelUpsert, ResetCardInventory,
-    ResetCardStatus, ResetCardType, SettingsAll, SettingsPlatformUsage, SettingsUsage,
-    SpendResetCard, WriteEffect, WorkflowGateBlock, WorkflowGateModeSetting,
+    AgentUpsert, Effect, HookEntryPatch, McpServerUpsert, ModelUpsert, PendingRestartStatus,
+    ResetCardInventory, ResetCardStatus, ResetCardType, SettingsAll, SettingsPlatformUsage,
+    SettingsUsage, SpendResetCard, WriteEffect, WorkflowGateBlock, WorkflowGateModeSetting,
     WorkflowGateSetResponse,
 };
 use protocol::hub::{
@@ -111,8 +111,21 @@ fn reconnect_delay_ms(attempts: u32) -> u64 {
         .saturating_mul(1u64 << attempts.min(5))
         .min(30_000)
 }
-/// Sidebar discovery refresh cadence once the hub answers.
+/// Sidebar discovery refresh cadence once the hub answers. Also the hub's
+/// Desktop Presence heartbeat (ADR-0010 amendment): every poll carries the
+/// desktop identity header and the hub keeps the app "present" for 45s past
+/// the last one (server DESKTOP_PRESENCE_TTL_MS) — raising this past ~40s
+/// would let presence lapse between polls and reopen terminal windows for
+/// phone-originated sessions while the app runs.
 const DISCOVERY_REFRESH_MS: u64 = 15_000;
+/// Failed reconnects after which a tab whose instance has left discovery is
+/// re-incubated (POST /api/instances, the resume form). Three honest retries
+/// first: a hub restart's ≤10s bridge re-registration window must not
+/// re-spawn bridges that are coming back on their own.
+const TAB_REINCUBATE_ATTEMPTS: u32 = 3;
+/// Minimum spacing between one tab's auto re-incubations — a backend that
+/// dies on arrival must not loop the spawn.
+const TAB_REINCUBATE_COOLDOWN_MS: u64 = 60_000;
 /// Re-probe cadence while the hub is up but no bridge instance exists yet.
 const NO_INSTANCE_RETRY_MS: u64 = 5_000;
 /// System-status poll cadence while the page is open (TS SystemStatusPage
@@ -175,6 +188,10 @@ pub enum UiCommand {
     },
     /// The composer's stop control: `session/cancel` on the active tab.
     CancelTurn,
+    /// The quit dialog's stop-all: `session/cancel` on EVERY tab whose turn
+    /// this app started (`local_prompt_active`), not just the active one.
+    /// Turns other clients started are not ours to stop.
+    CancelOwnTurns,
     /// The tab toolbar's model/mode/thought pick (appStore `setConfigOption`):
     /// `session/set_config_option` on the active tab's session; the answer's
     /// `configOptions` plus the bridge's broadcasts refresh the chips.
@@ -205,7 +222,7 @@ pub enum UiCommand {
         hub_url: String,
         token: String,
     },
-    /// The config dock's hub staleness check (TS SettingsPanel
+    /// The settings drawer's hub staleness check (TS SettingsPanel
     /// `checkHubUpgrade`, POST /api/upgrade): the hub alone decides whether
     /// to restart onto newer on-disk code; discovery's poll and the tabs'
     /// reconnect ride out the respawn.
@@ -348,6 +365,24 @@ pub enum UiCommand {
         adding: bool,
         body: ModelUpsert,
     },
+    /// DELETE /settings/models/{providerId}/{modelId} — removes the model's
+    /// rule and its entry in the provider's model list, so it stops being
+    /// offered anywhere. Two-gesture confirmed in the view.
+    RemoveModel {
+        provider_id: String,
+        model_id: String,
+    },
+    /// PUT /settings/providers/{id} — a provider's endpoint (base URL / API
+    /// type / key) and its enabled flag. `apiKey: None` keeps the stored key
+    /// (the server never sends it back, so a blank box cannot mean "clear").
+    UpdateProvider {
+        provider_id: String,
+        enabled: Option<bool>,
+        provider_name: Option<String>,
+        base_url: Option<String>,
+        api_type: Option<String>,
+        api_key: Option<String>,
+    },
     /// Open the Usage config page. Every open is a fresh mount
     /// (UsagePage.tsx): the platform tab first — the account-level view the
     /// page leads with — then the mount loads (capability probe once, the
@@ -362,15 +397,16 @@ pub enum UiCommand {
     /// A Usage range pill: the range controls the upstream query, not a
     /// client-side filter — a tap refetches.
     UsageRange { platform: bool, range: String },
-    /// Open the plan-quota config page. Every open re-runs the TS mount
-    /// pair: the /settings/all snapshot (capability + card eligibility) and
-    /// the quota read (QuotaPage's `loadConfigSection("quota")` →
+    /// Open the plan-quota drawer. Every open re-runs the TS mount pair: the
+    /// /settings/all snapshot (capability + card eligibility) and the quota
+    /// read (QuotaPage's `loadConfigSection("quota")` →
     /// `refreshUsageStats`).
     OpenQuota,
-    /// The page's back gesture — close it. The payloads survive (the TS
-    /// store keeps them), so a reopen paints instantly and re-seeds.
+    /// The drawer's close gesture (X, Esc, the rail toggle) — close it. The
+    /// payloads survive (the TS store keeps them), so a reopen paints
+    /// instantly and re-seeds.
     CloseQuota,
-    /// The page header's refresh control (TS `refreshUsageStats`).
+    /// The drawer header's refresh control (TS `refreshUsageStats`).
     RefreshQuota,
     /// The provider picker: read that provider's card inventory (TS
     /// `loadResetCards`).
@@ -410,6 +446,10 @@ pub enum UiCommand {
     SetSkillEnabled { path: String, enable: bool },
     /// POST /settings/skills/copy-to-user (TS `copySkillToUser`).
     CopySkillToUser { path: String },
+    /// DELETE /settings/skills/{path} (TS `deleteSkill`) — removes the skill
+    /// directory; the view confirms first (unrecoverable). Only rows the
+    /// server marks `deletable` offer the control.
+    DeleteSkill { path: String },
     /// PUT /settings/mcp/{name} (TS `upsertMcp`): add or edit one server;
     /// the body carries only its transport's fields (config_decode's
     /// `mcp_upsert_body`). `adding` names the failure label only.
@@ -418,6 +458,12 @@ pub enum UiCommand {
         name: String,
         body: McpServerUpsert,
     },
+    /// POST /settings/mcp/enable (TS `setMcpEnabled`) — the row switch,
+    /// without opening the form. The route reads `enabled`, not `enable`.
+    SetMcpEnabled { name: String, enable: bool },
+    /// DELETE /settings/mcp/{name} (TS `removeMcp`). The view confirms
+    /// first — the entry is gone from the config file with no undo.
+    DeleteMcpServer { name: String },
     /// POST /settings/hooks/enabled (TS `setHooksEnabled`) — the whole
     /// tree's switch.
     SetHooksEnabled { enabled: bool },
@@ -435,6 +481,20 @@ pub enum UiCommand {
     /// frontmatter patch; the model/thought-level keys travel only when the
     /// user actually picked (the modelTouched gate, TS PersonalAgentForm).
     UpsertAgent { name: String, body: AgentUpsert },
+    /// DELETE /settings/agents/{name} (TS `deleteAgent`). The view confirms
+    /// first — deleting an agent loses its prompt body, which is not
+    /// recoverable from the app.
+    DeleteAgent { name: String },
+    /// A built-in agent's model override (PUT on a built-in name). `None`
+    /// clears the override, restoring inheritance from the workspace default.
+    SetBuiltInAgentModel {
+        name: String,
+        selection: Option<BuiltInAgentSelection>,
+    },
+    /// POST /settings/models/test — one minimal request against a provider,
+    /// to answer "does this model work" without spending a real turn. The
+    /// answer is reported inline on the model row, never as a form error.
+    TestModelConnectivity { provider_id: String, model_id: String },
     /// POST /settings/backups/restore (TS `restoreBackup`) — two-gesture
     /// confirmed in the view before it ever reaches here.
     RestoreBackup { file: String, path: String },
@@ -603,6 +663,16 @@ pub enum RuntimeEvent {
     ComposerPrefill(protocol::chat::PromptDraft),
 }
 
+/// A built-in agent's model override (server `AgentModelSelection`): the
+/// provider/model pair plus the reasoning level, which is part of the override
+/// rather than a separate setting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuiltInAgentSelection {
+    pub provider_id: String,
+    pub model_id: String,
+    pub reasoning_level: Option<String>,
+}
+
 /// The six ZCode-config section pages (batch I, requirements §7): one
 /// shared panel shape — every one is a section read plus writes through the
 /// applyConfigWrite path (effect class surfaced, section reloaded). App
@@ -746,6 +816,10 @@ pub struct SessionRow {
 pub struct TabSummary {
     pub id: u64,
     pub session_id: Option<String>,
+    /// The tab's workspace path — the tab strip's project identity: the
+    /// leaf name prefixes the session title (the CLI composer-cap shape)
+    /// and the hover carries the full path.
+    pub workspace: Option<String>,
     /// The session's display name (discovery's title — the rename target,
     /// or whatever the bridge titled it). The tab strip shows this, falling
     /// back to the short id while discovery has not named it yet.
@@ -1004,7 +1078,7 @@ pub struct QuotaPageView {
 }
 
 /// The side panels' account quota card (TS QuotaSection): the combined
-/// multi-provider allowance, shared by the config dock and the session
+/// multi-provider allowance, shared by the settings drawer and the session
 /// panel. The same driver state the plan-quota page reads (TS keeps ONE
 /// `usageStats` store field for all three surfaces), so the card repaints
 /// whenever a refresh lands from any of them.
@@ -1227,8 +1301,12 @@ pub struct WorkbenchSnapshot {
     pub active: Option<TabView>,
     pub history: HistoryPanelView,
     /// Distinct sessions whose Session Activity reads `running` across all
-    /// tabs — the quit guard's number (requirements §4).
+    /// tabs — the status bar's number.
     pub running_session_count: usize,
+    /// Tabs whose prompt this app sent is still in flight — the quit
+    /// dialog's own-task number (requirements §4): turns other clients
+    /// started keep running untouched and never gate quitting.
+    pub own_running_session_count: usize,
     /// Ephemeral workbench toast (notify-toast semantics; e.g. an approval
     /// requested in a non-active session).
     pub toast: Option<Toast>,
@@ -1241,11 +1319,13 @@ pub struct WorkbenchSnapshot {
     /// The Usage config page; `None` = closed (a full page of its own, like
     /// every config section — ADR-0009).
     pub usage_page: Option<UsagePageView>,
-    /// The plan-quota config page; `None` = closed (a full page of its own,
-    /// like every config section — ADR-0009).
+    /// The plan-quota drawer; `None` = closed. The drawer floats above the
+    /// workbench (the only config surface that does NOT replace it — the
+    /// rail gauge and the settings entry both open it).
     pub quota_page: Option<QuotaPageView>,
     /// The side panels' quota card (TS QuotaSection): always present — the
-    /// config dock and the session panel both render it while they are up.
+    /// settings drawer and the session panel both render it while they are
+    /// up.
     pub quota_card: QuotaCardView,
     /// The hub's preformatted quota dock line (ADR-0021) — the top status
     /// bar's rightmost segment. `None` = no quota data (hide, not an error).
@@ -1256,6 +1336,14 @@ pub struct WorkbenchSnapshot {
     /// A needs-restart write has not been applied yet (TS `pendingRestart`)
     /// — drives the Backend Restart affordance on the config pages.
     pub pending_restart: bool,
+    /// The last connectivity verdict per `(providerId, modelId)`, painted on
+    /// the model row. Not cleared on reload: the verdict describes a request
+    /// that already happened, and a section refresh does not make it stale.
+    pub model_tests:
+        std::collections::HashMap<(String, String), protocol::settings::ConnectivityResult>,
+    /// The probe currently in flight, if any — one at a time, so the row's
+    /// spinner names a specific target.
+    pub model_test_pending: Option<(String, String)>,
     /// Connection Profile book (CONTEXT.md): saved remote hubs plus the
     /// active id; `None` active = the local hub (Hub Bootstrap path).
     pub servers: Vec<protocol::hub::SavedServer>,
@@ -1282,7 +1370,7 @@ pub struct WorkbenchSnapshot {
     /// the page's own `action_instance` is `None` on every real open (the
     /// TS store writes the active session's instance, page-independent).
     pub active_instance: Option<String>,
-    /// The config dock's hub-upgrade check (TS SettingsPanel): in flight, and
+    /// The settings drawer's hub-upgrade check (TS SettingsPanel): in flight, and
     /// the last verdict's display text.
     pub hub_upgrade_busy: bool,
     pub hub_upgrade_note: Option<String>,
@@ -1301,6 +1389,7 @@ impl WorkbenchSnapshot {
             active: None,
             history: HistoryPanelView::default(),
             running_session_count: 0,
+            own_running_session_count: 0,
             toast: None,
             system_status: None,
             models_page: None,
@@ -1309,6 +1398,8 @@ impl WorkbenchSnapshot {
             quota_card: QuotaCardView::default(),
             config_notice: None,
             pending_restart: false,
+            model_tests: std::collections::HashMap::new(),
+            model_test_pending: None,
             servers: Vec::new(),
             active_server_id: None,
             new_session: None,
@@ -1334,7 +1425,22 @@ impl WorkbenchSnapshot {
 /// arrives here, tagged with the owning tab.
 enum LoopEvent {
     ConnHandle { tab: u64, conn: AcpConnection },
-    ConnectResult { tab: u64, result: Result<AcpInitializeResult, String> },
+    /// One model-connectivity probe settled (POST /settings/models/test). The
+    /// answer is painted on the row the probe was started from, so the
+    /// provider/model pair travels back with it.
+    ModelTestSettled {
+        provider_id: String,
+        model_id: String,
+        result: Result<protocol::settings::ConnectivityResult, SettingsApiError>,
+    },    ConnectResult { tab: u64, result: Result<AcpInitializeResult, String> },
+    /// A dead tab's re-incubation settled (POST /api/instances, the resume
+    /// form): `Ok` carries the (new or reused) instance the tab re-points at
+    /// and reconnects to; `Err` parks the tab in Failed — its backend could
+    /// not be brought back.
+    TabReincubated {
+        tab: u64,
+        result: Result<HubCreateInstanceResult, HubApiError>,
+    },
     Update {
         tab: u64,
         session_id: String,
@@ -1460,7 +1566,7 @@ enum LoopEvent {
     /// GET /settings/all settled for the quota page (TS `loadConfigAll`:
     /// capability verdict + reset-card eligibility).
     QuotaSettingsAll(Result<SettingsAll, SettingsApiError>),
-    /// GET /settings/quota settled (TS `refreshUsageStats`): `Ok(None)` = a
+    /// GET /api/quota settled (TS `refreshUsageStats`): `Ok(None)` = a
     /// 2xx body that did not fit the combined shape.
     QuotaUsage {
         result: Result<Option<AccountUsageStats>, SettingsApiError>,
@@ -1525,6 +1631,11 @@ enum LoopEvent {
         reload: &'static [ConfigPageKind],
         result: Result<WriteEffect, SettingsApiError>,
     },
+    /// GET /api/instances/{id}/settings/pending-restart settled — a
+    /// cross-client needs-restart the driver never saw (another client's
+    /// write on the active bridge). Only ever ARMS the flag; the restart
+    /// flow and a hub switch own clearing it.
+    PendingRestartChecked(Result<PendingRestartStatus, SettingsApiError>),
     /// POST /api/upgrade settled — the hub's own staleness verdict.
     HubUpgraded(Result<HubUpgradeResult, SettingsApiError>),
     /// POST …/app-update/install settled: the POST's body is discarded (TS
@@ -1805,6 +1916,9 @@ struct Tab {
     /// Consecutive failed reconnect attempts; drives the exponential backoff
     /// (mirrors appStore.ts `reconnectAttempt`) and resets on a live connect.
     reconnect_attempts: u32,
+    /// Epoch-ms of the last auto re-incubation (dead-backend revival);
+    /// another within TAB_REINCUBATE_COOLDOWN_MS is refused.
+    reincubated_at: Option<u64>,
     /// The bridge advertised the zcode fs capability on the last
     /// `initialize` (Session Files gating, TS `fsCapable`).
     fs_capable: bool,
@@ -2443,7 +2557,7 @@ struct Driver {
     /// The App Update page's release channel (TS `updateChannel`): the
     /// persisted pick (ui-prefs), stable by default — the check names it.
     update_channel: String,
-    /// POST /api/upgrade in flight (the config dock's check button).
+    /// POST /api/upgrade in flight (the settings drawer's check button).
     hub_upgrade_busy: bool,
     /// The last hub-upgrade verdict as display text (TS `upgradeNote`);
     /// cleared by the next check or by its 5s timer (the TS effect).
@@ -2460,6 +2574,10 @@ struct Driver {
     /// A needs-restart write is pending on the connected bridge — drives the
     /// Backend Restart affordance (armed by config writes; M3 pages).
     pending_restart: bool,
+    /// The last connectivity verdict per `(providerId, modelId)`.
+    model_tests: std::collections::HashMap<(String, String), protocol::settings::ConnectivityResult>,
+    /// The probe in flight, if any — one at a time.
+    model_test_pending: Option<(String, String)>,
 
     /// Workbench-level ephemeral toast (notify-toast semantics).
     toast: ToastState,
@@ -2538,6 +2656,8 @@ impl Driver {
             workflows: WorkflowsPanel::default(),
             config_notice: None,
             pending_restart: false,
+            model_tests: std::collections::HashMap::new(),
+            model_test_pending: None,
             toast: ToastState::new(),
             last_fingerprint: 0,
         }
@@ -2570,6 +2690,25 @@ impl Driver {
     /// Open a tab on `instance_id`, attaching `target` (or booting a fresh
     /// `session/new` when `None`). The tab becomes active.
     fn open_tab(&mut self, instance_id: String, target: Option<String>, cwd: String) -> u64 {
+        // One tab per session: a second open of the same target — a
+        // discovery row, a history resume, a workflow's "open session" —
+        // activates the tab that already holds it instead of stacking a
+        // duplicate. An attaching tab counts (its target IS the session);
+        // the instance is deliberately NOT part of the key, so a session
+        // that moved bridges keeps one tab too.
+        if let Some(sid) = target.as_deref() {
+            if let Some(existing) = self.tabs.iter().find(|t| {
+                t.target.as_deref() == Some(sid)
+                    || t.core.active_session_id.as_deref() == Some(sid)
+            }) {
+                traceln!(
+                    "[driver] session {sid} already has tab {}; activating",
+                    existing.id
+                );
+                self.active_tab = Some(existing.id);
+                return existing.id;
+            }
+        }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         self.ever_had_tab = true;
@@ -2586,6 +2725,7 @@ impl Driver {
             agent_version: None,
             retry_at: None,
             reconnect_attempts: 0,
+            reincubated_at: None,
             fs_capable: false,
         });
         self.active_tab = Some(id);
@@ -2649,6 +2789,23 @@ impl Driver {
         }
         self.tabs.clear();
         self.active_tab = None;
+    }
+
+    /// Re-incubate a dead tab's backend (POST /api/instances, the resume
+    /// form): the desktop-stamped call reuses the workspace's live serve
+    /// bridge or headless-spawns one (server ADR-0010 amendment), and
+    /// [`LoopEvent::TabReincubated`] re-points the tab at the answer.
+    fn spawn_reincubate(&mut self, tab: u64, workspace_path: String, session_id: Option<String>) {
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            // No client-side deadline: incubation is slow by design (the
+            // resume flow's contract).
+            let result = hub
+                .create_instance(&workspace_path, session_id.as_deref())
+                .await;
+            let _ = tx.send(LoopEvent::TabReincubated { tab, result });
+        });
     }
 
     // ---- discovery ----
@@ -3533,6 +3690,29 @@ impl Driver {
         }
     }
 
+    /// One model-connectivity probe settled. The verdict replaces whatever the
+    /// same row showed before; a probe for a model the user has since moved
+    /// away from still lands in the map (keyed by provider/model), so returning
+    /// to the row shows its real answer instead of a stale one.
+    fn on_model_test_settled(
+        &mut self,
+        provider_id: String,
+        model_id: String,
+        result: Result<protocol::settings::ConnectivityResult, SettingsApiError>,
+    ) {
+        self.model_test_pending = None;
+        let verdict = match result {
+            Ok(r) => r,
+            Err(e) => protocol::settings::ConnectivityResult {
+                success: false,
+                message: Some(e.to_string()),
+                ..Default::default()
+            },
+        };
+        self.model_tests
+            .insert((provider_id, model_id), verdict);
+    }
+
     /// One write through the applyConfigWrite path (label, write, reload):
     /// the future is boxed by the spawn because each route returns its own
     /// concrete future type.
@@ -3556,6 +3736,25 @@ impl Driver {
                 result,
             });
         });
+    }
+
+    /// One cross-client pending-restart probe per config entry: a
+    /// needs-restart write another client made never reached this app's
+    /// `pending_restart` flag, and the restart banner is the only surface
+    /// that says "a change is not applied yet". Skipped while the flag is
+    /// already armed (the probe can only set it, never clear).
+    fn maybe_spawn_pending_restart_check(&mut self) {
+        if self.pending_restart {
+            return;
+        }
+        if let Some(instance) = self.active_instance_id() {
+            let hub = self.settings_client();
+            let tx = self.loop_tx.clone();
+            tokio::spawn(async move {
+                let result = hub.settings_pending_restart(&instance).await;
+                let _ = tx.send(LoopEvent::PendingRestartChecked(result));
+            });
+        }
     }
 
     /// The write settled — the applyConfigWrite outcome port (the
@@ -5015,6 +5214,9 @@ impl Driver {
 
     /// The quota read (TS `refreshUsageStats`): pull-only — failures land in
     /// `quota_unavailable` (hide data, retry later), never in a toast.
+    /// `/api/quota` answers the RAW combined payload (the settings mount's
+    /// `/settings/quota` wraps it in `{ok, quota}` — parsing that bare
+    /// yielded "no data" on every successful fetch).
     fn spawn_quota_usage(&mut self) {
         if !matches!(
             self.phase,
@@ -5027,7 +5229,7 @@ impl Driver {
         tokio::spawn(async move {
             // parseUsageStats: a 2xx body that does not fit the combined
             // shape reads as no data — NOT as a failed fetch.
-            let result = match hub.settings_quota().await {
+            let result = match hub.quota().await {
                 Ok(v) => Ok(serde_json::from_value::<AccountUsageStats>(v).ok()),
                 Err(e) => Err(e),
             };
@@ -5576,6 +5778,41 @@ impl Driver {
             LoopEvent::ConnectResult { tab, result } => {
                 self.on_connect_result(tab, result, now);
             }
+            LoopEvent::TabReincubated { tab, result } => match result {
+                Ok(created) => {
+                    // Re-point and reconnect: the tab keeps its target
+                    // session (the attach replays it over the new bridge).
+                    // The same id back (a re-registering bridge) reconnects
+                    // just the same — only without the toast.
+                    let outcome = self.tab_mut(tab).map(|t| {
+                        let was = t.instance_id.clone();
+                        t.instance_id = created.id.clone();
+                        t.reconnect_attempts = 0;
+                        t.retry_at = None;
+                        was != created.id
+                    });
+                    if outcome.is_some() {
+                        if outcome == Some(true) {
+                            self.toast.notify(now, "backend restarted — resuming the session");
+                            traceln!(
+                                "[driver] tab {tab} re-pointed at instance {} (reused: {})",
+                                created.id,
+                                created.reused
+                            );
+                        }
+                        self.spawn_connect(tab);
+                    }
+                }
+                Err(e) => {
+                    // The revival itself failed (unknown project, hub
+                    // refusing): parking in Failed is more honest than an
+                    // endless retry ladder against a dead id.
+                    traceln!("[driver] tab {tab} re-incubation failed: {e}");
+                    if let Some(t) = self.tab_mut(tab) {
+                        t.state = TabPhase::Failed(format!("backend restart failed: {e}"));
+                    }
+                }
+            },
             LoopEvent::Closed { tab } => {
                 if self.closing.remove(&tab) {
                     return; // we closed it — expected
@@ -5693,7 +5930,7 @@ impl Driver {
                             // landed last.
                             self.record_readouts(&req.session_id);
                         }
-                        Err(_) => t.core.on_prompt_failed(now),
+                        Err(e) => t.core.on_prompt_failed(now, Some(&req), &e),
                     }
                 }
             }
@@ -6105,6 +6342,22 @@ impl Driver {
                 reload,
                 result,
             } => self.on_config_write_settled(page, label, reload, result),
+            LoopEvent::PendingRestartChecked(result) => {
+                // A silent arm by design: the banner it raises IS the
+                // notice. A failure is dropped the same way — the next
+                // config entry re-probes.
+                if let Ok(status) = result {
+                    if status.pending_restart && !self.pending_restart {
+                        self.pending_restart = true;
+                        self.config_notice = Some(NOTICE_NEEDS_RESTART.to_string());
+                    }
+                }
+            }
+            LoopEvent::ModelTestSettled {
+                provider_id,
+                model_id,
+                result,
+            } => self.on_model_test_settled(provider_id, model_id, result),
             LoopEvent::HubUpgraded(result) => self.on_hub_upgraded(result),
             LoopEvent::AppUpdateInstalled(result) => self.on_app_update_installed(result),
             LoopEvent::AppUpdatePolled(result) => self.on_app_update_polled(result),
@@ -6186,6 +6439,10 @@ impl Driver {
     fn on_connect_result(&mut self, tab: u64, result: Result<AcpInitializeResult, String>, now: u64) {
         // Collect the spawn inputs before the mutable tab borrow.
         let mut fresh_session: Option<(AcpConnection, String)> = None;
+        // Dead-backend revival candidate (see the Err arm): the (instance,
+        // cwd, session) the re-incubation would target. Decided after the
+        // tab borrow — the discovery list read needs `&self`.
+        let mut revive: Option<(String, String, Option<String>)> = None;
         // Batch H1 restore-on-attach: this tab is about to attach a session
         // that may have persisted pending drafts. Read the seed before the
         // mutable borrow; seed ONLY when the core holds no live queue for
@@ -6278,7 +6535,51 @@ impl Driver {
                     t.state = TabPhase::Reconnecting;
                     t.retry_at = Some(now + delay);
                     t.core.conn_open = false;
+                    // Revival candidate: the tab holds a session target, this
+                    // failure is not the first, and the cooldown allows
+                    // another attempt. `ever_connected` is deliberately NOT
+                    // required — a freshly restarted app's auto-attached tab
+                    // has never connected, yet a hub restart that wipes the
+                    // registry (a busy serve bridge can stay unregistered for
+                    // minutes mid-turn) leaves it dialing a corpse id forever
+                    // (observed 2026-10-21: a 2.5min "unknown instance"
+                    // ladder until the user closed and reopened the tab).
+                    // The instance-gone check (the actual trigger) runs after
+                    // the borrow — a bridge still in discovery gets the plain
+                    // retry ladder.
+                    if t.reconnect_attempts >= TAB_REINCUBATE_ATTEMPTS
+                        && t
+                            .reincubated_at
+                            .map(|at| now >= at + TAB_REINCUBATE_COOLDOWN_MS)
+                            .unwrap_or(true)
+                    {
+                        let sid = t
+                            .core
+                            .active_session_id
+                            .clone()
+                            .or_else(|| t.target.clone());
+                        if sid.is_some() {
+                            revive = Some((t.instance_id.clone(), t.cwd.clone(), sid));
+                        }
+                    }
                 }
+            }
+        }
+        if let Some((instance_id, cwd, sid)) = revive {
+            // The instance left discovery: retrying its dead id can never
+            // succeed. Re-incubate instead — the desktop-stamped POST
+            // (server ADR-0010 amendment) reuses the workspace's live serve
+            // bridge or headless-spawns one, and TabReincubated re-points
+            // the tab there. A discovery snapshot up to 15s stale only
+            // delays this to the next retry.
+            if !self.instances.iter().any(|i| i.id == instance_id) {
+                if let Some(t) = self.tab_mut(tab) {
+                    t.reincubated_at = Some(now);
+                }
+                traceln!(
+                    "[driver] tab {tab}: instance {instance_id} left discovery — re-incubating its backend"
+                );
+                self.spawn_reincubate(tab, cwd, sid);
             }
         }
         if let Some((conn, cwd)) = fresh_session {
@@ -6448,6 +6749,17 @@ impl Driver {
                     if let (Some(sid), Some(conn)) =
                         (t.core.active_session_id.clone(), t.conn.clone())
                     {
+                        conn.notify("session/cancel", json!({ "sessionId": sid }));
+                    }
+                }
+            }
+            UiCommand::CancelOwnTurns => {
+                for t in &self.tabs {
+                    if let (true, Some(sid), Some(conn)) = (
+                        &t.core.local_prompt_active,
+                        &t.core.active_session_id,
+                        &t.conn,
+                    ) {
                         conn.notify("session/cancel", json!({ "sessionId": sid }));
                     }
                 }
@@ -6699,6 +7011,9 @@ impl Driver {
                     self.spawn_config_probe();
                 }
                 self.spawn_models_load();
+                // Cross-client pending-restart probe (see
+                // maybe_spawn_pending_restart_check).
+                self.maybe_spawn_pending_restart_check();
             }
             UiCommand::CloseModels => {
                 self.models.open = false;
@@ -6711,6 +7026,62 @@ impl Driver {
                 // this is the same guard on the driver side).
                 if !self.models.busy {
                     self.spawn_model_upsert(adding, body);
+                }
+            }
+            UiCommand::RemoveModel {
+                provider_id,
+                model_id,
+            } => {
+                if !self.models.busy {
+                    self.models.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.remove_model(&provider_id, &model_id).await;
+                        let _ = tx.send(LoopEvent::ModelUpsert {
+                            adding: false,
+                            result,
+                        });
+                    });
+                }
+            }
+            UiCommand::UpdateProvider {
+                provider_id,
+                enabled,
+                provider_name,
+                base_url,
+                api_type,
+                api_key,
+            } => {
+                if !self.models.busy {
+                    self.models.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let mut body = serde_json::Map::new();
+                        if let Some(v) = enabled {
+                            body.insert("enabled".into(), serde_json::json!(v));
+                        }
+                        if let Some(v) = provider_name {
+                            body.insert("providerName".into(), serde_json::json!(v));
+                        }
+                        if let Some(v) = base_url {
+                            body.insert("baseUrl".into(), serde_json::json!(v));
+                        }
+                        if let Some(v) = api_type {
+                            body.insert("apiType".into(), serde_json::json!(v));
+                        }
+                        if let Some(v) = api_key {
+                            body.insert("apiKey".into(), serde_json::json!(v));
+                        }
+                        let result = hub
+                            .update_provider(&provider_id, serde_json::Value::Object(body))
+                            .await;
+                        let _ = tx.send(LoopEvent::ModelUpsert {
+                            adding: false,
+                            result,
+                        });
+                    });
                 }
             }
             UiCommand::OpenUsage => {
@@ -6814,6 +7185,9 @@ impl Driver {
                 if page == ConfigPageKind::Agents && self.models.models.is_none() {
                     self.spawn_models_load();
                 }
+                // Cross-client pending-restart probe (see
+                // maybe_spawn_pending_restart_check).
+                self.maybe_spawn_pending_restart_check();
             }
             UiCommand::CloseConfigPage { page } => {
                 self.sections[page.index()].open = false;
@@ -6847,6 +7221,17 @@ impl Driver {
                     );
                 }
             }
+            UiCommand::DeleteSkill { path } => {
+                if !self.sections[ConfigPageKind::Skills.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Skills,
+                        "delete skill",
+                        &[ConfigPageKind::Skills],
+                        async move { hub.delete_skill(&path).await },
+                    );
+                }
+            }
             UiCommand::UpsertMcpServer { adding, name, body } => {
                 if !self.sections[ConfigPageKind::Mcp.index()].busy {
                     let hub = self.settings_client();
@@ -6857,6 +7242,30 @@ impl Driver {
                         label,
                         &[ConfigPageKind::Mcp],
                         async move { hub.upsert_mcp_server(&name, body).await },
+                    );
+                }
+            }
+            UiCommand::SetMcpEnabled { name, enable } => {
+                if !self.sections[ConfigPageKind::Mcp.index()].busy {
+                    let hub = self.settings_client();
+                    let label: &'static str =
+                        if enable { "enable MCP server" } else { "disable MCP server" };
+                    self.spawn_config_write(
+                        ConfigPageKind::Mcp,
+                        label,
+                        &[ConfigPageKind::Mcp],
+                        async move { hub.set_mcp_enabled(&name, enable).await },
+                    );
+                }
+            }
+            UiCommand::DeleteMcpServer { name } => {
+                if !self.sections[ConfigPageKind::Mcp.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Mcp,
+                        "delete MCP server",
+                        &[ConfigPageKind::Mcp],
+                        async move { hub.remove_mcp_server(&name).await },
                     );
                 }
             }
@@ -6915,6 +7324,60 @@ impl Driver {
                         async move { hub.upsert_agent(&name, body).await },
                     );
                 }
+            }
+            UiCommand::DeleteAgent { name } => {
+                if !self.sections[ConfigPageKind::Agents.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Agents,
+                        "delete subagent",
+                        &[ConfigPageKind::Agents],
+                        async move { hub.delete_agent(&name).await },
+                    );
+                }
+            }
+            UiCommand::SetBuiltInAgentModel { name, selection } => {
+                if !self.sections[ConfigPageKind::Agents.index()].busy {
+                    let hub = self.settings_client();
+                    // Clearing sends providerId+modelId as null TOGETHER — the
+                    // route's documented clear shape, and the only way to
+                    // restore inheritance.
+                    let body = match selection {
+                        Some(s) => protocol::settings::AgentUpsert {
+                            provider_id: Some(Some(s.provider_id)),
+                            model_id: Some(Some(s.model_id)),
+                            reasoning_level: s.reasoning_level,
+                            ..Default::default()
+                        },
+                        None => protocol::settings::AgentUpsert {
+                            provider_id: Some(None),
+                            model_id: Some(None),
+                            ..Default::default()
+                        },
+                    };
+                    self.spawn_config_write(
+                        ConfigPageKind::Agents,
+                        "set built-in agent model",
+                        &[ConfigPageKind::Agents],
+                        async move { hub.upsert_agent(&name, body).await },
+                    );
+                }
+            }
+            UiCommand::TestModelConnectivity {
+                provider_id,
+                model_id,
+            } => {
+                let hub = self.settings_client();
+                let tx = self.loop_tx.clone();
+                self.model_test_pending = Some((provider_id.clone(), model_id.clone()));
+                tokio::spawn(async move {
+                    let result = hub.test_model_connectivity(&provider_id, &model_id).await;
+                    let _ = tx.send(LoopEvent::ModelTestSettled {
+                        provider_id,
+                        model_id,
+                        result,
+                    });
+                });
             }
             UiCommand::RestoreBackup { file, path } => {
                 if !self.sections[ConfigPageKind::Backups.index()].busy {
@@ -7342,8 +7805,9 @@ impl Driver {
     // ---- snapshot ----
 
     /// Distinct sessions whose Session Activity reads `running` across all
-    /// tabs, plus each tab's optimistic local turn. This is the quit
-    /// guard's number (requirements §4).
+    /// tabs, plus each tab's optimistic local turn — the status bar's
+    /// number. The quit dialog gates on the NARROWER own-turn count
+    /// instead (see [`WorkbenchSnapshot::own_running_session_count`]).
     fn running_sessions(&self) -> HashSet<String> {
         let mut running = HashSet::new();
         for tab in &self.tabs {
@@ -7480,8 +7944,14 @@ impl Driver {
         }
         for tab in &self.tabs {
             mix(tab.id, &mut sig);
+            // The tab label's project half (TabSummary.workspace); length
+            // only, the cheap idiom used everywhere else in this signature.
+            mix(tab.cwd.len() as u64, &mut sig);
             mix(messages_signature(&tab.core.messages), &mut sig);
             mix(tab.core.is_running as u64, &mut sig);
+            // The quit dialog's own-task count rides this flag — a prompt
+            // settling or starting must re-emit.
+            mix(tab.core.local_prompt_active as u64, &mut sig);
             mix(tab.core.active_session_id.clone().map(|s| s.len() as u64).unwrap_or(u64::MAX), &mut sig);
             // The queue's CONTENT, not just its length — an edit/discard
             // swaps drafts without a count change.
@@ -7788,7 +8258,7 @@ impl Driver {
                 &mut sig,
             );
         }
-        // App Update's channel + the config dock's hub-upgrade check.
+        // App Update's channel + the settings drawer's hub-upgrade check.
         mix(fold_str(&self.update_channel), &mut sig);
         // The status bar's quota dock line (ADR-0021).
         mix(
@@ -8009,6 +8479,11 @@ impl Driver {
         self.last_fingerprint = fp;
         let running = self.running_sessions();
         let running_session_count = running.len();
+        let own_running_session_count = self
+            .tabs
+            .iter()
+            .filter(|t| t.core.local_prompt_active)
+            .count();
         let awaiting = self.awaiting_sessions();
         let sessions = self.session_rows(&running, &awaiting);
         let tabs: Vec<TabSummary> = self
@@ -8017,6 +8492,7 @@ impl Driver {
             .map(|t| TabSummary {
                 id: t.id,
                 session_id: t.core.active_session_id.clone().or_else(|| t.target.clone()),
+                workspace: (!t.cwd.is_empty()).then(|| t.cwd.clone()),
                 session_title: t.core.active_session_id.as_deref().and_then(|sid| {
                     sessions
                         .iter()
@@ -8098,6 +8574,7 @@ impl Driver {
             active,
             history,
             running_session_count,
+            own_running_session_count,
             toast: self.toast.current().cloned(),
             servers: self.book.servers.clone(),
             active_server_id: self.book.active_id.clone(),
@@ -8155,6 +8632,8 @@ impl Driver {
             quota_dock: self.quota_dock.clone(),
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
+            model_tests: self.model_tests.clone(),
+            model_test_pending: self.model_test_pending.clone(),
             workflows_page: self.workflows.open.then(|| WorkflowsPageView {
                 loading: self.workflows.loading,
                 error: self.workflows.error.clone(),
@@ -9021,6 +9500,194 @@ mod tests {
         assert!(
             d.instances.iter().any(|i| i.id == "i-edit" && i.sessions.is_empty()),
             "editor bridges stay for the heartbeat realign"
+        );
+    }
+
+    /// One tab per session: a second open of the same target activates the
+    /// existing tab instead of stacking a duplicate — including when the two
+    /// opens name DIFFERENT instances (the session moved bridges, or a
+    /// history resume raced a discovery row). An attaching tab counts; its
+    /// target IS the session.
+    #[tokio::test]
+    async fn opening_the_same_session_twice_activates_one_tab() {
+        let mut d = driver();
+        let first = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let second = d.open_tab("i2".to_string(), Some("s1".to_string()), "/w".to_string());
+        assert_eq!(first, second, "the duplicate open must reuse the tab");
+        assert_eq!(d.tabs.len(), 1);
+        assert_eq!(d.active_tab, Some(first));
+    }
+
+    /// The tab strip's project identity (the CLI composer-cap shape): a
+    /// tab's summary carries the workspace path it was opened for, so the
+    /// strip can prefix the project name and the hover can show the full
+    /// path. A root-only fallback workspace ("/") is suppressed.
+    #[tokio::test]
+    async fn tab_summaries_carry_the_workspace_path() {
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        let mut d = super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        let tab = d.open_tab(
+            "i1".to_string(),
+            Some("s1".to_string()),
+            "/Users/w/demo-project".to_string(),
+        );
+        d.open_tab("i2".to_string(), Some("s2".to_string()), "/".to_string());
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("expected a snapshot after emit_if_changed");
+        };
+        let first = snap.tabs.iter().find(|t| t.id == tab).unwrap();
+        assert_eq!(first.workspace.as_deref(), Some("/Users/w/demo-project"));
+        let root_only = snap.tabs.iter().find(|t| t.session_id.as_deref() == Some("s2")).unwrap();
+        assert_eq!(
+            root_only.workspace.as_deref(),
+            Some("/"),
+            "the path travels verbatim; the ROOT-only filter lives in the strip"
+        );
+    }
+
+    /// The quit dialog gates on turns THIS app started only: a prompt we
+    /// sent (local_prompt_active) counts, a broadcast-only running turn
+    /// another client started does not, and the prompt's own settle drops
+    /// the count again.
+    #[tokio::test]
+    async fn own_running_turns_count_only_prompts_this_app_sent() {
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, mut ev_rx) = unbounded_channel();
+        let mut d = super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        // The "other" tab: a turn the CLI started — broadcast activity
+        // only, never a prompt of ours.
+        d.open_tab("i2".to_string(), Some("s2".to_string()), "/w".to_string());
+        let t = d.tabs.iter_mut().find(|t| t.target.as_deref() == Some("s2")).unwrap();
+        t.core.session_states.insert(
+            "s2".to_string(),
+            protocol::session::SessionActivity {
+                running: true,
+                ..Default::default()
+            },
+        );
+        // The "own" tab: attached + open, then we send a prompt into it.
+        let own = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let t = d.tabs.iter_mut().find(|t| t.id == own).unwrap();
+        t.core.conn_open = true;
+        t.core.active_session_id = Some("s1".to_string());
+        d.handle_cmd(
+            super::UiCommand::SendPrompt {
+                text: "hi".to_string(),
+                images: vec![],
+            },
+            0,
+        );
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("expected a snapshot after emit_if_changed");
+        };
+        assert_eq!(snap.running_session_count, 2, "both turns run");
+        assert_eq!(snap.own_running_session_count, 1, "only OUR prompt counts");
+
+        // The prompt response settles our turn: the own count drops while
+        // the other client's turn keeps running.
+        let wire = d
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == own)
+            .unwrap()
+            .core
+            .take_wire()
+            .pop()
+            .expect("the prompt sat on the outbox (nothing pumped it)");
+        let super::WireRequest::Prompt(req) = wire else {
+            panic!("expected the prompt wire request");
+        };
+        d.handle_loop_event(
+            LoopEvent::PromptResult {
+                tab: own,
+                req,
+                result: Ok(serde_json::json!({})),
+            },
+            0,
+        );
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("expected a snapshot after the settle");
+        };
+        assert_eq!(snap.own_running_session_count, 0, "the settled turn is no longer ours");
+        assert_eq!(snap.running_session_count, 1, "the other client's turn still runs");
+    }
+
+    /// A dead backend revives instead of retrying forever: once a tab has
+    /// burned its honest-retry budget AND its instance left discovery, the
+    /// re-incubation arms (its own fetch talks to the test's bogus hub and
+    /// settles elsewhere — arming is the assertion). A bridge still listed in
+    /// discovery never arms. The arming must not require `ever_connected`:
+    /// a freshly RESTARTED app's auto-attached tab has never connected, yet
+    /// after a hub restart wiped the registry it dialed the corpse id for
+    /// minutes until the user closed the tab (observed 2026-10-21).
+    #[tokio::test]
+    async fn a_dead_instance_re_incubates_instead_of_retrying_forever() {
+        let mut d = driver();
+        let tab = d.open_tab("i-dead".to_string(), Some("sess_1".to_string()), "/w".to_string());
+        // No `ever_connected` seed — the fresh-process shape is the regression.
+
+        for attempt in 0..(super::TAB_REINCUBATE_ATTEMPTS - 1) {
+            d.handle_loop_event(
+                LoopEvent::ConnectResult {
+                    tab,
+                    result: Err("dial failed".to_string()),
+                },
+                attempt as u64 * 10_000,
+            );
+        }
+        assert!(
+            d.tabs.iter().all(|t| t.reincubated_at.is_none()),
+            "the honest-retry budget must not arm early"
+        );
+
+        d.handle_loop_event(
+            LoopEvent::ConnectResult {
+                tab,
+                result: Err("dial failed".to_string()),
+            },
+            30_000,
+        );
+        assert!(
+            d.tabs.iter().any(|t| t.id == tab && t.reincubated_at.is_some()),
+            "the instance left discovery — the revival must arm"
+        );
+
+        // The listed-bridge guard: the same burnout against an instance that
+        // discovery still holds keeps the plain retry ladder.
+        let mut d2 = driver();
+        let tab2 = d2.open_tab("i-live".to_string(), Some("sess_2".to_string()), "/w".to_string());
+        d2.instances
+            .push(instance("i-live", Some("/w"), vec![session("sess_2", None)]));
+        for attempt in 0..super::TAB_REINCUBATE_ATTEMPTS {
+            d2.handle_loop_event(
+                LoopEvent::ConnectResult {
+                    tab: tab2,
+                    result: Err("dial failed".to_string()),
+                },
+                attempt as u64 * 10_000,
+            );
+        }
+        assert!(
+            d2.tabs.iter().all(|t| t.reincubated_at.is_none()),
+            "a bridge still in discovery never re-incubates"
         );
     }
 

@@ -1,16 +1,20 @@
 //! Desktop Workbench entry point (requirements §6): one window with the
-//! connection status bar, the left dock (sessions / configuration panels),
-//! the one-connection-per-tab session tabs, the composer, and the right
-//! panel (the active session's file browser). The protocol driver thread
-//! (`runtime`) owns every wire concern; this layer only paints.
+//! connection status bar, the left dock (the sessions panel), the
+//! one-connection-per-tab session tabs, the composer, the right panel (the
+//! active session's file browser), and the left overlay drawer (settings /
+//! the all-providers quota display — non-modal, floats above the layout).
+//! The protocol driver thread (`runtime`) owns every wire concern; this
+//! layer only paints.
 //!
 //! Quit wiring: ⌘Q is bound to the workbench's `QuitApp` action and carried
 //! by a minimal native app menu; the window close rides
 //! `on_window_should_close` (registered in `Workbench::new`). Both routes
-//! run the quit guard — with any session running, a native confirm dialog
-//! asks first (requirements §4). Closing the last window quits the app
-//! (`QuitMode::LastWindowClosed`), so the confirmed close and a confirmed
-//! ⌘Q end identically — and neither stops the hub or the sessions.
+//! run the quit guard — with turns this app started still running, the quit
+//! dialog asks first (Quit Only, the default, or Stop Turns & Quit;
+//! requirements §4); anything else closes at once. Closing the last window
+//! quits the app (`QuitMode::LastWindowClosed`), so the confirmed close and
+//! a confirmed ⌘Q end identically — and neither stops the hub or other
+//! clients' turns.
 
 // `#[gpui_kit::test]` (gpui::test) nests deeply enough to need this.
 #![recursion_limit = "256"]
@@ -101,6 +105,12 @@ fn main() {
             // with no stored preference the system decides (the shared
             // rust-i18n global also drives gpui-kit's own strings).
             rust_i18n::set_locale(ui_prefs::load_locale().unwrap_or_else(i18n::detect_locale));
+            // Font scale: the persisted pick seeds the paint-time chrome
+            // factor (ui_prefs::ui_text); the settings panel's pick
+            // republishes it live.
+            ui_prefs::set_current_ui_scale(
+                ui_prefs::load_font_size().unwrap_or(ui_prefs::FontScale::Medium),
+            );
             // Dark theme only in P0 (requirements §2), polished onto the
             // product's quiet-dark palette (see apply_quiet_dark).
             Theme::change(ThemeMode::Dark, None, cx);

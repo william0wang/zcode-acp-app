@@ -40,6 +40,7 @@ use protocol::approval::{
 use rust_i18n::t;
 
 use crate::runtime::{ProtocolRuntime, UiCommand};
+use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
 
 /// Stream-reveal timing matching the chat rows (workbench's constants).
@@ -251,7 +252,7 @@ pub fn render_approval_card(
                     column = column.child(
                         div()
                             .font_family(theme.mono_font_family.clone())
-                            .text_size(px(12.))
+                            .text_size(ui_text(12.))
                             .text_color(theme.warning)
                             .child(name),
                     );
@@ -267,7 +268,7 @@ pub fn render_approval_card(
                             .gap_1()
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(ui_text(10.))
                                     .text_color(theme.muted_foreground)
                                     .child(h.label.to_uppercase()),
                             )
@@ -278,7 +279,7 @@ pub fn render_approval_card(
                                     .rounded_md()
                                     .bg(theme.background)
                                     .font_family(theme.mono_font_family.clone())
-                                    .text_size(px(12.))
+                                    .text_size(ui_text(12.))
                                     .text_color(theme.muted_foreground)
                                     .child(h.value.clone()),
                             ),
@@ -304,7 +305,7 @@ pub fn render_approval_card(
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .text_size(px(10.))
+                                .text_size(ui_text(10.))
                                 .text_color(theme.muted_foreground)
                                 .cursor_pointer()
                                 .child(if open { "▾" } else { "▸" })
@@ -327,7 +328,7 @@ pub fn render_approval_card(
                                     .rounded_md()
                                     .bg(theme.background)
                                     .font_family(theme.mono_font_family.clone())
-                                    .text_size(px(12.))
+                                    .text_size(ui_text(12.))
                                     .text_color(theme.muted_foreground)
                                     .child(raw),
                             );
@@ -337,7 +338,7 @@ pub fn render_approval_card(
                         // option's name (PermissionDialog's fallback).
                         column = column.child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(ui_text(13.))
                             .text_color(theme.muted_foreground)
                             .child(first.name.clone().unwrap_or_else(|| t!("permission.title").into_owned())),
                         );
@@ -429,7 +430,7 @@ pub fn render_approval_card(
                     let mut block = div().flex().flex_col().gap_1();
                     block = block.child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(ui_text(13.))
                             .text_color(theme.foreground)
                             .child(field.question.clone()),
                     );
@@ -544,7 +545,7 @@ pub fn render_approval_card(
     // The Permission Race hint (permission.hint).
     column = column.child(
         div()
-            .text_size(px(10.))
+            .text_size(ui_text(10.))
             .text_color(theme.muted_foreground)
             .child(t!("permission.hint").into_owned()),
     );
@@ -556,7 +557,7 @@ pub fn render_approval_card(
             div()
                 .w_12()
                 .flex_none()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.warning)
                 .child("Ask"),
         )
@@ -627,7 +628,7 @@ fn permission_option_buttons(
 
 fn card_title(text: &str, theme: &component::Theme) -> gpui::Div {
     div()
-        .text_size(px(13.))
+        .text_size(ui_text(13.))
         .text_color(theme.foreground)
         .child(text.to_string())
 }
@@ -661,7 +662,7 @@ pub fn render_toast_strip(
                 .min_w_0()
                 .flex_1()
                 .truncate()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.foreground)
                 .child(text.to_string()),
         )

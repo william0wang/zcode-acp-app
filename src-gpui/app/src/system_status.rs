@@ -35,6 +35,7 @@ use rust_i18n::t;
 use crate::approval_card::render_toast_strip;
 use crate::i18n::fill;
 use crate::runtime::{ProtocolRuntime, SystemStatusPageView, UiCommand};
+use crate::ui_prefs::ui_text;
 
 /// Null probe placeholder (TS `PLACEHOLDER`).
 const PLACEHOLDER: &str = "—";
@@ -193,7 +194,7 @@ fn config_row(theme: &Theme, label: &str, value: String, hint: Option<String>) -
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.muted_foreground)
                     .child(label.to_string()),
             )
@@ -201,7 +202,7 @@ fn config_row(theme: &Theme, label: &str, value: String, hint: Option<String>) -
                 div()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.foreground)
                     .child(value),
             ),
@@ -210,7 +211,7 @@ fn config_row(theme: &Theme, label: &str, value: String, hint: Option<String>) -
         row = row.child(
             div()
                 .pt(px(2.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(hint),
         );
@@ -259,7 +260,7 @@ fn bar_row(
                     div()
                         .flex_none()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(label),
                 )
@@ -267,7 +268,7 @@ fn bar_row(
                     div()
                         .flex_none()
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(faint(theme))
                         .child(value),
                 ),
@@ -295,7 +296,7 @@ fn config_block(
                 .px(px(16.))
                 .pb(px(4.))
                 .pt(px(12.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(title.to_uppercase()),
         )
@@ -618,7 +619,7 @@ fn render_stats(theme: &Theme, stats: &SystemStatsResponse) -> AnyElement {
                 .px(px(16.))
                 .pb(px(8.))
                 .pt(px(12.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(fill(
                     &t!("system.collected"),
@@ -656,7 +657,7 @@ fn render_notice_banner(
             div()
                 .min_w_0()
                 .flex_1()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(notice_text(notice)),
         )
@@ -687,14 +688,14 @@ fn render_restart_note(theme: &Theme, restart_available: bool, runtime: &Protoco
         .py(px(12.))
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.restartPending").into_owned()),
         )
         .child(
             div()
                 .pt(px(4.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(t!("zconfig.restartWarning").into_owned()),
         );
@@ -714,7 +715,7 @@ fn render_restart_note(theme: &Theme, restart_available: bool, runtime: &Protoco
         note = note.child(
             div()
                 .pt(px(8.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.warning_foreground)
                 .child(t!("zconfig.restartNoInstance").into_owned()),
         );
@@ -740,14 +741,14 @@ fn render_unsupported(theme: &Theme) -> AnyElement {
         .items_center()
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.unsupported").into_owned()),
         )
         .child(
             div()
                 .pt(px(6.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(t!("zconfig.unsupportedHint").into_owned()),
         )
@@ -770,14 +771,14 @@ fn render_error(theme: &Theme, error: &str) -> AnyElement {
         .items_center()
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.loadFailed").into_owned()),
         )
         .child(
             div()
                 .pt(px(6.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(error.to_string()),
         )
@@ -820,7 +821,7 @@ pub fn render_system_status_page(
                 .min_w_0()
                 .flex_1()
                 .truncate()
-                .text_size(px(14.))
+                .text_size(ui_text(14.))
                 .text_color(theme.foreground)
                 .child(t!("system.title").into_owned()),
         )
@@ -849,7 +850,7 @@ pub fn render_system_status_page(
             .justify_center()
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.loading").into_owned()),
             )

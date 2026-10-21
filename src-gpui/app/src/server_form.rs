@@ -1,4 +1,4 @@
-//! The remote-server form of the config dock's server book (TS
+//! The remote-server form of the settings drawer's server book (TS
 //! ConnectScreen's add/edit form): one kit dialog serves both Add and Edit,
 //! so the servers section itself stays a plain list.
 //!
@@ -10,7 +10,7 @@
 
 use std::cell::Cell;
 
-use gpui::{div, px, App, Context, Entity, IntoElement, Render, Subscription, Window};
+use gpui::{div, App, Context, Entity, IntoElement, Render, Subscription, Window};
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _};
@@ -18,6 +18,7 @@ use gpui_kit::*;
 use protocol::hub::SavedServer;
 
 use crate::runtime::{ProtocolRuntime, UiCommand};
+use crate::ui_prefs::ui_text;
 
 pub struct ServerForm {
     runtime: ProtocolRuntime,
@@ -134,7 +135,7 @@ impl ServerForm {
             .gap_1()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(label),
             )

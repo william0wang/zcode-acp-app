@@ -1,7 +1,10 @@
-//! The plan-quota configuration page (M3, requirements §4: "High-frequency
-//! configuration pages: … Quota (Effect Class and Backend Restart semantics
-//! included)") — the desktop port of `src/screens/config/QuotaPage.tsx`,
-//! semantics identical:
+//! The plan-quota PAGE — the GLM coding-plan surface with its reset cards
+//! (M3, requirements §4: "High-frequency configuration pages: … Quota
+//! (Effect Class and Backend Restart semantics included)") — the desktop
+//! port of `src/screens/config/QuotaPage.tsx`, semantics identical. It
+//! opens from the settings drawer's "Plan quota" entry as a full page; the
+//! rail gauge's drawer is the OTHER quota surface — the all-providers
+//! display (`quota_card`), not this page.
 //!
 //! - GLM only: this screen is the coding-plan surface (the card windows and
 //!   the quota they reset); other platforms' windows stay with the side
@@ -34,6 +37,7 @@ use rust_i18n::t;
 
 use crate::i18n::fill;
 use crate::runtime::{ProtocolRuntime, QuotaPageView, UiCommand};
+use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
 
 /// Below this window usage a spend asks for the extra warning step (TS
@@ -221,7 +225,7 @@ pub(crate) fn quota_bar_row(
                     div()
                         .flex_none()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(label.to_string()),
                 )
@@ -230,7 +234,7 @@ pub(crate) fn quota_bar_row(
                         .flex_none()
                         .truncate()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(faint(theme))
                         .child(line),
                 ),
@@ -263,7 +267,7 @@ fn config_block(theme: &Theme, title: Option<&str>, divided: bool) -> gpui::Div 
                 .px(px(16.))
                 .pb(px(4.))
                 .pt(px(12.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(title.to_uppercase()),
         )
@@ -276,7 +280,7 @@ fn config_empty(theme: &Theme, text: &str) -> AnyElement {
         .px(px(16.))
         .py(px(32.))
         .text_center()
-        .text_size(px(13.))
+        .text_size(ui_text(13.))
         .text_color(faint(theme))
         .child(text.to_string())
         .into_any_element()
@@ -302,7 +306,7 @@ fn notice_banner(theme: &Theme, notice: &str, runtime: &ProtocolRuntime) -> AnyE
             div()
                 .min_w_0()
                 .flex_1()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(notice_text(notice)),
         )
@@ -333,14 +337,14 @@ fn restart_note(theme: &Theme, restart_available: bool, runtime: &ProtocolRuntim
         .py(px(12.))
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.restartPending").into_owned()),
         )
         .child(
             div()
                 .pt(px(4.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(t!("zconfig.restartWarning").into_owned()),
         );
@@ -360,7 +364,7 @@ fn restart_note(theme: &Theme, restart_available: bool, runtime: &ProtocolRuntim
         note = note.child(
             div()
                 .pt(px(8.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.warning_foreground)
                 .child(t!("zconfig.restartNoInstance").into_owned()),
         );
@@ -415,7 +419,7 @@ fn card_list(
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.muted_foreground)
                     .child(title.clone()),
             )
@@ -423,7 +427,7 @@ fn card_list(
                 div()
                     .flex_none()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.foreground)
                     .child(sorted.len().to_string()),
             ),
@@ -433,7 +437,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(4.))
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(faint(theme))
                 .child(t!("zconfig.resetNone").into_owned()),
         );
@@ -446,7 +450,7 @@ fn card_list(
                     .items_center()
                     .gap(px(8.))
                     .py(px(2.))
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(faint(theme))
                     .child(
                         div()
@@ -464,7 +468,7 @@ fn card_list(
                             div()
                                 .ml_auto()
                                 .flex_none()
-                                .text_size(px(10.))
+                                .text_size(ui_text(10.))
                                 .text_color(faint(theme))
                                 .child(t!("zconfig.resetNextUp").into_owned()),
                         )
@@ -478,7 +482,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(4.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(format!("{} {}", t!("zconfig.resetLastUsed"), fmt_stamp_utc(used_at))),
         );
@@ -491,7 +495,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(4.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(amber_text())
                 .child(format!("{} {}", t!("zconfig.resetRetryAt"), fmt_stamp_utc(at))),
         );
@@ -536,7 +540,7 @@ fn card_list(
         column = column.child(
             div()
                 .pt(px(6.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(fill(
                     &t!("zconfig.resetBelowThreshold"),
@@ -570,7 +574,7 @@ fn use_card_button(
         .py(px(8.))
         .flex()
         .justify_center()
-        .text_size(px(13.))
+        .text_size(ui_text(13.))
         .text_color(theme.foreground)
         .when(busy, |this| this.opacity(0.4))
         .when(!busy, |this| {
@@ -597,7 +601,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
         .py(px(10.))
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(amber_text())
                 .child(fill(
                     &t!("zconfig.resetBelowWarn"),
@@ -621,7 +625,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(faint(theme))
                         .cursor_pointer()
                         .hover(|h| h.bg(white().opacity(0.06)))
@@ -643,7 +647,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(amber_text())
                         .cursor_pointer()
                         .hover(|h| h.bg(amber_fill(0.3)))
@@ -678,7 +682,7 @@ fn spend_confirm_box(
         .py(px(10.))
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(text),
         )
@@ -699,7 +703,7 @@ fn spend_confirm_box(
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(faint(theme))
                         .cursor_pointer()
                         .hover(|h| h.bg(white().opacity(0.06)))
@@ -721,7 +725,7 @@ fn spend_confirm_box(
                         .py(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(theme.foreground)
                         .when(busy, |this| this.opacity(0.6))
                         .when(!busy, |this| {
@@ -766,7 +770,7 @@ fn provider_picker(
                 .rounded_lg()
                 .px(px(10.))
                 .py(px(6.))
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .when(selected, |this| {
                     this.bg(white().opacity(0.12)).text_color(theme.foreground)
                 })
@@ -845,9 +849,11 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The plan-quota page: a full page of its own below the status bar (the
-    /// TS ConfigPageFrame — back header, refresh, notice banner, restart
-    /// note, then the unsupported / error / allowance+cards states).
+    /// The plan-quota PAGE (the settings drawer's "Plan quota" entry): a
+    /// full page of its own below the status bar (the TS ConfigPageFrame —
+    /// back header, refresh, notice banner, restart note, then the
+    /// unsupported / error / allowance+cards states). The rail gauge's
+    /// all-providers drawer is the OTHER quota surface (`quota_card`).
     pub fn render_quota_page(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let page = self.snap.quota_page.clone().unwrap_or_default();
@@ -876,12 +882,12 @@ impl Workbench {
                     .min_w_0()
                     .flex_1()
                     .truncate()
-                    .text_size(px(14.))
+                    .text_size(ui_text(14.))
                     .text_color(theme.foreground)
                     .child(t!("zconfig.quota").into_owned()),
             )
             .child(
-                Button::new("quota-refresh")
+                Button::new("quota-page-refresh")
                     .ghost()
                     .xsmall()
                     .icon(IconName::RefreshCw)
@@ -984,14 +990,14 @@ impl Workbench {
                         .items_center()
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(ui_text(13.))
                                 .text_color(theme.muted_foreground)
                                 .child(t!("zconfig.unsupported").into_owned()),
                         )
                         .child(
                             div()
                                 .pt(px(6.))
-                                .text_size(px(12.))
+                                .text_size(ui_text(12.))
                                 .text_color(faint(&theme))
                                 .child(t!("zconfig.unsupportedHint").into_owned()),
                         ),
@@ -1018,14 +1024,14 @@ impl Workbench {
                         .items_center()
                         .child(
                             div()
-                                .text_size(px(13.))
+                                .text_size(ui_text(13.))
                                 .text_color(theme.muted_foreground)
                                 .child(t!("zconfig.loadFailed").into_owned()),
                         )
                         .child(
                             div()
                                 .pt(px(6.))
-                                .text_size(px(12.))
+                                .text_size(ui_text(12.))
                                 .text_color(faint(&theme))
                                 .child(error.clone()),
                         ),
@@ -1057,7 +1063,7 @@ impl Workbench {
                         .pb(px(8.))
                         .flex()
                         .justify_center()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(faint(&theme))
                         .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
                 );

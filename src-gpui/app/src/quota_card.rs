@@ -1,5 +1,5 @@
 //! The side panels' account quota card — the port of
-//! `src/components/QuotaSection.tsx`, rendered by BOTH the config dock
+//! `src/components/QuotaSection.tsx`, rendered by BOTH the settings drawer
 //! (TS SettingsPanel) and the session panel (TS SessionPanel):
 //!
 //! - hub-level data (`/api/quota`, the plan-quota page's own read), never
@@ -27,6 +27,7 @@ use rust_i18n::t;
 
 use crate::quota_page::{faint, fmt_stamp_utc, quota_bar_row};
 use crate::runtime::{ProtocolRuntime, QuotaCardView, UiCommand};
+use crate::ui_prefs::ui_text;
 
 /// Status lines, verbatim from the CLI card's non-success prose (TS
 /// `GLM_STATUS`).
@@ -70,7 +71,7 @@ fn section_label(theme: &Theme, title: String, divided: bool) -> AnyElement {
         .pt(px(12.))
         .pb(px(2.))
         .when(divided, |this| this.mt(px(8.)).border_t_1().border_color(theme.border))
-        .text_size(px(12.))
+        .text_size(ui_text(12.))
         .text_color(faint(theme))
         .child(title.to_uppercase())
         .into_any_element()
@@ -81,7 +82,7 @@ fn status_line(theme: &Theme, text: &str) -> AnyElement {
     div()
         .px(px(16.))
         .py(px(4.))
-        .text_size(px(13.))
+        .text_size(ui_text(13.))
         .text_color(faint(theme))
         .child(text.to_string())
         .into_any_element()
@@ -191,8 +192,7 @@ pub(crate) fn render_quota_card(
 ) -> Option<AnyElement> {
     if !view.quota_unavailable && view.usage.is_none() {
         return None;
-    }
-    let refresh_runtime = runtime.clone();
+    }    let refresh_runtime = runtime.clone();
     let mut header = div()
         .mt(px(8.))
         .flex()
@@ -205,7 +205,7 @@ pub(crate) fn render_quota_card(
         .pb(px(2.))
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(faint(theme))
                 .child(t!("quota.title").to_uppercase()),
         );
@@ -215,7 +215,7 @@ pub(crate) fn render_quota_card(
             div()
                 .id("quota-card-updated")
                 .test_support()
-                .text_size(px(10.))
+                .text_size(ui_text(10.))
                 .font_family(theme.mono_font_family.clone())
                 .text_color(faint(theme))
                 .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
@@ -245,7 +245,7 @@ pub(crate) fn render_quota_card(
                 .test_support()
                 .px(px(16.))
                 .py(px(4.))
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(faint(theme))
                 .child(t!("quota.unavailable").into_owned()),
         );
@@ -253,4 +253,45 @@ pub(crate) fn render_quota_card(
         card = card.children(render_sections(theme, usage));
     }
     Some(card.into_any_element())
+}
+
+/// The quota DRAWER's body (the rail gauge's surface): the mobile side
+/// panels' card scaled up to a drawer — every provider section the hub
+/// reports, the unavailable note, and the last-refresh footer. The drawer
+/// frame (workbench `render_drawer`) owns the title and the refresh control.
+pub(crate) fn render_quota_drawer_body(view: &QuotaCardView, theme: &Theme) -> AnyElement {
+    let mut body = div()
+        .id("quota-drawer-body")
+        .test_support()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .overflow_y_scroll()
+        .pb_4();
+    if view.quota_unavailable {
+        body = body.child(status_line(theme, &t!("quota.unavailable").into_owned()));
+    } else if let Some(usage) = view.usage.as_ref() {
+        body = body.children(render_sections(theme, usage));
+    } else {
+        // Nothing answered yet — the drawer's open kicked the read (the TS
+        // mount effect); the frame's quiet stand-in until it lands.
+        body = body.child(status_line(theme, &t!("zconfig.loading").into_owned()));
+    }
+    if let Some(at) = view.usage_stats_at {
+        body = body.child(
+            div()
+                .id("quota-drawer-updated")
+                .test_support()
+                .px(px(16.))
+                .pt(px(12.))
+                .pb(px(8.))
+                .text_size(ui_text(10.))
+                .font_family(theme.mono_font_family.clone())
+                .text_color(faint(theme))
+                .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
+        );
+    }
+    body.into_any_element()
 }

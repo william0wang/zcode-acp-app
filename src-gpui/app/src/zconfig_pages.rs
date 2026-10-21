@@ -48,6 +48,7 @@ use serde_json::Value;
 
 use crate::i18n::{fill, t_count};
 use crate::runtime::{ConfigPageKind, ConfigSectionPageView, UiCommand};
+use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
 
 /// The eight colors the server's own agent form offers (agents-config.ts);
@@ -111,8 +112,15 @@ pub(crate) struct HookFormState {
 
 /// The personal-agent form's state (the TS `PersonalAgentForm`).
 pub(crate) struct AgentFormState {
-    target: AgentRow,
+    /// The agent being edited; `None` = creating one (the TS `NewAgentForm`
+    /// branch). A new agent has no name yet, so the identity field is editable
+    /// only in this mode — on an existing agent the name IS the file path.
+    target: Option<AgentRow>,
+    name: Entity<InputState>,
     description: Entity<TextareaState>,
+    /// The system-prompt body (the frontmatter's markdown text below the
+    /// fence). Multi-line: this is the one field a user rewrites most.
+    system_prompt: Entity<TextareaState>,
     /// One of [`AGENT_COLORS`], or `None` = leave unset.
     color: Option<String>,
     /// The picker's encoded value; `None` = inherit. Seeded from the file
@@ -127,6 +135,17 @@ pub(crate) struct AgentFormState {
     stored_raw: Option<String>,
     /// The file's own thought level — kept when an unrelated edit saves.
     stored_level: Option<String>,
+    /// Tool restriction: `true` = every tool (the key is absent),
+    /// `false` = only the checked ones in `tools`.
+    all_tools: bool,
+    tools: Vec<String>,
+    /// The file's own tool list, so "all tools" can be restored faithfully
+    /// and an untouched checkbox row does not rewrite the file.
+    stored_tools: Option<Vec<String>>,
+    permission_mode: Option<String>,
+    max_turns: Entity<InputState>,
+    inject_agents_md: bool,
+    background: bool,
 }
 
 impl ConfigPageKind {
@@ -168,6 +187,69 @@ fn agent_stored_match(options: &[ModelOption], form: &AgentFormState) -> Option<
         .and_then(|s| find_model_option(options, &s.provider_id, &s.model_id).cloned())
 }
 
+/// The agent's current permission mode, read from its frontmatter.
+fn stored_permission_mode(target: &Option<AgentRow>) -> Option<String> {
+    target
+        .as_ref()
+        .and_then(|t| t.frontmatter.as_ref())
+        .and_then(|fm| fm.permission_mode.clone())
+        .filter(|v| !v.is_empty())
+}
+
+/// The agent's current `maxTurns`, read from its frontmatter.
+fn stored_max_turns(target: &Option<AgentRow>) -> Option<u32> {
+    target
+        .as_ref()
+        .and_then(|t| t.frontmatter.as_ref())
+        .and_then(|fm| fm.max_turns)
+}
+
+/// The agent's current `injectAgentsMd`. Absent means the runtime's default
+/// (true), which is what the form shows.
+fn stored_inject_agents_md(target: &Option<AgentRow>) -> Option<bool> {
+    target
+        .as_ref()
+        .and_then(|t| t.frontmatter.as_ref())
+        .and_then(|fm| fm.inject_agents_md)
+}
+
+/// The agent's current `background`. `None` = the key was never set, and the
+/// form does not invent one.
+fn stored_background(target: &Option<AgentRow>) -> Option<bool> {
+    target
+        .as_ref()
+        .and_then(|t| t.frontmatter.as_ref())
+        .and_then(|fm| fm.background)
+}
+
+/// The tools a custom agent may be restricted to — the upstream app's list
+/// (`SubagentsSection.tsx` `TOOL_OPTIONS`). A tool outside this list stays
+/// visible as a checkbox when the file already names it, so a hand-written
+/// entry is never dropped by an unrelated save (see `agent_tool_options`).
+const AGENT_TOOL_OPTIONS: [&str; 9] = [
+    "Read",
+    "Grep",
+    "Glob",
+    "Bash",
+    "Edit",
+    "Write",
+    "WebFetch",
+    "WebSearch",
+    "TodoWrite",
+];
+
+/// The permission modes the runtime accepts (server `AGENT_PERMISSION_MODES`,
+/// itself mirroring `subagent-profile.ts`). Kept in step with the bridge: a
+/// value outside this list is refused server-side.
+const AGENT_PERMISSION_MODES: [&str; 6] = [
+    "acceptEdits",
+    "auto",
+    "bypassPermissions",
+    "default",
+    "dontAsk",
+    "plan",
+];
+
 // ---------------------------------------------------------------------------
 // The shared page shell
 // ---------------------------------------------------------------------------
@@ -194,14 +276,14 @@ fn state_card(title: &str, detail: &str, theme: &component::Theme) -> AnyElement
         .items_center()
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.foreground)
                 .child(title.to_string()),
         )
         .child(
             div()
                 .pt_2()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child(detail.to_string()),
         )
@@ -222,7 +304,7 @@ fn empty_card(text: &str, theme: &component::Theme) -> AnyElement {
         .justify_center()
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(text.to_string()),
         )
@@ -234,14 +316,14 @@ fn field_label(label: &str, hint: Option<&str>, theme: &component::Theme) -> gpu
     let mut field = div().flex().flex_col().gap_1().pt_2();
     field = field.child(
         div()
-            .text_size(px(12.))
+            .text_size(ui_text(12.))
             .text_color(theme.foreground)
             .child(label.to_string()),
     );
     if let Some(hint) = hint {
         field = field.child(
             div()
-                .text_size(px(10.))
+                .text_size(ui_text(10.))
                 .text_color(theme.muted_foreground)
                 .child(hint.to_string()),
         );
@@ -270,14 +352,14 @@ fn restart_card(
         .border_color(theme.border)
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.foreground)
                 .child(t!("zconfig.restartPending").into_owned()),
         )
         .child(
             div()
                 .pt_1()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child(t!("zconfig.restartWarning").into_owned()),
         )
@@ -293,7 +375,7 @@ fn restart_card(
         } else {
             div()
                 .pt_2()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.warning_foreground)
                 .child(t!("zconfig.restartNoInstance").into_owned())
                 .into_any_element()
@@ -350,7 +432,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
             )
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.foreground)
                     .child(t!(page.kind.title()).into_owned()),
             )
@@ -387,7 +469,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
                     div()
                         .min_w_0()
                         .flex_1()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.foreground)
                         .child(notice_text(notice)),
                 )
@@ -531,14 +613,14 @@ fn render_skill_row(
                 .gap(px(2.))
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(theme.foreground)
                         .child(name),
                 )
                 .when(skill.description.is_some(), |this| {
                     this.child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(ui_text(10.))
                             .text_color(theme.muted_foreground)
                             .truncate()
                             .child(skill.description.clone().unwrap_or_default()),
@@ -547,7 +629,7 @@ fn render_skill_row(
                 .child(
                     div()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(format!("{scope_note}{id}")),
@@ -586,14 +668,95 @@ fn render_skill_row(
                 }),
         );
     }
+    // Only the server's deletable rows (user/agents trees) get the control —
+    // the delete route refuses plugin and project skills anyway.
+    if skill.is_deletable() {
+        row = row.child(render_skill_delete(index, &id, busy, runtime, cx));
+    }
     row.into_any_element()
+}
+
+/// A deletable skill's delete control, two gestures like an agent delete: the
+/// first press arms it (the row swaps to Cancel / Delete), the second removes
+/// the skill directory — there is no undo from the app.
+fn render_skill_delete(
+    index: usize,
+    path: &str,
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let wb = cx.entity();
+    let armed = wb
+        .read_with(cx, |wb, _| wb.skill_delete_confirm.clone())
+        .as_deref()
+        == Some(path);
+
+    if armed {
+        let wb_cancel = wb.clone();
+        let wb_confirm = wb.clone();
+        let runtime_fire = runtime.clone();
+        let fire_path = path.to_string();
+        return div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .child(
+                Button::new(SharedString::from(format!("skill-delete-cancel-{index}")))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        wb_cancel.update(cx, |this, cx| {
+                            this.skill_delete_confirm = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("skill-delete-confirm-{index}")))
+                    .primary()
+                    .xsmall()
+                    .label(t!("zconfig.skillDelete").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        wb_confirm.update(cx, |this, cx| {
+                            this.skill_delete_confirm = None;
+                            cx.notify();
+                        });
+                        runtime_fire.send(UiCommand::DeleteSkill {
+                            path: fire_path.clone(),
+                        });
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let wb_arm = wb;
+    let arm_path = path.to_string();
+    Button::new(SharedString::from(format!("skill-delete-{index}")))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Trash)
+        .text_color(theme.muted_foreground)
+        .disabled(busy)
+        .on_click(move |_, _, cx| {
+            let path = arm_path.clone();
+            wb_arm.update(cx, |this, cx| {
+                this.skill_delete_confirm = Some(path);
+                cx.notify();
+            });
+        })
+        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
 // I2 — MCP
 // ---------------------------------------------------------------------------
 
-fn render_mcp_body(_wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<Workbench>) -> AnyElement {
+fn render_mcp_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<Workbench>) -> AnyElement {
     let theme = cx.theme();
     let rows = mcp_servers(page.payload.as_ref());
     let mut list = section_list("mcp-list");
@@ -603,7 +766,7 @@ fn render_mcp_body(_wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<W
     } else {
         let mut block = div().flex().flex_col();
         for (index, server) in rows.iter().enumerate() {
-            block = block.child(render_mcp_row(index, server, cx));
+            block = block.child(render_mcp_row(index, server, page.busy, wb, cx));
         }
         list = list.child(rows_card(theme).child(block));
     }
@@ -626,7 +789,13 @@ fn render_mcp_body(_wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<W
     list.into_any_element()
 }
 
-fn render_mcp_row(index: usize, server: &McpServerRow, cx: &Context<Workbench>) -> AnyElement {
+fn render_mcp_row(
+    index: usize,
+    server: &McpServerRow,
+    busy: bool,
+    wb_ref: &Workbench,
+    cx: &Context<Workbench>,
+) -> AnyElement {
     let theme = cx.theme();
     let name = server.name.clone().unwrap_or_default();
     let subtitle = if let Some(command) = server.command.as_deref() {
@@ -643,6 +812,11 @@ fn render_mcp_row(index: usize, server: &McpServerRow, cx: &Context<Workbench>) 
     let disabled = server.enabled == Some(false);
     let wb = cx.entity();
     let target = server.clone();
+    let runtime = wb_ref.runtime.clone();
+    let runtime_switch = runtime.clone();
+    let switch_name = name.clone();
+    let enable = !disabled;
+    let delete = render_mcp_delete(index, &name, busy, &runtime, cx);
     div()
         .id(SharedString::from(format!("mcp-row-{index}-{name}")))
         .test_support()
@@ -664,14 +838,14 @@ fn render_mcp_row(index: usize, server: &McpServerRow, cx: &Context<Workbench>) 
                 .flex_col()
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(theme.foreground)
                         .child(name),
                 )
                 .child(
                     div()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(subtitle),
@@ -679,12 +853,27 @@ fn render_mcp_row(index: usize, server: &McpServerRow, cx: &Context<Workbench>) 
                 .when(disabled, |this| {
                     this.child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(ui_text(10.))
                             .text_color(theme.muted_foreground)
                             .child(t!("zconfig.disabled").into_owned()),
                     )
                 }),
         )
+        // The row switch (POST /settings/mcp/enable) — immediate effect, so
+        // no confirm; stop_propagation keeps it from opening the form.
+        .child(
+            Switch::new(SharedString::from(format!("mcp-switch-{index}")))
+                .checked(!disabled)
+                .disabled(busy)
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    runtime_switch.send(UiCommand::SetMcpEnabled {
+                        name: switch_name.clone(),
+                        enable,
+                    });
+                }),
+        )
+        .child(delete)
         .child(
             div()
                 .size_3()
@@ -692,6 +881,84 @@ fn render_mcp_row(index: usize, server: &McpServerRow, cx: &Context<Workbench>) 
                 .text_color(theme.muted_foreground)
                 .child(Icon::new(IconName::ChevronRight)),
         )
+        .into_any_element()
+}
+
+/// An MCP server's delete control, two gestures like an agent delete: the
+/// first press arms it (Cancel / Delete swap in), the second removes the
+/// config entry — no undo from the app.
+fn render_mcp_delete(
+    index: usize,
+    name: &str,
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let wb = cx.entity();
+    let armed = wb
+        .read_with(cx, |wb, _| wb.mcp_delete_confirm.clone())
+        .as_deref()
+        == Some(name);
+
+    if armed {
+        let wb_cancel = wb.clone();
+        let wb_confirm = wb.clone();
+        let runtime_fire = runtime.clone();
+        let fire_name = name.to_string();
+        return div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .child(
+                Button::new(SharedString::from(format!("mcp-delete-cancel-{index}")))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        wb_cancel.update(cx, |this, cx| {
+                            this.mcp_delete_confirm = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("mcp-delete-confirm-{index}")))
+                    .primary()
+                    .xsmall()
+                    .label(t!("zconfig.mcpDelete").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        wb_confirm.update(cx, |this, cx| {
+                            this.mcp_delete_confirm = None;
+                            cx.notify();
+                        });
+                        runtime_fire.send(UiCommand::DeleteMcpServer {
+                            name: fire_name.clone(),
+                        });
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let wb_arm = wb;
+    let arm_name = name.to_string();
+    Button::new(SharedString::from(format!("mcp-delete-{index}")))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Trash)
+        .text_color(theme.muted_foreground)
+        .disabled(busy)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let name = arm_name.clone();
+            wb_arm.update(cx, |this, cx| {
+                this.mcp_delete_confirm = Some(name);
+                cx.notify();
+            });
+        })
         .into_any_element()
 }
 
@@ -737,7 +1004,7 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.foreground)
                     .child(t!("zconfig.hooksAll").into_owned()),
             )
@@ -804,14 +1071,14 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                         .child(
                             div()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(13.))
+                                .text_size(ui_text(13.))
                                 .text_color(theme.foreground)
                                 .truncate()
                                 .child(event.clone()),
                         )
                         .child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(ui_text(10.))
                                 .text_color(theme.muted_foreground)
                                 .child(fill(
                                     &t_count("zconfig.hooksEntryCount", entries.len() as u64),
@@ -836,7 +1103,7 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
         div()
             .px_4()
             .pt_1()
-            .text_size(px(10.))
+            .text_size(ui_text(10.))
             .text_color(theme.muted_foreground)
             .child(fill(
                 &t!("zconfig.hooksReadOnly"),
@@ -893,7 +1160,7 @@ fn render_hook_entry(
                         .child(
                             div()
                                 .font_family(theme.mono_font_family.clone())
-                                .text_size(px(12.))
+                                .text_size(ui_text(12.))
                                 .text_color(theme.foreground)
                                 .truncate()
                                 .child(matcher),
@@ -901,7 +1168,7 @@ fn render_hook_entry(
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(px(10.))
+                                .text_size(ui_text(10.))
                                 .text_color(if h.enabled {
                                     theme.muted_foreground
                                 } else {
@@ -918,7 +1185,7 @@ fn render_hook_entry(
                     div()
                         .pt(px(2.))
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(h.command.clone()),
@@ -957,15 +1224,34 @@ fn render_agents_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context
 
     if rows.is_empty() {
         list = list.child(empty_card(&t!("zconfig.agentsEmpty"), theme));
-        return list.into_any_element();
+    } else {
+        let mut block = div().flex().flex_col();
+        for (index, agent) in rows.iter().enumerate() {
+            block = block.child(render_agent_row(
+                index, agent, &options, page.busy, &wb.runtime, cx,
+            ));
+        }
+        list = list.child(rows_card(theme).child(block));
     }
 
-    let mut block = div().flex().flex_col();
-    for (index, agent) in rows.iter().enumerate() {
-        block = block.child(render_agent_row(index, agent, &options, page.busy, &wb.runtime, cx));
-    }
-    list.child(rows_card(theme).child(block))
-        .into_any_element()
+    // The create control — the one action the page was missing entirely: the
+    // route has always accepted a PUT on a new name, but nothing in the UI
+    // could reach it.
+    let wb_handle = cx.entity();
+    list = list.child(
+        div().px_3().child(
+            Button::new("agents-add")
+                .secondary()
+                .small()
+                .w_full()
+                .icon(IconName::Plus)
+                .label(t!("zconfig.agentsAdd").into_owned())
+                .on_click(move |_, window, cx| {
+                    wb_handle.update(cx, |this, cx| this.open_agent_form(None, window, cx));
+                }),
+        ),
+    );
+    list.into_any_element()
 }
 
 fn render_agent_row(
@@ -1020,7 +1306,9 @@ fn render_agent_row(
             .cursor_pointer()
             .hover(|this| this.bg(theme.secondary.opacity(0.6)))
             .on_click(move |_, window, cx| {
-                wb.update(cx, |this, cx| this.open_agent_form(target.clone(), window, cx));
+                wb.update(cx, |this, cx| {
+                    this.open_agent_form(Some(target.clone()), window, cx)
+                });
             });
     }
 
@@ -1039,7 +1327,7 @@ fn render_agent_row(
                     .min_w_0()
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(ui_text(13.))
                             .text_color(theme.foreground)
                             .truncate()
                             .child(name.clone()),
@@ -1055,7 +1343,7 @@ fn render_agent_row(
                                 .py(px(1.))
                                 .rounded_md()
                                 .bg(theme.secondary)
-                                .text_size(px(9.))
+                                .text_size(ui_text(9.))
                                 .text_color(theme.muted_foreground)
                                 .child(t!("zconfig.agentBuiltIn").into_owned()),
                         )
@@ -1064,7 +1352,7 @@ fn render_agent_row(
             .when(description.is_some(), |this| {
                 this.child(
                     div()
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(description.unwrap_or_default()),
@@ -1078,7 +1366,7 @@ fn render_agent_row(
                 };
                 this.child(
                     div()
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(note),
@@ -1107,8 +1395,197 @@ fn render_agent_row(
                     });
                 }),
         );
+        row = row.child(render_agent_delete(
+            index, &name, busy, runtime, cx,
+        ));
+    } else {
+        // A built-in has no file, but its MODEL is overridable — the server
+        // keeps that in the agents state file. Without this control the only
+        // way to change it was to hand-edit that file.
+        row = row.child(render_builtin_model_control(
+            index, agent, &name, options, busy, runtime, cx,
+        ));
     }
     row.into_any_element()
+}
+
+/// A built-in agent's model override picker (server `setBuiltInAgentModel`).
+/// "Inherit" is the clear path — it sends provider+model as null, restoring
+/// the workspace default. The thought level is part of the same override, so
+/// picking a model resets it to that model's first level.
+fn render_builtin_model_control(
+    index: usize,
+    agent: &AgentRow,
+    name: &str,
+    options: &[protocol::config_decode::ModelOption],
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    // The models payload may not have landed; the button then shows the
+    // stored override's id without offering a picker to change it.
+    let override_pair = agent.model_selection.as_ref().and_then(|s| {
+        let provider = s.provider_id.clone()?;
+        let model = s.model_id.clone()?;
+        Some((provider, model))
+    });
+    let label = override_pair
+        .as_ref()
+        .and_then(|(p, m)| find_model_option(options, p, m).map(|o| o.label.clone()))
+        .or_else(|| override_pair.as_ref().map(|(_, m)| m.clone()))
+        .unwrap_or_else(|| t!("zconfig.agentModelInherit").into_owned());
+
+    if options.is_empty() {
+        return div()
+            .flex_none()
+            .text_size(ui_text(10.))
+            .text_color(cx.theme().muted_foreground)
+            .child(label)
+            .into_any_element();
+    }
+
+    let entries: Vec<(Option<(String, String)>, String)> = std::iter::once((
+        None,
+        t!("zconfig.agentModelInherit").into_owned(),
+    ))
+    .chain(options.iter().map(|o| {
+        (
+            Some((o.provider_id.clone(), o.model_id.clone())),
+            o.label.clone(),
+        )
+    }))
+    .collect();
+    let runtime_pick = runtime.clone();
+    let agent_name = name.to_string();
+    let current = override_pair.clone();
+    // The menu builder is 'static, so it gets owned copies rather than
+    // borrows of the caller's slice.
+    let level_options: Vec<(String, String, Vec<String>)> = options
+        .iter()
+        .map(|o| {
+            (
+                o.provider_id.clone(),
+                o.model_id.clone(),
+                o.reasoning_levels.clone(),
+            )
+        })
+        .collect();
+
+    Button::new(SharedString::from(format!("agent-builtin-model-{index}")))
+        .secondary()
+        .outline()
+        .xsmall()
+        .label(label)
+        .disabled(busy)
+        .dropdown_menu(move |menu, _, _| {
+            let mut m = menu;
+            for (value, entry_label) in entries.clone() {
+                let active = value == current;
+                let runtime_item = runtime_pick.clone();
+                let agent_name = agent_name.clone();
+                let levels = level_options.clone();
+                m = m.item(
+                    PopupMenuItem::new(entry_label)
+                        .checked(active)
+                        .on_click(move |_, _, _| {
+                            runtime_item.send(UiCommand::SetBuiltInAgentModel {
+                                name: agent_name.clone(),
+                                selection: value.as_ref().map(|(provider_id, model_id)| {
+                                    let first_level = levels
+                                        .iter()
+                                        .find(|(p, m, _)| p == provider_id && m == model_id)
+                                        .and_then(|(_, _, ls)| ls.first().cloned());
+                                    crate::runtime::BuiltInAgentSelection {
+                                        provider_id: provider_id.clone(),
+                                        model_id: model_id.clone(),
+                                        reasoning_level: first_level,
+                                    }
+                                }),
+                            });
+                        }),
+                );
+            }
+            m
+        })
+        .into_any_element()
+}
+
+/// A personal agent's delete control, two gestures like a backup restore: the
+/// first press arms it (the row swaps to Cancel / Delete), the second fires.
+/// Deleting removes the markdown file — the prompt body included — and the app
+/// has no undo, so one stray click must not do it.
+fn render_agent_delete(
+    index: usize,
+    name: &str,
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let wb = cx.entity();
+    let armed = wb
+        .read_with(cx, |wb, _| wb.agent_delete_confirm.clone())
+        .as_deref()
+        == Some(name);
+
+    if armed {
+        let wb_cancel = wb.clone();
+        let wb_confirm = wb.clone();
+        let runtime_fire = runtime.clone();
+        let fire_name = name.to_string();
+        return div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .child(
+                Button::new(SharedString::from(format!("agent-delete-cancel-{index}")))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        wb_cancel.update(cx, |this, cx| {
+                            this.agent_delete_confirm = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("agent-delete-confirm-{index}")))
+                    .primary()
+                    .xsmall()
+                    .label(t!("zconfig.agentDelete").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        wb_confirm.update(cx, |this, cx| {
+                            this.agent_delete_confirm = None;
+                            cx.notify();
+                        });
+                        runtime_fire.send(UiCommand::DeleteAgent {
+                            name: fire_name.clone(),
+                        });
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let wb_arm = wb;
+    let arm_name = name.to_string();
+    Button::new(SharedString::from(format!("agent-delete-{index}")))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Trash)
+        .text_color(theme.muted_foreground)
+        .disabled(busy)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let name = arm_name.clone();
+            wb_arm.update(cx, |this, cx| {
+                this.agent_delete_confirm = Some(name);
+                cx.notify();
+            });
+        })
+        .into_any_element()
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,7 +1621,7 @@ fn render_backups_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Contex
                 .px_4()
                 .pt_3()
                 .pb_1()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.foreground)
                 .child(label.to_string()),
         );
@@ -1153,7 +1630,7 @@ fn render_backups_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Contex
                 div()
                     .px_4()
                     .pb_3()
-                    .text_size(px(10.))
+                    .text_size(ui_text(10.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.backupsNoneForFile").into_owned()),
             );
@@ -1177,7 +1654,7 @@ fn render_backups_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Contex
         div()
             .px_4()
             .pt_1()
-            .text_size(px(10.))
+            .text_size(ui_text(10.))
             .text_color(theme.muted_foreground)
             .child(t!("zconfig.backupsScope").into_owned()),
     );
@@ -1204,7 +1681,7 @@ fn render_backup_row(
     // First line: the stamp plus the gesture controls.
     let mut line = div().flex().items_center().gap_3().child(
         div()
-            .text_size(px(12.))
+            .text_size(ui_text(12.))
             .text_color(theme.foreground)
             .min_w_0()
             .truncate()
@@ -1287,7 +1764,7 @@ fn render_backup_row(
             .pt(px(2.))
             .w_full()
             .font_family(theme.mono_font_family.clone())
-            .text_size(px(10.))
+            .text_size(ui_text(10.))
             .text_color(theme.muted_foreground)
             .truncate()
             .child(backup.path.clone()),
@@ -1301,7 +1778,7 @@ fn render_backup_row(
 
 /// Sets one input's value during an open (window-gated, like every
 /// `set_value` in this codebase).
-fn prefill(
+pub(crate) fn prefill(
     state: &Entity<InputState>,
     text: String,
     window: &mut Window,
@@ -1418,18 +1895,30 @@ impl Workbench {
         cx.notify();
     }
 
-    /// Opens the personal-agent form (description / color / model / thought
-    /// level). The picker's data is the section page's models payload; the
-    /// file's model seeds the picker only when it maps onto an option —
-    /// anything else stays visible read-only and is never written.
-    pub fn open_agent_form(&mut self, target: AgentRow, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the personal-agent form (description / prompt / color / model /
+    /// thought level / tools / permission mode). The picker's data is the
+    /// section page's models payload; the file's model seeds the picker only
+    /// when it maps onto an option — anything else stays visible read-only and
+    /// is never written.
+    ///
+    /// `target = None` is the create form: the name box is editable and empty,
+    /// and every field starts at the runtime's default.
+    pub fn open_agent_form(
+        &mut self,
+        target: Option<AgentRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let models = self
             .snap
             .config_section_page
             .as_ref()
             .and_then(|page| page.models.clone());
         let options = model_options(models.as_ref());
-        let fm = target.frontmatter.clone().unwrap_or_default();
+        let fm = target
+            .as_ref()
+            .and_then(|t| t.frontmatter.clone())
+            .unwrap_or_default();
         let stored = decode_subagent_model(fm.model.as_deref());
         let matched = stored
             .as_ref()
@@ -1442,10 +1931,37 @@ impl Workbench {
             .zip(matched)
             .map(|(s, _)| encode_subagent_model(&s.provider_id, &s.model_id));
 
+        let name = cx.new(|cx| InputState::new(window, cx));
+        prefill(
+            &name,
+            target
+                .as_ref()
+                .and_then(|t| t.name.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
         let description = cx.new(|cx| TextareaState::new(window, cx));
         prefill_area(
             &description,
             fm.description.clone().unwrap_or_default(),
+            window,
+            cx,
+        );
+        let system_prompt = cx.new(|cx| TextareaState::new(window, cx));
+        prefill_area(
+            &system_prompt,
+            target
+                .as_ref()
+                .and_then(|t| t.system_prompt.clone())
+                .unwrap_or_default(),
+            window,
+            cx,
+        );
+        let max_turns = cx.new(|cx| InputState::new(window, cx));
+        prefill(
+            &max_turns,
+            fm.max_turns.map(|n| n.to_string()).unwrap_or_default(),
             window,
             cx,
         );
@@ -1454,10 +1970,19 @@ impl Workbench {
             .as_deref()
             .filter(|c| AGENT_COLORS.contains(c))
             .map(str::to_string);
+        // A file that names specific tools opens in custom mode with exactly
+        // those checked; an absent key means "every tool".
+        let stored_tools = fm.tools.clone().filter(|t| !t.is_empty());
+        let all_tools = stored_tools.is_none();
+        let tools = stored_tools.clone().unwrap_or_default();
         let sub = cx.subscribe(&description, |_, _, _: &InputEvent, cx| cx.notify());
+        let sub_prompt = cx.subscribe(&system_prompt, |_, _, _: &InputEvent, cx| cx.notify());
+        let sub_name = cx.subscribe(&name, |_, _, _: &InputEvent, cx| cx.notify());
         self.zconfig_form = Some(ZConfigForm::Agent(AgentFormState {
             target,
+            name,
             description,
+            system_prompt,
             color,
             // Seeded (not "picked") — an untouched save must not rewrite the
             // file's own spelling of the same model.
@@ -1466,8 +1991,15 @@ impl Workbench {
             thought_level: fm.thought_level.clone().filter(|l| !l.is_empty()),
             stored_raw: fm.model.clone(),
             stored_level: fm.thought_level.clone(),
+            all_tools,
+            tools,
+            stored_tools,
+            permission_mode: fm.permission_mode.clone().filter(|v| !v.is_empty()),
+            max_turns,
+            inject_agents_md: fm.inject_agents_md.unwrap_or(true),
+            background: fm.background.unwrap_or(false),
         }));
-        self.zconfig_form_subs = vec![sub];
+        self.zconfig_form_subs = vec![sub, sub_prompt, sub_name];
         cx.notify();
     }
 
@@ -1512,7 +2044,22 @@ impl Workbench {
         let Some(ZConfigForm::Agent(form)) = &self.zconfig_form else {
             return false;
         };
-        !form.description.read(cx).value().trim().is_empty()
+        if form.description.read(cx).value().trim().is_empty() {
+            return false;
+        }
+        // Creating needs a name the route accepts (`^[a-zA-Z0-9-]{3,50}$`).
+        // Checking here rather than letting the server refuse keeps the save
+        // button off for a value the user can still fix, which is a better
+        // answer than a toast after a round trip.
+        if let Some(_) = &form.target {
+            return true;
+        }
+        let name = form.name.read(cx).value();
+        let name = name.trim();
+        (3..=50).contains(&name.chars().count())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
     }
 
     // ---- submits ----
@@ -1574,14 +2121,28 @@ impl Workbench {
         let Some(ZConfigForm::Agent(form)) = &self.zconfig_form else {
             return;
         };
-        let name = form.target.name.clone().unwrap_or_default();
+        // Creating reads the name from its input; editing uses the row's own
+        // name (it is the file path, and the route addresses it in the URL).
+        let name = match &form.target {
+            Some(target) => target.name.clone().unwrap_or_default(),
+            None => form.name.read(cx).value().trim().to_string(),
+        };
         let description = form.description.read(cx).value().trim().to_string();
+        let prompt = form.system_prompt.read(cx).value().trim().to_string();
         let mut body = AgentUpsert {
             description: Some(description),
             ..Default::default()
         };
         if let Some(color) = &form.color {
             body.color = Some(color.clone());
+        }
+        // The prompt body: an edit sends what the box holds (a cleared box
+        // means an empty prompt, which is a legitimate state); a create sends
+        // it only when non-empty so the server's template seeds it.
+        if form.target.is_some() {
+            body.system_prompt = Some(Some(prompt.clone()));
+        } else if !prompt.is_empty() {
+            body.system_prompt = Some(Some(prompt));
         }
         if form.model_touched {
             match &form.model {
@@ -1605,6 +2166,37 @@ impl Workbench {
                     }
                 }
             }
+        }
+        // The tool list: "all tools" clears the key (the runtime's default),
+        // a custom list sends exactly what is checked. Only sent when the form
+        // actually diverges from the file — an untouched row must not rewrite
+        // a hand-written list.
+        let stored = form.stored_tools.clone();
+        let current = if form.all_tools { None } else { Some(form.tools.clone()) };
+        if stored != current {
+            body.tools = Some(current);
+        }
+        if form.permission_mode != stored_permission_mode(&form.target) {
+            body.permission_mode = Some(form.permission_mode.clone());
+        }
+        let max_turns = form.max_turns.read(cx).value().trim().to_string();
+        let stored_turns = stored_max_turns(&form.target);
+        if max_turns.is_empty() {
+            if stored_turns.is_some() {
+                body.max_turns = Some(None);
+            }
+        } else if let Ok(turns) = max_turns.parse::<u32>() {
+            if Some(turns) != stored_turns {
+                body.max_turns = Some(Some(turns));
+            }
+        }
+        let stored_inject = stored_inject_agents_md(&form.target);
+        if Some(form.inject_agents_md) != stored_inject {
+            body.inject_agents_md = Some(Some(form.inject_agents_md));
+        }
+        let stored_background = stored_background(&form.target);
+        if stored_background.is_some() && Some(form.background) != stored_background {
+            body.background = Some(Some(form.background));
         }
         self.runtime.send(UiCommand::UpsertAgent { name, body });
         cx.notify();
@@ -1679,15 +2271,17 @@ impl Workbench {
                     self.hook_form_can_submit(cx),
                     Self::submit_hook_form,
                 ),
-                Some(ZConfigForm::Agent(form)) => (
-                    format!(
-                        "{} · {}",
-                        t!("zconfig.agentEdit"),
-                        form.target.name.clone().unwrap_or_default()
-                    ),
-                    self.agent_form_can_submit(cx),
-                    Self::submit_agent_form,
-                ),
+                Some(ZConfigForm::Agent(form)) => {
+                    let title = match &form.target {
+                        Some(target) => format!(
+                            "{} · {}",
+                            t!("zconfig.agentEdit"),
+                            target.name.clone().unwrap_or_default()
+                        ),
+                        None => t!("zconfig.agentsAdd").into_owned(),
+                    };
+                    (title, self.agent_form_can_submit(cx), Self::submit_agent_form)
+                }
                 None => return div().into_any_element(),
             };
 
@@ -1716,7 +2310,7 @@ impl Workbench {
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(theme.foreground)
                         .truncate()
                         .min_w_0()
@@ -1778,7 +2372,7 @@ impl Workbench {
             body = body.child(
                 div()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(target.name.clone().unwrap_or_default()),
             );
@@ -1877,7 +2471,7 @@ impl Workbench {
                 .pt_2()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.enabled").into_owned()),
                 )
@@ -1918,7 +2512,7 @@ impl Workbench {
             .child(
                 div()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(format!("{} · {}", form.target.event, matcher)),
             )
@@ -1944,12 +2538,35 @@ impl Workbench {
     ) -> AnyElement {
         let mut body = div().flex().flex_col().gap_2().p_4();
 
+        // The name is the agent's identity AND its file name, so it is only
+        // editable while creating one. On an existing agent the row above the
+        // form already shows it.
+        if form.target.is_none() {
+            body = body
+                .child(field_label(
+                    &t!("zconfig.agentName"),
+                    Some(&t!("zconfig.agentNameHint")),
+                    theme,
+                ))
+                .child(div().max_w(rems(46.)).child(Input::new(&form.name)));
+        }
+
         body = body
             .child(field_label(&t!("zconfig.agentDescription"), None, theme))
             .child(
                 div()
                     .max_w(rems(46.))
                     .child(Textarea::new(&form.description).h(px(72.))),
+            )
+            .child(field_label(
+                &t!("zconfig.agentSystemPrompt"),
+                Some(&t!("zconfig.agentSystemPromptHint")),
+                theme,
+            ))
+            .child(
+                div()
+                    .max_w(rems(46.))
+                    .child(Textarea::new(&form.system_prompt).h(px(140.))),
             );
 
         // The color swatches (the server's own eight) plus the unset chip.
@@ -2020,14 +2637,14 @@ impl Workbench {
                 .child(
                     div()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(form.stored_raw.clone().unwrap_or_default()),
                 )
                 .child(
                     div()
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.agentModelUnavailable").into_owned()),
                 );
@@ -2040,7 +2657,7 @@ impl Workbench {
                 .child(
                     div()
                         .font_family(theme.mono_font_family.clone())
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .truncate()
                         .child(form.stored_raw.clone().unwrap_or_default()),
@@ -2132,7 +2749,7 @@ impl Workbench {
             if level_choices.is_empty() {
                 body = body.child(
                     div()
-                        .text_size(px(10.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.agentThoughtNone").into_owned()),
                 );
@@ -2166,6 +2783,256 @@ impl Workbench {
             }
         }
 
+        // ---- tools ----
+        body = body.child(field_label(
+            &t!("zconfig.agentTools"),
+            Some(&t!("zconfig.agentToolsHint")),
+            theme,
+        ));
+        let wb_all = cx.entity();
+        let wb_custom = cx.entity();
+        // Two-way: "All tools" collapses the grid, "Custom" (only shown while
+        // all is active) brings the checkboxes back with their last state —
+        // a one-way button left custom selection unreachable without
+        // reopening the form.
+        body = body
+            .child(
+                div().flex().flex_wrap().gap_2().child(
+                    Button::new("agent-tools-all")
+                        .secondary()
+                        .outline()
+                        .xsmall()
+                        .label(t!("zconfig.agentToolsAll").into_owned())
+                        .selected(form.all_tools)
+                        .on_click(move |_, _, cx| {
+                            wb_all.update(cx, |this, cx| {
+                                if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
+                                    form.all_tools = true;
+                                }
+                                cx.notify();
+                            });
+                        }),
+                ),
+            )
+            .when(form.all_tools, |this| {
+                this.child(
+                    div().flex().flex_wrap().gap_2().child(
+                        Button::new("agent-tools-custom")
+                            .secondary()
+                            .outline()
+                            .xsmall()
+                            .label(t!("zconfig.agentToolsCustom").into_owned())
+                            .on_click(move |_, _, cx| {
+                                wb_custom.update(cx, |this, cx| {
+                                    if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
+                                        form.all_tools = false;
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+                )
+            });
+        // The checkboxes only matter in custom mode; showing them greyed under
+        // "all tools" would suggest they still exclude something.
+        if !form.all_tools {
+            // The file's own tools come first so an unknown spelling stays
+            // visible and removable — dropping it silently would loosen the
+            // agent's restriction without saying so.
+            let mut options: Vec<String> = form
+                .stored_tools
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|t| !AGENT_TOOL_OPTIONS.contains(&t.as_str()))
+                .collect();
+            options.extend(AGENT_TOOL_OPTIONS.iter().map(|t| t.to_string()));
+            let mut grid = div().flex().flex_wrap().gap_2().max_w(rems(46.));
+            for tool in options {
+                let on = form.tools.contains(&tool);
+                let wb = cx.entity();
+                let label = tool.clone();
+                grid = grid.child(
+                    Button::new(SharedString::from(format!("agent-tool-{}", slug(&tool))))
+                        .xsmall()
+                        .label(label.clone())
+                        .when(on, |b| b.primary())
+                        .when(!on, |b| b.secondary().outline())
+                        .on_click(move |_, _, cx| {
+                            wb.update(cx, |this, cx| {
+                                if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
+                                    if on {
+                                        form.tools.retain(|t| t != &label);
+                                    } else if !form.tools.contains(&label) {
+                                        form.tools.push(label.clone());
+                                    }
+                                }
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            body = body.child(grid);
+        }
+
+        // ---- permission mode ----
+        body = body.child(field_label(&t!("zconfig.agentPermissionMode"), None, theme));
+        let wb_perm = cx.entity();
+        let perm_label = form
+            .permission_mode
+            .clone()
+            .unwrap_or_else(|| t!("zconfig.agentPermissionInherit").into_owned());
+        let perm_current = form.permission_mode.clone();
+        body = body.child(
+            div().max_w(rems(46.)).child(
+                Button::new("agent-permission-mode")
+                    .secondary()
+                    .small()
+                    .w_full()
+                    .label(perm_label)
+                    .dropdown_menu(move |menu, _, _| {
+                        let mut m = menu.item(
+                            PopupMenuItem::new(
+                                t!("zconfig.agentPermissionInherit").into_owned(),
+                            )
+                            .checked(perm_current.is_none())
+                            .on_click({
+                                let wb = wb_perm.clone();
+                                move |_, _, cx| {
+                                    wb.update(cx, |this, cx| {
+                                        if let Some(ZConfigForm::Agent(form)) =
+                                            &mut this.zconfig_form
+                                        {
+                                            form.permission_mode = None;
+                                        }
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                        );
+                        for mode in AGENT_PERMISSION_MODES {
+                            let wb = wb_perm.clone();
+                            let value = mode.to_string();
+                            let active = perm_current.as_deref() == Some(mode);
+                            m = m.item(
+                                PopupMenuItem::new(value.clone())
+                                    .checked(active)
+                                    .on_click(move |_, _, cx| {
+                                        let value = value.clone();
+                                        wb.update(cx, |this, cx| {
+                                            if let Some(ZConfigForm::Agent(form)) =
+                                                &mut this.zconfig_form
+                                            {
+                                                form.permission_mode = Some(value.clone());
+                                            }
+                                            cx.notify();
+                                        });
+                                    }),
+                            );
+                        }
+                        m
+                    }),
+            ),
+        );
+
+        // ---- max turns ----
+        body = body
+            .child(field_label(
+                &t!("zconfig.agentMaxTurns"),
+                Some(&t!("zconfig.agentMaxTurnsHint")),
+                theme,
+            ))
+            .child(div().max_w(rems(46.)).child(Input::new(&form.max_turns)));
+
+        // ---- the two switches ----
+        let wb_inject = cx.entity();
+        body = body.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .max_w(rems(46.))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(1.))
+                        .child(
+                            div()
+                                .text_size(ui_text(12.))
+                                .text_color(theme.foreground)
+                                .child(t!("zconfig.agentInjectAgentsMd").into_owned()),
+                        )
+                        .child(
+                            div()
+                                .text_size(ui_text(10.))
+                                .text_color(theme.muted_foreground)
+                                .child(t!("zconfig.agentInjectAgentsMdHint").into_owned()),
+                        ),
+                )
+                .child(
+                    Switch::new("agent-inject-agents-md")
+                        .checked(form.inject_agents_md)
+                        .on_click(move |checked: &bool, _, cx| {
+                            let checked = *checked;
+                            wb_inject.update(cx, |this, cx| {
+                                if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
+                                    form.inject_agents_md = checked;
+                                }
+                                cx.notify();
+                            });
+                        }),
+                ),
+        );
+        // `background` only appears once the file already declares it: it is
+        // not a setting the app introduces, and a default `false` written on
+        // every save would be a silent behavioural change.
+        if stored_background(&form.target).is_some() {
+            let wb_bg = cx.entity();
+            body = body.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .max_w(rems(46.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .child(
+                                div()
+                                    .text_size(ui_text(12.))
+                                    .text_color(theme.foreground)
+                                    .child(t!("zconfig.agentBackground").into_owned()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui_text(10.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(t!("zconfig.agentBackgroundHint").into_owned()),
+                            ),
+                    )
+                    .child(
+                        Switch::new("agent-background")
+                            .checked(form.background)
+                            .on_click(move |checked: &bool, _, cx| {
+                                let checked = *checked;
+                                wb_bg.update(cx, |this, cx| {
+                                    if let Some(ZConfigForm::Agent(form)) =
+                                        &mut this.zconfig_form
+                                    {
+                                        form.background = checked;
+                                    }
+                                    cx.notify();
+                                });
+                            }),
+                    ),
+            );
+        }
+
         body.into_any_element()
     }
 }
@@ -2185,13 +3052,13 @@ fn update_row(label: &str, value: &str, theme: &component::Theme) -> gpui::Div {
         .child(
             div()
                 .flex_1()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.muted_foreground)
                 .child(label.to_string()),
         )
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.foreground)
                 .child(value.to_string()),
         )
@@ -2261,7 +3128,7 @@ fn render_app_update_body(
             .child(
                 div()
                     .flex_1()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.updateChannel").into_owned()),
             )
@@ -2325,7 +3192,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.foreground)
                     .child(if stage == "installing" {
                         t!("zconfig.updateInstalling").into_owned()
@@ -2353,7 +3220,7 @@ fn render_app_update_body(
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(format!("{pct}%")),
                 )
@@ -2370,7 +3237,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(rgb(0x6ee7b7))
                     .child(fill(
                         &t!("zconfig.updateDone"),
@@ -2379,7 +3246,7 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.updateRestartApp").into_owned()),
             )
@@ -2395,7 +3262,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(rgb(0xfcd34d))
                     .child(t!("zconfig.updateNeedsUser").into_owned()),
             )
@@ -2410,7 +3277,7 @@ fn render_app_update_body(
                         div()
                             .w_full()
                             .font_family(theme.mono_font_family.clone())
-                            .text_size(px(12.))
+                            .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
                             .child(path),
                     )
@@ -2418,7 +3285,7 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.updateNeedsUserHint").into_owned()),
             )
@@ -2434,7 +3301,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(rgb(0xfca5a5))
                     .child(t!("zconfig.updateFailed").into_owned()),
             )
@@ -2449,7 +3316,7 @@ fn render_app_update_body(
                         div()
                             .w_full()
                             .font_family(theme.mono_font_family.clone())
-                            .text_size(px(12.))
+                            .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
                             .child(error),
                     )
@@ -2473,7 +3340,7 @@ fn render_app_update_body(
             .gap_2()
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.foreground)
                     .child(fill(
                         &t!("zconfig.updateConfirm"),
@@ -2549,7 +3416,7 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(fill(
                         &t!("zconfig.updateSize"),
@@ -2576,7 +3443,7 @@ fn render_app_update_body(
                         .px_4()
                         .pt_3()
                         .pb_1()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.updateNotes").into_owned()),
                 )
@@ -2586,7 +3453,7 @@ fn render_app_update_body(
                         .test_support()
                         .px_4()
                         .pb_3()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(notes),
                 ),

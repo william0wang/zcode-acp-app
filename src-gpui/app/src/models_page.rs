@@ -25,12 +25,14 @@ use gpui::{AnyElement, Context, Entity, SharedString, Window, div, px};
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Sizable as _,
 };
+use gpui_kit::assets::IconName as KitIconName;
 use gpui_kit::*;
 use protocol::config_decode::{
     context_window_for, provider_options, rule_for, ModelRef, ProviderOption,
@@ -39,7 +41,9 @@ use protocol::settings::ModelUpsert;
 use rust_i18n::t;
 
 use crate::runtime::{ModelsPageView, UiCommand};
+use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
+use crate::zconfig_pages::prefill;
 
 /// The config-screen notice (TS `notice`): a `notice.*` i18n key resolves
 /// through the shared catalog, anything else is plain failure text shown
@@ -70,6 +74,23 @@ pub struct ModelsForm {
     /// Every level any rule declares plus this model's own — the chips.
     candidates: Vec<String>,
     enabled: bool,
+}
+
+/// The provider endpoint form's state (name / base URL / API type / key).
+///
+/// Separate from the model form because the two edit different things: a model
+/// rule lives in `modelConfigRules`, an endpoint in the provider rule's
+/// `config.api` / `config.access`. One Save spanning both would have two
+/// independent failure modes.
+pub struct ProviderFormState {
+    provider_id: String,
+    provider_name: String,
+    base_url: Entity<InputState>,
+    /// The key box. The current key is never shown — the server does not send
+    /// it — so a blank box means "keep the stored key", not "clear it".
+    api_key: Entity<InputState>,
+    has_api_key: bool,
+    api_type: String,
 }
 
 impl Workbench {
@@ -151,6 +172,89 @@ impl Workbench {
     fn close_models_form(&mut self, cx: &mut Context<Self>) {
         self.models_form = None;
         self.models_form_subs.clear();
+        cx.notify();
+    }
+
+    /// Opens the provider endpoint form, prefilled from the row.
+    ///
+    /// The key box starts EMPTY even when a key is stored: the server never
+    /// sends the secret back, so there is nothing to prefill. A blank submit
+    /// therefore keeps the stored key (see `submit_provider_form`).
+    pub fn open_provider_form(
+        &mut self,
+        provider: protocol::config_decode::ProviderRef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(provider_id) = provider.provider_id.clone() else {
+            return;
+        };
+        let base_url = cx.new(|cx| InputState::new(window, cx));
+        prefill(
+            &base_url,
+            provider.base_url.clone().unwrap_or_default(),
+            window,
+            cx,
+        );
+        let api_key = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(
+                if provider.has_api_key {
+                    t!("zconfig.providerKeyKeep").into_owned()
+                } else {
+                    String::new()
+                },
+            )
+        });
+        let sub_url = cx.subscribe(&base_url, |_, _, _: &InputEvent, cx| cx.notify());
+        let sub_key = cx.subscribe(&api_key, |_, _, _: &InputEvent, cx| cx.notify());
+        self.provider_form = Some(ProviderFormState {
+            provider_id,
+            provider_name: provider.provider_name.clone().unwrap_or_default(),
+            base_url,
+            api_key,
+            has_api_key: provider.has_api_key,
+            api_type: provider
+                .api_type
+                .clone()
+                .unwrap_or_else(|| "openai-chat-completions".to_string()),
+        });
+        self.provider_form_subs = vec![sub_url, sub_key];
+        cx.notify();
+    }
+
+    pub fn close_provider_form(&mut self, cx: &mut Context<Self>) {
+        self.provider_form = None;
+        self.provider_form_subs.clear();
+        cx.notify();
+    }
+
+    /// Save the provider form. The key travels only when the box is non-empty:
+    /// a blank box means "keep the stored key", because the value was never
+    /// shown to be retyped.
+    fn submit_provider_form(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = &self.provider_form else {
+            return;
+        };
+        let base_url = form.base_url.read(cx).value().trim().to_string();
+        let api_key = form.api_key.read(cx).value().trim().to_string();
+        self.runtime.send(UiCommand::UpdateProvider {
+            provider_id: form.provider_id.clone(),
+            enabled: None,
+            provider_name: if form.provider_name.is_empty() {
+                None
+            } else {
+                Some(form.provider_name.clone())
+            },
+            base_url: Some(base_url),
+            api_type: Some(form.api_type.clone()),
+            api_key: if api_key.is_empty() {
+                None
+            } else {
+                Some(api_key)
+            },
+        });
+        self.provider_form = None;
+        self.provider_form_subs.clear();
         cx.notify();
     }
 
@@ -264,7 +368,7 @@ impl Workbench {
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.models").into_owned()),
                 )
@@ -302,7 +406,7 @@ impl Workbench {
                         div()
                             .min_w_0()
                             .flex_1()
-                            .text_size(px(12.))
+                            .text_size(ui_text(12.))
                     .text_color(theme.foreground)
                     .child(notice_text(notice)),
             )
@@ -364,19 +468,53 @@ impl Workbench {
             .and_then(|b| b.model_rules.as_deref())
             .unwrap_or(&[]);
 
+        // The providers block: every provider this machine declares, with its
+        // endpoint and enable switch. It leads because an endpoint problem
+        // breaks every model under it, and that is invisible in a flat model
+        // list.
+        let providers = block
+            .and_then(|b| b.providers.as_deref())
+            .unwrap_or(&[]);
+        if !providers.is_empty() {
+            list = list.child(
+                div()
+                    .px_4()
+                    .pb_1()
+                    .text_size(ui_text(11.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("zconfig.providersTitle").into_owned()),
+            );
+            let mut provider_rows = div().flex().flex_col();
+            for (index, p) in providers.iter().enumerate() {
+                provider_rows = provider_rows.child(render_provider_row(
+                    index, p, page.busy, &self.runtime, cx,
+                ));
+            }
+            list = list.child(
+                div()
+                    .m_3()
+                    .rounded_xl()
+                    .bg(theme.title_bar)
+                    .border_1()
+                    .border_color(theme.border)
+                    .overflow_hidden()
+                    .child(provider_rows),
+            );
+        }
+
         if available.is_empty() {
             list = list.child(
                 div()
                     .px_4()
                     .py_8()
-                    .text_size(px(13.))
+                    .text_size(ui_text(13.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.modelsEmpty").into_owned()),
             );
         } else {
             let mut rows = div().flex().flex_col();
             for (index, m) in available.iter().enumerate() {
-                rows = rows.child(self.render_model_row(index, m, rules, cx));
+                rows = rows.child(self.render_model_row(index, m, rules, page.busy, cx));
             }
             list = list.child(
                 div()
@@ -422,14 +560,14 @@ impl Workbench {
                 .border_color(theme.border)
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.restartPending").into_owned()),
                 )
                 .child(
                     div()
                         .pt_1()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(t!("zconfig.restartWarning").into_owned()),
                 )
@@ -445,7 +583,7 @@ impl Workbench {
                 } else {
                     div()
                         .pt_2()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.warning_foreground)
                         .child(t!("zconfig.restartNoInstance").into_owned())
                         .into_any_element()
@@ -464,6 +602,7 @@ impl Workbench {
         index: usize,
         m: &ModelRef,
         rules: &[protocol::config_decode::ModelRule],
+        busy: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
@@ -489,6 +628,19 @@ impl Workbench {
         };
         let wb = cx.entity();
         let target = m.clone();
+        // The probe's verdict for THIS row, if one has come back. A failed
+        // probe is expected news, not an error — it paints inline.
+        let test_verdict = self.snap.model_tests.get(&(
+            m.provider_id.clone().unwrap_or_default(),
+            m.model_id.clone().unwrap_or_default(),
+        ));
+        let testing = self
+            .snap
+            .model_test_pending
+            .as_ref()
+            .is_some_and(|(p, mo)| {
+                Some(p) == m.provider_id.as_ref() && Some(mo) == m.model_id.as_ref()
+            });
         div()
             .id(SharedString::from(format!("model-row-{index}-{key}")))
             .test_support()
@@ -512,18 +664,50 @@ impl Workbench {
                     .flex_col()
                     .child(
                         div()
-                            .text_size(px(13.))
-                            .text_color(theme.foreground)
-                            .child(title),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(ui_text(13.))
+                                    .text_color(theme.foreground)
+                                    .truncate()
+                                    .child(title),
+                            )
+                            .when_some(test_verdict, |this, verdict| {
+                                this.child(model_test_badge(verdict, theme))
+                            }),
                     )
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(ui_text(10.))
                             .text_color(theme.muted_foreground)
                             .truncate()
                             .child(subtitle),
+                    )
+                    .when_some(
+                        test_verdict.and_then(|v| v.message.clone()),
+                        |this, message| {
+                            this.child(
+                                div()
+                                    .pt(px(2.))
+                                    .text_size(ui_text(10.))
+                                    .text_color(theme.warning_foreground)
+                                    .child(message),
+                            )
+                        },
                     ),
             )
+            .child(render_model_test_button(
+                index,
+                m,
+                testing,
+                busy,
+                &self.runtime,
+                cx,
+            ))
+            .child(render_model_delete(index, m, busy, &self.runtime, cx))
             .child(
                 div()
                     .size_3()
@@ -532,9 +716,96 @@ impl Workbench {
                     .child(Icon::new(IconName::ChevronRight)),
             )
             .into_any_element()
-    }
+}
 
     // ---- the form ----
+
+    /// The provider form (base URL / API type / key), rendered in place of the
+    /// page like the model form.
+    pub fn render_provider_form(&self, cx: &Context<Workbench>) -> AnyElement {
+        let theme = cx.theme();
+        let Some(form) = &self.provider_form else {
+            return div().into_any_element();
+        };
+        let busy = self
+            .snap
+            .models_page
+            .as_ref()
+            .map(|p| p.busy)
+            .unwrap_or(false);
+
+        let mut column = div().flex().flex_col().flex_1().min_h_0();
+        let wb_close = cx.entity();
+        let wb_save = cx.entity();
+        column = column.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h_9()
+                .px_3()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.title_bar)
+                .child(
+                    Button::new("provider-form-back")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ArrowLeft)
+                        .on_click(move |_, _, cx| {
+                            wb_close.update(cx, |this, cx| this.close_provider_form(cx));
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(ui_text(13.))
+                        .text_color(theme.foreground)
+                        .child(format!(
+                            "{} · {}",
+                            t!("zconfig.providerEdit"),
+                            form.provider_name
+                        )),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("provider-form-save")
+                        .primary()
+                        .small()
+                        .label(t!("common.save").into_owned())
+                        .disabled(busy)
+                        .on_click(move |_, _, cx| {
+                            wb_save.update(cx, |this, cx| this.submit_provider_form(cx));
+                        }),
+                ),
+        );
+
+        let mut body = div()
+            .id("provider-form-body")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_4()
+            .overflow_y_scroll()
+            .flex_1()
+            .min_h_0();
+        body = body
+            .child(field_label(&t!("zconfig.providerBaseUrl"), None, &theme))
+            .child(div().max_w(rems(46.)).child(Input::new(&form.base_url)))
+            .child(field_label(&t!("zconfig.providerApiType"), None, &theme))
+            .child(div().max_w(rems(46.)).child(provider_api_type_picker(form, cx)))
+            .child(field_label(
+                &t!("zconfig.providerApiKey"),
+                Some(&if form.has_api_key {
+                    t!("zconfig.providerKeyKeepHint")
+                } else {
+                    t!("zconfig.providerKeyHint")
+                }),
+                &theme,
+            ))
+            .child(div().max_w(rems(46.)).child(Input::new(&form.api_key)));
+        column.child(body).into_any_element()
+    }
 
     /// The add/edit form (TS `ConfigFormSheet`: a full screen of its own —
     /// a half-open form never sits behind the section list).
@@ -577,7 +848,7 @@ impl Workbench {
                 )
                 .child(
                     div()
-                        .text_size(px(13.))
+                        .text_size(ui_text(13.))
                         .text_color(theme.foreground)
                         .child(if adding {
                             t!("zconfig.modelsAdd").into_owned()
@@ -600,7 +871,7 @@ impl Workbench {
             body = body.child(
                 div()
                     .font_family(theme.mono_font_family.clone())
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(ids),
             );
@@ -659,7 +930,7 @@ impl Workbench {
         if form.candidates.is_empty() {
             body = body.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.modelLevelsNone").into_owned()),
             );
@@ -694,7 +965,7 @@ impl Workbench {
                 .pt_2()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.foreground)
                         .child(t!("zconfig.enabled").into_owned()),
                 )
@@ -753,14 +1024,14 @@ fn field_label(label: &str, hint: Option<&str>, theme: &component::Theme) -> gpu
     let mut field = div().flex().flex_col().gap_1().pt_2();
     field = field.child(
         div()
-            .text_size(px(12.))
+            .text_size(ui_text(12.))
             .text_color(theme.foreground)
             .child(label.to_string()),
     );
     if let Some(hint) = hint {
         field = field.child(
             div()
-                .text_size(px(10.))
+                .text_size(ui_text(10.))
                 .text_color(theme.muted_foreground)
                 .child(hint.to_string()),
         );
@@ -784,14 +1055,14 @@ fn state_card(title: &str, detail: &str, theme: &component::Theme) -> AnyElement
         .items_center()
         .child(
             div()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.foreground)
                 .child(title.to_string()),
         )
         .child(
             div()
                 .pt_2()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child(detail.to_string()),
         )
@@ -820,4 +1091,325 @@ fn slug(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
         .collect()
+}
+
+/// The inline verdict badge for a connectivity probe: a green check or a red
+/// cross, plus how long the round trip took.
+fn model_test_badge(
+    verdict: &protocol::settings::ConnectivityResult,
+    theme: &component::Theme,
+) -> AnyElement {
+    let (mark, color) = if verdict.success {
+        ("✓", theme.success_foreground)
+    } else {
+        ("✕", theme.danger_foreground)
+    };
+    let text = match (verdict.success, verdict.elapsed_ms) {
+        (true, Some(ms)) => format!("{mark} {ms}ms"),
+        _ => mark.to_string(),
+    };
+    div()
+        .flex_none()
+        .px(px(5.))
+        .py(px(1.))
+        .rounded_md()
+        .bg(theme.secondary)
+        .text_size(ui_text(9.))
+        .text_color(color)
+        .child(text)
+        .into_any_element()
+}
+
+/// One model's "test" control. The probe costs a real (if tiny) request, so it
+/// is a button rather than something the list does on every paint.
+fn render_model_test_button(
+    index: usize,
+    m: &ModelRef,
+    testing: bool,
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    _cx: &Context<Workbench>,
+) -> AnyElement {
+    let (Some(provider_id), Some(model_id)) = (m.provider_id.clone(), m.model_id.clone()) else {
+        return div().into_any_element();
+    };
+    let runtime = runtime.clone();
+    let button = Button::new(SharedString::from(format!("model-test-{index}")))
+        .ghost()
+        .xsmall()
+        .disabled(busy || testing)
+        .tooltip("Send one minimal request to check this model answers")
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            runtime.send(UiCommand::TestModelConnectivity {
+                provider_id: provider_id.clone(),
+                model_id: model_id.clone(),
+            });
+        });
+    // A spinner while THIS row is the one in flight; the plug icon otherwise
+    // (the kit's `icon` takes an icon name, so the spinner is a child label).
+    if testing {
+        return div()
+            .flex_none()
+            .size(px(16.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(Spinner::new())
+            .into_any_element();
+    }
+    button
+        .icon(KitIconName::PlugZap)
+        .into_any_element()
+}
+
+/// One provider row: name, endpoint, key state, enable switch, and the entry
+/// to its endpoint form.
+///
+/// A coding-plan provider (`account:*`) has no rule in the personal config, so
+/// the write route refuses it: its row is informational (the switch and the
+/// edit control are absent rather than present-and-failing).
+fn render_provider_row(
+    index: usize,
+    p: &protocol::config_decode::ProviderRef,
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let Some(provider_id) = p.provider_id.clone() else {
+        return div().into_any_element();
+    };
+    let editable = !provider_id.starts_with("account:");
+    let name = p
+        .provider_name
+        .clone()
+        .unwrap_or_else(|| provider_id.clone());
+    let mut subtitle = vec![p.base_url.clone().unwrap_or_else(|| "—".into())];
+    if let Some(api) = &p.api_type {
+        subtitle.push(api.clone());
+    }
+    subtitle.push(if p.has_api_key {
+        t!("zconfig.providerKeySet").into_owned()
+    } else {
+        t!("zconfig.providerKeyMissing").into_owned()
+    });
+
+    let mut row = div()
+        .id(SharedString::from(format!("provider-row-{index}")))
+        .test_support()
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_4()
+        .py_3()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(ui_text(13.))
+                                .text_color(theme.foreground)
+                                .truncate()
+                                .child(name),
+                        )
+                        .when(!editable, |this| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .px(px(5.))
+                                    .py(px(1.))
+                                    .rounded_md()
+                                    .bg(theme.secondary)
+                                    .text_size(ui_text(9.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(t!("zconfig.providerPlan").into_owned()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(ui_text(10.))
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(subtitle.join(" · ")),
+                ),
+        );
+
+    if editable {
+        let wb = cx.entity();
+        let owned = p.clone();
+        row = row.child(
+            Button::new(SharedString::from(format!("provider-edit-{index}")))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Settings2)
+                .tooltip("Edit this provider's endpoint and key")
+                .disabled(busy)
+                .on_click(move |_, window, cx| {
+                    let p = owned.clone();
+                    wb.update(cx, |this, cx| this.open_provider_form(p, window, cx));
+                }),
+        );
+        let runtime1 = runtime.clone();
+        let id = provider_id.clone();
+        let enable = !p.enabled.unwrap_or(true);
+        row = row.child(
+            Switch::new(SharedString::from(format!("provider-switch-{index}")))
+                .checked(p.enabled.unwrap_or(true))
+                .disabled(busy)
+                .on_click(move |_, _, _| {
+                    runtime1.send(UiCommand::UpdateProvider {
+                        provider_id: id.clone(),
+                        enabled: Some(enable),
+                        provider_name: None,
+                        base_url: None,
+                        api_type: None,
+                        api_key: None,
+                    });
+                }),
+        );
+    }
+    row.into_any_element()
+}
+
+/// The provider form's API-protocol dropdown. Each option is one wire format;
+/// picking a different one changes how auth and the request body are shaped,
+/// so the choice is spelled out rather than abbreviated.
+fn provider_api_type_picker(
+    form: &ProviderFormState,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    const TYPES: [&str; 3] = [
+        "anthropic-messages",
+        "openai-chat-completions",
+        "openai-responses",
+    ];
+    let wb = cx.entity();
+    let current = form.api_type.clone();
+    Button::new("provider-api-type")
+        .secondary()
+        .small()
+        .w_full()
+        .label(current.clone())
+        .dropdown_menu(move |menu, _, _| {
+            let mut m = menu;
+            for api_type in TYPES {
+                let wb = wb.clone();
+                let value = api_type.to_string();
+                let active = current == value;
+                m = m.item(
+                    PopupMenuItem::new(value.clone())
+                        .checked(active)
+                        .on_click(move |_, _, cx| {
+                            let value = value.clone();
+                            wb.update(cx, |this, cx| {
+                                if let Some(form) = &mut this.provider_form {
+                                    form.api_type = value.clone();
+                                }
+                                cx.notify();
+                            });
+                        }),
+                );
+            }
+            m
+        })
+        .into_any_element()
+}
+
+/// A model's delete control, two gestures. Deleting a model removes its rule
+/// and its entry in the provider's model list — the model stops being offered
+/// anywhere in the app, so a stray click must not do it.
+fn render_model_delete(
+    index: usize,
+    m: &ModelRef,
+    busy: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let (Some(provider_id), Some(model_id)) = (m.provider_id.clone(), m.model_id.clone()) else {
+        return div().into_any_element();
+    };
+    // A coding-plan provider's models come from the plan, not this file: the
+    // route refuses them, so no control is offered.
+    if provider_id.starts_with("account:") {
+        return div().into_any_element();
+    }
+    let wb = cx.entity();
+    let armed = wb
+        .read_with(cx, |wb, _| wb.model_delete_confirm.clone())
+        .as_deref()
+        == Some(format!("{provider_id}/{model_id}").as_str());
+
+    if armed {
+        let wb_cancel = wb.clone();
+        let wb_confirm = wb.clone();
+        let runtime_fire = runtime.clone();
+        let fire_provider = provider_id.clone();
+        let fire_model = model_id.clone();
+        return div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .child(
+                Button::new(SharedString::from(format!("model-delete-cancel-{index}")))
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        wb_cancel.update(cx, |this, cx| {
+                            this.model_delete_confirm = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new(SharedString::from(format!("model-delete-confirm-{index}")))
+                    .primary()
+                    .xsmall()
+                    .label(t!("zconfig.modelDelete").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        wb_confirm.update(cx, |this, cx| {
+                            this.model_delete_confirm = None;
+                            cx.notify();
+                        });
+                        runtime_fire.send(UiCommand::RemoveModel {
+                            provider_id: fire_provider.clone(),
+                            model_id: fire_model.clone(),
+                        });
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let arm_key = format!("{provider_id}/{model_id}");
+    Button::new(SharedString::from(format!("model-delete-{index}")))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Trash)
+        .text_color(theme.muted_foreground)
+        .disabled(busy)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let key = arm_key.clone();
+            wb.update(cx, |this, cx| {
+                this.model_delete_confirm = Some(key);
+                cx.notify();
+            });
+        })
+        .into_any_element()
 }

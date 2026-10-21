@@ -32,6 +32,7 @@ use gpui_kit::{assets::IconName as KitIconName, *};
 use gpui_kit::TestSupportExt as _;
 
 use crate::runtime::{FileViewerView, FilesPanelView, ProtocolRuntime, UiCommand};
+use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
 use protocol::hub::{FsEntry, FsEntryKind};
 use rust_i18n::t;
@@ -319,7 +320,7 @@ pub(crate) fn render_files_header(
         .min_w_0()
         .child(
             div()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .font_family(theme.mono_font_family.clone())
                 .text_color(theme.muted_foreground)
                 .child(t!("files.title").to_uppercase()),
@@ -432,7 +433,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                 .id("files-crumb-root")
                 .test_support()
                 .flex_none()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.foreground)
                 .cursor_pointer()
                 .child(root_label)
@@ -450,7 +451,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
             .child(
                 div()
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child("/"),
             )
@@ -459,7 +460,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                     .id(SharedString::from(format!("files-crumb-{i}")))
                     .test_support()
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(if i + 1 == segments.len() {
                         theme.foreground
                     } else {
@@ -489,7 +490,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
             div()
                 .id("files-unsupported")
                 .test_support()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child(
                     "this bridge does not advertise session files — bridge 0.7.0+ required",
@@ -498,7 +499,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
     } else if view.loading {
         body = body.child(
             div()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child("reading…"),
         );
@@ -512,7 +513,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.danger)
                         .child(err.clone()),
                 )
@@ -540,7 +541,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                 div()
                     .id("files-truncated")
                     .test_support()
-                    .text_size(px(10.))
+                    .text_size(ui_text(10.))
                     .text_color(theme.warning_foreground)
                     .child("list truncated — enter a subdirectory to keep walking"),
             );
@@ -548,7 +549,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
         if entries.is_empty() {
             body = body.child(
                 div()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child("empty directory"),
             );
@@ -615,7 +616,7 @@ fn render_entry_row(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.foreground)
                 .child(entry.name.clone()),
         )
@@ -623,7 +624,7 @@ fn render_entry_row(
             this.child(
                 div()
                     .flex_none()
-                    .text_size(px(10.))
+                    .text_size(ui_text(10.))
                     .text_color(theme.muted_foreground)
                     .child(fmt_size(entry.size)),
             )
@@ -632,7 +633,7 @@ fn render_entry_row(
             this.child(
                 div()
                     .flex_none()
-                    .text_size(px(12.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child("▸"),
             )
@@ -695,7 +696,7 @@ pub(crate) fn render_file_viewer(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_size(px(13.))
+                .text_size(ui_text(13.))
                 .text_color(theme.foreground)
                 .child(view.name.clone()),
         )
@@ -704,7 +705,7 @@ pub(crate) fn render_file_viewer(
                 .id("file-viewer-meta")
                 .test_support()
                 .flex_none()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child(format!("{} · {}", fmt_size(view.size), kind_label(view.kind))),
         );
@@ -782,7 +783,7 @@ pub(crate) fn render_file_viewer(
     if view.loading {
         body = body.child(
             div()
-                .text_size(px(12.))
+                .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child("reading…"),
         );
@@ -796,7 +797,7 @@ pub(crate) fn render_file_viewer(
                 .gap_1()
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.danger)
                         .child(err.clone()),
                 )
@@ -821,7 +822,7 @@ pub(crate) fn render_file_viewer(
                 if view.loading {
                     body = body.child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
                             .child("loading preview…"),
                     );
@@ -851,7 +852,7 @@ pub(crate) fn render_file_viewer(
                 } else {
                     body = body.child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
                             .child("no preview available"),
                     );
@@ -860,7 +861,7 @@ pub(crate) fn render_file_viewer(
             FileKind::Binary => {
                 body = body.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child("binary file — open it with the default application instead"),
                 );
@@ -898,14 +899,14 @@ pub(crate) fn render_file_viewer(
                                             .flex_none()
                                             .w(px(44.))
                                             .text_right()
-                                            .text_size(px(10.))
+                                            .text_size(ui_text(10.))
                                             .text_color(theme.muted_foreground)
                                             .child(format!("{}", first.saturating_add(i as u64))),
                                     )
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .text_size(px(12.))
+                                            .text_size(ui_text(12.))
                                             .font_family(theme.mono_font_family.clone())
                                             .text_color(theme.foreground)
                                             .child(display_line(line)),
@@ -954,7 +955,7 @@ pub(crate) fn render_file_viewer(
                 .py_1()
                 .border_t_1()
                 .border_color(theme.border)
-                .text_size(px(10.))
+                .text_size(ui_text(10.))
                 .text_color(theme.muted_foreground)
                 .child(footer),
         );
@@ -968,6 +969,12 @@ pub(crate) fn render_file_viewer(
         .flex()
         .flex_col()
         .bg(theme.background)
+        // The viewer fills the content region above the chat and panels, so
+        // nothing behind it should answer a scroll once its own body reaches
+        // the end (gpui scroll containers never stop propagation). A
+        // BlockMouse hitbox ends the hit test here; `#file-viewer-body` is
+        // deeper, so it is collected first and keeps scrolling.
+        .occlude()
         .child(column)
         .into_any_element()
 }
