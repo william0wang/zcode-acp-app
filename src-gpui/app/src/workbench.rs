@@ -5427,12 +5427,15 @@ fn render_user_row(
         };
     }
     let text = row_plain_text(row);
-    // The user side hangs RIGHT and caps its width; the assistant side below
-    // stays full-width and borderless. That left/right split is the whole
-    // role signal — markdown reads better unconfined than in a bubble
-    // (ChatView.tsx UserMessage `items-end max-w-[85%]` vs AssistantMessage).
-    // The copy affordance sits UNDER the bubble, right-aligned like the TS
-    // ActionBar — beside it in the row it would push the bubble off the edge.
+    // The user side hangs RIGHT in a tinted, bordered bubble; the assistant
+    // side below stays full-width, borderless and unpainted. Alignment ALONE
+    // was not enough (user feedback, 2026-10-21): a message long enough to
+    // fill its 85% cap starts at almost the same x as the agent's row, so
+    // the two read alike. The fill and the hairline edge differ on every
+    // line, however wide the message gets — `secondary` alone (0x1e1e22) sits
+    // too close to the canvas (0x0d0d0f) to carry that on its own, so the
+    // accent tint and the border do the work.
+    // (ChatView.tsx UserMessage `items-end max-w-[85%]` vs AssistantMessage.)
     let mut side = div().flex().flex_col().items_end().flex_none().max_w(relative(0.85));
     side = side.child(
         div()
@@ -5441,8 +5444,10 @@ fn render_user_row(
             .min_w_0()
             .px_3()
             .py_2()
-            .rounded_md()
-            .bg(theme.secondary)
+            .rounded_lg()
+            .bg(theme.accent.opacity(0.18))
+            .border_1()
+            .border_color(theme.accent.opacity(0.45))
             .child(bubble),
     );
     if !text.trim().is_empty() {
@@ -8110,22 +8115,24 @@ mod ui_tests {
             window.draw(cx).clear(cx);
             let bubble = window.find("user-bubble-m_user").bounds();
             let agent = window.find("agent-row-m_agent").bounds();
-            // The bubble starts well to the right of where the agent's row
-            // starts, and is narrower: that asymmetry is the role signal.
+            // The bubble hangs RIGHT on the agent row's right edge. The
+            // 85% cap is asserted as a bound, not as a left-edge gap: a
+            // message long enough to fill the cap starts close to the
+            // agent's x, which is exactly why the tint and border (checked
+            // in the source below) carry the role, not the offset.
             assert!(
-                bubble.origin.x > agent.origin.x + px(100.),
-                "the user bubble hangs right ({bubble:?} vs agent {agent:?})"
+                bubble.size.width <= agent.size.width * 0.85 + px(1.),
+                "the bubble respects the 85% cap ({bubble:?} vs agent {agent:?})"
             );
-            assert!(
-                bubble.size.width < agent.size.width,
-                "the bubble is narrower than the agent row ({bubble:?} vs {agent:?})"
-            );
-            // Right-aligned: the bubble's right edge sits at the row's.
             let bubble_right = bubble.origin.x + bubble.size.width;
             let agent_right = agent.origin.x + agent.size.width;
             assert!(
                 (bubble_right - agent_right).abs() < px(2.),
                 "the bubble is flush with the right edge ({bubble_right:?} vs {agent_right:?})"
+            );
+            assert!(
+                bubble.origin.x > agent.origin.x,
+                "the bubble does not start left of the agent row ({bubble:?} vs {agent:?})"
             );
         })
         .unwrap();
