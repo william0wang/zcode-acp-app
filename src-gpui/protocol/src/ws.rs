@@ -168,7 +168,18 @@ impl WsFactory for TungsteniteWsFactory {
                 while let Some(msg) = stream.next().await {
                     match msg {
                         Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                            if event_tx.try_send(WsEvent::Text(text.to_string())).is_err() {
+                            // AWAIT the enqueue — never `try_send`. The feed is
+                            // bounded, and a `session/load` replay lands
+                            // hundreds of frames back to back (172 in the
+                            // observed shanghai-building-demo session, 692
+                            // total). Dropping a frame on a full queue broke
+                            // the outbound loop below, which the pump reads as
+                            // "socket died": the client reconnected in a ~1.5s
+                            // storm, replaying the same burst (observed
+                            // 2026-10-21, 99 connects in three minutes).
+                            // Backpressure stalls the socket read instead —
+                            // exactly what a browser WebSocket does.
+                            if event_tx.send(WsEvent::Text(text.to_string())).await.is_err() {
                                 break;
                             }
                         }
@@ -179,7 +190,10 @@ impl WsFactory for TungsteniteWsFactory {
                         Err(_) => break,
                     }
                 }
-                let _ = event_tx.try_send(WsEvent::Closed);
+                // AWAIT (not try_send) for the same reason as the text arm:
+                // a dropped `Closed` leaves the pump waiting on a socket that
+                // is already gone instead of surfacing the disconnect.
+                let _ = event_tx.send(WsEvent::Closed).await;
             });
 
             Ok((
@@ -407,5 +421,57 @@ mod tests {
         stream.send(r#"{"probe":1}"#);
         stream.close();
         assert_eq!(events.recv().await, Some(WsEvent::Closed));
+    }
+
+    /// Regression (found live, 2026-10-21): a `session/load` replay delivers
+    /// its whole history in one burst — 172 frames for one observed session.
+    /// The reader used `try_send` against a 64-slot feed, so frame 65 failed
+    /// and the reader broke out as if the socket had died: the client
+    /// reconnected, replayed the same burst, and repeated forever (99 connects
+    /// in three minutes). Every frame must survive, however far past the
+    /// channel capacity the burst runs.
+    #[tokio::test]
+    async fn real_factory_survives_a_replay_burst_past_the_feed_capacity() {
+        use futures_util::{SinkExt, StreamExt};
+        const FRAMES: usize = 300; // > the 64-slot feed, the observed 172
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for i in 0..FRAMES {
+                ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                    format!(r#"{{"n":{i}}}"#).into(),
+                ))
+                .await
+                .unwrap();
+            }
+            while ws.next().await.is_some() {}
+        });
+
+        let factory = TungsteniteWsFactory;
+        let (_stream, mut events) = factory
+            .connect(&format!("ws://127.0.0.1:{port}/acp?instance=i1"), "tok")
+            .await
+            .expect("handshake");
+        assert_eq!(events.recv().await, Some(WsEvent::Open));
+
+        // Consume deliberately slowly — the reader must block on the full
+        // feed instead of dropping frames or declaring the socket dead.
+        for i in 0..FRAMES {
+            match events.recv().await {
+                Some(WsEvent::Text(text)) => {
+                    assert_eq!(text, format!(r#"{{"n":{i}}}"#), "frame {i} out of order");
+                }
+                other => panic!("frame {i}: expected Text, got {other:?}"),
+            }
+        }
+        // Still alive and readable: the burst did not tear the socket down.
+        assert!(
+            events.try_recv().is_err() || matches!(events.try_recv(), Ok(WsEvent::Closed)),
+            "no unexpected frame after the burst"
+        );
     }
 }

@@ -8150,4 +8150,122 @@ mod ui_tests {
         })
         .unwrap();
     }
+
+    /// Regression (the 14:51 SIGABRT, 2026-10-21): the config pages' delete
+    /// controls read their armed flag with
+    /// `cx.entity().read_with(cx, ..)` from INSIDE `render`. gpui leases the
+    /// entity for the render, so that second lease panics with "cannot read
+    /// … while it is already being updated" the moment a deletable row paints
+    /// — the app died as soon as the Models page showed a model. The flag is
+    /// now resolved by the caller, which already holds `&Workbench`.
+    #[gpui_kit::test]
+    fn a_deletable_row_renders_without_re_leasing_the_workbench(cx: &mut TestAppContext) {
+        use protocol::config_decode::{ModelRef, ModelsBlock, ModelsPayload};
+
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.models_page = Some(crate::runtime::ModelsPageView {
+            supported: Some(true),
+            loading: false,
+            error: None,
+            models: Some(ModelsPayload {
+                ok: Some(true),
+                models: Some(ModelsBlock {
+                    available: Some(vec![ModelRef {
+                        provider_id: Some("prov_1".to_string()),
+                        provider_name: Some("Provider One".to_string()),
+                        model_id: Some("model_1".to_string()),
+                    }]),
+                    providers: None,
+                    model_rules: None,
+                }),
+            }),
+            busy: false,
+        });
+
+        let (handle, _wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            // Painting the page is the regression: before the fix this frame
+            // aborted the process on the double lease.
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("model-delete-0").visible(),
+                "the deletable row's control rendered (its presence is what \
+                 used to trigger the panic)"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Regression (the edit-form crash, 2026-10-21): opening the model edit
+    /// form and painting it. The form reads its own field entities
+    /// (`form.model_id.read(cx)`, `form.context_window.read(cx)`) while the
+    /// WORKBENCH is leased for this render — legal, because those are
+    /// different entities — but any helper that reached back for the
+    /// workbench itself (`cx.entity().read_with(cx, ..)`, as the delete
+    /// control used to) aborts the process here. Painting is the assertion.
+    #[gpui_kit::test]
+    fn the_model_edit_form_paints_without_re_leasing_the_workbench(
+        cx: &mut TestAppContext,
+    ) {
+        use protocol::config_decode::{ModelRef, ModelsBlock, ModelsPayload};
+
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.models_page = Some(crate::runtime::ModelsPageView {
+            supported: Some(true),
+            loading: false,
+            error: None,
+            models: Some(ModelsPayload {
+                ok: Some(true),
+                models: Some(ModelsBlock {
+                    available: Some(vec![ModelRef {
+                        provider_id: Some("prov_1".to_string()),
+                        provider_name: Some("Provider One".to_string()),
+                        model_id: Some("model_1".to_string()),
+                    }]),
+                    providers: None,
+                    model_rules: None,
+                }),
+            }),
+            busy: false,
+        });
+
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            // The row's edit control — the gesture that crashed.
+            let target = ModelRef {
+                provider_id: Some("prov_1".to_string()),
+                provider_name: Some("Provider One".to_string()),
+                model_id: Some("model_1".to_string()),
+            };
+            wb.update(cx, |this, cx| {
+                this.open_models_form(Some(target), window, cx)
+            });
+            // Painting the OPEN form is the regression: the context window
+            // and model id inputs are read during render, and the save
+            // button's canSubmit check reads them again.
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("model-form-body").visible(),
+                "the edit form rendered with its fields"
+            );
+            assert!(
+                window.find("model-save").visible(),
+                "the save control rendered (its disabled state reads the form)"
+            );
+        })
+        .unwrap();
+    }
 }

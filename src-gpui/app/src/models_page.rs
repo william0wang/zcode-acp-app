@@ -707,7 +707,22 @@ impl Workbench {
                 &self.runtime,
                 cx,
             ))
-            .child(render_model_delete(index, m, busy, &self.runtime, cx))
+            .child(render_model_delete(
+                index,
+                m,
+                busy,
+                self.model_delete_confirm.as_deref()
+                    == Some(
+                        format!(
+                            "{}/{}",
+                            m.provider_id.as_deref().unwrap_or_default(),
+                            m.model_id.as_deref().unwrap_or_default()
+                        )
+                        .as_str(),
+                    ),
+                &self.runtime,
+                cx,
+            ))
             .child(
                 div()
                     .size_3()
@@ -1333,6 +1348,7 @@ fn render_model_delete(
     index: usize,
     m: &ModelRef,
     busy: bool,
+    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -1345,11 +1361,11 @@ fn render_model_delete(
     if provider_id.starts_with("account:") {
         return div().into_any_element();
     }
+    // `armed` arrives from the caller, which already holds `&Workbench`.
+    // Reading it here via `cx.entity().read_with(cx, ..)` would lease the very
+    // entity being rendered — gpui panics on that double lease (the 14:51
+    // SIGABRT, 2026-10-21).
     let wb = cx.entity();
-    let armed = wb
-        .read_with(cx, |wb, _| wb.model_delete_confirm.clone())
-        .as_deref()
-        == Some(format!("{provider_id}/{model_id}").as_str());
 
     if armed {
         let wb_cancel = wb.clone();

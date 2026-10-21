@@ -567,7 +567,18 @@ fn render_skills_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context
 
     let mut block = div().flex().flex_col();
     for (index, skill) in rows.iter().enumerate() {
-        block = block.child(render_skill_row(index, skill, page.busy, &wb.runtime, cx));
+        // The armed flag is resolved HERE, from the `&Workbench` the body
+        // already holds: the delete control must never lease the entity being
+        // rendered (`cx.entity().read_with(cx, ..)` double-leases and panics).
+        let armed = wb.skill_delete_confirm.as_deref() == Some(skill.id());
+        block = block.child(render_skill_row(
+            index,
+            skill,
+            page.busy,
+            armed,
+            &wb.runtime,
+            cx,
+        ));
     }
     list.child(rows_card(theme).child(block))
         .into_any_element()
@@ -577,6 +588,7 @@ fn render_skill_row(
     index: usize,
     skill: &SkillRow,
     busy: bool,
+    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -671,7 +683,7 @@ fn render_skill_row(
     // Only the server's deletable rows (user/agents trees) get the control —
     // the delete route refuses plugin and project skills anyway.
     if skill.is_deletable() {
-        row = row.child(render_skill_delete(index, &id, busy, runtime, cx));
+        row = row.child(render_skill_delete(index, &id, busy, armed, runtime, cx));
     }
     row.into_any_element()
 }
@@ -683,15 +695,12 @@ fn render_skill_delete(
     index: usize,
     path: &str,
     busy: bool,
+    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
     let theme = cx.theme();
     let wb = cx.entity();
-    let armed = wb
-        .read_with(cx, |wb, _| wb.skill_delete_confirm.clone())
-        .as_deref()
-        == Some(path);
 
     if armed {
         let wb_cancel = wb.clone();
@@ -766,7 +775,18 @@ fn render_mcp_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<Wo
     } else {
         let mut block = div().flex().flex_col();
         for (index, server) in rows.iter().enumerate() {
-            block = block.child(render_mcp_row(index, server, page.busy, wb, cx));
+            // Resolved from `wb` (already borrowed) — never via
+            // `cx.entity().read_with(cx, ..)`, which double-leases the entity
+            // mid-render and panics (the 14:51 SIGABRT, 2026-10-21).
+            let armed = wb.mcp_delete_confirm.as_deref() == server.name.as_deref();
+            block = block.child(render_mcp_row(
+                index,
+                server,
+                page.busy,
+                armed,
+                wb,
+                cx,
+            ));
         }
         list = list.child(rows_card(theme).child(block));
     }
@@ -793,6 +813,7 @@ fn render_mcp_row(
     index: usize,
     server: &McpServerRow,
     busy: bool,
+    armed: bool,
     wb_ref: &Workbench,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -816,7 +837,7 @@ fn render_mcp_row(
     let runtime_switch = runtime.clone();
     let switch_name = name.clone();
     let enable = !disabled;
-    let delete = render_mcp_delete(index, &name, busy, &runtime, cx);
+    let delete = render_mcp_delete(index, &name, busy, armed, &runtime, cx);
     div()
         .id(SharedString::from(format!("mcp-row-{index}-{name}")))
         .test_support()
@@ -891,15 +912,12 @@ fn render_mcp_delete(
     index: usize,
     name: &str,
     busy: bool,
+    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
     let theme = cx.theme();
     let wb = cx.entity();
-    let armed = wb
-        .read_with(cx, |wb, _| wb.mcp_delete_confirm.clone())
-        .as_deref()
-        == Some(name);
 
     if armed {
         let wb_cancel = wb.clone();
@@ -1227,8 +1245,21 @@ fn render_agents_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context
     } else {
         let mut block = div().flex().flex_col();
         for (index, agent) in rows.iter().enumerate() {
+            // The delete key is the row's DISPLAY name (render_agent_row's
+            // `name`), so derive it the same way here. Resolved from `wb`
+            // (already borrowed) — never via `cx.entity().read_with(cx, ..)`,
+            // which double-leases the entity mid-render and panics (the
+            // 14:51 SIGABRT, 2026-10-21).
+            let row_name = agent.name.clone().unwrap_or_default();
+            let armed = wb.agent_delete_confirm.as_deref() == Some(row_name.as_str());
             block = block.child(render_agent_row(
-                index, agent, &options, page.busy, &wb.runtime, cx,
+                index,
+                agent,
+                &options,
+                page.busy,
+                armed,
+                &wb.runtime,
+                cx,
             ));
         }
         list = list.child(rows_card(theme).child(block));
@@ -1259,6 +1290,7 @@ fn render_agent_row(
     agent: &AgentRow,
     options: &[protocol::config_decode::ModelOption],
     busy: bool,
+    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -1396,7 +1428,7 @@ fn render_agent_row(
                 }),
         );
         row = row.child(render_agent_delete(
-            index, &name, busy, runtime, cx,
+            index, &name, busy, armed, runtime, cx,
         ));
     } else {
         // A built-in has no file, but its MODEL is overridable — the server
@@ -1518,15 +1550,12 @@ fn render_agent_delete(
     index: usize,
     name: &str,
     busy: bool,
+    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
     let theme = cx.theme();
     let wb = cx.entity();
-    let armed = wb
-        .read_with(cx, |wb, _| wb.agent_delete_confirm.clone())
-        .as_deref()
-        == Some(name);
 
     if armed {
         let wb_cancel = wb.clone();
