@@ -84,6 +84,7 @@ pub mod session;
 pub mod settings;
 pub mod settings_client;
 pub mod system_stats;
+pub mod terminal;
 pub mod toast;
 pub mod workflow;
 pub mod workflow_args;

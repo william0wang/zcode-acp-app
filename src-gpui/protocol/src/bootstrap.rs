@@ -123,13 +123,23 @@ pub struct RemoteSection {
     pub hub_host: Option<String>,
 }
 
-/// Parse the `remote` section out of a config-file body. `None` for every
-/// case the server's loader reads as "no usable section": malformed JSON, a
-/// non-object root, or `remote` missing / not an object (user-config.ts
-/// `loadUserConfig` best-effort doctrine — the env fallback then applies).
-pub fn parse_remote_section(file_text: &str) -> Option<RemoteSection> {
+/// The `remote` object of a config-file body. `None` for every case the
+/// server's loader reads as "no usable section": malformed JSON, a non-object
+/// root, or `remote` missing / not an object (user-config.ts `loadUserConfig`
+/// best-effort doctrine — the env fallback then applies).
+///
+/// Split out of [`parse_remote_section`] because the desktop models only a
+/// field subset: the blocks it does not mirror (`terminal`, `projectRoots`,
+/// `webDir`) still have to be readable without forking the file parse.
+pub fn remote_object(file_text: &str) -> Option<Map<String, Value>> {
     let root: Value = serde_json::from_str(file_text).ok()?;
-    let remote = root.get("remote")?.as_object()?;
+    root.get("remote")?.as_object().cloned()
+}
+
+/// Parse the `remote` section out of a config-file body (see
+/// [`remote_object`] for the `None` cases).
+pub fn parse_remote_section(file_text: &str) -> Option<RemoteSection> {
+    let remote = remote_object(file_text)?;
     let mut out = RemoteSection::default();
     if let Some(enabled) = remote.get("enabled").and_then(Value::as_bool) {
         out.enabled = Some(enabled);

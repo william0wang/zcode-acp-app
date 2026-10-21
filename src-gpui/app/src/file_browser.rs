@@ -252,6 +252,102 @@ pub fn open_in_zed(abs: &str) -> Result<(), String> {
         .map_err(|e| format!("Zed: {e}"))
 }
 
+// ---------------------------------------------------------------------------
+// "Open a terminal here"
+// ---------------------------------------------------------------------------
+
+/// The user's terminal preference list, read once. `remote.terminal` is the
+/// hub's own block (server ADR-0016): the ORDER it lists is the order the
+/// hub walks when it incubates a session terminal, so this action picks the
+/// same app the user already chose there — no second setting to keep in
+/// sync. Cached because it gates a paint; the click re-reads live.
+pub fn cached_terminal_apps() -> Vec<String> {
+    static APPS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    APPS.get_or_init(live_terminal_apps).clone()
+}
+
+/// A live read of the same list, so an edited config applies to the next
+/// click without an app restart (the server's live-config doctrine). An
+/// unreadable config is NOT "no terminals": it falls back to the same
+/// Terminal.app default the hub uses, and only an explicit
+/// `remote.terminal.enabled = false` empties the list.
+fn live_terminal_apps() -> Vec<String> {
+    read_terminal_apps().unwrap_or_else(|| vec!["Terminal".to_string()])
+}
+
+fn read_terminal_apps() -> Option<Vec<String>> {
+    let env = protocol::bootstrap::BootstrapEnv::from_env();
+    let path = protocol::bootstrap::user_config_path(&env);
+    let text = std::fs::read_to_string(path).ok()?;
+    let remote = protocol::bootstrap::remote_object(&text)?;
+    Some(protocol::terminal::parse_terminal_prefs(&remote).app_candidates())
+}
+
+/// Hand `dir` to the first configured terminal that accepts it, returning the
+/// app that took it. BLOCKING (one LaunchServices round-trip per candidate) —
+/// call it from the background executor, never from a click on the UI thread.
+pub fn open_terminal_here(dir: &str) -> Result<String, String> {
+    let apps = live_terminal_apps();
+    first_accepting(&apps, |app| {
+        let (program, args) = terminal_open_argv(app, dir);
+        std::process::Command::new(&program)
+            .args(&args)
+            .status()
+            .map(|status| status.success())
+            .map_err(|e| e.to_string())
+    })
+    .ok_or_else(|| {
+        if apps.is_empty() {
+            "no terminal is configured in remote.terminal".to_string()
+        } else {
+            format!("no configured terminal opened {dir}")
+        }
+    })
+}
+
+/// The list walk, with the launcher injected: the first candidate whose
+/// launch reports success wins. `Ok(false)` (the app declined the path) and
+/// `Err` (not installed, bad bundle) both fall through to the next entry —
+/// the hub's own rule for its ordered terminal preferences.
+pub fn first_accepting(
+    apps: &[String],
+    mut launch: impl FnMut(&str) -> Result<bool, String>,
+) -> Option<String> {
+    apps.iter()
+        .find(|app| launch(app).unwrap_or(false))
+        .cloned()
+}
+
+/// How one app is told "open a terminal at this directory". argv only, never
+/// a shell, so a path with spaces or quotes needs no escaping.
+///
+/// The general form is `open -a <app> <dir>`: Terminal, iTerm, Warp and
+/// Ghostty all declare a Folders document type (`public.directory` /
+/// `public.folder`) with the Editor role in their Info.plist, so
+/// LaunchServices hands the directory over and the app opens a new surface
+/// already cd'd there — in the RUNNING instance, which is what a "new tab
+/// here" gesture should do. (Ghostty's `-na --working-directory` form also
+/// works, but forces a second app process; the folder document does not.)
+/// WezTerm, kitty and Alacritty declare no folder documents, so they take
+/// their own CLI flags — the same recipes the hub's
+/// `TERMINAL_APP_LAUNCHERS` table uses.
+pub fn terminal_open_argv(app: &str, dir: &str) -> (String, Vec<String>) {
+    let argv = |extra: &[&str], tail: &[&str]| {
+        let mut args: Vec<String> = extra.iter().map(|s| s.to_string()).collect();
+        args.push(app.to_string());
+        args.extend(tail.iter().map(|s| s.to_string()));
+        args.push(dir.to_string());
+        args
+    };
+    let args = match app {
+        "WezTerm" => argv(&["-na"], &["--args", "start", "--cwd"]),
+        "kitty" => argv(&["-na"], &["--args", "--directory"]),
+        "Alacritty" => argv(&["-na"], &["--args", "--working-directory"]),
+        _ => argv(&["-a"], &[]),
+    };
+    ("open".to_string(), args)
+}
+
 /// The session root's display name for the breadcrumb's first crumb (TS
 /// `rootName`): the root's last path segment, `"/"` for the filesystem root.
 pub fn root_name(root: &str) -> String {
@@ -336,12 +432,44 @@ pub(crate) fn render_files_header(
     if can_local {
         let wb_open = ctx.wb.clone();
         let wb_zed = ctx.wb.clone();
+        let wb_term = ctx.wb.clone();
         let root = view
             .listing
             .as_ref()
             .map(|l| l.root.clone())
             .unwrap_or_default();
         let path = view.path.clone();
+        // A terminal at the browsed directory, chosen from the SAME ordered
+        // list the hub incubates with (`remote.terminal.terminals`) — the
+        // user's first working choice, so one broken entry does not hide the
+        // action. Hidden entirely when they disabled visible terminals.
+        if !cached_terminal_apps().is_empty() {
+            let root = root.clone();
+            let path = path.clone();
+            row = row.child(
+                Button::new("files-open-terminal")
+                    .ghost()
+                    .xsmall()
+                    .icon(KitIconName::SquareTerminal)
+                    .tooltip("Open a terminal in this directory")
+                    .on_click(move |_, _, cx| {
+                        let abs = absolute_dir(&root, &path);
+                        let wb = wb_term.clone();
+                        // LaunchServices is a round trip per candidate: keep it
+                        // off the UI thread and land only the failure, like the
+                        // other file actions.
+                        let launch = cx
+                            .background_executor()
+                            .spawn(async move { open_terminal_here(&abs) });
+                        cx.spawn(async move |cx| {
+                            if let Err(e) = launch.await {
+                                let _ = wb.update(cx, |wb, cx| wb.files_notice(&e, cx));
+                            }
+                        })
+                        .detach();
+                    }),
+            );
+        }
         // Open the current directory as a Zed workspace. Only where the
         // bridge's paths name real local files AND Zed is installed — the
         // user asked for the entry to vanish, not to fail, otherwise.
@@ -992,10 +1120,68 @@ mod tests {
     // Explicit imports only — the file-root kit glob would shadow the
     // built-in #[test] with gpui's macro (see gpui-kit-notes.md).
     use super::{
-        absolute_dir, display_line, file_kind_of, fmt_size, is_loopback_hub, is_markdown, join_dir,
-        root_name, viewer_next_window, viewer_window, zed_bundle_present, FileKind,
-        SERVER_LINE_WINDOW, VIEWER_LINE_BUDGET,
+        absolute_dir, display_line, file_kind_of, first_accepting, fmt_size, is_loopback_hub,
+        is_markdown, join_dir, root_name, terminal_open_argv, viewer_next_window, viewer_window,
+        zed_bundle_present, FileKind, SERVER_LINE_WINDOW, VIEWER_LINE_BUDGET,
     };
+
+    /// The list walk: the first app that accepts wins, and a refusal or an
+    /// error falls through to the next — an uninstalled first preference must
+    /// not swallow the action (the hub's ordered-preference rule).
+    #[test]
+    fn the_first_accepting_terminal_wins_and_failures_fall_through() {
+        let apps = vec![
+            "Ghostty".to_string(),
+            "Warp".to_string(),
+            "Terminal".to_string(),
+        ];
+        let took = first_accepting(&apps, |app| Ok(app == "Warp"));
+        assert_eq!(took.as_deref(), Some("Warp"));
+
+        // Not installed (Err) and declined (Ok(false)) both move on.
+        let took = first_accepting(&apps, |app| match app {
+            "Ghostty" => Err("not installed".to_string()),
+            "Warp" => Ok(false),
+            _ => Ok(true),
+        });
+        assert_eq!(took.as_deref(), Some("Terminal"));
+
+        assert_eq!(first_accepting(&apps, |_| Ok(false)), None);
+        assert_eq!(first_accepting(&[], |_| Ok(true)), None);
+    }
+
+    /// Each recipe must name the directory as its OWN argv argument — never
+    /// spliced into a shell string, so a path with spaces stays one path.
+    #[test]
+    fn terminal_argv_keeps_the_directory_a_single_argument() {
+        let dir = "/work/A Project";
+        let (program, args) = terminal_open_argv("Terminal", dir);
+        assert_eq!(program, "open");
+        assert_eq!(args, vec!["-a", "Terminal", dir]);
+        // Apps with a Folders document type ride the generic form: the
+        // directory is handed to the RUNNING instance (a new Ghostty process
+        // would come from `-na`, which a "new tab here" gesture must not do).
+        let (_, args) = terminal_open_argv("Ghostty", dir);
+        assert_eq!(args, vec!["-a", "Ghostty", dir]);
+        let (_, args) = terminal_open_argv("Warp", dir);
+        assert_eq!(args, vec!["-a", "Warp", dir]);
+        // Flag-taking terminals keep the path positional.
+        let (_, args) = terminal_open_argv("WezTerm", dir);
+        assert_eq!(
+            args,
+            vec!["-na", "WezTerm", "--args", "start", "--cwd", dir]
+        );
+        let (_, args) = terminal_open_argv("kitty", dir);
+        assert_eq!(args, vec!["-na", "kitty", "--args", "--directory", dir]);
+        let (_, args) = terminal_open_argv("Alacritty", dir);
+        assert_eq!(
+            args,
+            vec!["-na", "Alacritty", "--args", "--working-directory", dir]
+        );
+        // An unknown app is passed straight to LaunchServices.
+        let (_, args) = terminal_open_argv("SomeTerm", dir);
+        assert_eq!(args, vec!["-a", "SomeTerm", dir]);
+    }
 
     /// Zed's presence gate: the affordance is a filesystem probe over the
     /// standard install folders, so an empty set reads as "not installed".
