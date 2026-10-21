@@ -1,5 +1,6 @@
 {
-  "name": "zcode-acp-remote",
+  "name": "zcode-acp-app",
+  "description": "ZCode ACP: native desktop workbench, Android app, and web SPA for zcode-acp sessions",
   "private": true,
   "version": "0.33.2",
   "license": "MIT",
@@ -11,7 +12,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/william0wang/zcode-acp-remote.git"
+    "url": "git+https://github.com/william0wang/zcode-acp-app.git"
   },
   "type": "module",
   "scripts": {

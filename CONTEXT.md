@@ -1,8 +1,14 @@
-# zcode-acp-remote
+# ZCode ACP
 
-ZCode ACP: mobile Remote Client for zcode-acp-server. A Tauri 2 + React app
-that attaches to a Hub over WebSocket and drives the same agent sessions as
-the desktop editor. Android-first; iOS deferred.
+ZCode ACP: the app for zcode-acp-server. Three clients over one family of
+products — a native desktop workbench in Rust on gpui-kit (`src-gpui/`), and
+an Android app plus a Web SPA sharing one Tauri 2 + React codebase (`src/`).
+All of them attach to a Hub over WebSocket and drive the same agent sessions
+as the desktop editor.
+
+Two identifiers keep the historical `zcode-acp-remote` spelling on
+purpose: the desktop client's wire identity (`zcode-acp-remote-desktop`, matched
+by the hub) and the desktop config directory (`~/.config/zcode-acp-remote`).
 
 ## Language
 
@@ -31,18 +37,25 @@ bundles it.
 _Avoid_: embedded server, hub host, sidecar
 
 **Desktop Workbench**:
-The desktop-only client (a separate product line, not a port of the mobile
-UI): a dock-style window — sessions/files/settings as dockable panels around
-a chat area, multiple sessions in tabs. The mobile and web clients remain the
-universal UI and stay in low-intensity maintenance.
+The native desktop client in `src-gpui/` — a dock-style window: sessions and
+configuration as dockable panels around a chat area, the active session's file
+browser on the right, multiple sessions in tabs. It is a separate product line
+on gpui-kit, not a port of the React UI (ADR-0009); both lines share the
+protocol crate's semantics and the i18n catalogs.
 _Avoid_: desktop mode, desktop skin
+
+**Mobile / Web Client**:
+The React clients in `src/` — one codebase behind two surfaces: the Android
+APK (Tauri 2 shell) and the browser SPA (no Tauri APIs). The capability
+reference for the desktop line, never its layout reference.
+_Avoid_: phone app, legacy client
 
 **Parity**:
 The desktop client's coverage rule against the mobile app: every mobile
 capability must be reachable on the desktop — that completeness comes first,
-and reshaping the interaction to desktop conventions comes second. The
-mobile app is the capability reference, never the layout reference: a
-missing capability is a gap by definition; a different layout is not.
+and reshaping the interaction to desktop conventions comes second. The mobile
+app is the capability reference, never the layout reference: a missing
+capability is a gap by definition; a different layout is not.
 _Avoid_: UI port, pixel parity, mobile skin
 
 **Desktop Presence**:

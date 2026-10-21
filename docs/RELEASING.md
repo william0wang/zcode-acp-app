@@ -1,5 +1,21 @@
 # Releasing
 
+The two product lines release differently: the Android/Web line publishes a
+signed APK to GitHub Releases from the maintainer's machine, while the desktop
+workbench is a local unsigned build with no artifact channel.
+
+## Desktop workbench
+
+No release pipeline. `scripts/build-macos-gpui.sh` builds
+`dist/ZCode-acp.app` from the version in `src-gpui/Cargo.toml`
+(`[workspace.package].version`), which follows the repo's main version — bump
+it in the same commit as the other carriers when cutting a release so the two
+lines never report different numbers. There is no tag, no upload, and no
+signing: the bundle runs on the build machine and needs a one-time
+right-click → Open elsewhere.
+
+## Android / Web
+
 Manual and local-first: release APKs are built on the maintainer's machine
 (the Android signing key lives in gitignored `.signing/`), and
 `scripts/release.sh` turns a version number into a tag, a push and a GitHub

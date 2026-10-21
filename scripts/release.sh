@@ -22,7 +22,10 @@ if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   exit 1
 fi
 
-# Bump the 4 version carriers: package.json, tauri.conf.json, Cargo.toml, Cargo.lock.
+# Bump the 6 version carriers: package.json, tauri.conf.json, Cargo.toml,
+# Cargo.lock, plus the desktop line's src-gpui workspace + its lock (the app
+# reports this number in its bundle Info.plist, so a drifted pair would ship
+# two different versions of one release).
 # Regex, not JSON rewrite, keeps the files byte-identical apart from the version.
 node - "$VERSION" <<'EOF'
 const fs = require("fs");
@@ -38,17 +41,20 @@ bump("package.json", /("version"\s*:\s*)"[^"]*"/);
 bump("src-tauri/tauri.conf.json", /("version"\s*:\s*)"[^"]*"/);
 bump("src-tauri/Cargo.toml", /(^version\s*=\s*)"[^"]*"/m);
 bump("src-tauri/Cargo.lock", /(name = "app"\nversion = )"[^"]*"/);
+bump("src-gpui/Cargo.toml", /(^version\s*=\s*)"[^"]*"/m);
+bump("src-gpui/Cargo.lock", /(name = "app"\nversion = )"[^"]*"/);
+bump("src-gpui/Cargo.lock", /(name = "protocol"\nversion = )"[^"]*"/);
 EOF
 
 # Build before any commit/tag lands: a failed build reverts the bump and aborts.
 APK="dist/ZCode-ACP-v${VERSION}-release.apk"
 if ! pnpm build:android; then
-  git checkout -- package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+  git checkout -- package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-gpui/Cargo.toml src-gpui/Cargo.lock
   echo "error: build failed; version bump reverted" >&2
   exit 1
 fi
 
-git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+git add package.json src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock src-gpui/Cargo.toml src-gpui/Cargo.lock
 # The version may already sit at the target (e.g. the fix/feature commit was
 # tested at that version) — nothing to stage then, and a bare `git commit`
 # would abort the whole flow. Skip the commit in that case.

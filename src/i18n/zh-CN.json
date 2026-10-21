@@ -1,6 +1,6 @@
 {
   "connect": {
-    "subtitle": "远程掌控你的 Agent 会话",
+    "subtitle": "接入你的 Agent 会话",
     "hubUrl": "Hub 地址",
     "token": "访问令牌",
     "connect": "连接",
@@ -470,7 +470,7 @@
     "loading": "正在加载项目…",
     "empty": "没有匹配的项目",
     "sessionCount": "{{count}} 个会话",
-    "tooOld": "远程创建会话需要 bridge 0.17.0+",
+    "tooOld": "新建会话需要 bridge 0.17.0+",
     "browse": "浏览目录",
     "startHere": "在此启动会话",
     "notAllowed": "无法在此目录启动新会话——它既不是已知项目，也不在桌面机配置的 remote.projectRoots 允许根目录内",

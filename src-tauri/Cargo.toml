@@ -1,10 +1,10 @@
 [package]
 name = "app"
 version = "0.33.2"
-description = "Mobile remote client for zcode-acp: attach to a Hub over WebSocket"
+description = "ZCode ACP for Android and the web: attach to a zcode-acp Hub over WebSocket"
 authors = ["William Wang"]
 license = "MIT"
-repository = "https://github.com/william0wang/zcode-acp-remote"
+repository = "https://github.com/william0wang/zcode-acp-app"
 edition = "2021"
 rust-version = "1.77.2"
 

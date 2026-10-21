@@ -1,59 +1,92 @@
-# zcode-acp-remote
+# ZCode ACP
 
 [简体中文](README.zh-CN.md) | English
 
-Mobile remote client for [zcode-acp-server](https://github.com/william0wang/zcode-acp):
-attach to your Hub over WebSocket from an Android phone and drive the same
-agent sessions as your editor. See the server's
-[REMOTE-CLIENTS.md](https://github.com/william0wang/zcode-acp/blob/main/docs/REMOTE-CLIENTS.md)
-for the transport contract this app implements.
+The app for [zcode-acp](https://github.com/william0wang/zcode-acp): drive the
+agent sessions your machine runs, from a native desktop workbench, an Android
+phone, or any browser. Every surface attaches to a zcode-acp Hub over
+WebSocket; the transport contract is the server's
+[REMOTE-CLIENTS.md](https://github.com/william0wang/zcode-acp/blob/main/docs/REMOTE-CLIENTS.md).
 
-Attach to existing sessions, or start new ones in any of the machine's known
-projects (bridge 0.17.0+) — the hub spawns a headless serve bridge for the
-project and the session runs there.
+Two identifiers deliberately keep the historical `zcode-acp-remote` spelling
+and must not be renamed casually: the desktop client's wire identity
+(`zcode-acp-remote-desktop`, matched by the hub) and the desktop config
+directory (`~/.config/zcode-acp-remote`).
+
+## Surfaces
+
+| Surface | Stack | Where it runs |
+| --- | --- | --- |
+| **Desktop workbench** (`src-gpui/`) | Native Rust, gpui-kit | macOS (unsigned `.app`) |
+| **Android** (`src/` + `src-tauri/`) | Tauri 2 + React + TypeScript | Android APK |
+| **Web** (same `src/`) | Plain SPA, no Tauri APIs | Any browser |
+
+The desktop workbench is a dock-style window: a rail of panel toggles, the
+sessions and configuration panels docked beside a tabbed chat area, and the
+active session's file browser on the right. The Android and web clients share
+one React codebase; the desktop client is its own product line, not a port of
+it (ADR-0009). Both compile the same i18n catalogs.
 
 ## Features
 
-- Session list with live activity badges (running / idle / just finished),
-  long-press to retire a session remotely
-- Start new sessions remotely: pick one of the machine's known projects and a
-  CLI session starts there (bridge 0.17.0+)
-- Chat with streaming assistant replies, Markdown + code highlight, diff views
-- Approve tool permission requests and answer AskUserQuestion forms in the
-  session that raised them — even ones that fired while the phone was offline
+Shared by every surface:
+
+- Attach to existing sessions, or start new ones in any of the machine's known
+  projects (bridge 0.17.0+), or browse the machine's directories for a target
+  (bridge 0.65.0+)
+- Streaming assistant replies with Markdown, syntax-highlighted code, and diff
+  views
+- Approve tool permissions and answer AskUserQuestion forms in the session that
+  raised them — including requests that fired while the client was offline
   (re-delivered after reconnect)
-- Prompt queue per session — drafts survive app restarts
-- Slash command completion, including `$`-prefixed skills
-- Usage quota card with green→yellow→red heat colors
-- Reconnect with replay catch-up; transient connection drops stay quiet
+- Per-session prompt queue whose drafts survive app restarts
+- Session files: breadcrumb browser over the active session's directory tree,
+  with a line-windowed text viewer, image preview, and a download fallback
+- Configuration pages for the machine: models, usage statistics, plan quota and
+  its reset cards, system status, skills, MCP servers, hooks, subagents,
+  backups, dynamic workflows, and app updates
+- Plan-quota allowance windows with reset cards, and the account's usage
+  statistics
+- Reconnect with replay catch-up; transient drops stay quiet
 - English / 简体中文 UI
+
+Desktop-only:
+
+- One tab per session, each with its own connection; ⌘1–9 switch tabs, ⌘K
+  searches sessions, Esc stops the running turn
+- Hub bootstrap — when no hub is listening the app spawns the installed
+  `zcode-acp-server` daemon and connects to it (ADR-0010)
+- Desktop Presence — while the workbench is connected, new sessions incubate
+  headless instead of opening terminal windows (ADR-0010)
+- Open the browsed folder or file in Zed, when the hub is local and Zed is
+  installed (the action is absent otherwise)
 
 ## Install
 
-Grab the latest APK from [Releases](../../releases), sideload it, and enter
-your Hub URL + remote token in the app.
+**Android** — grab the latest APK from [Releases](../../releases), sideload
+it, and enter your Hub URL + token.
 
-The app is also a plain SPA — no Tauri APIs are used — so the web build runs
-on iOS, desktop, and any other browser. See
+**Desktop** — build it yourself (no prebuilt download), see
+[Desktop workbench](#desktop-workbench).
+
+**Web** — deploy the SPA yourself, see
 [Standalone web deployment](#standalone-web-deployment).
 
 ## Server setup
 
-This app is a client; it needs a running zcode-acp-server hub:
+Every surface is a client; you need a running zcode-acp-server hub:
 
 1. Install and run [zcode-acp-server](https://github.com/william0wang/zcode-acp)
-   in your editor (it bridges the agent over a Hub WebSocket).
-2. Set a remote token (`ZCODE_ACP_REMOTE_TOKEN`) when starting the bridge.
-3. Expose the hub over `https://` (a tunnel works — the app upgrades
-   https→wss itself) or use plain `http://` on your LAN.
+   on the machine whose agent sessions you want to drive.
+2. Set a remote token (`ZCODE_ACP_REMOTE_TOKEN`) when starting the bridge if the
+   hub is reachable from other machines.
+3. Expose the hub over `https://` (a tunnel works — the app upgrades https→wss
+   itself) or use plain `http://` on your LAN.
 
-## Stack
-
-- Tauri 2 shell (no custom Rust code) — `docs/adr/0001`
-- React + TypeScript + Vite, Tailwind CSS v4
-- assistant-ui + shadcn-style custom components — `docs/adr/0002`
-- Zustand store, native WebSocket + custom reconnect manager
-- i18next (default `en`, ships `zh-CN`)
+On the machine running the workbench the hub may be local: the desktop app
+starts it when nothing is listening. A token is still required — when neither
+the config file nor `ZCODE_ACP_REMOTE_TOKEN` carries one, the app shows a
+guided setup card and writes the token it generates.
 
 ## Development
 
@@ -62,6 +95,14 @@ pnpm install
 pnpm dev                # browser at http://localhost:5173 (fastest loop)
 pnpm tauri android dev  # on a device/emulator via adb
 pnpm build              # type-check + bundle to dist/
+pnpm test               # vitest
+```
+
+Desktop workbench:
+
+```bash
+cargo check  --manifest-path src-gpui/Cargo.toml
+cargo test   --manifest-path src-gpui/Cargo.toml -p app
 ```
 
 ## Android APK
@@ -80,32 +121,29 @@ The icon set is generated from `scripts/gen-icon.mjs` (SVG via `sharp` →
 `node scripts/gen-icon.mjs && pnpm tauri icon src-tauri/icons/app-icon.png`
 after changing the design.
 
-## macOS app (build it yourself)
+## Desktop workbench
 
 ```bash
-pnpm build:macos          # unsigned .app -> dist/ZCode-acp.app
+./scripts/build-macos-gpui.sh   # native gpui build -> dist/ZCode-acp.app
+pnpm build:macos                # WebView shell build -> dist/ZCode-acp.app
 ```
 
-No prebuilt macOS download is provided — anyone can build one from source.
-The bundle is unsigned (no Developer ID, no notarization): it runs as built
-on your machine; on another machine Gatekeeper needs a one-time
-right-click → Open. The embedded Info.plist allows plain http://ws:// hubs
-(same policy as Android's cleartext traffic).
-
-Releasing (maintainers): `pnpm release <version>` bumps all version files,
-builds the APK, commits, tags, pushes, and publishes the GitHub Release in
-one shot.
+Two different macOS builds write the same bundle path and replace each other by
+design: the native workbench (gpui, the desktop product line) and the Tauri
+WebView shell (the same React UI the phone runs). Neither is signed (no
+Developer ID, no notarization): it runs as built on your machine; on another
+machine Gatekeeper needs a one-time right-click → Open.
 
 ## Standalone web deployment
 
-The app is a plain SPA — no Tauri APIs are used — so the web build runs on
-iOS, desktop, and any other browser. Deploy it yourself; no backend of your
-own is needed: the hub serves `Access-Control-Allow-Origin: *`.
+The React client is a plain SPA — no Tauri APIs are used — so the web build
+runs on iOS, desktop, and any other browser. Deploy it yourself; no backend of
+your own is needed: the hub serves `Access-Control-Allow-Origin: *`.
 
 **One click (Netlify)** — forks the repo into your own GitHub account and
 builds it for you:
 
-[![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/william0wang/zcode-acp-remote)
+[![Deploy to Netlify](https://www.netlify.com/img/deploy/button.svg)](https://app.netlify.com/start/deploy?repository=https://github.com/william0wang/zcode-acp-app)
 
 **Cloudflare Pages** — two ways:
 
@@ -146,6 +184,13 @@ Caveats:
   the hub's tunneled `https://` URL.
 - The token is stored in the browser's localStorage: don't use a shared
   machine, and prefer a private/incognito window for one-off access.
+
+## Releasing
+
+`pnpm release <version>` bumps the version carriers, builds the Android APK,
+commits, tags, pushes, and publishes the GitHub Release in one shot. The
+desktop workbench is built and distributed separately (it has no signed
+artifact channel). Details: `docs/RELEASING.md`.
 
 ## Docs
 

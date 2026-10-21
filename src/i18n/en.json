@@ -1,6 +1,6 @@
 {
   "connect": {
-    "subtitle": "Remote control for your agent sessions",
+    "subtitle": "Connect to your agent sessions",
     "hubUrl": "Hub URL",
     "token": "Access token",
     "connect": "Connect",
@@ -473,7 +473,7 @@
     "empty": "No matching projects",
     "sessionCount": "{{count}} sessions",
     "sessionCount_one": "1 session",
-    "tooOld": "Bridge 0.17.0+ required for remote session-create",
+    "tooOld": "Bridge 0.17.0+ required to start sessions",
     "browse": "Browse directories",
     "startHere": "Start session here",
     "notAllowed": "New sessions can't start in this directory — it is neither a known project nor under a remote.projectRoots root on the hub machine",

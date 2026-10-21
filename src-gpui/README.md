@@ -1,7 +1,7 @@
 # Desktop Workbench (gpui client)
 
-Cargo workspace for the zcode-acp-remote desktop client, a separate product
-line on gpui-kit — not a port of the mobile UI (see
+Cargo workspace for the ZCode ACP desktop client, the desktop product line on
+gpui-kit — not a port of the mobile UI (see
 `docs/adr/0009-desktop-client-as-gpui-product-line.md`). It is split in two
 layers with a one-way dependency edge: `protocol` is the pure-logic library
 (hub WebSocket client, Settings API client, ACP message types, replay and

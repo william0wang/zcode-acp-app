@@ -131,8 +131,8 @@ fn main() {
                 KeyBinding::new("cmd-8", SelectTab8, None),
                 KeyBinding::new("cmd-9", SelectTab9, None),
             ]);
-            cx.set_menus(vec![Menu::new("zcode-acp-remote").items([MenuItem::action(
-                "Quit zcode-acp-remote",
+            cx.set_menus(vec![Menu::new("ZCode ACP").items([MenuItem::action(
+                "Quit ZCode ACP",
                 QuitApp,
             )])]);
 
@@ -145,7 +145,7 @@ fn main() {
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("zcode-acp-remote".into()),
+                    title: Some("ZCode ACP".into()),
                     ..Default::default()
                 }),
                 ..Default::default()

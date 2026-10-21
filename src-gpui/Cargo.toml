@@ -1,4 +1,4 @@
-# Cargo workspace for the zcode-acp-remote desktop client ("Desktop
+# Cargo workspace for the ZCode ACP desktop client ("Desktop
 # Workbench", see docs/adr/0009-desktop-client-as-gpui-product-line.md).
 # Layering contract (docs/.zcode desktop-client-requirements.md §5):
 #   protocol — pure logic, no UI dependencies
@@ -14,8 +14,8 @@ resolver = "2"
 members = ["app", "protocol"]
 
 [workspace.package]
-# Follows the repo's main version; the desktop line ships from 0.33.0.
-version = "0.33.0"
+# Follows the repo's main version (package.json / tauri.conf.json).
+version = "0.33.1"
 edition = "2021"
 license = "MIT"
 

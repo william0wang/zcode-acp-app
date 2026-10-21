@@ -1,4 +1,4 @@
-//! Pure protocol layer for the zcode-acp-remote desktop client ("Desktop
+//! Pure protocol layer for the ZCode ACP desktop client ("Desktop
 //! Workbench") — no UI dependencies by contract (see
 //! `.zcode/docs/desktop-client-requirements.md` §5 and
 //! `docs/adr/0009-desktop-client-as-gpui-product-line.md`).
