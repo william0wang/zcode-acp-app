@@ -3334,8 +3334,17 @@ impl Workbench {
             }
             if last_workspace != Some(sess.workspace.as_str()) {
                 last_workspace = Some(sess.workspace.as_str());
+                // The heading is the project's LEAF name, not its path — a
+                // deep workspace made the heading run past the panel's width
+                // and ellipsize mid-directory (user feedback, 2026-10-21).
+                // The full path stays one hover away.
                 rows.push(
                     div()
+                        .id(SharedString::from(format!(
+                            "session-group-{}",
+                            sess.workspace
+                        )))
+                        .test_support()
                         .mt_1()
                         .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
@@ -3343,7 +3352,11 @@ impl Workbench {
                         .child(if sess.workspace.is_empty() {
                             "(no workspace)".to_string()
                         } else {
-                            sess.workspace.clone()
+                            project_name(&sess.workspace)
+                        })
+                        .tooltip({
+                            let full = sess.workspace.clone();
+                            move |window, cx| Tooltip::new(full.clone()).build(window, cx)
                         })
                         .into_any_element(),
                 );
@@ -3483,13 +3496,11 @@ impl Workbench {
                         m
                     }),
             );
-        // The hover carries the full title plus the workspace path — the row
-        // itself ellipsizes both away (same shape as the tab strip's hover).
-        let hover_label = if sess.workspace.is_empty() || sess.workspace == "/" {
-            title.clone()
-        } else {
-            format!("{title} · {}", sess.workspace)
-        };
+        // The hover carries the full title — the row ellipsizes it away. The
+        // workspace path is deliberately OUT: the heading above already names
+        // the project (its leaf), and a deep path made the tooltip wider than
+        // the panel (user feedback, 2026-10-21).
+        let hover_label = title.clone();
         div()
             .id(SharedString::from(format!("session-row-{}", sess.session_id)))
             .test_support()
@@ -4206,13 +4217,15 @@ impl Workbench {
             TabPhase::Connecting | TabPhase::Reconnecting => Some(tab.phase.label()),
             _ => None,
         };
-        // Hover carries the FULL pair — the ellipsized title plus the
-        // workspace path the project half was shortened from.
+        // Hover carries the FULL title — it ellipsizes on the strip — over
+        // the project's LEAF name, not its path. A deep workspace path made
+        // the tooltip a line of directories (user feedback, 2026-10-21); the
+        // tab already shows that same leaf as its prefix.
         let hover_label = tab
             .workspace
             .as_deref()
-            .filter(|w| !w.is_empty())
-            .map(|w| format!("{title} · {w}"))
+            .filter(|w| !w.is_empty() && *w != "/")
+            .map(|w| format!("{title} · {}", project_name(w)))
             .unwrap_or_else(|| title.clone());
 
         let runtime = self.runtime.clone();
