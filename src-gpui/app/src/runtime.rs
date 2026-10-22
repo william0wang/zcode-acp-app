@@ -264,6 +264,17 @@ pub enum UiCommand {
     LoadEarlier,
     SelectTab { id: u64 },
     CloseTab { id: u64 },
+    /// Drag-reorder (the tab strip): move `id` in front of `before_id`, or
+    /// to the strip's end when `None`. Pure strip order — no connection
+    /// moves with it.
+    MoveTab {
+        id: u64,
+        before_id: Option<u64>,
+    },
+    /// Tab context menu: close every tab except `id`.
+    CloseOtherTabs { id: u64 },
+    /// Tab context menu: close every tab to the right of `id`.
+    CloseRightTabs { id: u64 },
     /// A discovery session row: attach it — a new tab with its own
     /// connection unless one already holds it (appStore `openSession`).
     OpenSession {
@@ -2757,6 +2768,17 @@ impl Driver {
         self.tabs.retain(|t| t.id != id);
         if self.active_tab == Some(id) {
             self.active_tab = self.tabs.last().map(|t| t.id);
+        }
+    }
+
+    /// A batch close's anchor tab takes over focus when the tab that WAS
+    /// active got closed along the way — `close_tab`'s own fallback picks
+    /// the last survivor, which a right-close can make the wrong pick.
+    fn refocus_batch_close(&mut self, anchor: u64, was_active: Option<u64>) {
+        let active_gone =
+            was_active.is_some_and(|a| !self.tabs.iter().any(|t| t.id == a));
+        if active_gone && self.tabs.iter().any(|t| t.id == anchor) {
+            self.active_tab = Some(anchor);
         }
     }
 
@@ -6858,6 +6880,45 @@ impl Driver {
             UiCommand::CloseTab { id } => {
                 self.close_tab(id);
             }
+            UiCommand::MoveTab { id, before_id } => {
+                // A drop on the dragged tab's own slot is a no-op; without
+                // the guard the target lookup would fail after the remove
+                // and the tab would fall through to the END slot.
+                if before_id == Some(id) {
+                    return Flow::Continue;
+                }
+                if let Some(at) = self.tabs.iter().position(|t| t.id == id) {
+                    let tab = self.tabs.remove(at);
+                    match before_id.and_then(|b| self.tabs.iter().position(|t| t.id == b)) {
+                        Some(to) => self.tabs.insert(to, tab),
+                        None => self.tabs.push(tab),
+                    }
+                }
+            }
+            UiCommand::CloseOtherTabs { id } => {
+                // A vanished anchor (closed between the render that built the
+                // menu and the click) must not close the whole strip.
+                if self.tabs.iter().any(|t| t.id == id) {
+                    let was_active = self.active_tab;
+                    let others: Vec<u64> =
+                        self.tabs.iter().filter(|t| t.id != id).map(|t| t.id).collect();
+                    for other in others {
+                        self.close_tab(other);
+                    }
+                    self.refocus_batch_close(id, was_active);
+                }
+            }
+            UiCommand::CloseRightTabs { id } => {
+                let was_active = self.active_tab;
+                let right: Vec<u64> = match self.tabs.iter().position(|t| t.id == id) {
+                    Some(at) => self.tabs[at + 1..].iter().map(|t| t.id).collect(),
+                    None => Vec::new(),
+                };
+                for rid in right {
+                    self.close_tab(rid);
+                }
+                self.refocus_batch_close(id, was_active);
+            }
             UiCommand::OpenSession {
                 instance_id,
                 session_id,
@@ -9623,6 +9684,78 @@ mod tests {
         assert_eq!(first, second, "the duplicate open must reuse the tab");
         assert_eq!(d.tabs.len(), 1);
         assert_eq!(d.active_tab, Some(first));
+    }
+
+    /// Drag-reorder: drop-before-target inserts at the target's slot, a
+    /// drop on the strip's tail moves to the end, and a drop on the
+    /// dragged tab's own slot leaves the order untouched (the remove-first
+    /// insert would otherwise push it to the end).
+    #[tokio::test]
+    async fn move_tab_reorders_the_strip() {
+        let mut d = driver();
+        let a = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let b = d.open_tab("i2".to_string(), Some("s2".to_string()), "/w".to_string());
+        let c = d.open_tab("i3".to_string(), Some("s3".to_string()), "/w".to_string());
+        let ids = |d: &super::Driver| d.tabs.iter().map(|t| t.id).collect::<Vec<_>>();
+
+        d.handle_cmd(
+            super::UiCommand::MoveTab { id: c, before_id: Some(a) },
+            0,
+        );
+        assert_eq!(ids(&d), vec![c, a, b], "drop on a lands before a");
+
+        d.handle_cmd(
+            super::UiCommand::MoveTab { id: a, before_id: None },
+            0,
+        );
+        assert_eq!(ids(&d), vec![c, b, a], "tail drop moves to the end");
+
+        d.handle_cmd(
+            super::UiCommand::MoveTab { id: b, before_id: Some(b) },
+            0,
+        );
+        assert_eq!(ids(&d), vec![c, b, a], "a self-drop is a no-op");
+
+        d.handle_cmd(
+            super::UiCommand::MoveTab { id: b, before_id: Some(999) },
+            0,
+        );
+        assert_eq!(ids(&d), vec![c, a, b], "a vanished target falls to the end");
+    }
+
+    /// The tab context menu's batch closes: "close others" keeps only the
+    /// anchor and focuses it; "close right" trims the tail and hands focus
+    /// to the anchor only when the active tab was among the closed.
+    #[tokio::test]
+    async fn close_other_and_close_right_batch_close() {
+        let mut d = driver();
+        let a = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let b = d.open_tab("i2".to_string(), Some("s2".to_string()), "/w".to_string());
+        let c = d.open_tab("i3".to_string(), Some("s3".to_string()), "/w".to_string());
+        let e = d.open_tab("i4".to_string(), Some("s4".to_string()), "/w".to_string());
+        let ids = |d: &super::Driver| d.tabs.iter().map(|t| t.id).collect::<Vec<_>>();
+
+        d.handle_cmd(super::UiCommand::CloseOtherTabs { id: b }, 0);
+        assert_eq!(ids(&d), vec![b]);
+        assert_eq!(d.active_tab, Some(b), "close-others focuses the anchor");
+
+        let mut d = driver();
+        let a = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let b = d.open_tab("i2".to_string(), Some("s2".to_string()), "/w".to_string());
+        let _c = d.open_tab("i3".to_string(), Some("s3".to_string()), "/w".to_string());
+        let _e = d.open_tab("i4".to_string(), Some("s4".to_string()), "/w".to_string());
+        // Active is the LAST tab (open_tab activates); closing right of b
+        // kills it, so the anchor takes focus.
+        d.handle_cmd(super::UiCommand::CloseRightTabs { id: b }, 0);
+        assert_eq!(ids(&d), vec![a, b]);
+        assert_eq!(d.active_tab, Some(b), "the anchor takes over when the active closed");
+
+        // Active left of the anchor stays active; a right close with no
+        // tabs to the right changes nothing.
+        d.handle_cmd(super::UiCommand::SelectTab { id: a }, 0);
+        d.handle_cmd(super::UiCommand::CloseRightTabs { id: b }, 0);
+        assert_eq!(ids(&d), vec![a, b]);
+        assert_eq!(d.active_tab, Some(a), "a surviving active keeps focus");
     }
 
     /// The tab strip's project identity (the CLI composer-cap shape): a

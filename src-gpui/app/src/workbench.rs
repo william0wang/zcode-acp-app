@@ -36,14 +36,16 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     relative, AnyElement, App, ClipboardEntry, ClipboardItem, Context, Entity, ExternalPaths,
-    ImageFormat, PathPromptOptions, SharedString, Subscription, Window, div, img, px,
+    ImageFormat, MouseButton, PathPromptOptions, SharedString, Subscription, Window, div, img, px,
 };
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{
     Input, InputEvent, InputState, Textarea, TextareaState,
 };
-use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::menu::{
+    ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem,
+};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::{TextView, TextViewMotion, TextViewState};
 use gpui_kit::component::{
@@ -52,7 +54,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::TestSupportExt as _;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::{assets::IconName as KitIconName, *};
+use gpui_kit::{assets::IconName as KitIconName, base::TextSelection, *};
 use rust_i18n::t;
 use protocol::chat::{AttachmentDraft, ChatMessage, ChatPart, ChatRole};
 use protocol::image::{
@@ -856,6 +858,72 @@ fn copy_button(
                 }
             }
         })
+}
+
+/// The chat row's right-click menu (the E4 copy affordance as a context
+/// menu): the window's LIVE text selection first, then the row's message
+/// source — the same text the trailing copy button writes. The selection is
+/// captured at OPEN time, not click time: this framework clears the
+/// selection during a left press (the menu item IS one), so a click-time
+/// read would always come back empty.
+fn chat_row_menu(
+    text: String,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu + 'static {
+    move |menu, window, cx| {
+        let mut m = menu;
+        let selection = TextSelection::has_selection(window, cx)
+            .then(|| TextSelection::selected_text(window, cx))
+            .filter(|s| !s.trim().is_empty());
+        let has_text = !text.trim().is_empty();
+        if let Some(selected) = selection {
+            m = m.item(
+                PopupMenuItem::new("Copy selection").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(selected.clone()));
+                }),
+            );
+            if has_text {
+                m = m.separator();
+            }
+        }
+        if has_text {
+            let text = text.clone();
+            m = m.item(
+                PopupMenuItem::new("Copy message text").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
+                }),
+            );
+        }
+        m
+    }
+}
+
+/// Drag-and-drop payload of one tab (strip reorder): the dragged tab's id.
+/// A newtype — not a bare `u64` — so the drop targets can name exactly this
+/// drag (`on_drop::<TabDragId>`), never some other u64 payload.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct TabDragId(u64);
+
+/// The pill that follows the cursor while a tab drags (gpui renders the
+/// constructor's entity under the pointer; see `on_drag`).
+struct TabDragPreview(SharedString);
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.title_bar)
+            .font_family(theme.mono_font_family.clone())
+            .text_size(ui_text(13.))
+            .text_color(theme.foreground)
+            .max_w(px(240.))
+            .truncate()
+            .child(self.0.clone())
+    }
 }
 
 /// Updates a part view in place. Returns true when its rendered content
@@ -4013,6 +4081,23 @@ impl Workbench {
                 .on_click(move |_, _, _| runtime.send(UiCommand::NewSessionToggle)),
         );
 
+        // The strip's drop tail: releasing a dragged tab past the last slot
+        // (over the `+`'s trailing space) moves it to the END of the strip.
+        let tail_runtime = self.runtime.clone();
+        strip = strip.child(
+            div()
+                .id("tab-strip-drop-tail")
+                .flex_none()
+                .w_8()
+                .h_full()
+                .drag_over::<TabDragId>(|this, _, _, cx| {
+                    this.rounded_md().bg(cx.theme().secondary)
+                })
+                .on_drop(move |drag: &TabDragId, _, _| {
+                    tail_runtime.send(UiCommand::MoveTab { id: drag.0, before_id: None });
+                }),
+        );
+
         // The tab strip stays global (sessions only): the model/mode/thought
         // chips moved down to the composer (batch S — the TUI keeps its
         // switchers at the input). The manage-workflows entry (batch M, the
@@ -4251,6 +4336,29 @@ impl Workbench {
             })
             .on_click(move |_, _, _| runtime.send(UiCommand::SelectTab { id: tab_id }));
 
+        // Drag-reorder (strip): press-and-move starts the drag — gpui
+        // suppresses the click when one starts — and the dragged id rides
+        // the drag payload. Releasing over a TAB inserts before it (the
+        // accent left edge marks the slot); the strip's tail zone takes
+        // the end slot.
+        let drag_title = title.clone();
+        tab_view = tab_view.on_drag(TabDragId(tab.id), move |_, _, _, cx| {
+            cx.stop_propagation();
+            cx.new(|_| TabDragPreview(drag_title.clone().into()))
+        });
+        let drop_runtime = self.runtime.clone();
+        let target_id = tab.id;
+        tab_view = tab_view
+            .drag_over::<TabDragId>(|this, _, _, cx| {
+                this.border_l_2().border_color(cx.theme().accent)
+            })
+            .on_drop(move |drag: &TabDragId, _, _| {
+                drop_runtime.send(UiCommand::MoveTab {
+                    id: drag.0,
+                    before_id: Some(target_id),
+                });
+            });
+
         // Session Activity badges: running dot / awaiting ring / pending
         // count; a non-connected phase shows its state instead.
         match phase_label {
@@ -4351,9 +4459,42 @@ impl Workbench {
                 .tooltip("Close tab — the session keeps running on the hub")
                 .on_click(move |_, _, _| runtime2.send(UiCommand::CloseTab { id: close_id })),
         );
-        tab_view.into_any_element()
-    }
 
+        // Right-click (the tab's context menu): the standard trio. The
+        // disabled flags are read at render and captured fresh — the menu
+        // builder runs per open, and every open follows a render.
+        let menu_runtime = self.runtime.clone();
+        let has_others = self.snap.tabs.iter().any(|t| t.id != tab.id);
+        let has_right = self
+            .snap
+            .tabs
+            .iter()
+            .position(|t| t.id == tab.id)
+            .is_some_and(|at| at + 1 < self.snap.tabs.len());
+        let menu_id = tab.id;
+        let with_menu = tab_view.context_menu(move |menu, _, _| {
+            let mut m = menu;
+            let (runtime, id) = (menu_runtime.clone(), menu_id);
+            m = m.item(
+                PopupMenuItem::new("Close tab")
+                    .on_click(move |_, _, _| runtime.send(UiCommand::CloseTab { id })),
+            );
+            let (runtime, id) = (menu_runtime.clone(), menu_id);
+            m = m.item(
+                PopupMenuItem::new("Close other tabs")
+                    .disabled(!has_others)
+                    .on_click(move |_, _, _| runtime.send(UiCommand::CloseOtherTabs { id })),
+            );
+            let (runtime, id) = (menu_runtime.clone(), menu_id);
+            m = m.item(
+                PopupMenuItem::new("Close tabs to the right")
+                    .disabled(!has_right)
+                    .on_click(move |_, _, _| runtime.send(UiCommand::CloseRightTabs { id })),
+            );
+            m
+        });
+        with_menu.into_any_element()
+    }
     fn render_chat(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let mut column = div().flex().flex_col().flex_1().min_h_0().min_w_0();
@@ -5344,7 +5485,7 @@ fn render_user_row(
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     theme: &component::Theme,
-) -> gpui::Div {
+) -> AnyElement {
     // Harness task lifecycle notices are system plumbing, not user speech
     // (E5 — ChatView.tsx `parseTaskNotification`): a centered chip with the
     // summary and status, no bubble, no copy affordance.
@@ -5384,7 +5525,12 @@ fn render_user_row(
                     .child(format!("· {}", status.to_uppercase())),
             );
         }
-        return div().flex().min_w_0().justify_center().child(chip.test_support());
+        return div()
+            .flex()
+            .min_w_0()
+            .justify_center()
+            .child(chip.test_support())
+            .into_any_element();
     }
     if row.collapsed {
         // Replay harness fold (`_meta.zcode.collapsed`): the wall of context
@@ -5401,7 +5547,8 @@ fn render_user_row(
                 .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
                 .child(t!("chat.contextHandoff").into_owned()),
-        );
+        )
+            .into_any_element();
     }
     let mut bubble = div().flex().flex_col().gap_2().min_w_0();
     for (part_index, part) in row.parts.iter().enumerate() {
@@ -5464,9 +5611,17 @@ fn render_user_row(
             .child(bubble),
     );
     if !text.trim().is_empty() {
-        side = side.child(copy_button(row, text, copied == Some(row.id.as_str()), wb));
+        side = side.child(copy_button(row, text.clone(), copied == Some(row.id.as_str()), wb));
     }
-    div().flex().justify_end().min_w_0().child(side)
+    div()
+        .id(SharedString::from(format!("user-row-{}", row.id)))
+        .test_support()
+        .flex()
+        .justify_end()
+        .min_w_0()
+        .child(side)
+        .context_menu(chat_row_menu(text))
+        .into_any_element()
 }
 
 fn render_assistant_row(
@@ -5693,8 +5848,9 @@ fn render_assistant_row(
         .gap_3()
         .child(div().flex_1().min_w_0().child(column))
         .when(!text.trim().is_empty(), |this| {
-            this.child(copy_button(row, text, copied == Some(row.id.as_str()), wb))
+            this.child(copy_button(row, text.clone(), copied == Some(row.id.as_str()), wb))
         })
+        .context_menu(chat_row_menu(text))
         .into_any_element()
 }
 
@@ -5709,7 +5865,7 @@ fn render_tool_card(
     view: &PartView,
     wb: &WeakEntity<Workbench>,
     theme: &component::Theme,
-) -> gpui::Div {
+) -> AnyElement {
     let PartView::ToolCall {
         label,
         status,
@@ -5721,7 +5877,7 @@ fn render_tool_card(
         diffs,
     } = view
     else {
-        return div();
+        return div().into_any_element();
     };
     let done = status == "completed";
     let glyph = if done { "✓" } else { "…" };
@@ -5848,7 +6004,35 @@ fn render_tool_card(
         );
         card = card.child(body.test_support());
     }
+    // Right-click on the card (run members included): copy the raw command
+    // line, or the full output behind the fold. The right-mouse stop keeps
+    // the enclosing run/row menus out — bubble dispatch is reverse paint
+    // order, so this card's own menu listener has already run.
+    let menu_command = label.to_string();
+    let menu_output = detail.clone();
     card
+        .id(SharedString::from(format!("tool-card-{}-{}", row_id, part_index)))
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .context_menu(move |menu, _, _| {
+            let mut m = menu;
+            let command = menu_command.clone();
+            m = m.item(
+                PopupMenuItem::new("Copy command").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+                }),
+            );
+            let empty = menu_output.trim().is_empty();
+            let output = menu_output.clone();
+            m = m.item(
+                PopupMenuItem::new("Copy output")
+                    .disabled(empty)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(output.clone()));
+                    }),
+            );
+            m
+        })
+        .into_any_element()
 }
 
 /// The aggregated summary of an adjacent tool run (the TS `summarizeToolRun`):
@@ -5886,7 +6070,7 @@ fn render_tool_run(
     open: bool,
     wb: &WeakEntity<Workbench>,
     theme: &component::Theme,
-) -> gpui::Div {
+) -> AnyElement {
     let (names, running, failed) = tool_run_summary(run);
     // Same palette as the single card's glyph: accent while live, danger on
     // failure, muted once settled.
@@ -5987,7 +6171,52 @@ fn render_tool_run(
         }
         card = card.child(body);
     }
+    // Right-click on the run's chrome (summary row, the gaps between member
+    // cards — the members themselves carry their own menus): copy every
+    // command of the run, or every output joined. The same reverse-paint
+    // stop as the member cards keeps the row menu out.
+    let commands = run
+        .iter()
+        .filter_map(|p| match p {
+            PartView::ToolCall { label, .. } => Some(label.to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let outputs = run
+        .iter()
+        .filter_map(|p| match p {
+            PartView::ToolCall { detail, .. } => Some(detail.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
     card
+        .id(SharedString::from(format!(
+            "tool-run-card-{}-{}",
+            row_id, start_index
+        )))
+        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+        .context_menu(move |menu, _, _| {
+            let mut m = menu;
+            let commands = commands.clone();
+            m = m.item(
+                PopupMenuItem::new("Copy commands").on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(commands.clone()));
+                }),
+            );
+            let empty = outputs.trim().is_empty();
+            let outputs = outputs.clone();
+            m = m.item(
+                PopupMenuItem::new("Copy output")
+                    .disabled(empty)
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(outputs.clone()));
+                    }),
+            );
+            m
+        })
+        .into_any_element()
 }
 
 impl Render for Workbench {
