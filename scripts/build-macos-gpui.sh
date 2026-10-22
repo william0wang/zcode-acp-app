@@ -60,3 +60,9 @@ cat > "${OUT}/Contents/Info.plist" <<PLIST
 PLIST
 echo "==> ${OUT} (${VERSION})"
 du -sh "${OUT}" | awk '{print $1, $2}'
+# The bundle is self-contained, but the cargo tree behind it is not small
+# (debug + release easily 6G+) and fully regenerable — drop it so a build
+# leaves only the installable artifact behind. `set -e` keeps this on the
+# success path only; the cost is a cold (full-deps) rebuild next time.
+cargo clean --manifest-path src-gpui/Cargo.toml
+echo "==> cleaned src-gpui/target"
