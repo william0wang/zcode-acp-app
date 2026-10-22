@@ -2541,9 +2541,6 @@ struct Driver {
     /// events are expected, not reconnect triggers.
     closing: HashSet<u64>,
     next_tab_id: u64,
-    /// Once any tab has existed, discovery stops auto-opening one (the user
-    /// expressed intent by closing it); M1 parity until then.
-    ever_had_tab: bool,
 
     history: HistoryPanel,
 
@@ -2650,7 +2647,6 @@ impl Driver {
             active_tab: None,
             closing: HashSet::new(),
             next_tab_id: 1,
-            ever_had_tab: false,
             history: HistoryPanel::default(),
             new_session: NewSessionPanel::default(),
             files: FilesPanel::default(),
@@ -2735,7 +2731,6 @@ impl Driver {
         }
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        self.ever_had_tab = true;
         self.tabs.push(Tab {
             id,
             instance_id,
@@ -2898,25 +2893,18 @@ impl Driver {
                 if self.quota_dock.is_none() {
                     self.spawn_quota_dock();
                 }
-                // M1 parity auto-attach: while NO tab has ever existed, the
-                // most recently updated session (any instance) opens one.
-                // Instances without sessions never mint a tab — the landing
-                // note shows instead (the TS picker's empty state).
-                if self.tabs.is_empty() && !self.ever_had_tab {
-                    if let Some((instance_id, session_id, cwd)) = pick_target(&self.instances) {
-                        traceln!(
-                            "[driver] auto-tab on {} (attach {})",
-                            instance_id,
-                            session_id
-                        );
-                        self.open_tab(instance_id, Some(session_id), cwd);
-                    } else {
-                        self.discovery_note = Some(
-                            "no open session on the hub yet — start one from the editor, the \
-                              + button, or pick one from history below"
-                                .to_string(),
-                        );
-                    }
+                // Discovery NEVER opens a tab (2026-10-22 decision, dropping
+                // M1 parity with appStore's cold-start auto-attach): neither
+                // a cold start nor a remotely-opened session may pop one —
+                // tabs come only from explicit gestures (+, sidebar row,
+                // history). The landing note still covers the truly empty
+                // hub: no tab open and no session row anywhere to click.
+                if self.tabs.is_empty() && !self.instances.iter().any(|i| !i.sessions.is_empty()) {
+                    self.discovery_note = Some(
+                        "no open session on the hub yet — start one from the editor, the \
+                          + button, or pick one from history below"
+                            .to_string(),
+                    );
                 }
             }
             Err(e) => {
@@ -6606,8 +6594,8 @@ impl Driver {
                     // Revival candidate: the tab holds a session target, this
                     // failure is not the first, and the cooldown allows
                     // another attempt. `ever_connected` is deliberately NOT
-                    // required — a freshly restarted app's auto-attached tab
-                    // has never connected, yet a hub restart that wipes the
+                    // required — a tab opened right before a hub restart has
+                    // never connected, yet a hub restart that wipes the
                     // registry (a busy serve bridge can stay unregistered for
                     // minutes mid-turn) leaves it dialing a corpse id forever
                     // (observed 2026-10-21: a 2.5min "unknown instance"
@@ -9172,39 +9160,6 @@ fn quota_cards_signature(cards: &ResetCardInventory) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// Instance selection
-// ---------------------------------------------------------------------------
-
-/// The M1 attach rule, mirroring the supervisor's auto-attach: the most
-/// recently updated session across instances. Attach ONLY — an instance
-/// without sessions must not mint a fresh `session/new` on cold start (the
-/// TS picker's empty state; the user starts one via + or history).
-/// Returns `(instance id, session id, cwd)`.
-fn pick_target(instances: &[HubInstance]) -> Option<(String, String, String)> {
-    let mut best: Option<(&HubInstance, u64, String)> = None;
-    for inst in instances {
-        for sess in &inst.sessions {
-            let updated = sess.updated_at.unwrap_or(0);
-            let better = match &best {
-                Some((_, best_updated, _)) => updated > *best_updated,
-                None => true,
-            };
-            if better {
-                best = Some((inst, updated, sess.session_id.clone()));
-            }
-        }
-    }
-    best.map(|(inst, _, sid)| (inst.id.clone(), sid, workspace_or_root(inst)))
-}
-
-fn workspace_or_root(inst: &HubInstance) -> String {
-    inst.workspace
-        .clone()
-        .filter(|w| !w.is_empty())
-        .unwrap_or_else(|| "/".to_string())
-}
-
-// ---------------------------------------------------------------------------
 // The driver loop
 // ---------------------------------------------------------------------------
 
@@ -9367,8 +9322,8 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         );
 
         // ---- Steady state: one 120ms tick, commands, and every tab's wire
-        // events. Discovery (and the initial auto-tab) ride the same loop;
-        // replay (a fresh `session/load`) is each tab's catch-up.
+        // events. Discovery rides the same loop; replay (a fresh
+        // `session/load`) is each tab's catch-up.
         d.phase = Phase::Discovering;
         d.next_discovery_at = 0; // fire on the first tick
         // A config page the user left open through the re-bootstrap re-seeds
@@ -9508,7 +9463,7 @@ type _TabViewMap = HashMap<u64, ()>;
 mod tests {
     // Plain #[test] with explicit imports — this file has no kit glob, but
     // the sibling test modules' explicit-import shape is the convention.
-    use super::{fold_session_runs, max_run_sequence, merge_run_events, pick_target, LoopEvent};
+    use super::{fold_session_runs, max_run_sequence, merge_run_events, LoopEvent};
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
     use protocol::hub_client::HubApiError;
     use protocol::workflow::WorkflowRunEvent;
@@ -9622,9 +9577,6 @@ mod tests {
     #[test]
     fn a_closed_session_is_not_resurrected_by_a_discovery_refresh() {
         let mut d = driver();
-        // Skip the M1 auto-attach path (it dials the instance — a live-socket
-        // spawn this unit test must not need).
-        d.ever_had_tab = true;
         d.handle_loop_event(
             LoopEvent::SessionClosed {
                 instance_id: "i-edit".to_string(),
@@ -9875,8 +9827,8 @@ mod tests {
     /// re-incubation arms (its own fetch talks to the test's bogus hub and
     /// settles elsewhere — arming is the assertion). A bridge still listed in
     /// discovery never arms. The arming must not require `ever_connected`:
-    /// a freshly RESTARTED app's auto-attached tab has never connected, yet
-    /// after a hub restart wiped the registry it dialed the corpse id for
+    /// a tab opened right before a hub restart has never connected, yet
+    /// after the restart wiped the registry it dialed the corpse id for
     /// minutes until the user closed the tab (observed 2026-10-21).
     #[tokio::test]
     async fn a_dead_instance_re_incubates_instead_of_retrying_forever() {
@@ -9974,76 +9926,63 @@ mod tests {
         assert_eq!(d.quota_dock.as_deref(), Some("NEW HUB · 10%"));
     }
 
-    /// Batch H2's attach rule (appStore.ts:1847-1855): the cold-start
-    /// auto-tab attaches the MOST RECENTLY UPDATED session across
-    /// discovery's instances — not the first instance's first session.
+    /// Discovery never opens a tab on its own (2026-10-22 decision, dropping
+    /// M1 parity with appStore's cold-start auto-attach): sessions on the
+    /// hub — cold start, a remote create, anything — only repaint the
+    /// sidebar; a tab needs an explicit gesture (+, sidebar row, history).
     #[test]
-    fn cold_start_attaches_most_recently_updated_session() {
-        let instances = vec![
-            instance(
-                "inst-old",
-                Some("/w/first"),
-                vec![session("s_old", Some(1_000))],
-            ),
-            instance(
-                "inst-new",
-                Some("/w/second"),
-                vec![
-                    session("s_quiet", None),
-                    session("s_latest", Some(9_000)),
-                ],
-            ),
-        ];
-        let (inst, attach, cwd) = pick_target(&instances).expect("a target exists");
-        assert_eq!(inst, "inst-new");
-        assert_eq!(attach, "s_latest");
-        assert_eq!(cwd, "/w/second");
-    }
-
-    /// Sessions without timestamps rank as 0 — a timestamped session beats
-    /// them, and ties keep the first walked (strictly-greater comparison).
-    #[test]
-    fn untimestamped_sessions_rank_below_dated_ones() {
-        let instances = vec![instance(
-            "inst-a",
-            Some("/w/a"),
-            vec![session("s_undated", None), session("s_dated", Some(10))],
-        )];
-        let (_, attach, _) = pick_target(&instances).expect("a target exists");
-        assert_eq!(attach, "s_dated");
-    }
-
-    /// The "no history" half: instances whose sessions are all gone do NOT
-    /// mint a fresh `session/new` — the driver keeps its landing note (the
-    /// TS picker's empty state; the user decides what to open).
-    #[test]
-    fn sessionless_instances_yield_no_target() {
-        let instances = vec![
-            instance("inst-a", Some("/w/a"), vec![]),
-            instance("inst-b", Some("/w/b"), vec![]),
-        ];
+    fn discovery_never_opens_a_tab() {
+        let mut d = driver();
+        d.on_discovery(
+            Ok(vec![instance(
+                "inst-a",
+                Some("/w/a"),
+                vec![session("s_latest", Some(9_000))],
+            )]),
+            0,
+        );
+        assert!(d.tabs.is_empty(), "no tab may be minted by a poll");
         assert!(
-            pick_target(&instances).is_none(),
-            "no sessions anywhere means the empty state, not session/new"
+            d.discovery_note.is_none(),
+            "a session exists — no landing note"
+        );
+        assert_eq!(
+            d.instances.len(),
+            1,
+            "the row still lands in the sidebar list"
         );
     }
 
-    /// An instance with no workspace falls back to "/" for the attach cwd
-    /// (session/load's cwd is backend-authoritative anyway).
+    /// The landing note (the TS picker's empty state): with no tab open and
+    /// no session row anywhere, the status bar carries the hint — instance
+    /// rows without sessions never mint a tab either. A session appearing
+    /// anywhere replaces the hint with the row.
     #[test]
-    fn missing_workspace_falls_back_to_root() {
-        let instances = vec![instance("inst-a", None, vec![session("s_a", Some(1))])];
-        let (_, attach, cwd) = pick_target(&instances).expect("a target exists");
-        assert_eq!(attach, "s_a");
-        assert_eq!(cwd, "/");
-    }
+    fn sessionless_discovery_keeps_the_landing_note() {
+        let mut d = driver();
+        d.on_discovery(
+            Ok(vec![
+                instance("inst-a", Some("/w/a"), vec![]),
+                instance("inst-b", Some("/w/b"), vec![]),
+            ]),
+            0,
+        );
+        assert!(d.tabs.is_empty());
+        assert!(
+            d.discovery_note.is_some(),
+            "nothing to open — the hint shows"
+        );
 
-    /// No instance at all (cold hub, nothing discovered): no tab — the
-    /// driver keeps its empty-workbench note instead (on_discovery's
-    /// discovery_note branch).
-    #[test]
-    fn no_instances_yields_no_target() {
-        assert!(pick_target(&[]).is_none());
+        d.on_discovery(
+            Ok(vec![instance(
+                "inst-a",
+                Some("/w/a"),
+                vec![session("s_a", None)],
+            )]),
+            1_000,
+        );
+        assert!(d.tabs.is_empty(), "still no tab without a gesture");
+        assert!(d.discovery_note.is_none(), "the row replaces the hint");
     }
 
     /// The third ladder's map fold (TS `new Map(conv.runs.map(...))`): a
