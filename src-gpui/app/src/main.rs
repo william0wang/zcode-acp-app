@@ -24,6 +24,7 @@ mod diff_view;
 mod file_browser;
 mod http_transport;
 mod i18n;
+mod local_time;
 mod models_page;
 mod pending_store;
 mod quota_card;

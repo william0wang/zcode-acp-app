@@ -192,6 +192,7 @@ name = "app"
 version = "0.33.2"
 dependencies = [
  "gpui-kit",
+ "libc",
  "protocol",
  "rust-i18n",
  "rustls",

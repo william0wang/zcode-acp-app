@@ -56,6 +56,10 @@ base64 = "0.22"
 rust-i18n = "4"
 # System locale for the i18n startup pick; already in-tree via cosmic-text.
 sys-locale = "0.3"
+# Local-timezone stamps for the config surfaces (app/src/local_time.rs):
+# localtime_r reads /etc/localtime, so no date crate is needed. Already
+# in-tree via gpui-kit's dependencies — no new external crate.
+libc = "0.2"
 # gpui distribution is pinned by gpui-kit itself (docs/adr/0009 §decision,
 # requirements §7); the app never adds a direct gpui dependency.
 gpui-kit = "0.7"

@@ -25,7 +25,8 @@ use gpui_kit::{assets::IconName as KitIconName, *};
 use protocol::quota::AccountUsageStats;
 use rust_i18n::t;
 
-use crate::quota_page::{faint, fmt_stamp_utc, quota_bar_row};
+use crate::local_time::fmt_stamp;
+use crate::quota_page::{faint, quota_bar_row};
 use crate::runtime::{ProtocolRuntime, QuotaCardView, UiCommand};
 use crate::ui_prefs::ui_text;
 
@@ -218,7 +219,7 @@ pub(crate) fn render_quota_card(
                 .text_size(ui_text(10.))
                 .font_family(theme.mono_font_family.clone())
                 .text_color(faint(theme))
-                .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
+                .child(format!("{} {}", t!("quota.updated"), fmt_stamp(at))),
         );
     }
     trailing = trailing.child(
@@ -290,7 +291,7 @@ pub(crate) fn render_quota_drawer_body(view: &QuotaCardView, theme: &Theme) -> A
                 .text_size(ui_text(10.))
                 .font_family(theme.mono_font_family.clone())
                 .text_color(faint(theme))
-                .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
+                .child(format!("{} {}", t!("quota.updated"), fmt_stamp(at))),
         );
     }
     body.into_any_element()

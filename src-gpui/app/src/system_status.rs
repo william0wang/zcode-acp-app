@@ -34,6 +34,7 @@ use rust_i18n::t;
 
 use crate::approval_card::render_toast_strip;
 use crate::i18n::fill;
+use crate::local_time::fmt_stamp;
 use crate::runtime::{ProtocolRuntime, SystemStatusPageView, UiCommand};
 use crate::ui_prefs::ui_text;
 
@@ -121,27 +122,6 @@ fn heat_rgb(pct: f64) -> (u8, u8, u8) {
 fn heat_color(pct: f64) -> Hsla {
     let (r, g, b) = heat_rgb(pct);
     rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
-}
-
-/// The collected stamp. TS `fmtStamp` renders LOCAL `MM-DD HH:MM`; Rust std
-/// has no local-timezone conversion and the workspace pins no date crate,
-/// so this renders UTC with an explicit suffix until the M4 i18n pass.
-/// Pure civil-from-days arithmetic (Howard Hinnant), no dependencies.
-fn fmt_stamp_utc(ms: u64) -> String {
-    let secs = ms / 1000;
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (h, mi) = (rem / 3600, (rem % 3600) / 60);
-    let z = days + 719_468;
-    // Only the day-of-era feeds month/day (the year itself is not shown).
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    debug_assert!((1..=12).contains(&m) && (1..=31).contains(&d));
-    format!("{m:02}-{d:02} {h:02}:{mi:02} UTC")
 }
 
 /// Last non-empty path segment (the TS bridge-row label:
@@ -623,7 +603,7 @@ fn render_stats(theme: &Theme, stats: &SystemStatsResponse) -> AnyElement {
                 .text_color(faint(theme))
                 .child(fill(
                     &t!("system.collected"),
-                    &[("time", &fmt_stamp_utc(stats.collected_at))],
+                    &[("time", &fmt_stamp(stats.collected_at))],
                 )),
         )
         .into_any_element()
@@ -897,7 +877,7 @@ mod tests {
     // re-exports GPUI's `test` macro, which would shadow Rust's built-in
     // #[test] (the kit's own doc note).
     use super::{
-        battery_status, fmt_bytes, fmt_minutes, fmt_rate, fmt_stamp_utc, fmt_uptime, heat_rgb,
+        battery_status, fmt_bytes, fmt_minutes, fmt_rate, fmt_uptime, heat_rgb,
         notice_text, workspace_leaf,
     };
 
@@ -948,13 +928,6 @@ mod tests {
         // Clamped outside [0, 100].
         assert_eq!(heat_rgb(-10.0), (34, 197, 94));
         assert_eq!(heat_rgb(140.0), (239, 68, 68));
-    }
-
-    #[test]
-    fn stamp_renders_utc_month_day_hour_minute() {
-        assert_eq!(fmt_stamp_utc(0), "01-01 00:00 UTC");
-        // 2023-11-14 22:13:20 UTC.
-        assert_eq!(fmt_stamp_utc(1_700_000_000_000), "11-14 22:13 UTC");
     }
 
     #[test]

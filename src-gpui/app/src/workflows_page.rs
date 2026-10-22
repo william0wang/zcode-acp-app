@@ -62,6 +62,7 @@ use protocol::workflow_run_event_text::{
 use rust_i18n::t;
 
 use crate::i18n::fill;
+use crate::local_time::fmt_stamp;
 use crate::runtime::{
     UiCommand, WorkflowArtifactViewerView, WorkflowDetailView, WorkflowLaunchRef,
     WorkflowNodeResultView, WorkflowRunTab, WorkflowRunView, WorkflowsPageView,
@@ -149,25 +150,6 @@ fn status_badge(status: Option<&str>, key: &str, theme: &component::Theme) -> An
         .into_any_element()
 }
 
-/// TS `fmtStamp` renders LOCAL `MM-DD HH:MM`; Rust std has no
-/// local-timezone conversion and the workspace pins no date crate, so this
-/// renders UTC with an explicit suffix (the same trade the sibling config
-/// pages make). Pure civil-from-days arithmetic (Howard Hinnant).
-fn fmt_stamp_utc(ms: u64) -> String {
-    let secs = ms / 1000;
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (h, mi) = (rem / 3600, (rem % 3600) / 60);
-    let z = days + 719_468;
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    format!("{m:02}-{d:02} {h:02}:{mi:02} UTC")
-}
-
 /// Compact token count (TS `fmtTokens`): `1.2M`, `34K`, `870`.
 fn fmt_tokens(n: u64) -> String {
     if n < 1_000 {
@@ -190,7 +172,7 @@ fn fmt_tokens(n: u64) -> String {
 fn run_meta_line(r: &WorkflowRunRow) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(at) = r.updated_at {
-        parts.push(fmt_stamp_utc(at));
+        parts.push(fmt_stamp(at));
     }
     if let Some(tokens) = r.spent_tokens {
         parts.push(fmt_tokens(tokens));
@@ -633,7 +615,7 @@ fn render_run_zone_row(
                 .flex_none()
                 .text_size(ui_text(10.))
                 .text_color(theme.muted_foreground)
-                .child(fmt_stamp_utc(at)),
+                .child(fmt_stamp(at)),
         );
     }
     line = line.child(status_badge(Some(&r.status), &key, theme));
@@ -835,7 +817,7 @@ fn render_group_card(
                             div()
                                 .text_size(ui_text(10.))
                                 .text_color(theme.muted_foreground)
-                                .child(fmt_stamp_utc(at))
+                                .child(fmt_stamp(at))
                                 .into_any_element()
                         }),
                         |this, stamp| this.child(stamp),
@@ -1533,7 +1515,7 @@ fn render_run_body(
                                 .child({
                                     let mut parts: Vec<String> = Vec::new();
                                     if let Some(at) = run.summary.as_ref().and_then(|s| s.updated_at) {
-                                        parts.push(fmt_stamp_utc(at));
+                                        parts.push(fmt_stamp(at));
                                     }
                                     if let Some(reason) =
                                         run.summary.as_ref().and_then(|s| s.stop_reason.clone())

@@ -22,6 +22,9 @@ serde.workspace = true
 # pins already sit in the workspace tree via gpui-kit's own dependencies.
 rust-i18n.workspace = true
 sys-locale.workspace = true
+# Local-timezone stamps for the config surfaces (local_time.rs); already
+# in the workspace tree via gpui-kit's dependencies.
+libc.workspace = true
 # https:// on remote Connection Profiles: tokio-rustls wraps the transport's
 # TcpStream; rustls-native-certs loads the system trust store (the same
 # policy the WS side gets from tokio-tungstenite's feature).

@@ -36,6 +36,7 @@ use protocol::settings::{ResetCardExpiry, ResetCardType};
 use rust_i18n::t;
 
 use crate::i18n::fill;
+use crate::local_time::fmt_stamp;
 use crate::runtime::{ProtocolRuntime, QuotaPageView, UiCommand};
 use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
@@ -95,29 +96,6 @@ fn fmt_percent(pct: f64) -> String {
     } else {
         format!("{v:.1}")
     }
-}
-
-/// The stamp layout (`MM-DD HH:MM`, TS ConfigPage `fmtStamp`). Rust std has
-/// no local-timezone conversion and the workspace pins no date crate, so
-/// this renders UTC with an explicit suffix until the M4 i18n pass — the
-/// same tradeoff the System Status page's collected stamp makes. Pure
-/// civil-from-days arithmetic (Howard Hinnant), no dependencies.
-pub(crate) fn fmt_stamp_utc(ms: u64) -> String {
-    let secs = ms / 1000;
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (h, mi) = (rem / 3600, (rem % 3600) / 60);
-    let z = days + 719_468;
-    // The era (400-year blocks) only positions the year; month/day read
-    // off the day-of-era alone.
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    debug_assert!((1..=12).contains(&m) && (1..=31).contains(&d));
-    format!("{m:02}-{d:02} {h:02}:{mi:02} UTC")
 }
 
 /// CLI-parity heat color (TS `heatColor`): green → yellow → red,
@@ -209,7 +187,7 @@ pub(crate) fn quota_bar_row(
         None => format!("{}%", fmt_percent(percent)),
     };
     let line = match reset_ms {
-        Some(reset) => format!("{value} · {}", fmt_stamp_utc(reset)),
+        Some(reset) => format!("{value} · {}", fmt_stamp(reset)),
         None => value,
     };
     div()
@@ -461,7 +439,7 @@ fn card_list(
                     .child(
                         div()
                             .font_family(theme.mono_font_family.clone())
-                            .child(format!("{} {}", t!("zconfig.resetExpires"), fmt_stamp_utc(card.expire_at))),
+                            .child(format!("{} {}", t!("zconfig.resetExpires"), fmt_stamp(card.expire_at))),
                     )
                     .when(index == 0, |this| {
                         this.child(
@@ -484,7 +462,7 @@ fn card_list(
                 .pt(px(4.))
                 .text_size(ui_text(12.))
                 .text_color(faint(theme))
-                .child(format!("{} {}", t!("zconfig.resetLastUsed"), fmt_stamp_utc(used_at))),
+                .child(format!("{} {}", t!("zconfig.resetLastUsed"), fmt_stamp(used_at))),
         );
     }
 
@@ -497,7 +475,7 @@ fn card_list(
                 .pt(px(4.))
                 .text_size(ui_text(12.))
                 .text_color(amber_text())
-                .child(format!("{} {}", t!("zconfig.resetRetryAt"), fmt_stamp_utc(at))),
+                .child(format!("{} {}", t!("zconfig.resetRetryAt"), fmt_stamp(at))),
         );
     }
 
@@ -509,7 +487,7 @@ fn card_list(
             // specific window and expiry.
             Some(SpendStage { warned: true, .. }) => {
                 let expires = next
-                    .map(|c| fmt_stamp_utc(c.expire_at))
+                    .map(|c| fmt_stamp(c.expire_at))
                     .unwrap_or_default();
                 spend_confirm_box(
                     theme,
@@ -1065,7 +1043,7 @@ impl Workbench {
                         .justify_center()
                         .text_size(ui_text(12.))
                         .text_color(faint(&theme))
-                        .child(format!("{} {}", t!("quota.updated"), fmt_stamp_utc(at))),
+                        .child(format!("{} {}", t!("quota.updated"), fmt_stamp(at))),
                 );
             }
             scroll.into_any_element()
@@ -1103,7 +1081,7 @@ mod tests {
     // re-exports GPUI's `test` macro, which would shadow Rust's built-in
     // #[test] (the kit's own doc note).
     use super::{
-        fmt_percent, fmt_stamp_utc, heat_rgb, is_team_plan, notice_text, provider_label,
+        fmt_percent, heat_rgb, is_team_plan, notice_text, provider_label,
         window_used_percent, QuotaPageView,
     };
     use protocol::settings::ResetCardType;
@@ -1114,13 +1092,6 @@ mod tests {
         assert_eq!(fmt_percent(12.34), "12.3");
         assert_eq!(fmt_percent(100.0), "100");
         assert_eq!(fmt_percent(87.06), "87.1");
-    }
-
-    #[test]
-    fn stamp_renders_utc_month_day_hour_minute() {
-        assert_eq!(fmt_stamp_utc(0), "01-01 00:00 UTC");
-        // 2023-11-14 22:13:20 UTC.
-        assert_eq!(fmt_stamp_utc(1_700_000_000_000), "11-14 22:13 UTC");
     }
 
     #[test]
