@@ -79,11 +79,12 @@
 //!    settings-endpoint.ts:656-662). Rust keeps the nullable spelling.
 //! 8. `SettingsAll.workflow` — the PER-INSTANCE mount's block is
 //!    `WorkflowGateBlock` (settings-endpoint.ts:681-708); the hub's
-//!    machine-level mount instead reports `{available:false}` (:671) — a
+//!    machine-level mount instead reports `{available:false}` (:675) — a
 //!    different shape the TS app deliberately does not model (it reads the
-//!    per-instance route, src/lib/hub.ts:722-741). Rust models only
-//!    `WorkflowGateBlock`, matching both the TS type and the route the app
-//!    actually calls.
+//!    per-instance route, src/lib/hub.ts:722-741). Rust models BOTH via the
+//!    untagged `SettingsWorkflowBlock`: the machine-level snapshot feeds the
+//!    plan-quota page's eligibility read, and a strict `WorkflowGateBlock`
+//!    failed that whole snapshot's decode on the degrade shape.
 //! 9. `FsEntry.mtime` — TS optional; the server always sends a number (0
 //!    placeholders for symlinks/raced deletions, file-endpoint.ts:187-192,
 //!    226-243). Rust keeps it optional for older bridges; the fixture

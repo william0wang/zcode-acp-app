@@ -1962,8 +1962,34 @@ mod tests {
         body["workflow"] = json!({ "enabled": true, "mode": "alwaysOn", "source": "remote" });
         t.push(ok_json(body));
         let all = client(&t).instance_settings_all("i1").await.unwrap();
-        assert_eq!(all.workflow.as_ref().unwrap().enabled, true);
+        assert_eq!(
+            all.workflow.and_then(|w| w.verdict()).map(|g| g.enabled),
+            Some(true)
+        );
         assert_eq!(t.urls()[0], "http://hub/api/instances/i1/settings/all");
+    }
+
+    #[tokio::test]
+    async fn the_machine_level_degrade_block_still_decodes_the_whole_snapshot() {
+        // The hub's /api/settings/all answers `workflow: {available:false}`
+        // (settings-endpoint.ts:675). A strict WorkflowGateBlock failed the
+        // ENTIRE snapshot decode on that shape, which broke the plan-quota
+        // page's eligibility read (2026-10-22).
+        let t = transport();
+        let mut body = settings_all_body();
+        body["workflow"] = json!({ "available": false });
+        body["resetCards"]["providers"] =
+            json!(["account:bigmodel-individual-coding-plan"]);
+        t.push(ok_json(body));
+        let all = client(&t).settings_all().await.unwrap();
+        assert!(matches!(
+            all.workflow,
+            Some(crate::settings::SettingsWorkflowBlock::Unavailable { available: false })
+        ));
+        assert_eq!(
+            all.reset_cards.providers,
+            vec!["account:bigmodel-individual-coding-plan".to_string()]
+        );
     }
 
     #[tokio::test]

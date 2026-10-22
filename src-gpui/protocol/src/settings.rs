@@ -359,7 +359,7 @@ pub struct BackendRestartResult {
 /// has no decryptable credential store — both are normal, not errors.
 ///
 /// Divergence note: the hub's machine-level mount reports the workflow gate
-/// as a bare `{available:false}` (settings-endpoint.ts:671) — a DIFFERENT
+/// as a bare `{available:false}` (settings-endpoint.ts:675) — a DIFFERENT
 /// shape the TS app does not model either; the app reads the per-instance
 /// mount (`/api/instances/{id}/settings/all`), whose block is
 /// [`WorkflowGateBlock`].
@@ -377,10 +377,36 @@ pub struct SettingsAll {
     #[serde(default)]
     pub usage: Option<SettingsUsage>,
     pub reset_cards: ResetCardEligibility,
-    /// Dynamic-workflow gate verdict (bridge 0.48.0, ADR-0029). Absent on an
-    /// older bridge — read as "off", which hides the workflows section.
+    /// Dynamic-workflow gate (bridge 0.48.0, ADR-0029). Absent on an older
+    /// bridge — read as "off", which hides the workflows section.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<WorkflowGateBlock>,
+    pub workflow: Option<SettingsWorkflowBlock>,
+}
+
+/// `/settings/all`'s workflow block: two mounts, two shapes. The per-instance
+/// mount (a live bridge) reports the pinned verdict ([`WorkflowGateBlock`]);
+/// the hub's machine-level mount has no backend and degrades to a bare
+/// `{available:false}`. Both must decode — the machine-level snapshot feeds
+/// the plan-quota page, and a strict `WorkflowGateBlock` failed that whole
+/// snapshot on the degrade shape (the "quota page unusable" bug, 2026-10-22).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SettingsWorkflowBlock {
+    Verdict(WorkflowGateBlock),
+    /// The machine-level degrade: no gate on this mount, no verdict to read.
+    Unavailable {
+        available: bool,
+    },
+}
+
+impl SettingsWorkflowBlock {
+    /// The pinned verdict, or `None` for the machine-level degrade block.
+    pub fn verdict(self) -> Option<WorkflowGateBlock> {
+        match self {
+            SettingsWorkflowBlock::Verdict(v) => Some(v),
+            SettingsWorkflowBlock::Unavailable { .. } => None,
+        }
+    }
 }
 
 /// Which providers could spend a reset card, and whether the machine has a

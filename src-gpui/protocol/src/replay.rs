@@ -601,6 +601,13 @@ pub fn apply_one(
             }
             for p in msgs[i].parts.iter_mut() {
                 if let ChatPart::ToolCall(t) = p {
+                    // The update addresses ONE call (TS maps parts and patches
+                    // only `p.toolCallId === toolCallId`): a message holding
+                    // several — the merged tool-run card — must not have every
+                    // card rewritten by the newest update.
+                    if t.tool_call_id != tool_call_id {
+                        continue;
+                    }
                     // JS `chunk || rawOut || p.detail`: empty strings fall
                     // through, so each fallback only applies when non-empty.
                     t.detail = if let Some(term) = term_text {
@@ -1124,6 +1131,51 @@ mod tests {
         let part = find_tool_call_part(&msgs, "tc_1").unwrap();
         assert_eq!(part.diffs, None);
         assert_eq!(part.detail, "final");
+    }
+
+    #[test]
+    fn tool_call_update_targets_only_the_matching_call_in_a_merged_run() {
+        // Adjacent calls without message ids merge into ONE assistant message
+        // (the collapsed tool-run card). An update for the last call rewrote
+        // EVERY card's detail/status before the toolCallId filter — the
+        // "merged messages all become the last one" bug (2026-10-22).
+        let mut msgs = Vec::new();
+        let mut ids = factory();
+        for (cid, name) in [("tc_1", "Bash: one"), ("tc_2", "Bash: two")] {
+            let mut call = serde_json::Map::new();
+            call.insert("toolCallId".to_owned(), json!(cid));
+            call.insert("title".to_owned(), json!(name));
+            call.insert("status".to_owned(), json!("pending"));
+            apply_one(
+                &mut msgs,
+                &SessionUpdate::with_rest("tool_call", call),
+                None,
+                &mut ids,
+                1,
+            );
+        }
+        assert_eq!(msgs.len(), 1, "both calls merge into one message");
+
+        let mut upd = serde_json::Map::new();
+        upd.insert("toolCallId".to_owned(), json!("tc_2"));
+        upd.insert(
+            "content".to_owned(),
+            json!([{ "type": "text", "text": "second output" }]),
+        );
+        upd.insert("status".to_owned(), json!("completed"));
+        apply_one(
+            &mut msgs,
+            &SessionUpdate::with_rest("tool_call_update", upd),
+            None,
+            &mut ids,
+            2,
+        );
+        let first = find_tool_call_part(&msgs, "tc_1").unwrap();
+        let second = find_tool_call_part(&msgs, "tc_2").unwrap();
+        assert_eq!(first.detail, "");
+        assert_eq!(first.status, "pending");
+        assert_eq!(second.detail, "second output");
+        assert_eq!(second.status, "completed");
     }
 
     #[test]

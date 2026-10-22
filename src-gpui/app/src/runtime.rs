@@ -118,6 +118,11 @@ fn reconnect_delay_ms(attempts: u32) -> u64 {
 /// would let presence lapse between polls and reopen terminal windows for
 /// phone-originated sessions while the app runs.
 const DISCOVERY_REFRESH_MS: u64 = 15_000;
+/// How long a closed session stays hidden from incoming discovery lists —
+/// long enough to cover the hub's ≤10s heartbeat staleness plus a bridge
+/// re-advertising a retired conversation, short enough that a session
+/// genuinely reused elsewhere (ADR-0006's re-arm) comes back promptly.
+const CLOSE_TOMBSTONE_MS: u64 = 60_000;
 /// Failed reconnects after which a tab whose instance has left discovery is
 /// re-incubated (POST /api/instances, the resume form). Three honest retries
 /// first: a hub restart's ≤10s bridge re-registration window must not
@@ -2511,6 +2516,13 @@ struct Driver {
     discovery_note: Option<String>,
     next_discovery_at: u64,
     discovery_probe: bool,
+    /// Sessions THIS client closed, with the close time. A discovery refresh
+    /// must not resurrect them inside the window: the hub serves the last
+    /// heartbeat's list (up to ~10s stale, and a bridge that re-advertises a
+    /// retired conversation — a turn settling after the force-close — keeps
+    /// it for good). Bounded so a session genuinely reused elsewhere
+    /// reappears once the window lapses (ADR-0006's re-arm).
+    closed_sessions: HashMap<(String, String), u64>,
 
     tabs: Vec<Tab>,
     active_tab: Option<u64>,
@@ -2622,6 +2634,7 @@ impl Driver {
             discovery_note: None,
             next_discovery_at: 0,
             discovery_probe: true,
+            closed_sessions: HashMap::new(),
             tabs: Vec::new(),
             active_tab: None,
             closing: HashSet::new(),
@@ -2819,10 +2832,37 @@ impl Driver {
         });
     }
 
+    /// Hide tombstoned closes from an incoming discovery list (see
+    /// [`Self::closed_sessions`]). Rows the hub no longer carries stay gone;
+    /// a tombstone's window lapsing lets the row back in.
+    fn filter_closed_sessions(&self, mut list: Vec<HubInstance>, now: u64) -> Vec<HubInstance> {
+        if self.closed_sessions.is_empty() {
+            return list;
+        }
+        for inst in &mut list {
+            if !self.closed_sessions.keys().any(|(i, _)| i == &inst.id) {
+                continue;
+            }
+            inst.sessions.retain(|s| {
+                !self
+                    .closed_sessions
+                    .get(&(inst.id.clone(), s.session_id.clone()))
+                    .is_some_and(|at| now.saturating_sub(*at) < CLOSE_TOMBSTONE_MS)
+            });
+        }
+        list
+    }
+
     fn on_discovery(&mut self, result: Result<Vec<HubInstance>, HubApiError>, now: u64) {
         match result {
             Ok(list) => {
                 traceln!("[driver] discovery: {} instance(s)", list.len());
+                // Expired close-tombstones go first, then hide the rest from
+                // the incoming list — the hub's answer is the last heartbeat's
+                // snapshot and may still carry rows this client retired.
+                self.closed_sessions
+                    .retain(|_, at| now.saturating_sub(*at) < CLOSE_TOMBSTONE_MS);
+                let list = self.filter_closed_sessions(list, now);
                 self.instances = list;
                 self.discovery_note = None;
                 self.next_discovery_at = now + DISCOVERY_REFRESH_MS;
@@ -3959,7 +3999,9 @@ impl Driver {
             let result = hub
                 .instance_settings_all(&instance_id)
                 .await
-                .map(|all| all.workflow);
+                // The per-instance mount always answers the verdict shape; a
+                // degrade block (machine-level shape) carries no verdict.
+                .map(|all| all.workflow.and_then(|w| w.verdict()));
             let _ = tx.send(LoopEvent::WorkflowGateProbed { instance_id, result });
         });
     }
@@ -6130,10 +6172,14 @@ impl Driver {
                 result,
             } => match result {
                 Ok(()) => {
-                    // Drop the row locally (the heartbeat list aligns within
-                    // ~10s) and close any tab holding the conversation — the
-                    // TS store returns to the list screen when it ended the
-                    // open one; the tab list is this client's list screen.
+                    // Drop the row locally and tombstone it against the
+                    // discovery refreshes below: the hub serves the last
+                    // heartbeat's list, which still carries the row (and a
+                    // bridge whose cancelled turn settles late re-advertises
+                    // it) — without the tombstone the row vanished, RESURRECTED
+                    // on the next 15s poll, then lingered (2026-10-22).
+                    self.closed_sessions
+                        .insert((instance_id.clone(), session_id.clone()), now);
                     for inst in &mut self.instances {
                         if inst.id == instance_id {
                             inst.sessions.retain(|s| s.session_id != session_id);
@@ -9147,6 +9193,9 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         // Session Files belong to a (hub, instance, session) triple — a new
         // lifecycle means a new machine's paths; nothing survives.
         d.files.reset();
+        // Close tombstones name the OLD hub's instance ids; the new hub's
+        // rows owe them nothing.
+        d.closed_sessions.clear();
         d.config_notice = None;
         d.pending_restart = false;
         d.emit_if_changed();
@@ -9500,6 +9549,64 @@ mod tests {
         assert!(
             d.instances.iter().any(|i| i.id == "i-edit" && i.sessions.is_empty()),
             "editor bridges stay for the heartbeat realign"
+        );
+    }
+
+    /// A closed session stays gone across discovery refreshes: the hub serves
+    /// the last heartbeat's list, which still carries the row (and a bridge
+    /// can re-advertise a retired conversation), so the poll that REPLACES
+    /// `instances` resurrected the row — gone, back, then lingering. The
+    /// tombstone hides it for CLOSE_TOMBSTONE_MS; the window lapsing lets a
+    /// genuinely reused session back in (ADR-0006's re-arm).
+    #[test]
+    fn a_closed_session_is_not_resurrected_by_a_discovery_refresh() {
+        let mut d = driver();
+        // Skip the M1 auto-attach path (it dials the instance — a live-socket
+        // spawn this unit test must not need).
+        d.ever_had_tab = true;
+        d.handle_loop_event(
+            LoopEvent::SessionClosed {
+                instance_id: "i-edit".to_string(),
+                session_id: "s1".to_string(),
+                result: Ok(()),
+            },
+            1_000,
+        );
+
+        // The next poll still carries the row (stale heartbeat).
+        d.on_discovery(
+            Ok(vec![
+                instance("i-edit", Some("/e"), vec![session("s1", None), session("s2", None)]),
+            ]),
+            5_000,
+        );
+        assert!(
+            !d.instances.iter().any(|i| i
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "s1")),
+            "the closed row stays hidden inside the window"
+        );
+        assert!(
+            d.instances.iter().any(|i| i
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "s2")),
+            "the sibling row is untouched"
+        );
+
+        // Past the window the same list re-admits the row (it was genuinely
+        // used again server-side).
+        d.on_discovery(
+            Ok(vec![instance("i-edit", Some("/e"), vec![session("s1", None)])]),
+            1_000 + super::CLOSE_TOMBSTONE_MS + 1,
+        );
+        assert!(
+            d.instances.iter().any(|i| i
+                .sessions
+                .iter()
+                .any(|s| s.session_id == "s1")),
+            "an expired tombstone re-admits the row"
         );
     }
 
