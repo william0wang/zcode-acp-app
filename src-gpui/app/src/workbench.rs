@@ -7681,6 +7681,33 @@ mod ui_tests {
         (handle, wb, runtime)
     }
 
+    /// Fenced code blocks in the chat's markdown colour through the kit's
+    /// tree-sitter grammars. The highlighter installs with the kit theme
+    /// (`Theme::sync_base`) only while the `tree-sitter-*` features are on
+    /// in src-gpui/Cargo.toml — dropping them would silently return every
+    /// code block to plain text, so the install and the fence tags an agent
+    /// reply actually uses are pinned here.
+    #[gpui_kit::test]
+    fn chat_code_blocks_have_a_syntax_highlighter(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            assert!(
+                gpui_kit::base::TextViewDefaults::global(cx).has_code_block_highlighter(),
+                "the kit's code-block highlighter must install with the theme"
+            );
+        });
+        let registry = gpui_kit::component::highlighter::LanguageRegistry::singleton();
+        for lang in [
+            "rust", "typescript", "tsx", "javascript", "python", "go", "bash", "json", "yaml",
+            "toml", "diff", "markdown",
+        ] {
+            assert!(
+                registry.language(lang).is_some(),
+                "fence tag `{lang}` must resolve to a compiled grammar"
+            );
+        }
+    }
+
     /// The quit dialog gates on turns THIS app started only (§4): other
     /// clients' running turns never open it; an own turn opens the
     /// two-choice dialog, Esc dismisses it (keep window), and the stop-all

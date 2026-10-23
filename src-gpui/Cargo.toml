@@ -62,7 +62,50 @@ sys-locale = "0.3"
 libc = "0.2"
 # gpui distribution is pinned by gpui-kit itself (docs/adr/0009 §decision,
 # requirements §7); the app never adds a direct gpui dependency.
-gpui-kit = "0.7"
+# tree-sitter-*: the kit's markdown TextView highlights fenced code blocks
+# only with the component's `tree-sitter` feature on (every language
+# feature implies it; JSON rides the base), one grammar feature per
+# language. This is the kit's own `tree-sitter-languages` bundle spelled
+# out MINUS sql: tree-sitter-sequel pins `cc ~1.2` and the tree is on cc
+# 1.8 (aws-lc-sys, cmake), so the bundle feature cannot resolve. Covers the
+# same ground as the TS side's highlight.js registration (FileViewer.tsx).
+gpui-kit = { version = "0.7", features = [
+  "tree-sitter-astro",
+  "tree-sitter-bash",
+  "tree-sitter-c",
+  "tree-sitter-cmake",
+  "tree-sitter-cpp",
+  "tree-sitter-csharp",
+  "tree-sitter-css",
+  "tree-sitter-diff",
+  "tree-sitter-ejs",
+  "tree-sitter-elixir",
+  "tree-sitter-erb",
+  "tree-sitter-go",
+  "tree-sitter-graphql",
+  "tree-sitter-html",
+  "tree-sitter-java",
+  "tree-sitter-javascript",
+  "tree-sitter-jsdoc",
+  "tree-sitter-kotlin",
+  "tree-sitter-lua",
+  "tree-sitter-make",
+  "tree-sitter-markdown",
+  "tree-sitter-markdown-inline",
+  "tree-sitter-php",
+  "tree-sitter-proto",
+  "tree-sitter-python",
+  "tree-sitter-ruby",
+  "tree-sitter-rust",
+  "tree-sitter-scala",
+  "tree-sitter-svelte",
+  "tree-sitter-swift",
+  "tree-sitter-toml",
+  "tree-sitter-tsx",
+  "tree-sitter-typescript",
+  "tree-sitter-yaml",
+  "tree-sitter-zig",
+] }
 # https:// for the hub REST API on remote profiles: the hand-rolled
 # socket-per-request transport wraps its TcpStream with tokio-rustls and the
 # system trust store (same policy as the WS side above).
