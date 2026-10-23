@@ -2955,10 +2955,11 @@ impl Workbench {
     /// The settings drawer's body (formerly the config dock panel): the
     /// entry list for the high-frequency config pages (requirements §4 —
     /// the TS app reaches these from the settings panel), plus the server
-    /// book, appearance picks, the hub upgrade check, the workflow gate
-    /// switch, and the account quota card. The drawer frame
-    /// (`render_drawer`) provides the chrome — header, close, border;
-    /// scrolling lives here.
+    /// book, appearance picks, the hub upgrade check and the workflow gate
+    /// switch. The account quota has its own rail toggle and drawer
+    /// (`DrawerSurface::Quota`) plus a page entry in the list below, so it
+    /// does not repeat here. The drawer frame (`render_drawer`) provides
+    /// the chrome — header, close, border; scrolling lives here.
     fn render_config_panel(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
@@ -3210,15 +3211,6 @@ impl Workbench {
                 }),
         );
 
-        // The account quota card (TS SettingsPanel's `<QuotaSection />`):
-        // hub-level, so it sits with the global settings as well as in the
-        // session panel.
-        if let Some(card) =
-            crate::quota_card::render_quota_card(&self.snap.quota_card, &self.runtime, theme)
-        {
-            column = column.child(card);
-        }
-
         div()
             .id("config-panel")
             .flex_1()
@@ -3235,7 +3227,7 @@ impl Workbench {
     /// The right panel IS the active session's file browser: a header strip
     /// (dotfiles / Finder / refresh) plus the breadcrumb and one directory
     /// level. Session config, turn stats, the workflow entry and the quota
-    /// card all live elsewhere (composer chips, tab strip, settings drawer,
+    /// card all live elsewhere (composer chips, tab strip, quota drawer,
     /// status bar), so this panel carries nothing else.
     fn render_session_panel(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();

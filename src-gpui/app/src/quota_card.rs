@@ -1,10 +1,9 @@
-//! The side panels' account quota card — the port of
-//! `src/components/QuotaSection.tsx`, rendered by BOTH the settings drawer
-//! (TS SettingsPanel) and the session panel (TS SessionPanel):
+//! The account quota card — the port of `src/components/QuotaSection.tsx`,
+//! rendered as the quota DRAWER's body (the rail gauge's surface):
 //!
 //! - hub-level data (`/api/quota`, the plan-quota page's own read), never
-//!   session-scoped — the two panels paint the same driver state, and a
-//!   refresh from either (or from the plan page) repaints all three;
+//!   session-scoped — the drawer and the plan page paint the same driver
+//!   state, and a refresh from either repaints both;
 //! - one row implementation shared with the plan page
 //!   (`quota_page::quota_bar_row`), so the surfaces cannot drift apart;
 //! - the sections the hub reports, in the CLI card's order: GLM Coding Plan,
@@ -14,20 +13,19 @@
 //! - status prose for the non-success kinds, verbatim from the CLI card.
 //!
 //! Hidden entirely until the first read answers (TS `if (!quotaUnavailable
-//! && !usageStats) return null`); the panels' open kicks that read (the TS
+//! && !usageStats) return null`); the drawer's open kicks that read (the TS
 //! mount effect).
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{AnyElement, div, px};
-use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{Sizable as _, Theme};
-use gpui_kit::{assets::IconName as KitIconName, *};
+use gpui_kit::component::Theme;
+use gpui_kit::*;
 use protocol::quota::AccountUsageStats;
 use rust_i18n::t;
 
 use crate::local_time::fmt_stamp;
 use crate::quota_page::{faint, quota_bar_row};
-use crate::runtime::{ProtocolRuntime, QuotaCardView, UiCommand};
+use crate::runtime::QuotaCardView;
 use crate::ui_prefs::ui_text;
 
 /// Status lines, verbatim from the CLI card's non-success prose (TS
@@ -181,79 +179,6 @@ fn render_sections(theme: &Theme, usage: &AccountUsageStats) -> Vec<AnyElement> 
     }
 
     out
-}
-
-/// The card, or `None` while nothing has answered yet (the TS early
-/// return): header with the last-refresh stamp and the refresh control,
-/// then the unavailable note or the provider sections.
-pub(crate) fn render_quota_card(
-    view: &QuotaCardView,
-    runtime: &ProtocolRuntime,
-    theme: &Theme,
-) -> Option<AnyElement> {
-    if !view.quota_unavailable && view.usage.is_none() {
-        return None;
-    }    let refresh_runtime = runtime.clone();
-    let mut header = div()
-        .mt(px(8.))
-        .flex()
-        .items_center()
-        .justify_between()
-        .border_t_1()
-        .border_color(theme.border)
-        .px(px(16.))
-        .pt(px(12.))
-        .pb(px(2.))
-        .child(
-            div()
-                .text_size(ui_text(12.))
-                .text_color(faint(theme))
-                .child(t!("quota.title").to_uppercase()),
-        );
-    let mut trailing = div().flex().items_center().gap(px(6.));
-    if let Some(at) = view.usage_stats_at {
-        trailing = trailing.child(
-            div()
-                .id("quota-card-updated")
-                .test_support()
-                .text_size(ui_text(10.))
-                .font_family(theme.mono_font_family.clone())
-                .text_color(faint(theme))
-                .child(format!("{} {}", t!("quota.updated"), fmt_stamp(at))),
-        );
-    }
-    trailing = trailing.child(
-        Button::new("quota-card-refresh")
-            .ghost()
-            .xsmall()
-            .icon(KitIconName::RefreshCw)
-            .tooltip(t!("quota.refresh").into_owned())
-            .on_click(move |_, _, _| refresh_runtime.send(UiCommand::RefreshQuota)),
-    );
-    header = header.child(trailing);
-
-    let mut card = div()
-        .id("quota-card")
-        .test_support()
-        .flex()
-        .flex_col()
-        .min_w_0()
-        .child(header);
-    if view.quota_unavailable {
-        card = card.child(
-            div()
-                .id("quota-card-unavailable")
-                .test_support()
-                .px(px(16.))
-                .py(px(4.))
-                .text_size(ui_text(13.))
-                .text_color(faint(theme))
-                .child(t!("quota.unavailable").into_owned()),
-        );
-    } else if let Some(usage) = view.usage.as_ref() {
-        card = card.children(render_sections(theme, usage));
-    }
-    Some(card.into_any_element())
 }
 
 /// The quota DRAWER's body (the rail gauge's surface): the mobile side

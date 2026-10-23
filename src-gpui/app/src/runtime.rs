@@ -5269,6 +5269,12 @@ impl Driver {
     /// `/api/quota` answers the RAW combined payload (the settings mount's
     /// `/settings/quota` wraps it in `{ok, quota}` — parsing that bare
     /// yielded "no data" on every successful fetch).
+    ///
+    /// The status bar's dock line rides along: it is the same account quota
+    /// in one line, so a read that repaints the drawer or page (a manual
+    /// refresh, a spent reset card) must not leave the resident line stale.
+    /// The two are separate hub endpoints with separate caches, so the dock
+    /// needs its own request — `spawn_quota_dock` dedupes an in-flight one.
     fn spawn_quota_usage(&mut self) {
         if !matches!(
             self.phase,
@@ -5276,6 +5282,7 @@ impl Driver {
         ) {
             return;
         }
+        self.spawn_quota_dock();
         let hub = self.settings_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
@@ -5310,9 +5317,10 @@ impl Driver {
     }
 
     /// The title-bar quota dock line (TS `refreshQuotaDock`, ADR-0021):
-    /// pulled when the hub first answers and at every turn end (usage moved —
+    /// pulled when the hub first answers, at every turn end (usage moved —
     /// the bridge force-refreshes its cache exactly then, so the read is
-    /// cheap). Failures stay silent and sticky.
+    /// cheap), and alongside every quota usage read (`spawn_quota_usage`).
+    /// Failures stay silent and sticky.
     fn spawn_quota_dock(&mut self) {
         if !matches!(
             self.phase,
@@ -9924,6 +9932,29 @@ mod tests {
         assert_eq!(d.quota_dock, None, "a successful empty clears");
         d.on_quota_dock(1, Ok(Some("NEW HUB · 10%".to_string())));
         assert_eq!(d.quota_dock.as_deref(), Some("NEW HUB · 10%"));
+    }
+
+    /// The status bar's quota dock line follows every quota usage read: the
+    /// drawer / page and the resident line are the same account quota, so a
+    /// manual refresh that repaints one must repaint the other — the hub
+    /// caches the two endpoints separately, so only a second request gets
+    /// the line fresh. Outside the hub-reachable phases neither read fires.
+    #[tokio::test]
+    async fn a_quota_usage_read_also_refreshes_the_dock_line() {
+        let mut d = driver();
+        assert!(matches!(d.phase, super::Phase::Bootstrapping));
+        d.handle_cmd(super::UiCommand::RefreshQuota, 0);
+        assert!(
+            !d.quota_dock_loading,
+            "no hub yet — the dock read must wait like the usage read"
+        );
+
+        d.phase = super::Phase::Connected;
+        d.handle_cmd(super::UiCommand::RefreshQuota, 0);
+        assert!(
+            d.quota_dock_loading,
+            "a quota refresh must also kick the dock line read"
+        );
     }
 
     /// Discovery never opens a tab on its own (2026-10-22 decision, dropping
