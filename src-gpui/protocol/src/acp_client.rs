@@ -74,6 +74,13 @@ pub trait AcpHandlers: Send + Sync {
     fn on_ask_settled(&self, _session_id: &str, _kind: Option<&str>, _tool_call_id: Option<&str>) {}
     fn on_turn_state(&self, session_id: &str, running: bool, turn: Option<TurnStateInfo>);
     fn on_workflow_list_changed(&self) {}
+    /// `$/zcode/session_closed` — the bridge's cross-client retirement
+    /// notice: another client closed this conversation through the hub, and
+    /// a serve bridge is about to self-exit when that was its last session
+    /// (ADR-0006/0016). Holders drop the session's tab instead of reading
+    /// the following disconnect as a dead backend to revive. One copy per
+    /// session alias — route by the payload's session id. Default no-op.
+    fn on_session_closed(&self, _session_id: &str) {}
 }
 
 /// Answer channel for a server request — carries the request id back on the
@@ -537,6 +544,15 @@ fn route_message(core: &Arc<ConnCore>, data: &str) {
                         .and_then(Value::as_str);
                     core.handlers
                         .on_ask_settled(session_id, kind, tool_call_id);
+                }
+            }
+            "$/zcode/session_closed" => {
+                // Payload: {sessionId} — one copy per session alias.
+                if let Some(session_id) = params
+                    .and_then(|p| p.get("sessionId"))
+                    .and_then(Value::as_str)
+                {
+                    core.handlers.on_session_closed(session_id);
                 }
             }
             "$/cancel_request" => {

@@ -1539,6 +1539,13 @@ enum LoopEvent {
         session_id: String,
         result: Result<(), HubApiError>,
     },
+    /// The bridge's `$/zcode/session_closed` broadcast on `tab`'s socket:
+    /// another client retired `session_id` through the hub. Tagged with the
+    /// tab because every tab dialing that bridge receives its own copy.
+    SessionClosedRemotely {
+        tab: u64,
+        session_id: String,
+    },
     HistorySessionDeleted {
         session_id: String,
         result: Result<(), HubApiError>,
@@ -1839,6 +1846,13 @@ impl AcpHandlers for DriverHandlers {
             session_id: session_id.to_string(),
             running,
             turn,
+        });
+    }
+
+    fn on_session_closed(&self, session_id: &str) {
+        let _ = self.tx.send(LoopEvent::SessionClosedRemotely {
+            tab: self.tab,
+            session_id: session_id.to_string(),
         });
     }
 }
@@ -2847,6 +2861,50 @@ impl Driver {
             let result = hub.instances(probe).await;
             let _ = tx.send(LoopEvent::Discovery(result));
         });
+    }
+
+    /// The shared retirement of one conversation — the hub answered our own
+    /// close, or the bridge broadcast `$/zcode/session_closed` (another
+    /// client retired it). Tombstone the row against discovery, drop it from
+    /// the instance list, close every tab holding it, and drop a serve
+    /// bridge whose LAST advertised session just closed (self-exit,
+    /// ADR-0006/0016). Without the tombstone the row vanished and
+    /// RESURRECTED on the next 15s poll, then lingered (2026-10-22); without
+    /// the tab close the reconnect ladder would try to resume a
+    /// deliberately-closed session (2026-10-23).
+    fn retire_closed_session(&mut self, instance_id: &str, session_id: &str, now: u64) {
+        self.closed_sessions
+            .insert((instance_id.to_string(), session_id.to_string()), now);
+        for inst in &mut self.instances {
+            if inst.id == instance_id {
+                inst.sessions.retain(|s| s.session_id != session_id);
+            }
+        }
+        let holders: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| {
+                t.core.active_session_id.as_deref() == Some(session_id)
+                    || t.target.as_deref() == Some(session_id)
+            })
+            .map(|t| t.id)
+            .collect();
+        for id in holders {
+            self.close_tab(id);
+        }
+        let last_session_gone = self.instances.iter().any(|i| {
+            i.id == instance_id && i.origin == InstanceOrigin::Serve && i.sessions.is_empty()
+        });
+        if last_session_gone {
+            self.instances.retain(|i| i.id != instance_id);
+        }
+        self.toast.notify(
+            now,
+            // The TS store sets the notice KEY (appStore.ts:2011) and the UI
+            // localizes; resolving here covers the desktop's raw-string
+            // toast/error slots equally.
+            &rust_i18n::t!("notice.sessionClosed"),
+        );
     }
 
     /// Hide tombstoned closes from an incoming discovery list (see
@@ -6189,54 +6247,7 @@ impl Driver {
                 session_id,
                 result,
             } => match result {
-                Ok(()) => {
-                    // Drop the row locally and tombstone it against the
-                    // discovery refreshes below: the hub serves the last
-                    // heartbeat's list, which still carries the row (and a
-                    // bridge whose cancelled turn settles late re-advertises
-                    // it) — without the tombstone the row vanished, RESURRECTED
-                    // on the next 15s poll, then lingered (2026-10-22).
-                    self.closed_sessions
-                        .insert((instance_id.clone(), session_id.clone()), now);
-                    for inst in &mut self.instances {
-                        if inst.id == instance_id {
-                            inst.sessions.retain(|s| s.session_id != session_id);
-                        }
-                    }
-                    let holders: Vec<u64> = self
-                        .tabs
-                        .iter()
-                        .filter(|t| {
-                            t.core.active_session_id.as_deref() == Some(session_id.as_str())
-                                || t.target.as_deref() == Some(session_id.as_str())
-                        })
-                        .map(|t| t.id)
-                        .collect();
-                    for id in holders {
-                        self.close_tab(id);
-                    }
-                    // A serve bridge whose LAST advertised session just closed
-                    // self-exits (~1.5s, ADR-0006/0016): drop the instance row
-                    // now so no surface dials a corpse — the discovery poll
-                    // would otherwise keep it until the hub's prune, and every
-                    // attach in that window fails. Editor bridges stay (no
-                    // self-exit; the heartbeat list keeps them honest).
-                    let last_session_gone = self.instances.iter().any(|i| {
-                        i.id == instance_id
-                            && i.origin == InstanceOrigin::Serve
-                            && i.sessions.is_empty()
-                    });
-                    if last_session_gone {
-                        self.instances.retain(|i| i.id != instance_id);
-                    }
-                    self.toast.notify(
-                        now,
-                        // The TS store sets the notice KEY (appStore.ts:2011)
-                        // and the UI localizes; resolving here covers the
-                        // desktop's raw-string toast/error slots equally.
-                        &rust_i18n::t!("notice.sessionClosed"),
-                    );
-                }
+                Ok(()) => self.retire_closed_session(&instance_id, &session_id, now),
                 Err(e) => {
                     let msg = if e.status == Some(409) {
                         // A turn is in flight — stop it first (ADR-0006).
@@ -6247,6 +6258,25 @@ impl Driver {
                     self.toast.notify(now, &msg);
                 }
             },
+            LoopEvent::SessionClosedRemotely { tab, session_id } => {
+                // The bridge's `$/zcode/session_closed` broadcast (martty's
+                // quit-cleanly contract): someone retired this conversation.
+                // Retire locally exactly like an own close — tab, row,
+                // tombstone — so the reconnect ladder never sees the gone
+                // session and the re-incubator never resumes a deliberately
+                // closed conversation (a serve bridge self-exits right after
+                // this broadcast; without the retirement the revive path
+                // pulled the session back up, 2026-10-23). Tabs holding OTHER
+                // sessions on the same bridge ignore their copy.
+                let holder = self.tab(tab).filter(|t| {
+                    t.core.active_session_id.as_deref() == Some(session_id.as_str())
+                        || t.target.as_deref() == Some(session_id.as_str())
+                });
+                if let Some(t) = holder {
+                    let instance_id = t.instance_id.clone();
+                    self.retire_closed_session(&instance_id, &session_id, now);
+                }
+            }
             LoopEvent::HistorySessionDeleted { session_id, result } => {
                 // Clear the in-flight marker first (one mutable pass; the
                 // error slot is written again below on failure).
@@ -9628,6 +9658,60 @@ mod tests {
                 .iter()
                 .any(|s| s.session_id == "s1")),
             "an expired tombstone re-admits the row"
+        );
+    }
+
+    /// The bridge's `$/zcode/session_closed` broadcast (another client
+    /// retired the conversation through the hub): the holding tab closes and
+    /// the row tombstones — the same retirement an own close performs — so
+    /// the reconnect ladder never sees the gone session and the re-incubator
+    /// never pulls it back up. A copy addressing a session this tab does not
+    /// hold is ignored, and an unknown tab id is a no-op.
+    #[tokio::test]
+    async fn a_remote_session_close_retires_the_holding_tab() {
+        let mut d = driver();
+        let mut serve =
+            instance("i-serve", Some("/w"), vec![session("s1", None), session("s2", None)]);
+        serve.origin = InstanceOrigin::Serve;
+        d.instances.push(serve);
+        let tab = d.open_tab("i-serve".to_string(), Some("s1".to_string()), "/w".to_string());
+        assert_eq!(d.tabs.len(), 1);
+
+        // Another session on the same bridge: the copy is ignored.
+        d.handle_loop_event(
+            LoopEvent::SessionClosedRemotely { tab, session_id: "s2".to_string() },
+            1_000,
+        );
+        assert_eq!(d.tabs.len(), 1, "an unrelated close keeps the tab");
+        assert!(d.closed_sessions.is_empty());
+
+        // The held session: tab gone, row tombstoned and dropped from the
+        // instance; the instance itself stays — its sibling s2 is still
+        // advertised, so no self-exit is coming.
+        d.handle_loop_event(
+            LoopEvent::SessionClosedRemotely { tab, session_id: "s1".to_string() },
+            2_000,
+        );
+        assert!(d.tabs.is_empty(), "the retirement closes the holding tab");
+        assert!(
+            d.closed_sessions
+                .contains_key(&("i-serve".to_string(), "s1".to_string())),
+            "the row tombstones against the next discovery poll"
+        );
+        let serve = d
+            .instances
+            .iter()
+            .find(|i| i.id == "i-serve")
+            .expect("a bridge with a live sibling session keeps its row");
+        assert_eq!(
+            serve.sessions.iter().map(|s| s.session_id.as_str()).collect::<Vec<_>>(),
+            vec!["s2"]
+        );
+
+        // A stale event for the now-closed tab is a no-op.
+        d.handle_loop_event(
+            LoopEvent::SessionClosedRemotely { tab, session_id: "s1".to_string() },
+            3_000,
         );
     }
 

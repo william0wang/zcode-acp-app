@@ -27,6 +27,7 @@ struct CaptureHandlers {
     cancels: Mutex<Vec<u64>>,
     turns: Mutex<Vec<(String, bool, Option<super::TurnStateInfo>)>>,
     workflow_list_changes: Mutex<u32>,
+    session_closes: Mutex<Vec<String>>,
 }
 
 impl AcpHandlers for CaptureHandlers {
@@ -58,6 +59,10 @@ impl AcpHandlers for CaptureHandlers {
 
     fn on_workflow_list_changed(&self) {
         *self.workflow_list_changes.lock().unwrap() += 1;
+    }
+
+    fn on_session_closed(&self, session_id: &str) {
+        self.session_closes.lock().unwrap().push(session_id.to_string());
     }
 }
 
@@ -309,6 +314,24 @@ async fn workflow_list_changed_routes() {
     ws.server(json!({ "jsonrpc": "2.0", "method": "$/zcode/workflowListChanged" }));
     clock.advance(0).await;
     assert_eq!(*handlers.workflow_list_changes.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn session_closed_routes_by_payload_session_id() {
+    let handlers = Arc::new(CaptureHandlers::default());
+    let (_conn, _factory, clock, ws) = opened(handlers.clone()).await;
+    ws.server(json!({
+        "jsonrpc": "2.0",
+        "method": "$/zcode/session_closed",
+        "params": { "sessionId": "s" },
+    }));
+    // A copy without the id drops instead of misrouting.
+    ws.server(json!({ "jsonrpc": "2.0", "method": "$/zcode/session_closed", "params": {} }));
+    clock.advance(0).await;
+    assert_eq!(
+        *handlers.session_closes.lock().unwrap(),
+        vec!["s".to_string()]
+    );
 }
 
 // -- session/new & session/load wire shapes ------------------------------------
