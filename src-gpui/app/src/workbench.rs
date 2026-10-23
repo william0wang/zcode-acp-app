@@ -35,31 +35,27 @@ use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    relative, AnyElement, App, ClipboardEntry, ClipboardItem, Context, Entity, ExternalPaths,
-    ImageFormat, MouseButton, PathPromptOptions, SharedString, Subscription, Window, div, img, px,
+    div, img, px, relative, AnyElement, App, ClipboardEntry, ClipboardItem, Context, Entity,
+    ExternalPaths, ImageFormat, MouseButton, PathPromptOptions, SharedString, Subscription, Window,
 };
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
-use gpui_kit::component::input::{
-    Input, InputEvent, InputState, Textarea, TextareaState,
-};
-use gpui_kit::component::menu::{
-    ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem,
-};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
 use gpui_kit::component::text::{TextView, TextViewMotion, TextViewState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
-    h_resizable, resizable_panel, ActiveTheme as _, Disableable as _, Icon, IconName,
+    h_resizable, resizable_panel, v_resizable, ActiveTheme as _, Disableable as _, Icon, IconName,
     ResizableState, Selectable as _, Sizable as _,
 };
 use gpui_kit::TestSupportExt as _;
-use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::{assets::IconName as KitIconName, base::TextSelection, *};
-use rust_i18n::t;
 use protocol::chat::{AttachmentDraft, ChatMessage, ChatPart, ChatRole};
 use protocol::image::{
     decode_attachment_bytes, prepare_image, sniff_mime, PrepareError, MAX_IMAGES,
 };
+use rust_i18n::t;
 
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
 use crate::diff_view::{blocks_of, DiffBlock, DiffLineKind};
@@ -69,18 +65,17 @@ use crate::file_browser::{
 };
 use crate::i18n::{fill, fmt_relative, now_ms, parse_iso_ms, t_count};
 use crate::models_page::ModelsForm;
+use crate::quota_page::SpendStage;
 use crate::runtime::{
     FsBrowseView, HistoryRow, HistorySelected, NewSessionView, Phase, ProtocolRuntime,
     RuntimeEvent, SessionRow, TabPhase, TabSummary, TabView, UiCommand, WorkbenchSnapshot,
 };
-use crate::quota_page::SpendStage;
 use crate::server_form::ServerForm;
 use crate::system_status::render_system_status_page;
+use crate::terminal_panel;
 use crate::ui_prefs::ui_text;
 use crate::usage_page::render_usage_page;
-use crate::workflows_page::{
-    WorkflowAmendForm, WorkflowMetaForm, WorkflowStartForm,
-};
+use crate::workflows_page::{WorkflowAmendForm, WorkflowMetaForm, WorkflowStartForm};
 use crate::zconfig_pages::ZConfigForm;
 
 /// Stream-reveal timing for streamed markdown chunks (the Claude-style fade
@@ -111,6 +106,7 @@ gpui_kit::actions!(
         QuitApp,
         FocusSessionSearch,
         StopTurn,
+        ToggleTerminal,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -218,6 +214,14 @@ pub struct Workbench {
     /// like the left dock, with its own splitter.
     session_panel_open: bool,
     session_dock_sizes: Entity<ResizableState>,
+    /// The embedded terminal dock (view-local, never wire state): spawned
+    /// lazily on the first open — the active session's workspace is the
+    /// shell's cwd — and kept alive across hide/show. `None` also under
+    /// test (cfg!(test)): the suite must not leak real shell processes.
+    terminal_dock: Option<terminal_panel::TerminalDock>,
+    terminal_open: bool,
+    /// The chat ↔ terminal vertical split's sizes.
+    terminal_sizes: Entity<ResizableState>,
     /// The font ladder (TS `fontSize`): scales the reading text through the
     /// chat px pairs and every other UI role through the paint-time factor
     /// (`ui_prefs::ui_text` reads the published step).
@@ -642,12 +646,7 @@ fn render_diff_block(
             DiffLineKind::Del => ("-", rgb(0xfca5a5).into(), Some(rgb(0x33141a).into())),
             DiffLineKind::Context => (" ", theme.muted_foreground, None),
         };
-        let mut row = div()
-            .min_w_0()
-            .flex()
-            .px_2()
-            .gap_1()
-            .text_color(text_color);
+        let mut row = div().min_w_0().flex().px_2().gap_1().text_color(text_color);
         if let Some(bg) = bg {
             row = row.bg(bg);
         }
@@ -833,12 +832,7 @@ fn parse_task_notification(text: &str) -> Option<(String, String)> {
 /// `ActionBarPrimitive.Copy`): writes the row's source text to the platform
 /// clipboard; the icon flips to a checkmark for a beat after the click (the
 /// TS `data-copied` swap).
-fn copy_button(
-    row: &RowModel,
-    text: String,
-    copied: bool,
-    wb: &WeakEntity<Workbench>,
-) -> Button {
+fn copy_button(row: &RowModel, text: String, copied: bool, wb: &WeakEntity<Workbench>) -> Button {
     let row_id = row.id.clone();
     Button::new(SharedString::from(format!("copy-{}", row.id)))
         .ghost()
@@ -1110,10 +1104,10 @@ impl Workbench {
             cx.subscribe(&history_filter, |_, _, _: &InputEvent, cx| cx.notify());
         // The rename sheet's draft (G1) — Enter saves when non-empty (the TS
         // sheet's disabled-Save guard), every keystroke re-renders the button.
-        let rename_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
-        let rename_sub = cx.subscribe(&rename_input, |this, _, event: &InputEvent, cx| {
-            match event {
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
+        let rename_sub = cx.subscribe(
+            &rename_input,
+            |this, _, event: &InputEvent, cx| match event {
                 InputEvent::PressEnter {
                     secondary: false,
                     shift: false,
@@ -1124,10 +1118,11 @@ impl Workbench {
                     }
                 }
                 _ => cx.notify(),
-            }
-        });
+            },
+        );
         let dock_sizes = cx.new(|_| ResizableState::default());
         let session_dock_sizes = cx.new(|_| ResizableState::default());
+        let terminal_sizes = cx.new(|_| ResizableState::default());
         // The composer is the primary surface — start focused.
         let focus = composer.read(cx).focus_handle(cx).clone();
         window.focus(&focus, cx);
@@ -1158,6 +1153,9 @@ impl Workbench {
             drawer: None,
             session_panel_open: false,
             files_panel_session: None,
+            terminal_dock: None,
+            terminal_open: false,
+            terminal_sizes,
             font_scale: crate::ui_prefs::load_font_size()
                 .unwrap_or(crate::ui_prefs::FontScale::Medium),
             session_dock_sizes,
@@ -1290,6 +1288,96 @@ impl Workbench {
     fn toggle_dock(&mut self, cx: &mut Context<Self>) {
         self.dock_open = !self.dock_open;
         cx.notify();
+    }
+
+    // -- embedded terminal ---------------------------------------------------
+
+    /// View-local toggle (the drawers' shape): the dock spawns lazily on
+    /// the first open — in the ACTIVE session's workspace — and survives
+    /// hide/show; reopening never respawns a live shell.
+    pub(crate) fn toggle_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal_open = !self.terminal_open;
+        if self.terminal_open && self.terminal_dock.is_none() && !cfg!(test) {
+            self.spawn_terminal(cx);
+        }
+        cx.notify();
+    }
+
+    /// The exit callback's deferred close (terminal_panel is a sibling
+    /// module, so the fields stay private). `exited` is the view that saw
+    /// the EOF: a shell the restart already replaced still lives in the
+    /// previous frame's element tree for one draw, and its late exit must
+    /// not close the fresh dock.
+    pub(crate) fn close_terminal(&mut self, exited: gpui::EntityId, cx: &mut Context<Self>) {
+        let current = self
+            .terminal_dock
+            .as_ref()
+            .is_some_and(|dock| dock.view.entity_id() == exited);
+        if !current {
+            return;
+        }
+        self.terminal_dock = None;
+        self.terminal_open = false;
+        cx.notify();
+    }
+
+    pub(crate) fn on_toggle_terminal(
+        &mut self,
+        _: &ToggleTerminal,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.toggle_terminal(cx);
+        // Opening hands the keyboard to the shell at once; closing leaves
+        // the focus where the terminal had it (VS Code's behavior).
+        if let Some(dock) = self.terminal_dock.as_ref().filter(|_| self.terminal_open) {
+            window.focus(&dock.focus, cx);
+        }
+    }
+
+    /// Kill the shell and spawn a fresh one in the CURRENT session's
+    /// workspace — the point of the restart button (a `cd` elsewhere in the
+    /// old shell is not undone, it is abandoned).
+    pub(crate) fn restart_terminal(&mut self, cx: &mut Context<Self>) {
+        self.terminal_dock = None;
+        if !cfg!(test) {
+            self.spawn_terminal(cx);
+        }
+        cx.notify();
+    }
+
+    fn spawn_terminal(&mut self, cx: &mut Context<Self>) {
+        let cwd = self.active_workspace();
+        let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
+        match dock {
+            Ok(dock) => self.terminal_dock = Some(dock),
+            Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
+        }
+    }
+
+    /// The active tab's workspace path — the shell's cwd (the tab strip's
+    /// project identity, TS parity).
+    fn active_workspace(&self) -> Option<String> {
+        let active = self.snap.active_tab?;
+        self.snap
+            .tabs
+            .iter()
+            .find(|t| t.id == active)?
+            .workspace
+            .clone()
+    }
+
+    /// Whether the embedded terminal owns the keyboard right now. The
+    /// `terminal_open` gate matters on HIDE: gpui keeps a hidden handle's
+    /// focus until something else takes it, so without the gate Esc would
+    /// keep yielding to an invisible shell — the whole app's Esc ladder
+    /// (sheet, drawer, cancel turn) dead until the next click.
+    fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
+        self.terminal_open
+            && self
+                .terminal_dock
+                .as_ref()
+                .is_some_and(|dock| window.focused(cx) == Some(dock.focus.clone()))
     }
 
     /// Rail toggle for the overlay drawer: one slot, so opening a surface
@@ -1425,7 +1513,17 @@ impl Workbench {
     /// drawer already); otherwise it is ChatView's Cancel — `session/cancel`
     /// on the running turn. (The "/" menu's Escape never reaches here: the
     /// keystroke interceptor consumes it before the global binding.)
-    pub(crate) fn on_stop_turn(&mut self, _: &StopTurn, _window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn on_stop_turn(
+        &mut self,
+        _: &StopTurn,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The embedded terminal owns the keyboard while focused: Esc is the
+        // shell's (vim's mode switch), never this app's unwind ladder.
+        if self.terminal_focused(window, cx) {
+            return;
+        }
         if self.quit_dialog_open {
             // Esc on the quit dialog keeps the window — modal dismiss only
             // (a flushing stop-all below is NOT cancellable).
@@ -1549,8 +1647,11 @@ impl Workbench {
                     }
                     // Also on the switch-to-nothing (last tab closed): the
                     // composer must not keep the closed session's text.
-                    self.composer_restore =
-                        Some(snap.active_tab.and_then(|new| self.tab_drafts.remove(&new)).unwrap_or_default());
+                    self.composer_restore = Some(
+                        snap.active_tab
+                            .and_then(|new| self.tab_drafts.remove(&new))
+                            .unwrap_or_default(),
+                    );
                 }
                 self.snap = snap;
                 // Closed tabs' parked drafts go with them — the decoded
@@ -1812,9 +1913,11 @@ impl Workbench {
     /// need a window to be created.
     fn reconcile_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use protocol::approval::PendingAsk;
-        let key = self.tab.as_ref().and_then(|t| t.approval.as_ref()).map(|a| {
-            (a.request_id(), matches!(a, PendingAsk::Elicitation(_)))
-        });
+        let key = self
+            .tab
+            .as_ref()
+            .and_then(|t| t.approval.as_ref())
+            .map(|a| (a.request_id(), matches!(a, PendingAsk::Elicitation(_))));
         let current = self.card.as_ref().map(|c| c.read(cx).key());
         if key != current {
             self.card = self
@@ -1985,9 +2088,12 @@ impl Workbench {
             inputs.truncate(budget);
             self.notice = Some(t!("chat.attachLimit").into_owned());
         }
-        let prepare = cx
-            .background_executor()
-            .spawn(async move { inputs.into_iter().map(|i| (prepare_image(&i.bytes, &i.mime), i.mime)).collect::<Vec<_>>() });
+        let prepare = cx.background_executor().spawn(async move {
+            inputs
+                .into_iter()
+                .map(|i| (prepare_image(&i.bytes, &i.mime), i.mime))
+                .collect::<Vec<_>>()
+        });
         cx.spawn(async move |this, cx| {
             let results = prepare.await;
             if let Some(entity) = this.upgrade() {
@@ -2013,8 +2119,7 @@ impl Workbench {
                     });
                 }
                 Err(PrepareError::TooLarge) => {
-                    self.notice =
-                        Some(format!("{mime} is too large (over 5 MB passthrough cap)"));
+                    self.notice = Some(format!("{mime} is too large (over 5 MB passthrough cap)"));
                 }
                 Err(PrepareError::Unsupported) => {
                     self.notice = Some(format!("{}: {mime}", t!("chat.attachFailed")));
@@ -2048,7 +2153,9 @@ impl Workbench {
             return;
         };
         if let Some(PartView::Markdown {
-            thought: true, fold, ..
+            thought: true,
+            fold,
+            ..
         }) = row.parts.get_mut(part_index)
         {
             *fold = Some(!open_now);
@@ -2106,9 +2213,7 @@ impl Workbench {
         self.copied_row = Some(row_id.to_string());
         cx.notify();
         let row_id = row_id.to_string();
-        let clear = cx
-            .background_executor()
-            .timer(Duration::from_millis(1400));
+        let clear = cx.background_executor().timer(Duration::from_millis(1400));
         cx.spawn(async move |this, cx| {
             clear.await;
             if let Some(entity) = this.upgrade() {
@@ -2337,31 +2442,26 @@ impl Workbench {
             .min_w_0()
             .child(rail)
             .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .child(
-                        h_resizable("dock-split")
-                            .with_state(&self.dock_sizes)
-                            .child(
-                                resizable_panel()
-                                    .size(px(280.))
-                                    .size_range(px(200.)..px(520.))
-                                    // flex_none (shrink 0) kept the dragged
-                                    // width while the window shrank, pushing
-                                    // the chat column past the right edge
-                                    // (2026-10-21): the dock still never
-                                    // GROWS, but under pressure it yields
-                                    // down to its 200px floor and the chat
-                                    // keeps a usable width.
-                                    .flex_grow_0()
-                                    .flex_shrink_1()
-                                    .child(panel),
-                            )
-                            .child(resizable_panel().child(self.render_chat_area(cx))),
-                    ),
+                div().flex().flex_1().min_w_0().min_h_0().child(
+                    h_resizable("dock-split")
+                        .with_state(&self.dock_sizes)
+                        .child(
+                            resizable_panel()
+                                .size(px(280.))
+                                .size_range(px(200.)..px(520.))
+                                // flex_none (shrink 0) kept the dragged
+                                // width while the window shrank, pushing
+                                // the chat column past the right edge
+                                // (2026-10-21): the dock still never
+                                // GROWS, but under pressure it yields
+                                // down to its 200px floor and the chat
+                                // keeps a usable width.
+                                .flex_grow_0()
+                                .flex_shrink_1()
+                                .child(panel),
+                        )
+                        .child(resizable_panel().child(self.render_chat_area(cx))),
+                ),
             )
             .into_any_element()
     }
@@ -2412,18 +2512,18 @@ impl Workbench {
             return self.render_token_guide(path, preview, error.as_deref(), cx);
         }
         let toast = self.snap.toast.as_ref().map(|t| t.text.clone());
-        // overflow_hidden is the hard width guarantee: a narrow window makes
-        // the resizable clamp the column, and content min-widths (the
-        // composer's button row, wide rows) must CLIP here instead of
-        // pushing the column past the window's right edge (observed
-        // 2026-10-21: the chat kept its old width and ran off-screen until
-        // a dock toggle re-laid the split). Deferred popovers (the slash
-        // menu) paint in their own layer and escape the clip.
-        div()
+        // The chat stack (everything above the terminal dock): tab strip,
+        // plan bar, scroller, toast, composer — the v_resizable split's top
+        // panel while the terminal is open.
+        let chat_stack = div()
             .flex()
             .flex_col()
             .flex_1()
+            .min_h_0()
             .min_w_0()
+            // The hard width guarantee (2026-10-21): narrow windows CLIP the
+            // stack's wide min-contents instead of pushing the column past
+            // the window's right edge.
             .overflow_hidden()
             .child(self.render_tab_strip(cx))
             // The plan/todo strip (E3 — ChatScreen's PlanPanel above the
@@ -2442,7 +2542,54 @@ impl Workbench {
             .when_some(toast, |this, text| {
                 this.child(render_toast_strip(&runtime, &text, &theme))
             })
-            .child(self.render_composer(cx))
+            .child(self.render_composer(cx));
+        if !self.terminal_open {
+            // The plain column: the stack fills it as before.
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .overflow_hidden()
+                .child(chat_stack)
+                .into_any_element();
+        }
+        // The terminal dock: a v_resizable split under the chat stack (the
+        // left dock's h_resizable pattern turned vertical). Sizes are
+        // view-local and reset on a viewport-width change like the others.
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .overflow_hidden()
+            .child(
+                v_resizable("terminal-split")
+                    .with_state(&self.terminal_sizes)
+                    .child(
+                        resizable_panel()
+                            .size(px(420.))
+                            .size_range(px(160.)..px(6000.))
+                            .flex_shrink_1()
+                            .child(chat_stack),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size(px(240.))
+                            .size_range(px(80.)..px(2000.))
+                            .flex_grow_0()
+                            .child(terminal_panel::render_terminal_panel(
+                                self.terminal_dock.as_ref(),
+                                self.active_workspace()
+                                    .as_deref()
+                                    .map(crate::file_browser::root_name)
+                                    .as_deref(),
+                                cx,
+                            )),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -2764,7 +2911,9 @@ impl Workbench {
                         .icon(KitIconName::Plug)
                         .tooltip("Switch to this hub")
                         .on_click(move |_, _, _| {
-                            runtime.send(UiCommand::SwitchProfile { id: Some(id.clone()) })
+                            runtime.send(UiCommand::SwitchProfile {
+                                id: Some(id.clone()),
+                            })
                         }),
                 );
             }
@@ -2794,8 +2943,8 @@ impl Workbench {
                 if *id == server.id && at.elapsed() < std::time::Duration::from_secs(3));
             let wb_arm = cx.entity();
             let arm_id = server.id.clone();
-            let remove = Button::new(SharedString::from(format!("server-remove-{}", server.id)))
-                .xsmall();
+            let remove =
+                Button::new(SharedString::from(format!("server-remove-{}", server.id))).xsmall();
             let remove = if armed {
                 remove.danger().label("Confirm remove")
             } else {
@@ -2816,7 +2965,9 @@ impl Workbench {
                     fresh
                 });
                 if confirmed {
-                    runtime_remove.send(UiCommand::RemoveServer { id: remove_id.clone() });
+                    runtime_remove.send(UiCommand::RemoveServer {
+                        id: remove_id.clone(),
+                    });
                 }
             }));
             column = column.child(row);
@@ -3096,12 +3247,7 @@ impl Workbench {
                 },
             ),
         ];
-        if self
-            .snap
-            .workflow_gate
-            .as_ref()
-            .is_some_and(|g| g.enabled)
-        {
+        if self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled) {
             entries.push((
                 KitIconName::Workflow,
                 t!("zconfig.entryWorkflows").into_owned(),
@@ -3303,9 +3449,7 @@ impl Workbench {
                             .active
                             .as_ref()
                             .is_some_and(|t| t.session_id.is_some()),
-                        |this| {
-                            this.child(render_files_panel(&self.snap.files, &files_ctx, cx))
-                        },
+                        |this| this.child(render_files_panel(&self.snap.files, &files_ctx, cx)),
                     ),
             )
             .into_any_element()
@@ -3519,42 +3663,41 @@ impl Workbench {
             // own on_click sits above in the bubble path).
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(
-                Button::new(SharedString::from(format!("session-menu-{}", sess.session_id)))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Ellipsis)
-                    .tooltip("Session actions")
-                    .dropdown_menu(move |menu, _, _| {
-                        let mut m = menu;
-                        // The builder runs on every open — fresh captures.
-                        let (wb, inst, sid, prefill) = (
-                            wb.clone(),
-                            menu_instance.clone(),
-                            menu_session.clone(),
-                            menu_prefill.clone(),
-                        );
-                        m = m.item(
-                            PopupMenuItem::new("Rename…").on_click(move |_, _, cx| {
-                                wb.update(cx, |wb, cx| {
-                                    wb.open_rename(inst.clone(), sid.clone(), prefill.clone(), cx)
-                                });
-                            }),
-                        );
-                        let (runtime, inst, sid) = (
-                            menu_runtime.clone(),
-                            menu_instance.clone(),
-                            menu_session.clone(),
-                        );
-                        m = m.item(
-                            PopupMenuItem::new("End session").on_click(move |_, _, _| {
-                                runtime.send(UiCommand::CloseSession {
-                                    instance_id: inst.clone(),
-                                    session_id: sid.clone(),
-                                });
-                            }),
-                        );
-                        m
-                    }),
+                Button::new(SharedString::from(format!(
+                    "session-menu-{}",
+                    sess.session_id
+                )))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Ellipsis)
+                .tooltip("Session actions")
+                .dropdown_menu(move |menu, _, _| {
+                    let mut m = menu;
+                    // The builder runs on every open — fresh captures.
+                    let (wb, inst, sid, prefill) = (
+                        wb.clone(),
+                        menu_instance.clone(),
+                        menu_session.clone(),
+                        menu_prefill.clone(),
+                    );
+                    m = m.item(PopupMenuItem::new("Rename…").on_click(move |_, _, cx| {
+                        wb.update(cx, |wb, cx| {
+                            wb.open_rename(inst.clone(), sid.clone(), prefill.clone(), cx)
+                        });
+                    }));
+                    let (runtime, inst, sid) = (
+                        menu_runtime.clone(),
+                        menu_instance.clone(),
+                        menu_session.clone(),
+                    );
+                    m = m.item(PopupMenuItem::new("End session").on_click(move |_, _, _| {
+                        runtime.send(UiCommand::CloseSession {
+                            instance_id: inst.clone(),
+                            session_id: sid.clone(),
+                        });
+                    }));
+                    m
+                }),
             );
         // The hover carries the full title — the row ellipsizes it away. The
         // workspace path is deliberately OUT: the heading above already names
@@ -3562,7 +3705,10 @@ impl Workbench {
         // the panel (user feedback, 2026-10-21).
         let hover_label = title.clone();
         div()
-            .id(SharedString::from(format!("session-row-{}", sess.session_id)))
+            .id(SharedString::from(format!(
+                "session-row-{}",
+                sess.session_id
+            )))
             .test_support()
             .flex()
             .items_center()
@@ -3587,9 +3733,7 @@ impl Workbench {
                     .text_size(ui_text(13.))
                     .text_color(theme.foreground)
                     .child(title)
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(hover_label.clone()).build(window, cx)
-                    }),
+                    .tooltip(move |window, cx| Tooltip::new(hover_label.clone()).build(window, cx)),
             )
             .when(finished_fresh, |this| {
                 // The TS just-finished badge: text only, no dot (the dot
@@ -3755,7 +3899,10 @@ impl Workbench {
 
         let Some(selected) = self.snap.history.selected.as_ref() else {
             // Project chooser.
-            match (&self.snap.history.projects, &self.snap.history.projects_error) {
+            match (
+                &self.snap.history.projects,
+                &self.snap.history.projects_error,
+            ) {
                 (None, None) => {
                     column = column.child(
                         div()
@@ -3776,8 +3923,8 @@ impl Workbench {
                     // The project-layer filter (TS ProjectHistoryDialog
                     // :413-421): case-insensitive path match, the same
                     // shape as the chooser's.
-                    column = column
-                        .child(div().px_1().child(Input::new(&self.history_filter).small()));
+                    column =
+                        column.child(div().px_1().child(Input::new(&self.history_filter).small()));
                     let q = self.history_filter.read(cx).value().trim().to_lowercase();
                     let shown: Vec<_> = list
                         .iter()
@@ -3801,44 +3948,44 @@ impl Workbench {
                         let hover_path = workspace.clone();
                         column = column.child(
                             div()
-                            .id(SharedString::from(format!("history-project-{}", workspace)))
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
-                            .cursor_pointer()
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui_text(13.))
-                                    .text_color(theme.foreground)
-                                    .child(project_name(&p.workspace_path)),
-                            )
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .text_size(ui_text(10.))
-                                    .text_color(theme.muted_foreground)
-                                    // TS ProjectHistoryDialog:529 — count
-                                    // plus fmtRelative(lastActive).
-                                    .child(project_meta_line(p.sessions, p.last_active)),
-                            )
-                            // The chooser shows only the leaf name — the
-                            // hover disambiguates same-named projects with
-                            // the full workspace path.
-                            .tooltip(move |window, cx| {
-                                Tooltip::new(hover_path.clone()).build(window, cx)
-                            })
-                            .on_click(move |_, _, _| {
-                                runtime.send(UiCommand::HistoryOpenProject {
-                                    workspace_path: workspace.clone(),
-                                });
-                            }),
+                                .id(SharedString::from(format!("history-project-{}", workspace)))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui_text(13.))
+                                        .text_color(theme.foreground)
+                                        .child(project_name(&p.workspace_path)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(ui_text(10.))
+                                        .text_color(theme.muted_foreground)
+                                        // TS ProjectHistoryDialog:529 — count
+                                        // plus fmtRelative(lastActive).
+                                        .child(project_meta_line(p.sessions, p.last_active)),
+                                )
+                                // The chooser shows only the leaf name — the
+                                // hover disambiguates same-named projects with
+                                // the full workspace path.
+                                .tooltip(move |window, cx| {
+                                    Tooltip::new(hover_path.clone()).build(window, cx)
+                                })
+                                .on_click(move |_, _, _| {
+                                    runtime.send(UiCommand::HistoryOpenProject {
+                                        workspace_path: workspace.clone(),
+                                    });
+                                }),
                         );
                     }
                 }
@@ -3940,26 +4087,32 @@ impl Workbench {
             .flex_none()
             .on_click(|_, _, cx| cx.stop_propagation())
             .child(
-                Button::new(SharedString::from(format!("history-menu-{}", row.session_id)))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::Ellipsis)
-                    .tooltip("Session actions")
-                    .dropdown_menu(move |menu, _, _| {
-                        let mut m = menu;
-                        let (runtime, sid) = (menu_runtime.clone(), menu_session.clone());
-                        m = m.item(
-                            PopupMenuItem::new("Delete from history").on_click(move |_, _, _| {
-                                runtime.send(UiCommand::DeleteHistorySession {
-                                    session_id: sid.clone(),
-                                });
-                            }),
-                        );
-                        m
-                    }),
+                Button::new(SharedString::from(format!(
+                    "history-menu-{}",
+                    row.session_id
+                )))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Ellipsis)
+                .tooltip("Session actions")
+                .dropdown_menu(move |menu, _, _| {
+                    let mut m = menu;
+                    let (runtime, sid) = (menu_runtime.clone(), menu_session.clone());
+                    m = m.item(PopupMenuItem::new("Delete from history").on_click(
+                        move |_, _, _| {
+                            runtime.send(UiCommand::DeleteHistorySession {
+                                session_id: sid.clone(),
+                            });
+                        },
+                    ));
+                    m
+                }),
             );
         div()
-            .id(SharedString::from(format!("history-row-{}", row.session_id)))
+            .id(SharedString::from(format!(
+                "history-row-{}",
+                row.session_id
+            )))
             .test_support()
             .flex()
             .items_center()
@@ -3983,9 +4136,7 @@ impl Workbench {
                     .text_color(theme.foreground)
                     .child(title.clone())
                     // The row ellipsizes; the hover carries the full title.
-                    .tooltip(move |window, cx| {
-                        Tooltip::new(title.clone()).build(window, cx)
-                    }),
+                    .tooltip(move |window, cx| Tooltip::new(title.clone()).build(window, cx)),
             )
             .child(
                 div()
@@ -4082,11 +4233,12 @@ impl Workbench {
                 .flex_none()
                 .w_8()
                 .h_full()
-                .drag_over::<TabDragId>(|this, _, _, cx| {
-                    this.rounded_md().bg(cx.theme().secondary)
-                })
+                .drag_over::<TabDragId>(|this, _, _, cx| this.rounded_md().bg(cx.theme().secondary))
                 .on_drop(move |drag: &TabDragId, _, _| {
-                    tail_runtime.send(UiCommand::MoveTab { id: drag.0, before_id: None });
+                    tail_runtime.send(UiCommand::MoveTab {
+                        id: drag.0,
+                        before_id: None,
+                    });
                 }),
         );
 
@@ -4104,16 +4256,16 @@ impl Workbench {
             .is_some();
         let manage_row = (session_live
             && self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled))
-            .then(|| {
-                let runtime = self.runtime.clone();
-                Button::new("session-manage-workflows")
-                    .ghost()
-                    .xsmall()
-                    .icon(Icon::new(KitIconName::Workflow))
-                    .tooltip(t!("panel.workflowManage").into_owned())
-                    .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows))
-                    .into_any_element()
-            });
+        .then(|| {
+            let runtime = self.runtime.clone();
+            Button::new("session-manage-workflows")
+                .ghost()
+                .xsmall()
+                .icon(Icon::new(KitIconName::Workflow))
+                .tooltip(t!("panel.workflowManage").into_owned())
+                .on_click(move |_, _, _| runtime.send(UiCommand::OpenWorkflows))
+                .into_any_element()
+        });
         // The right side panel's toggle (TS ChatScreen's files button): the
         // panel is the session's file browser, so it needs a session.
         let wb_toggle = cx.entity();
@@ -4258,8 +4410,7 @@ impl Workbench {
                                     .min_w_0()
                                     .text_size(ui_text(13.))
                                     .when(status == Some("completed"), |this| {
-                                        this.line_through()
-                                            .text_color(theme.muted_foreground)
+                                        this.line_through().text_color(theme.muted_foreground)
                                     })
                                     .when(status != Some("completed"), |this| {
                                         this.text_color(theme.muted_foreground)
@@ -4280,10 +4431,9 @@ impl Workbench {
         // target); the short id is only the fallback before discovery names
         // it, never the steady state.
         let title = match (&tab.session_id, &tab.phase) {
-            (Some(_), _) => tab
-                .session_title
-                .clone()
-                .unwrap_or_else(|| short_id(tab.session_id.as_deref().unwrap_or("session"), "session")),
+            (Some(_), _) => tab.session_title.clone().unwrap_or_else(|| {
+                short_id(tab.session_id.as_deref().unwrap_or("session"), "session")
+            }),
             (None, TabPhase::Failed(_)) => "failed".to_string(),
             (None, _) => "new session".to_string(),
         };
@@ -4372,7 +4522,11 @@ impl Workbench {
             }
             None if tab.running => {
                 tab_view = tab_view.child(
-                    div().size(px(6.)).flex_none().rounded_full().bg(theme.accent),
+                    div()
+                        .size(px(6.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(theme.accent),
                 );
             }
             None if tab.awaiting => {
@@ -4426,9 +4580,7 @@ impl Workbench {
                     },
                 )
                 .child(div().min_w_0().truncate().child(title))
-                .tooltip(move |window, cx| {
-                    Tooltip::new(hover_label.clone()).build(window, cx)
-                }),
+                .tooltip(move |window, cx| Tooltip::new(hover_label.clone()).build(window, cx)),
         );
         if tab.pending > 0 {
             tab_view = tab_view.child(
@@ -4507,28 +4659,20 @@ impl Workbench {
                 match remaining {
                     // The catalog carries the plural form only (the TS page
                     // uses the same key for every count).
-                    Some(n) if n > 0 => fill(
-                        &t!("chat.loadEarlier"),
-                        &[("n", &n.to_string())],
-                    ),
+                    Some(n) if n > 0 => fill(&t!("chat.loadEarlier"), &[("n", &n.to_string())]),
                     _ => t!("chat.loadEarlierGeneric").into_owned(),
                 }
             };
             column = column.child(
-                div()
-                    .flex()
-                    .justify_center()
-                    .flex_none()
-                    .py_2()
-                    .child(
-                        Button::new("load-earlier")
-                            .secondary()
-                            .small()
-                            .label(label)
-                            .disabled(loading)
-                            .tooltip("session/load_earlier — the stored cursor rides back verbatim")
-                            .on_click(move |_, _, _| runtime.send(UiCommand::LoadEarlier)),
-                    ),
+                div().flex().justify_center().flex_none().py_2().child(
+                    Button::new("load-earlier")
+                        .secondary()
+                        .small()
+                        .label(label)
+                        .disabled(loading)
+                        .tooltip("session/load_earlier — the stored cursor rides back verbatim")
+                        .on_click(move |_, _, _| runtime.send(UiCommand::LoadEarlier)),
+                ),
             );
         }
 
@@ -4642,8 +4786,7 @@ impl Workbench {
             // replay finished; the phase flips Connected before load_session
             // runs, so loading_session alone would leave a dead button up
             // through the whole replay (force_send refuses while loading).
-            let connected =
-                matches!(t.phase, TabPhase::Connected) && !t.loading_session;
+            let connected = matches!(t.phase, TabPhase::Connected) && !t.loading_session;
             for (index, draft) in t.pending.iter().enumerate() {
                 let runtime = self.runtime.clone();
                 let mut row = div()
@@ -4713,9 +4856,7 @@ impl Workbench {
                         .xsmall()
                         .icon(IconName::CircleX)
                         .tooltip("Discard")
-                        .on_click(move |_, _, _| {
-                            runtime.send(UiCommand::DiscardPending { index })
-                        }),
+                        .on_click(move |_, _, _| runtime.send(UiCommand::DiscardPending { index })),
                 );
                 column = column.child(row);
             }
@@ -4766,22 +4907,18 @@ impl Workbench {
                         .into_any_element(),
                 };
                 strip = strip.child(
-                    div()
-                        .relative()
-                        .flex_none()
-                        .child(thumb)
-                        .child(
-                            div().absolute().top_0().right_0().child(
-                                Button::new(("remove-attachment", index))
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::CircleX)
-                                    .tooltip("Remove attachment")
-                                    .on_click(move |_, _, cx| {
-                                        wb.update(cx, |this, cx| this.remove_staged(index, cx));
-                                    }),
-                            ),
+                    div().relative().flex_none().child(thumb).child(
+                        div().absolute().top_0().right_0().child(
+                            Button::new(("remove-attachment", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::CircleX)
+                                .tooltip("Remove attachment")
+                                .on_click(move |_, _, cx| {
+                                    wb.update(cx, |this, cx| this.remove_staged(index, cx));
+                                }),
                         ),
+                    ),
                 );
             }
             let count = self.staged.len();
@@ -4843,8 +4980,7 @@ impl Workbench {
                                 .background_executor()
                                 .spawn(async move { read_image_files(paths) });
                             let inputs = load.await;
-                            let _ =
-                                cx.update_entity(&wb, |wb, cx| wb.stage_inputs(inputs, cx));
+                            let _ = cx.update_entity(&wb, |wb, cx| wb.stage_inputs(inputs, cx));
                         })
                         .detach();
                     }
@@ -4867,10 +5003,11 @@ impl Workbench {
                 .on_paste({
                     let wb = cx.entity();
                     move |item: &ClipboardItem, _window, cx| {
-                        paste_inputs(item).map(|inputs| {
-                            wb.update(cx, |wb, cx| wb.stage_inputs(inputs, cx));
-                        })
-                        .is_some()
+                        paste_inputs(item)
+                            .map(|inputs| {
+                                wb.update(cx, |wb, cx| wb.stage_inputs(inputs, cx));
+                            })
+                            .is_some()
                     }
                 }),
         );
@@ -4888,8 +5025,7 @@ impl Workbench {
         let runtime = self.runtime.clone();
         let composer = self.composer.clone();
         let wb = cx.entity();
-        let can_send = !self.staged.is_empty()
-            || !self.composer.read(cx).value().trim().is_empty();
+        let can_send = !self.staged.is_empty() || !self.composer.read(cx).value().trim().is_empty();
         controls = controls.child(
             Button::new("send")
                 .primary()
@@ -5040,19 +5176,17 @@ impl Workbench {
             .filter(|u| u.size > 0)
         {
             let pct = (((usage.used as f32 / usage.size as f32) * 100.0).min(100.0) / 100.0) as f32;
-            composer = composer
-                .relative()
-                .child(
-                    div()
-                        .id("context-progress")
-                        .absolute()
-                        .top_0()
-                        .left_0()
-                        .h(px(2.))
-                        .w(relative(pct))
-                        .bg(theme.accent)
-                        .test_support(),
-                );
+            composer = composer.relative().child(
+                div()
+                    .id("context-progress")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h(px(2.))
+                    .w(relative(pct))
+                    .bg(theme.accent)
+                    .test_support(),
+            );
         }
         composer.into_any_element()
     }
@@ -5103,8 +5237,7 @@ fn slash_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
     while caret > 0 && !value.is_char_boundary(caret) {
         caret -= 1;
     }
-    let is_ws =
-        |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
+    let is_ws = |b: u8| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c');
     let mut start = caret;
     while start > 0 && !is_ws(bytes[start - 1]) {
         start -= 1;
@@ -5132,7 +5265,10 @@ fn slash_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
 /// Bridge-ordered prefix matches (TS `matches`): the query is the token
 /// after "/", lowercased; skill commands ride a "$" grouping prefix that is
 /// stripped on BOTH sides so "/td" matches "$tdd" and "/$tdd" does too.
-fn slash_matches(token: &str, commands: &[protocol::acp::SlashCommand]) -> Vec<protocol::acp::SlashCommand> {
+fn slash_matches(
+    token: &str,
+    commands: &[protocol::acp::SlashCommand],
+) -> Vec<protocol::acp::SlashCommand> {
     let q = strip_dollar(&token[1..]).to_lowercase();
     commands
         .iter()
@@ -5248,7 +5384,10 @@ mod drop_ref_tests {
             "an unreadable file still references: {tail}"
         );
         assert!(
-            tail.contains(&format!("{:?}", dir.join("with space.md").display().to_string())),
+            tail.contains(&format!(
+                "{:?}",
+                dir.join("with space.md").display().to_string()
+            )),
             "a whitespace path stays one quoted reference: {tail}"
         );
 
@@ -5301,7 +5440,9 @@ fn render_attachment_echo(
         .id(id)
         .test_support()
         .on_click(move |_, _, cx| {
-            let _ = wb.update(cx, |this, cx| this.open_lightbox(open_src.clone(), None, cx));
+            let _ = wb.update(cx, |this, cx| {
+                this.open_lightbox(open_src.clone(), None, cx)
+            });
         })
         .child(
             img(src.clone())
@@ -5361,8 +5502,7 @@ fn render_slash_menu(
             .on_click({
                 let wb = wb.clone();
                 move |_, _, cx| {
-                    let _ =
-                        wb.update(cx, |this, cx| this.stage_slash_select(&name, cx));
+                    let _ = wb.update(cx, |this, cx| this.stage_slash_select(&name, cx));
                 }
             })
             .child(
@@ -5453,9 +5593,7 @@ fn render_row(
 ) -> AnyElement {
     let theme = cx.theme();
     match row.role {
-        ChatRole::User => {
-            render_user_row(row, copied, wb, chat_font, theme).into_any_element()
-        }
+        ChatRole::User => render_user_row(row, copied, wb, chat_font, theme).into_any_element(),
         ChatRole::Assistant => render_assistant_row(
             row,
             is_last_row,
@@ -5505,10 +5643,12 @@ fn render_user_row(
                     .text_color(theme.muted_foreground),
             )
             .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .child(summary.is_empty().then(|| t!("chat.taskNotice").into_owned()).unwrap_or(summary)),
+                div().min_w_0().truncate().child(
+                    summary
+                        .is_empty()
+                        .then(|| t!("chat.taskNotice").into_owned())
+                        .unwrap_or(summary),
+                ),
             );
         if !status.is_empty() {
             chip = chip.child(
@@ -5531,15 +5671,15 @@ fn render_user_row(
             .flex()
             .gap_3()
             .child(
-            div()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .bg(theme.secondary)
-                .text_size(ui_text(12.))
-                .text_color(theme.muted_foreground)
-                .child(t!("chat.contextHandoff").into_owned()),
-        )
+                div()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(theme.secondary)
+                    .text_size(ui_text(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("chat.contextHandoff").into_owned()),
+            )
             .into_any_element();
     }
     let mut bubble = div().flex().flex_col().gap_2().min_w_0();
@@ -5588,7 +5728,12 @@ fn render_user_row(
     // too close to the canvas (0x0d0d0f) to carry that on its own, so the
     // accent tint and the border do the work.
     // (ChatView.tsx UserMessage `items-end max-w-[85%]` vs AssistantMessage.)
-    let mut side = div().flex().flex_col().items_end().flex_none().max_w(relative(0.85));
+    let mut side = div()
+        .flex()
+        .flex_col()
+        .items_end()
+        .flex_none()
+        .max_w(relative(0.85));
     side = side.child(
         div()
             .id(SharedString::from(format!("user-bubble-{}", row.id)))
@@ -5603,7 +5748,12 @@ fn render_user_row(
             .child(bubble),
     );
     if !text.trim().is_empty() {
-        side = side.child(copy_button(row, text.clone(), copied == Some(row.id.as_str()), wb));
+        side = side.child(copy_button(
+            row,
+            text.clone(),
+            copied == Some(row.id.as_str()),
+            wb,
+        ));
     }
     div()
         .id(SharedString::from(format!("user-row-{}", row.id)))
@@ -5788,11 +5938,9 @@ fn render_assistant_row(
             // TextView resolves its body size off the wrapper's text_size —
             // the ladder rides that inheritance (no wrapper = the window's
             // 16px default, which is the Medium step).
-            PartView::Markdown { state, .. } => column.child(
-                div()
-                    .text_size(px(chat_font.1))
-                    .child(TextView::new(state)),
-            ),
+            PartView::Markdown { state, .. } => {
+                column.child(div().text_size(px(chat_font.1)).child(TextView::new(state)))
+            }
             PartView::Plain { text } => column.child(
                 div()
                     .text_size(px(chat_font.1))
@@ -5840,7 +5988,12 @@ fn render_assistant_row(
         .gap_3()
         .child(div().flex_1().min_w_0().child(column))
         .when(!text.trim().is_empty(), |this| {
-            this.child(copy_button(row, text.clone(), copied == Some(row.id.as_str()), wb))
+            this.child(copy_button(
+                row,
+                text.clone(),
+                copied == Some(row.id.as_str()),
+                wb,
+            ))
         })
         .context_menu(chat_row_menu(text))
         .into_any_element()
@@ -6002,29 +6155,31 @@ fn render_tool_card(
     // order, so this card's own menu listener has already run.
     let menu_command = label.to_string();
     let menu_output = detail.clone();
-    card
-        .id(SharedString::from(format!("tool-card-{}-{}", row_id, part_index)))
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .context_menu(move |menu, _, _| {
-            let mut m = menu;
-            let command = menu_command.clone();
-            m = m.item(
-                PopupMenuItem::new("Copy command").on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+    card.id(SharedString::from(format!(
+        "tool-card-{}-{}",
+        row_id, part_index
+    )))
+    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+    .context_menu(move |menu, _, _| {
+        let mut m = menu;
+        let command = menu_command.clone();
+        m = m.item(
+            PopupMenuItem::new("Copy command").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+            }),
+        );
+        let empty = menu_output.trim().is_empty();
+        let output = menu_output.clone();
+        m = m.item(
+            PopupMenuItem::new("Copy output")
+                .disabled(empty)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(output.clone()));
                 }),
-            );
-            let empty = menu_output.trim().is_empty();
-            let output = menu_output.clone();
-            m = m.item(
-                PopupMenuItem::new("Copy output")
-                    .disabled(empty)
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(output.clone()));
-                    }),
-            );
-            m
-        })
-        .into_any_element()
+        );
+        m
+    })
+    .into_any_element()
 }
 
 /// The aggregated summary of an adjacent tool run (the TS `summarizeToolRun`):
@@ -6183,32 +6338,31 @@ fn render_tool_run(
         })
         .collect::<Vec<_>>()
         .join("\n\n");
-    card
-        .id(SharedString::from(format!(
-            "tool-run-card-{}-{}",
-            row_id, start_index
-        )))
-        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-        .context_menu(move |menu, _, _| {
-            let mut m = menu;
-            let commands = commands.clone();
-            m = m.item(
-                PopupMenuItem::new("Copy commands").on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(commands.clone()));
+    card.id(SharedString::from(format!(
+        "tool-run-card-{}-{}",
+        row_id, start_index
+    )))
+    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+    .context_menu(move |menu, _, _| {
+        let mut m = menu;
+        let commands = commands.clone();
+        m = m.item(
+            PopupMenuItem::new("Copy commands").on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(commands.clone()));
+            }),
+        );
+        let empty = outputs.trim().is_empty();
+        let outputs = outputs.clone();
+        m = m.item(
+            PopupMenuItem::new("Copy output")
+                .disabled(empty)
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(outputs.clone()));
                 }),
-            );
-            let empty = outputs.trim().is_empty();
-            let outputs = outputs.clone();
-            m = m.item(
-                PopupMenuItem::new("Copy output")
-                    .disabled(empty)
-                    .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(outputs.clone()));
-                    }),
-            );
-            m
-        })
-        .into_any_element()
+        );
+        m
+    })
+    .into_any_element()
 }
 
 impl Render for Workbench {
@@ -6377,6 +6531,7 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_quit_action))
             .on_action(cx.listener(Self::on_focus_search))
             .on_action(cx.listener(Self::on_stop_turn))
+            .on_action(cx.listener(Self::on_toggle_terminal))
             .on_action(cx.listener(Self::on_select_tab1))
             .on_action(cx.listener(Self::on_select_tab2))
             .on_action(cx.listener(Self::on_select_tab3))
@@ -6422,23 +6577,20 @@ impl Render for Workbench {
                             })
                         },
                     )
-                    .when_some(
-                        self.snap.system_status.clone(),
-                        |this, page| {
-                            this.child(render_system_status_page(
-                                &page,
-                                self.snap.config_notice.as_deref(),
-                                self.snap.pending_restart,
-                                // The restart addresses the ACTIVE TAB's bridge (the
-                                // desktop's connected-session instance); with no tab
-                                // open the note shows its no-instance hint instead.
-                                self.snap.active_tab.is_some(),
-                                toast.as_deref(),
-                                &runtime,
-                                cx,
-                            ))
-                        },
-                    )
+                    .when_some(self.snap.system_status.clone(), |this, page| {
+                        this.child(render_system_status_page(
+                            &page,
+                            self.snap.config_notice.as_deref(),
+                            self.snap.pending_restart,
+                            // The restart addresses the ACTIVE TAB's bridge (the
+                            // desktop's connected-session instance); with no tab
+                            // open the note shows its no-instance hint instead.
+                            self.snap.active_tab.is_some(),
+                            toast.as_deref(),
+                            &runtime,
+                            cx,
+                        ))
+                    })
                     .when_some(
                         self.snap.quota_page.clone(),
                         // The plan-quota page (settings entry): a full page
@@ -6446,50 +6598,41 @@ impl Render for Workbench {
                         // the separate all-providers surface.
                         |this, _page| this.child(self.render_quota_page(cx)),
                     )
-                    .when_some(
-                        self.snap.usage_page.clone(),
-                        |this, page| {
-                            this.child(render_usage_page(
-                                &page,
-                                self.snap.config_notice.as_deref(),
-                                self.snap.pending_restart,
-                                // The restart addresses the ACTIVE TAB's bridge (the
-                                // desktop's connected-session instance); with no tab
-                                // open the note shows its no-instance hint instead.
-                                self.snap.active_tab.is_some(),
-                                &runtime,
-                                &theme,
-                            ))
-                        },
-                    )
+                    .when_some(self.snap.usage_page.clone(), |this, page| {
+                        this.child(render_usage_page(
+                            &page,
+                            self.snap.config_notice.as_deref(),
+                            self.snap.pending_restart,
+                            // The restart addresses the ACTIVE TAB's bridge (the
+                            // desktop's connected-session instance); with no tab
+                            // open the note shows its no-instance hint instead.
+                            self.snap.active_tab.is_some(),
+                            &runtime,
+                            &theme,
+                        ))
+                    })
                     // The ZCode-config section pages (batch I): the open form
                     // replaces the page while open, exactly like the Models form.
-                    .when_some(
-                        self.snap.config_section_page.clone(),
-                        |this, _page| {
-                            this.child(if self.zconfig_form.is_some() {
-                                self.render_zconfig_form(cx)
-                            } else {
-                                crate::zconfig_pages::render_config_section_page(self, cx)
-                            })
-                        },
-                    )
+                    .when_some(self.snap.config_section_page.clone(), |this, _page| {
+                        this.child(if self.zconfig_form.is_some() {
+                            self.render_zconfig_form(cx)
+                        } else {
+                            crate::zconfig_pages::render_config_section_page(self, cx)
+                        })
+                    })
                     // The Workflows page (batch J): the same contract — the open
                     // start/amend/meta form replaces the page while open.
-                    .when_some(
-                        self.snap.workflows_page.clone(),
-                        |this, _page| {
-                            this.child(if self.workflow_start_form.is_some() {
-                                self.render_workflow_start_form(cx)
-                            } else if self.workflow_amend_form.is_some() {
-                                self.render_workflow_amend_form(cx)
-                            } else if self.workflow_meta_form.is_some() {
-                                self.render_workflow_meta_form(cx)
-                            } else {
-                                crate::workflows_page::render_workflows_page(self, cx)
-                            })
-                        },
-                    )
+                    .when_some(self.snap.workflows_page.clone(), |this, _page| {
+                        this.child(if self.workflow_start_form.is_some() {
+                            self.render_workflow_start_form(cx)
+                        } else if self.workflow_amend_form.is_some() {
+                            self.render_workflow_amend_form(cx)
+                        } else if self.workflow_meta_form.is_some() {
+                            self.render_workflow_meta_form(cx)
+                        } else {
+                            crate::workflows_page::render_workflows_page(self, cx)
+                        })
+                    })
                     // The overlay drawer floats above whichever surface is
                     // current — settings or the all-providers quota display.
                     .when_some(self.drawer, |this, surface| {
@@ -6503,10 +6646,9 @@ impl Render for Workbench {
             })
             // The new-session chooser rides ON TOP of whatever surface is
             // below (the TS dialog is a fixed full-screen overlay).
-            .when_some(
-                self.snap.new_session.clone(),
-                |this, view| this.child(self.render_new_session(&view, cx)),
-            )
+            .when_some(self.snap.new_session.clone(), |this, view| {
+                this.child(self.render_new_session(&view, cx))
+            })
             // The rename sheet (G1) sits above the chooser — the TS action
             // sheet is the topmost layer while open.
             .when(self.rename_target.is_some(), |this| {
@@ -6532,8 +6674,7 @@ impl Render for Workbench {
                     .filter(|addr| is_loopback_hub(addr))
                     .zip(self.snap.files.listing.as_ref().map(|l| l.root.clone()))
                     .map(|(_, root)| absolute_dir(&root, &view.path));
-                let md_source =
-                    matches!(&self.file_md_source, Some((p, true)) if *p == view.path);
+                let md_source = matches!(&self.file_md_source, Some((p, true)) if *p == view.path);
                 this.child(render_file_viewer(
                     &view,
                     &runtime,
@@ -6792,13 +6933,19 @@ impl Workbench {
                     .text_color(theme.foreground)
                     .child("Quit with your turns still running"),
             )
-            .child(div().min_w_0().text_size(ui_text(12.)).text_color(theme.muted_foreground).child(format!(
-                "{n} turn{s} you started from this app {is} still running on the hub — \
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(ui_text(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{n} turn{s} you started from this app {is} still running on the hub — \
                  they keep running after it closes. Turns started from other clients \
                  are never touched.",
-                s = if n == 1 { "" } else { "s" },
-                is = if n == 1 { "is" } else { "are" },
-            )));
+                        s = if n == 1 { "" } else { "s" },
+                        is = if n == 1 { "is" } else { "are" },
+                    )),
+            );
         if stopping {
             card = card.child(
                 div()
@@ -6956,9 +7103,7 @@ impl Workbench {
                             .disabled(!can_save)
                             .on_click({
                                 let wb = wb.clone();
-                                move |_, _, cx| {
-                                    wb.update(cx, |wb, cx| wb.submit_rename(cx))
-                                }
+                                move |_, _, cx| wb.update(cx, |wb, cx| wb.submit_rename(cx))
                             }),
                     ),
             );
@@ -7075,7 +7220,9 @@ impl Workbench {
         // meaningful in projects mode; browse mode walks the whole machine.
         if view.browse.is_none() {
             card = card.child(
-                div().px_1().child(Input::new(&self.new_session_filter).small()),
+                div()
+                    .px_1()
+                    .child(Input::new(&self.new_session_filter).small()),
             );
         }
 
@@ -7629,13 +7776,13 @@ mod ui_tests {
     use crate::runtime::{
         Phase, ProtocolRuntime, RuntimeEvent, TabPhase, TabSummary, UiCommand, WorkbenchSnapshot,
     };
-    use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt;
-    use protocol::chat::ChatRole;
+    use gpui_kit::InputEvent as _;
     use gpui_kit::{
         px, AnyWindowHandle, App, AppContext as _, Bounds, Entity, Point, Size, TestAppContext,
         WindowBounds, WindowOptions,
     };
+    use protocol::chat::ChatRole;
 
     fn connected_snapshot() -> WorkbenchSnapshot {
         let mut snap = WorkbenchSnapshot::initial();
@@ -7698,14 +7845,59 @@ mod ui_tests {
         });
         let registry = gpui_kit::component::highlighter::LanguageRegistry::singleton();
         for lang in [
-            "rust", "typescript", "tsx", "javascript", "python", "go", "bash", "json", "yaml",
-            "toml", "diff", "markdown",
+            "rust",
+            "typescript",
+            "tsx",
+            "javascript",
+            "python",
+            "go",
+            "bash",
+            "json",
+            "yaml",
+            "toml",
+            "diff",
+            "markdown",
         ] {
             assert!(
                 registry.language(lang).is_some(),
                 "fence tag `{lang}` must resolve to a compiled grammar"
             );
         }
+    }
+
+    /// The embedded terminal dock toggles under the chat column: hidden by
+    /// default, the toggle mounts the panel (the test build's placeholder —
+    /// `cfg!(test)` never spawns a real shell), toggling again unmounts it.
+    #[gpui_kit::test]
+    fn the_terminal_panel_toggles_under_the_chat(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let snap = connected_snapshot();
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "the dock starts hidden"
+            );
+            wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
+            window.draw(cx).clear(cx);
+            assert!(window.find("terminal-panel").visible());
+            assert!(
+                window.find("terminal-placeholder").visible(),
+                "the test build paints the placeholder, not a live shell"
+            );
+            wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "the second toggle unmounts the panel"
+            );
+        })
+        .unwrap();
     }
 
     /// The quit dialog gates on turns THIS app started only (§4): other
@@ -7756,7 +7948,10 @@ mod ui_tests {
         .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            assert!(window.try_find("quit-dialog").is_none(), "Esc dismisses the quit dialog");
+            assert!(
+                window.try_find("quit-dialog").is_none(),
+                "Esc dismisses the quit dialog"
+            );
             assert!(
                 !wb.update(cx, |wb, cx| wb.request_quit(window, cx)),
                 "still gated — the own turn keeps running"
@@ -7774,7 +7969,10 @@ mod ui_tests {
         .unwrap();
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            assert!(window.find("quit-stopping").visible(), "the flush window paints");
+            assert!(
+                window.find("quit-stopping").visible(),
+                "the flush window paints"
+            );
             assert!(
                 !wb.update(cx, |wb, cx| wb.request_quit(window, cx)),
                 "the close stays vetoed while the cancels flush"
@@ -7929,7 +8127,10 @@ mod ui_tests {
             window.draw(cx).clear(cx);
             assert!(window.find("drawer-quota").visible());
             assert!(window.find("quota-drawer-body").visible());
-            assert!(window.find("composer").visible(), "still no surface replaced");
+            assert!(
+                window.find("composer").visible(),
+                "still no surface replaced"
+            );
             assert!(window.try_find("quota-back").is_none(), "not the plan page");
             wb.update(cx, |wb, cx| wb.on_stop_turn(&super::StopTurn, window, cx));
         })
@@ -7956,10 +8157,15 @@ mod ui_tests {
             window.click("dock-rail-quota", cx);
             let mut snap = connected_snapshot();
             snap.quota_page = Some(crate::runtime::QuotaPageView::default());
-            wb.update(cx, |wb, cx| wb.on_runtime_event(RuntimeEvent::Snapshot(snap), cx));
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::Snapshot(snap), cx)
+            });
             window.draw(cx).clear(cx);
             assert!(window.find("quota-back").visible(), "the plan page mounted");
-            assert!(window.try_find("composer").is_none(), "a page replaces the chat");
+            assert!(
+                window.try_find("composer").is_none(),
+                "a page replaces the chat"
+            );
             assert!(
                 window.try_find("drawer-quota").is_none(),
                 "the page dismisses the drawer"
@@ -8055,7 +8261,10 @@ mod ui_tests {
                 "the parked draft returns on the switch back"
             );
             assert_eq!(
-                wb.read(cx).tab_drafts.get(&8).map(|(text, _)| text.as_str()),
+                wb.read(cx)
+                    .tab_drafts
+                    .get(&8)
+                    .map(|(text, _)| text.as_str()),
                 Some("for sess_2"),
                 "the other tab's draft is parked, not lost"
             );
@@ -8075,8 +8284,7 @@ mod ui_tests {
         });
         let mut snap = connected_snapshot();
         snap.quota_dock = Some(
-            "GLM coding plan · 5h 42% ↻ 2h13m · week 12% ↻ 3d 4h · month 61% · $3.50"
-                .to_string(),
+            "GLM coding plan · 5h 42% ↻ 2h13m · week 12% ↻ 3d 4h · month 61% · $3.50".to_string(),
         );
         let (handle, _wb, _runtime) = cx.update(|cx| open(cx, snap, 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
@@ -8103,7 +8311,10 @@ mod ui_tests {
                 dock.size.width
             );
             let bridge = window.find("status-bridge").bounds();
-            assert!(bridge.right() <= dock.left(), "the bridge label keeps its place");
+            assert!(
+                bridge.right() <= dock.left(),
+                "the bridge label keeps its place"
+            );
         })
         .unwrap();
     }
@@ -8131,11 +8342,17 @@ mod ui_tests {
             window.draw(cx).clear(cx);
             window.click("dock-rail-config", cx);
             window.draw(cx).clear(cx);
-            assert!(window.try_find("server-form").is_none(), "no form until asked");
+            assert!(
+                window.try_find("server-form").is_none(),
+                "no form until asked"
+            );
 
             window.click("server-edit-srv-1", cx);
             window.draw(cx).clear(cx);
-            assert!(window.find("server-form").visible(), "Edit opens the dialog");
+            assert!(
+                window.find("server-form").visible(),
+                "Edit opens the dialog"
+            );
             assert_eq!(
                 window.find("server-form-save").label().as_deref(),
                 Some("Save")
@@ -8194,7 +8411,9 @@ mod ui_tests {
     /// move. Without `occlude` the wheel past the list's end scrolls it and
     /// the row's bounds shift.
     #[gpui_kit::test]
-    fn a_wheel_at_the_history_dialogs_end_never_scrolls_the_sessions_panel(cx: &mut TestAppContext) {
+    fn a_wheel_at_the_history_dialogs_end_never_scrolls_the_sessions_panel(
+        cx: &mut TestAppContext,
+    ) {
         let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -8263,7 +8482,10 @@ mod ui_tests {
                 .try_find("session-row-sess_0")
                 .map(|row| row.bounds().origin.y != b0.origin.y)
                 .unwrap_or(true);
-            assert!(moved, "control: the sessions panel scrolls when nothing covers it");
+            assert!(
+                moved,
+                "control: the sessions panel scrolls when nothing covers it"
+            );
         })
         .unwrap();
 
@@ -8320,9 +8542,7 @@ mod ui_tests {
     /// chat convention (ChatView.tsx `items-end max-w-[85%]` vs a plain
     /// full-width assistant block) carries the same information for free.
     #[gpui_kit::test]
-    fn the_user_bubble_hangs_right_while_the_agent_reply_runs_full_width(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_user_bubble_hangs_right_while_the_agent_reply_runs_full_width(cx: &mut TestAppContext) {
         let _windows = super::window_test_lock();
         cx.update(|cx| {
             gpui_kit::init(cx);
@@ -8458,9 +8678,7 @@ mod ui_tests {
     /// workbench itself (`cx.entity().read_with(cx, ..)`, as the delete
     /// control used to) aborts the process here. Painting is the assertion.
     #[gpui_kit::test]
-    fn the_model_edit_form_paints_without_re_leasing_the_workbench(
-        cx: &mut TestAppContext,
-    ) {
+    fn the_model_edit_form_paints_without_re_leasing_the_workbench(cx: &mut TestAppContext) {
         use protocol::config_decode::{ModelRef, ModelsBlock, ModelsPayload};
 
         let _windows = super::window_test_lock();

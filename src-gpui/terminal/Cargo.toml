@@ -1,0 +1,25 @@
+[package]
+name = "gpui-terminal"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Vendored terminal emulator component for gpui (upstream zortax/gpui-terminal at 0.1.0 / 51f0292)"
+
+# Vendored from https://github.com/zortax/gpui-terminal (MIT OR Apache-2.0,
+# both licenses shipped alongside). Local changes vs upstream, kept minimal
+# so future upstream pulls stay diffable:
+#   - the example `main.rs` and the arboard `clipboard` module are dropped —
+#     the host app owns the PTY (portable-pty) and the clipboard (gpui's own,
+#     wired through the view's callbacks);
+#   - the `gpui` dependency is gpui-kit under the name `gpui` (ADR-0009: one
+#     gpui distribution, pinned by the kit — never a second crate identity);
+#   - mouse-wheel scrollback (alacritty display_offset) and paste
+#     (platform+v / ctrl+shift+v from the host clipboard) are implemented,
+#     both "planned" upstream.
+#   - unused upstream deps (ropey, anyhow) are dropped.
+
+[dependencies]
+gpui = { package = "gpui-kit", version = "0.7" }
+alacritty_terminal = "0.25.1"
+flume = "0.12"
+parking_lot = "0.12"

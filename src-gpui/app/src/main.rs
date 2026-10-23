@@ -33,6 +33,7 @@ mod readout_store;
 mod runtime;
 mod server_form;
 mod system_status;
+mod terminal_panel;
 mod ui_prefs;
 mod usage_page;
 mod workbench;
@@ -42,13 +43,13 @@ mod zconfig_pages;
 
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
-    px, size, App, AppContext as _, Bounds, Hsla, KeyBinding, Menu, MenuItem, QuitMode, TitlebarOptions,
-    WindowBounds, WindowOptions, rgb,
+    px, rgb, size, App, AppContext as _, Bounds, Hsla, KeyBinding, Menu, MenuItem, QuitMode,
+    TitlebarOptions, WindowBounds, WindowOptions,
 };
 use runtime::ProtocolRuntime;
 use workbench::{
     FocusSessionSearch, QuitApp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
-    SelectTab6, SelectTab7, SelectTab8, SelectTab9, StopTurn, Workbench,
+    SelectTab6, SelectTab7, SelectTab8, SelectTab9, StopTurn, ToggleTerminal, Workbench,
 };
 
 // The shared catalogs (requirements §2): the mobile/web i18next JSONs are
@@ -79,10 +80,10 @@ fn apply_quiet_dark(cx: &mut App) {
         theme.colors.sidebar_border = hairline;
         theme.colors.foreground = rgb(0xececf1).into(); // --color-ink
         theme.colors.muted_foreground = rgb(0xa6a6b0).into(); // --color-dim
-        // emerald-700 — the third step down (user feedback, three rounds:
-        // 400 → 500 → 600 still read as a glare on every selected state and
-        // filled control that rides the accent; 700 is the deepest step that
-        // still reads unmistakably green against the near-black canvas).
+                                                              // emerald-700 — the third step down (user feedback, three rounds:
+                                                              // 400 → 500 → 600 still read as a glare on every selected state and
+                                                              // filled control that rides the accent; 700 is the deepest step that
+                                                              // still reads unmistakably green against the near-black canvas).
         theme.colors.accent = rgb(0x047857).into();
         // Amber-300/500: the quota page's own amber pair, made theme-wide so
         // the awaiting ring and restart notes match it (kit dark ships
@@ -132,6 +133,9 @@ fn main() {
                 KeyBinding::new("cmd-k", FocusSessionSearch, None),
                 KeyBinding::new("ctrl-k", FocusSessionSearch, None),
                 KeyBinding::new("escape", StopTurn, None),
+                // The embedded terminal dock (⌃` — VS Code's binding; ⌘`
+                // is macOS window cycling).
+                KeyBinding::new("ctrl-`", ToggleTerminal, None),
                 KeyBinding::new("cmd-1", SelectTab1, None),
                 KeyBinding::new("cmd-2", SelectTab2, None),
                 KeyBinding::new("cmd-3", SelectTab3, None),
@@ -142,10 +146,9 @@ fn main() {
                 KeyBinding::new("cmd-8", SelectTab8, None),
                 KeyBinding::new("cmd-9", SelectTab9, None),
             ]);
-            cx.set_menus(vec![Menu::new("ZCode ACP").items([MenuItem::action(
-                "Quit ZCode ACP",
-                QuitApp,
-            )])]);
+            cx.set_menus(vec![
+                Menu::new("ZCode ACP").items([MenuItem::action("Quit ZCode ACP", QuitApp)])
+            ]);
 
             let (runtime, mut event_rx) = ProtocolRuntime::start();
 
@@ -161,14 +164,13 @@ fn main() {
                 }),
                 ..Default::default()
             };
-            let (window_handle, workbench) =
-                gpui_kit::open_window(options, cx, |window, cx| {
-                    let runtime = runtime.clone();
-                    cx.new(|cx| {
-                        Workbench::new(window, cx, runtime, runtime::WorkbenchSnapshot::initial())
-                    })
+            let (window_handle, workbench) = gpui_kit::open_window(options, cx, |window, cx| {
+                let runtime = runtime.clone();
+                cx.new(|cx| {
+                    Workbench::new(window, cx, runtime, runtime::WorkbenchSnapshot::initial())
                 })
-                .expect("open the workbench window");
+            })
+            .expect("open the workbench window");
 
             // The quit guard's ⌘Q half: the action may fire while a dialog
             // layer holds focus, so listen globally rather than only on the
@@ -186,9 +188,7 @@ fn main() {
             // the workbench entity on the main thread.
             cx.spawn(async move |cx| {
                 while let Some(event) = event_rx.recv().await {
-                    let _ = cx.update_entity(&workbench, |wb, cx| {
-                        wb.on_runtime_event(event, cx)
-                    });
+                    let _ = cx.update_entity(&workbench, |wb, cx| wb.on_runtime_event(event, cx));
                 }
             })
             .detach();

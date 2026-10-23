@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 gpui-kit.workspace = true
 protocol.workspace = true
+# The embedded terminal: the vendored gpui-terminal view plus its PTY
+# (spawn the login shell, resize, kill). The kit owns the gpui identity;
+# these two only extend it (workspace pins in ../Cargo.toml).
+gpui-terminal.workspace = true
+portable-pty.workspace = true
 # The protocol crate deliberately ships no real HTTP stack (its `hub_client`
 # module doc names the app layer as the supplier), so the app owns the
 # transport plus the tokio driver thread that runs the protocol futures.

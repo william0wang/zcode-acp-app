@@ -11,7 +11,7 @@
 
 [workspace]
 resolver = "2"
-members = ["app", "protocol"]
+members = ["app", "protocol", "terminal"]
 
 [workspace.package]
 # Follows the repo's main version (package.json / tauri.conf.json).
@@ -21,6 +21,12 @@ license = "MIT"
 
 [workspace.dependencies]
 protocol = { path = "protocol" }
+# Vendored embedded-terminal component (see terminal/Cargo.toml for the
+# upstream provenance and the local changes).
+gpui-terminal = { path = "terminal" }
+# The embedded terminal's PTY (spawn the login shell, resize, kill). Same
+# 0.9 line the vendored crate's upstream example pinned.
+portable-pty = "0.9"
 serde = { version = "1", features = ["derive"] }
 # preserve_order: JSON objects keep insertion order (IndexMap) — the typed
 # workflow-args form must render fields in the workflow's DECLARED order, and

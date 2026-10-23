@@ -487,6 +487,14 @@
     "updated": "更新于",
     "unavailable": "暂不可用，点刷新重试"
   },
+  "terminal": {
+    "title": "终端",
+    "toggle": "切换内嵌终端（⌃`）",
+    "restart": "在会话目录重新打开",
+    "hide": "收起终端",
+    "spawnFailed": "终端启动失败",
+    "testPlaceholder": "终端（测试构建，未启动 shell）"
+  },
   "permission": {
     "title": "权限请求",
     "planTitle": "可以开始编码了吗？",

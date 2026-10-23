@@ -489,6 +489,14 @@
     "updated": "Updated",
     "unavailable": "Unavailable — tap Refresh to retry"
   },
+  "terminal": {
+    "title": "Terminal",
+    "toggle": "Toggle the embedded terminal (⌃`)",
+    "restart": "Restart in the session's directory",
+    "hide": "Hide the terminal",
+    "spawnFailed": "Failed to start the terminal",
+    "testPlaceholder": "terminal (test build — no shell)"
+  },
   "permission": {
     "title": "Permission requested",
     "planTitle": "Ready to code?",
