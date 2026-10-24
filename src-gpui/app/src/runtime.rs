@@ -2549,6 +2549,19 @@ struct Driver {
     /// reappears once the window lapses (ADR-0006's re-arm).
     closed_sessions: HashMap<(String, String), u64>,
 
+    /// Session ids discovery has EVER advertised (grows monotonically) —
+    /// the remote-open watch's memory. An id appearing in a LATER snapshot
+    /// that this set has never carried is a mid-run remote open (a phone
+    /// create, a remote resume) and pops an attaching tab; an id seen once
+    /// never pops again, so a tombstone-lapsed re-advertisement (a stubborn
+    /// post-close row) is a reappearance, not an opening.
+    seen_sessions: HashSet<String>,
+    /// Discovery's cold-start baseline has landed (one successful
+    /// snapshot): tabs may pop for mid-run arrivals only — the boot
+    /// snapshot registers every already-advertised session without opening
+    /// anything (the 2026-10-22 quiet-cold-start half).
+    discovery_baselined: bool,
+
     tabs: Vec<Tab>,
     active_tab: Option<u64>,
     /// Tabs whose connection WE closed (tab close / Retry) — their Closed
@@ -2657,6 +2670,8 @@ impl Driver {
             next_discovery_at: 0,
             discovery_probe: true,
             closed_sessions: HashMap::new(),
+            seen_sessions: HashSet::new(),
+            discovery_baselined: false,
             tabs: Vec::new(),
             active_tab: None,
             closing: HashSet::new(),
@@ -2769,7 +2784,23 @@ impl Driver {
 
     fn close_tab(&mut self, id: u64) {
         // Mark + close without holding the tab borrow across the mutations.
-        let conn = self.tab(id).and_then(|t| t.conn.clone());
+        // A closed TAB is not a remote open: its session ids go into the
+        // seen set so the remote-open watch never pops a tab back for a
+        // conversation whose id has not reached discovery yet (our own
+        // new/resumed session inside the heartbeat + poll lag, up to ~25s).
+        let (conn, held): (Option<_>, Vec<String>) = match self.tab(id) {
+            Some(t) => (
+                t.conn.clone(),
+                [t.target.clone(), t.core.active_session_id.clone()]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            ),
+            None => (None, Vec::new()),
+        };
+        for sid in held {
+            self.seen_sessions.insert(sid);
+        }
         if let Some(conn) = conn {
             self.closing.insert(id);
             conn.close();
@@ -2938,7 +2969,55 @@ impl Driver {
                 self.closed_sessions
                     .retain(|_, at| now.saturating_sub(*at) < CLOSE_TOMBSTONE_MS);
                 let list = self.filter_closed_sessions(list, now);
+                // Remote-open watch (2026-10-24, amending the 2026-10-22
+                // quiet rule): a session that first appears in a LATER
+                // snapshot — a phone create, a remote resume, any client's
+                // new conversation — pops an ATTACHING tab. The attached
+                // client is what keeps the hosting serve bridge alive: its
+                // idle self-exit only counts idle time with zero clients
+                // attached, so without a tab a remotely-opened session died
+                // ~10min after the remote client walked away. Cold start
+                // stays quiet (the 2026-10-22 half): the first snapshot is
+                // the baseline. Sessions a tab already holds (our own
+                // attach/resume in flight) are not remote opens.
+                let arrivals: Vec<(String, String, String)> = if self.discovery_baselined {
+                    list.iter()
+                        .flat_map(|inst| inst.sessions.iter().map(move |s| (inst, s)))
+                        .filter(|(_, s)| !self.seen_sessions.contains(&s.session_id))
+                        .filter(|(_, s)| {
+                            !self.tabs.iter().any(|t| {
+                                t.target.as_deref() == Some(s.session_id.as_str())
+                                    || t.core.active_session_id.as_deref()
+                                        == Some(s.session_id.as_str())
+                            })
+                        })
+                        .map(|(inst, s)| {
+                            (
+                                inst.id.clone(),
+                                s.session_id.clone(),
+                                inst.workspace
+                                    .clone()
+                                    .filter(|w| !w.is_empty())
+                                    .unwrap_or_else(|| "/".to_string()),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                for inst in &list {
+                    for s in &inst.sessions {
+                        self.seen_sessions.insert(s.session_id.clone());
+                    }
+                }
+                self.discovery_baselined = true;
                 self.instances = list;
+                for (instance_id, sid, cwd) in arrivals {
+                    traceln!(
+                        "[driver] remote-opened session {sid} — attaching a tab (holds the serve bridge open)"
+                    );
+                    self.open_tab(instance_id, Some(sid), cwd);
+                }
                 self.discovery_note = None;
                 self.next_discovery_at = now + DISCOVERY_REFRESH_MS;
                 self.discovery_probe = false;
@@ -2951,12 +3030,11 @@ impl Driver {
                 if self.quota_dock.is_none() {
                     self.spawn_quota_dock();
                 }
-                // Discovery NEVER opens a tab (2026-10-22 decision, dropping
-                // M1 parity with appStore's cold-start auto-attach): neither
-                // a cold start nor a remotely-opened session may pop one —
-                // tabs come only from explicit gestures (+, sidebar row,
-                // history). The landing note still covers the truly empty
-                // hub: no tab open and no session row anywhere to click.
+                // Tabs otherwise come only from explicit gestures (+,
+                // sidebar row, history) — the 2026-10-22 rule minus the
+                // remote-open exception above. The landing note still covers
+                // the truly empty hub: no tab open and no session row
+                // anywhere to click.
                 if self.tabs.is_empty() && !self.instances.iter().any(|i| !i.sessions.is_empty()) {
                     self.discovery_note = Some(
                         "no open session on the hub yet — start one from the editor, the \
@@ -9264,6 +9342,13 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         // Close tombstones name the OLD hub's instance ids; the new hub's
         // rows owe them nothing.
         d.closed_sessions.clear();
+        // The remote-open watch's memory names the OLD hub's sessions too:
+        // without this reset, the new hub's first snapshot would treat every
+        // row the old hub never carried as a mid-run arrival and pop tabs
+        // for all of them — the mass-open the cold-start baseline exists to
+        // prevent. The next successful discovery re-baselines quietly.
+        d.seen_sessions.clear();
+        d.discovery_baselined = false;
         d.config_notice = None;
         d.pending_restart = false;
         d.emit_if_changed();
@@ -9625,9 +9710,11 @@ mod tests {
     /// can re-advertise a retired conversation), so the poll that REPLACES
     /// `instances` resurrected the row — gone, back, then lingering. The
     /// tombstone hides it for CLOSE_TOMBSTONE_MS; the window lapsing lets a
-    /// genuinely reused session back in (ADR-0006's re-arm).
-    #[test]
-    fn a_closed_session_is_not_resurrected_by_a_discovery_refresh() {
+    /// genuinely reused session back in (ADR-0006's re-arm) — and under the
+    /// remote-open watch that re-admission is a mid-run arrival, so it pops
+    /// an attaching tab like any other remote open.
+    #[tokio::test]
+    async fn a_closed_session_is_not_resurrected_by_a_discovery_refresh() {
         let mut d = driver();
         d.handle_loop_event(
             LoopEvent::SessionClosed {
@@ -9673,6 +9760,14 @@ mod tests {
                 .any(|s| s.session_id == "s1")),
             "an expired tombstone re-admits the row"
         );
+        // The re-admitted row is a never-seen mid-run arrival: the remote-open
+        // watch attaches to it (someone genuinely reused the conversation).
+        assert_eq!(
+            d.tabs.len(),
+            1,
+            "the re-admitted session pops an attaching tab"
+        );
+        assert_eq!(d.tabs[0].target.as_deref(), Some("s1"));
     }
 
     /// The bridge's `$/zcode/session_closed` broadcast (another client
@@ -9787,6 +9882,111 @@ mod tests {
             d.tabs.iter().all(|t| t.reincubated_at.is_none()),
             "a tombstoned session must not revive"
         );
+    }
+
+    /// Remote-opened sessions pop a tab (2026-10-24, amending the
+    /// 2026-10-22 quiet rule): a session that first appears in a LATER
+    /// snapshot — a phone create, a remote resume — gets an attaching tab,
+    /// because the attached client is what holds the hosting serve bridge
+    /// open (its idle self-exit only counts idle time with no clients). The
+    /// cold-start baseline stays quiet; a tombstone-lapsed re-admission of
+    /// an already-seen id never pops.
+    #[tokio::test]
+    async fn a_remotely_opened_session_pops_a_tab_once_baselined() {
+        let mut d = driver();
+
+        // Cold start: everything advertised at boot is the baseline — quiet.
+        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
+        assert!(d.tabs.is_empty(), "cold start opens nothing");
+
+        // A remote create/resume lands next to s0 — one attaching tab,
+        // active, on the right instance.
+        d.on_discovery(
+            Ok(vec![instance("i", Some("/w"), vec![
+                session("s0", None),
+                session("s_new", None),
+            ])]),
+            16_000,
+        );
+        assert_eq!(d.tabs.len(), 1);
+        assert_eq!(d.tabs[0].target.as_deref(), Some("s_new"));
+        assert_eq!(d.tabs[0].instance_id, "i");
+        assert_eq!(d.active_tab, Some(d.tabs[0].id));
+
+        // Plain re-advertisement of the same ids never pops again.
+        d.on_discovery(
+            Ok(vec![instance("i", Some("/w"), vec![
+                session("s0", None),
+                session("s_new", None),
+            ])]),
+            31_000,
+        );
+        assert_eq!(d.tabs.len(), 1, "a seen id re-advertised is not an opening");
+
+        // The remote close retires the tab; a stubborn row riding past the
+        // tombstone window back into the list is a REAPPEARANCE — no pop.
+        let tab_id = d.tabs[0].id;
+        d.handle_loop_event(
+            LoopEvent::SessionClosedRemotely { tab: tab_id, session_id: "s_new".to_string() },
+            32_000,
+        );
+        assert!(d.tabs.is_empty(), "the retirement closed the holding tab");
+        d.on_discovery(
+            Ok(vec![instance("i", Some("/w"), vec![
+                session("s0", None),
+                session("s_new", None),
+            ])]),
+            32_000 + super::CLOSE_TOMBSTONE_MS + 1,
+        );
+        assert!(d.tabs.is_empty(), "an already-seen id never re-pops");
+    }
+
+    /// A session a tab already holds is not a remote open: the desktop's own
+    /// attach/resume in flight (the tab exists, discovery has not advertised
+    /// the id before) must not pop — or activate — a second tab.
+    #[tokio::test]
+    async fn a_session_a_tab_already_holds_is_not_a_remote_open() {
+        let mut d = driver();
+        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
+        let held = d.open_tab("i".to_string(), Some("s_mine".to_string()), "/w".to_string());
+
+        d.on_discovery(
+            Ok(vec![instance("i", Some("/w"), vec![
+                session("s0", None),
+                session("s_mine", None),
+                session("s_other", None),
+            ])]),
+            16_000,
+        );
+        assert_eq!(d.tabs.len(), 2, "only the genuinely remote s_other pops");
+        assert!(
+            d.tabs.iter().any(|t| t.id == held && t.target.as_deref() == Some("s_mine")),
+            "the held tab is untouched"
+        );
+        assert!(d.tabs.iter().any(|t| t.target.as_deref() == Some("s_other")));
+    }
+
+    /// A tab the user closed is not a remote open: closing a tab whose
+    /// session discovery has not advertised yet (our own fresh conversation
+    /// inside the heartbeat + poll lag) must not pop the tab back open when
+    /// the id first appears.
+    #[tokio::test]
+    async fn closing_a_tab_marks_its_session_seen_not_remote_opened() {
+        let mut d = driver();
+        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
+        let tab = d.open_tab("i".to_string(), Some("s_mine".to_string()), "/w".to_string());
+        d.close_tab(tab);
+        assert!(d.tabs.is_empty());
+
+        d.on_discovery(
+            Ok(vec![instance(
+                "i",
+                Some("/w"),
+                vec![session("s0", None), session("s_mine", None)],
+            )]),
+            16_000,
+        );
+        assert!(d.tabs.is_empty(), "the closed tab's session never pops back");
     }
 
     /// One tab per session: a second open of the same target activates the
@@ -10145,9 +10345,10 @@ mod tests {
     /// The landing note (the TS picker's empty state): with no tab open and
     /// no session row anywhere, the status bar carries the hint — instance
     /// rows without sessions never mint a tab either. A session appearing
-    /// anywhere replaces the hint with the row.
-    #[test]
-    fn sessionless_discovery_keeps_the_landing_note() {
+    /// anywhere replaces the hint with the row, and under the remote-open
+    /// watch a mid-run arrival attaches to it as well.
+    #[tokio::test]
+    async fn sessionless_discovery_keeps_the_landing_note() {
         let mut d = driver();
         d.on_discovery(
             Ok(vec![
@@ -10170,7 +10371,8 @@ mod tests {
             )]),
             1_000,
         );
-        assert!(d.tabs.is_empty(), "still no tab without a gesture");
+        assert_eq!(d.tabs.len(), 1, "the mid-run arrival attaches");
+        assert_eq!(d.tabs[0].target.as_deref(), Some("s_a"));
         assert!(d.discovery_note.is_none(), "the row replaces the hint");
     }
 
