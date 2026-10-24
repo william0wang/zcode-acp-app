@@ -6258,7 +6258,7 @@ impl Driver {
                     self.toast.notify(now, &msg);
                 }
             },
-            LoopEvent::SessionClosedRemotely { tab, session_id } => {
+            LoopEvent::SessionClosedRemotely { tab: _, session_id } => {
                 // The bridge's `$/zcode/session_closed` broadcast (martty's
                 // quit-cleanly contract): someone retired this conversation.
                 // Retire locally exactly like an own close — tab, row,
@@ -6266,9 +6266,14 @@ impl Driver {
                 // session and the re-incubator never resumes a deliberately
                 // closed conversation (a serve bridge self-exits right after
                 // this broadcast; without the retirement the revive path
-                // pulled the session back up, 2026-10-23). Tabs holding OTHER
-                // sessions on the same bridge ignore their copy.
-                let holder = self.tab(tab).filter(|t| {
+                // pulled the session back up, 2026-10-23). The hub delivers
+                // one copy per session alias to EVERY attached socket, so
+                // the delivering tab is just where the copy landed: the
+                // holder's own connection may be mid-reconnect at that
+                // moment (its ladder is precisely what must not resurrect
+                // the session) and a sibling tab's socket gets the copy —
+                // look the holder up across every tab.
+                let holder = self.tabs.iter().find(|t| {
                     t.core.active_session_id.as_deref() == Some(session_id.as_str())
                         || t.target.as_deref() == Some(session_id.as_str())
                 });
@@ -6665,8 +6670,17 @@ impl Driver {
             // (server ADR-0010 amendment) reuses the workspace's live serve
             // bridge or headless-spawns one, and TabReincubated re-points
             // the tab there. A discovery snapshot up to 15s stale only
-            // delays this to the next retry.
-            if !self.instances.iter().any(|i| i.id == instance_id) {
+            // delays this to the next retry. A live close-tombstone vetoes
+            // the revive: the ladder can burn out right as the remote-close
+            // broadcast lands, and a resume POST cannot be recalled —
+            // resuming a retired session is the resurrection this gate
+            // exists to prevent.
+            let tombstoned = sid.as_ref().is_some_and(|sid| {
+                self.closed_sessions
+                    .get(&(instance_id.clone(), sid.clone()))
+                    .is_some_and(|at| now.saturating_sub(*at) < CLOSE_TOMBSTONE_MS)
+            });
+            if !tombstoned && !self.instances.iter().any(|i| i.id == instance_id) {
                 if let Some(t) = self.tab_mut(tab) {
                     t.reincubated_at = Some(now);
                 }
@@ -9665,8 +9679,8 @@ mod tests {
     /// retired the conversation through the hub): the holding tab closes and
     /// the row tombstones — the same retirement an own close performs — so
     /// the reconnect ladder never sees the gone session and the re-incubator
-    /// never pulls it back up. A copy addressing a session this tab does not
-    /// hold is ignored, and an unknown tab id is a no-op.
+    /// never pulls it back up. A copy addressing a session no tab holds is
+    /// ignored, and a stale event for the already-closed tab is a no-op.
     #[tokio::test]
     async fn a_remote_session_close_retires_the_holding_tab() {
         let mut d = driver();
@@ -9712,6 +9726,66 @@ mod tests {
         d.handle_loop_event(
             LoopEvent::SessionClosedRemotely { tab, session_id: "s1".to_string() },
             3_000,
+        );
+    }
+
+    /// The broadcast copy is socket-agnostic: the hub hands EVERY attached
+    /// client connection one copy per session alias, and the holder's own
+    /// connection may be down at that moment (mid-reconnect — the state
+    /// whose ladder must not revive the session). A copy that lands on a
+    /// sibling tab's socket therefore still retires the holder.
+    #[tokio::test]
+    async fn a_remote_close_landing_on_a_sibling_socket_still_retires_the_holder() {
+        let mut d = driver();
+        let mut serve =
+            instance("i-serve", Some("/w"), vec![session("s1", None), session("s2", None)]);
+        serve.origin = InstanceOrigin::Serve;
+        d.instances.push(serve);
+        let tab1 = d.open_tab("i-serve".to_string(), Some("s1".to_string()), "/w".to_string());
+        let tab2 = d.open_tab("i-serve".to_string(), Some("s2".to_string()), "/w".to_string());
+        assert_eq!(d.tabs.len(), 2);
+
+        // The s1 copy arrives on tab2's socket (tab1's connection is the
+        // one that would be down here): tab1 retires anyway.
+        d.handle_loop_event(
+            LoopEvent::SessionClosedRemotely { tab: tab2, session_id: "s1".to_string() },
+            1_000,
+        );
+        assert_eq!(
+            d.tabs.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![tab2],
+            "the holder retires regardless of the delivering socket; the sibling stays"
+        );
+        assert!(
+            d.closed_sessions
+                .contains_key(&("i-serve".to_string(), "s1".to_string())),
+            "the row tombstones against the next discovery poll"
+        );
+    }
+
+    /// A live close-tombstone vetoes the re-incubation: a ladder that burns
+    /// out right as the remote close lands must not POST a resume for the
+    /// retired session — a resume cannot be recalled once sent, and the
+    /// server honors it (the resurrection this prevents).
+    #[tokio::test]
+    async fn a_live_close_tombstone_vetoes_re_incubation() {
+        let mut d = driver();
+        let tab = d.open_tab("i-dead".to_string(), Some("sess_1".to_string()), "/w".to_string());
+        d.closed_sessions
+            .insert(("i-dead".to_string(), "sess_1".to_string()), 25_000);
+
+        for attempt in 0..super::TAB_REINCUBATE_ATTEMPTS {
+            d.handle_loop_event(
+                LoopEvent::ConnectResult {
+                    tab,
+                    result: Err("dial failed".to_string()),
+                },
+                attempt as u64 * 10_000,
+            );
+        }
+        assert!(
+            d.tabs.iter().all(|t| t.reincubated_at.is_none()),
+            "a tombstoned session must not revive"
         );
     }
 
