@@ -41,6 +41,7 @@ mod workflow_launches;
 mod workflows_page;
 mod zconfig_pages;
 
+use gpui_kit::component::highlighter::SyntaxColors;
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::{
     px, rgb, size, App, AppContext as _, Bounds, Hsla, KeyBinding, Menu, MenuItem, QuitMode,
@@ -90,7 +91,50 @@ fn apply_quiet_dark(cx: &mut App) {
         // yellow-600 as warning foreground — muddy as text on this canvas).
         theme.colors.warning_foreground = rgb(0xfcd34d).into();
         theme.colors.warning = rgb(0xf59e0b).into();
+        // The chat's syntax tokens: the kit Default Dark ships an
+        // editor-grade palette (bright green strings and inline code
+        // spans, saturated gold constants and titles) — right for an
+        // editor where code IS the content, wrong for chat where the
+        // agent's reply is prose first. Swap the tokens onto the muted
+        // github-dark set the mobile app renders
+        // (src/chat/ChatView.tsx); unlisted tokens carry no colour at
+        // all, which is the point: inline code spans and headings keep
+        // the prose colour.
+        let mut highlight = (*theme.highlight_theme).clone();
+        highlight.style.syntax = muted_chat_syntax();
+        theme.highlight_theme = std::sync::Arc::new(highlight);
     });
+}
+
+/// The chat syntax palette as a theme-file fragment (the same JSON shape
+/// the kit's default-theme.json carries): github-dark, the mobile app's
+/// highlight.js palette. Only the tokens a chat reply should tint.
+const MUTED_CHAT_SYNTAX: &str = r##"{
+    "keyword": { "color": "#ff7b72" },
+    "string": { "color": "#a5d6ff" },
+    "string.escape": { "color": "#a5d6ff" },
+    "string.regex": { "color": "#a5d6ff" },
+    "string.special": { "color": "#a5d6ff" },
+    "string.special.symbol": { "color": "#a5d6ff" },
+    "constant": { "color": "#79c0ff" },
+    "number": { "color": "#79c0ff" },
+    "boolean": { "color": "#79c0ff" },
+    "function": { "color": "#d2a8ff" },
+    "constructor": { "color": "#d2a8ff" },
+    "type": { "color": "#d2a8ff" },
+    "variable.special": { "color": "#79c0ff" },
+    "tag": { "color": "#7ee787" },
+    "attribute": { "color": "#79c0ff" },
+    "comment": { "color": "#8b949e" },
+    "comment.doc": { "color": "#8b949e" },
+    "emphasis": { "font_style": "italic" },
+    "emphasis.strong": { "font_weight": 700 },
+    "link_text": { "color": "#419cff" },
+    "link_uri": { "color": "#7faef9", "font_style": "italic" }
+}"##;
+
+fn muted_chat_syntax() -> SyntaxColors {
+    serde_json::from_str(MUTED_CHAT_SYNTAX).expect("the muted chat palette is static JSON")
 }
 
 fn main() {
