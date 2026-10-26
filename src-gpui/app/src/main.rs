@@ -41,8 +41,9 @@ mod workflow_launches;
 mod workflows_page;
 mod zconfig_pages;
 
-use gpui_kit::component::highlighter::SyntaxColors;
+use gpui_kit::base::{TextViewDefaults, TextViewStyle};
 use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::gpui::{HighlightStyle, StyleRefinement, Styled as _};
 use gpui_kit::{
     px, rgb, size, App, AppContext as _, Bounds, Hsla, KeyBinding, Menu, MenuItem, QuitMode,
     TitlebarOptions, WindowBounds, WindowOptions,
@@ -91,50 +92,54 @@ fn apply_quiet_dark(cx: &mut App) {
         // yellow-600 as warning foreground — muddy as text on this canvas).
         theme.colors.warning_foreground = rgb(0xfcd34d).into();
         theme.colors.warning = rgb(0xf59e0b).into();
-        // The chat's syntax tokens: the kit Default Dark ships an
-        // editor-grade palette (bright green strings and inline code
-        // spans, saturated gold constants and titles) — right for an
-        // editor where code IS the content, wrong for chat where the
-        // agent's reply is prose first. Swap the tokens onto the muted
-        // github-dark set the mobile app renders
-        // (src/chat/ChatView.tsx); unlisted tokens carry no colour at
-        // all, which is the point: inline code spans and headings keep
-        // the prose colour.
-        let mut highlight = (*theme.highlight_theme).clone();
-        highlight.style.syntax = muted_chat_syntax();
-        theme.highlight_theme = std::sync::Arc::new(highlight);
     });
+
+    // The chat's code surfaces: the kit derives TextViewDefaults from the
+    // theme and maps the inline-code chip onto `accent` — every `code` span
+    // in an agent reply painted a solid emerald rectangle, a brand/action
+    // colour used as furniture. That chip was the "highlight" glare all
+    // along (a background problem, unreachable by syntax-palette tuning);
+    // the tokens themselves are the kit's own Default Dark set, untouched.
+    // Re-style the installed defaults with the chip on the hairline gray;
+    // starting from the installed global keeps the tree-sitter block
+    // highlighter. A later Theme::update re-derives the defaults and would
+    // bring the accent chip back — re-run this after any theme edit.
+    TextViewDefaults::global(cx)
+        .with_style(chat_text_view_style(Theme::global(cx)))
+        .install(cx);
 }
 
-/// The chat syntax palette as a theme-file fragment (the same JSON shape
-/// the kit's default-theme.json carries): github-dark, the mobile app's
-/// highlight.js palette. Only the tokens a chat reply should tint.
-const MUTED_CHAT_SYNTAX: &str = r##"{
-    "keyword": { "color": "#ff7b72" },
-    "string": { "color": "#a5d6ff" },
-    "string.escape": { "color": "#a5d6ff" },
-    "string.regex": { "color": "#a5d6ff" },
-    "string.special": { "color": "#a5d6ff" },
-    "string.special.symbol": { "color": "#a5d6ff" },
-    "constant": { "color": "#79c0ff" },
-    "number": { "color": "#79c0ff" },
-    "boolean": { "color": "#79c0ff" },
-    "function": { "color": "#d2a8ff" },
-    "constructor": { "color": "#d2a8ff" },
-    "type": { "color": "#d2a8ff" },
-    "variable.special": { "color": "#79c0ff" },
-    "tag": { "color": "#7ee787" },
-    "attribute": { "color": "#79c0ff" },
-    "comment": { "color": "#8b949e" },
-    "comment.doc": { "color": "#8b949e" },
-    "emphasis": { "font_style": "italic" },
-    "emphasis.strong": { "font_weight": 700 },
-    "link_text": { "color": "#419cff" },
-    "link_uri": { "color": "#7faef9", "font_style": "italic" }
-}"##;
-
-fn muted_chat_syntax() -> SyntaxColors {
-    serde_json::from_str(MUTED_CHAT_SYNTAX).expect("the muted chat palette is static JSON")
+/// The chat's rich-text style: the kit's own theme mapping
+/// (`base_text_view_style`) with ONE change — the inline-code chip moves
+/// off the accent onto the hairline gray, the quiet "gray over black" lift
+/// every agent chat uses for code. A fn (not an inline closure) so the
+/// ui_tests can assert the surfaces directly.
+fn chat_text_view_style(theme: &Theme) -> TextViewStyle {
+    let radius = theme.semantic_tokens().radius.md;
+    let mut rounded = StyleRefinement::default();
+    rounded.corner_radii.top_left = Some(radius.into());
+    rounded.corner_radii.top_right = Some(radius.into());
+    rounded.corner_radii.bottom_left = Some(radius.into());
+    rounded.corner_radii.bottom_right = Some(radius.into());
+    TextViewStyle::default()
+        .with_foreground(theme.foreground)
+        .with_muted_foreground(theme.muted_foreground)
+        .with_link(theme.link)
+        .with_selection(theme.selection)
+        .with_code_background(theme.muted)
+        .with_border(theme.border)
+        .with_code_block(rounded.clone())
+        .with_table(rounded)
+        .with_table_head(
+            StyleRefinement::default()
+                .bg(theme.table_head)
+                .text_color(theme.table_head_foreground),
+        )
+        .with_inline_code(HighlightStyle {
+            background_color: Some(theme.border),
+            ..Default::default()
+        })
+        .with_dark(theme.is_dark())
 }
 
 /// The workbench's global key bindings. App bootstrap registers them; the

@@ -8154,31 +8154,40 @@ mod ui_tests {
         .unwrap();
     }
 
-    /// The quiet-dark polish (main.rs `apply_quiet_dark`) swaps the kit's
-    /// editor-grade syntax palette for the chat's muted one: inline code
-    /// spans, literals, and titles carry no token colour at all (the prose
-    /// colour), while code tokens stay tinted (github-dark).
+    /// The chat's code surfaces are neutral grays and the syntax tokens are
+    /// the kit's own Default Dark set. The glare the user kept reporting as
+    /// "the highlight" was never a token colour: the kit maps the
+    /// inline-code chip onto the theme accent — a solid emerald rectangle
+    /// behind every `code` span. `apply_quiet_dark` re-styles the installed
+    /// TextViewDefaults (chip on the hairline gray, fenced panels on the
+    /// muted surface) and leaves the highlight theme untouched.
     #[gpui_kit::test]
-    fn quiet_dark_mutes_the_chat_syntax_palette(cx: &mut TestAppContext) {
+    fn quiet_dark_paints_code_surfaces_neutral(cx: &mut TestAppContext) {
         cx.update(|cx| {
             gpui_kit::init(cx);
             gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
             crate::apply_quiet_dark(cx);
-            let syntax = &gpui_kit::component::Theme::global(cx)
-                .highlight_theme
-                .style
-                .syntax;
-            assert!(
-                syntax.text_code_span.is_none(),
-                "inline code keeps the prose colour"
+            let theme = gpui_kit::component::Theme::global(cx);
+            let style = crate::chat_text_view_style(theme);
+            assert_ne!(
+                style.inline_code().background_color,
+                Some(theme.accent),
+                "no accent chip behind `code` spans"
             );
-            assert!(
-                syntax.text_literal.is_none() && syntax.title.is_none(),
-                "literals and headings carry no token colour"
+            assert_eq!(
+                style.inline_code().background_color,
+                Some(theme.border),
+                "the inline-code chip is the hairline gray"
             );
-            assert!(
-                syntax.keyword.is_some() && syntax.string.is_some(),
-                "code tokens stay tinted (github-dark)"
+            assert_eq!(
+                style.code_background(),
+                theme.muted,
+                "fenced panels keep the theme's muted surface"
+            );
+            assert_eq!(
+                *theme.highlight_theme,
+                *gpui_kit::component::highlighter::HighlightTheme::default_dark(),
+                "the syntax tokens are the kit defaults again"
             );
         });
     }
