@@ -5769,6 +5769,7 @@ fn render_row(
             chat_font,
             thought_full,
             tool_run_open,
+            cx,
             theme,
         )
         .into_any_element(),
@@ -5932,6 +5933,11 @@ fn render_user_row(
         .into_any_element()
 }
 
+/// The settled thought card's collapsed cap, in body lines (the TS
+/// ThoughtCard's max-h-52 ≈ 208px ≈ 10 lines at the default ladder; a line
+/// cap follows the font scale).
+const THOUGHT_CLAMP_LINES: usize = 10;
+
 fn render_assistant_row(
     row: &RowModel,
     is_last_row: bool,
@@ -5941,6 +5947,7 @@ fn render_assistant_row(
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
     tool_run_open: &std::collections::HashMap<(String, usize), bool>,
+    cx: &App,
     theme: &component::Theme,
 ) -> AnyElement {
     let mut column = div().flex().flex_col().gap_2().min_w_0();
@@ -6073,38 +6080,45 @@ fn render_assistant_row(
                     // capture phase whenever the list can still move, so an
                     // inner scroll window only worked at the list's edges
                     // ("sometimes the session scrolls, sometimes the
-                    // thought"). The body clips at the TS max-h-52 cap and
-                    // expands inline on demand; the session scroll owns
-                    // navigation.
+                    // thought"). The clamp rides the view itself
+                    // (max_lines): whole lines stay visible and
+                    // TextViewState::is_clamped reports whether anything is
+                    // hidden — the "Show all" affordance appears ONLY when
+                    // content was actually clipped away, so a short thought
+                    // carries no dead button.
                     let full = thought_full.contains(&(row.id.clone(), part_index));
                     card = card.child(
                         div()
                             .id(SharedString::from(format!("thought-body-{}", row.id)))
                             .test_support()
-                            .when(!full, |this| this.max_h(px(208.)).overflow_hidden())
                             .px_3()
                             .pb_1()
                             .text_size(px(chat_font.1))
                             .text_color(theme.muted_foreground)
-                            .child(TextView::new(state)),
+                            .child(
+                                TextView::new(state)
+                                    .when(!full, |view| view.max_lines(THOUGHT_CLAMP_LINES)),
+                            ),
                     );
-                    let row_id = row.id.clone();
-                    let wb = wb.clone();
-                    card = card.child(
-                        div().flex().justify_end().px_2().pb_1().child(
-                            Button::new(SharedString::from(format!("thought-more-{}", row.id)))
-                                .ghost()
-                                .xsmall()
-                                .label(if full { "Collapse" } else { "Show all" })
-                                .on_click(move |_, _window, cx| {
-                                    if let Some(wb) = wb.upgrade() {
-                                        wb.update(cx, |wb, cx| {
-                                            wb.toggle_thought_full(&row_id, part_index, cx)
-                                        });
-                                    }
-                                }),
-                        ),
-                    );
+                    if full || state.read(cx).is_clamped() {
+                        let row_id = row.id.clone();
+                        let wb = wb.clone();
+                        card = card.child(
+                            div().flex().justify_end().px_2().pb_1().child(
+                                Button::new(SharedString::from(format!("thought-more-{}", row.id)))
+                                    .ghost()
+                                    .xsmall()
+                                    .label(if full { "Collapse" } else { "Show all" })
+                                    .on_click(move |_, _window, cx| {
+                                        if let Some(wb) = wb.upgrade() {
+                                            wb.update(cx, |wb, cx| {
+                                                wb.toggle_thought_full(&row_id, part_index, cx)
+                                            });
+                                        }
+                                    }),
+                            ),
+                        );
+                    }
                 }
                 column.child(card)
             }
