@@ -123,6 +123,14 @@ const DISCOVERY_REFRESH_MS: u64 = 15_000;
 /// re-advertising a retired conversation, short enough that a session
 /// genuinely reused elsewhere (ADR-0006's re-arm) comes back promptly.
 const CLOSE_TOMBSTONE_MS: u64 = 60_000;
+/// How long a session id must be ABSENT from discovery before its return
+/// counts as a remote open again — the resume cycle: the serve bridge
+/// idle-exits (~10min after the last client leaves), a phone resumes the
+/// conversation, the row re-appears, and the desktop must attach. Above the
+/// hub-restart churn window (bridges re-register within ~30s carrying the
+/// same ids — partial snapshots there must not pop tabs), comfortably below
+/// the idle death it exists to catch.
+const REMOTE_OPEN_REAPPEAR_MS: u64 = 2 * 60_000;
 /// Failed reconnects after which a tab whose instance has left discovery is
 /// re-incubated (POST /api/instances, the resume form). Three honest retries
 /// first: a hub restart's ≤10s bridge re-registration window must not
@@ -2549,13 +2557,14 @@ struct Driver {
     /// reappears once the window lapses (ADR-0006's re-arm).
     closed_sessions: HashMap<(String, String), u64>,
 
-    /// Session ids discovery has EVER advertised (grows monotonically) —
-    /// the remote-open watch's memory. An id appearing in a LATER snapshot
-    /// that this set has never carried is a mid-run remote open (a phone
-    /// create, a remote resume) and pops an attaching tab; an id seen once
-    /// never pops again, so a tombstone-lapsed re-advertisement (a stubborn
-    /// post-close row) is a reappearance, not an opening.
-    seen_sessions: HashSet<String>,
+    /// Session id → the last discovery snapshot that advertised it — the
+    /// remote-open watch's memory. An id a snapshot carries that was never
+    /// seen, or has been ABSENT for [`REMOTE_OPEN_REAPPEAR_MS`] (a bridge
+    /// idle-death followed by a remote resume), is a remote open and pops an
+    /// attaching tab. Recent sightings suppress the pop, so hub-restart
+    /// churn and a tombstone-lapsed re-advertisement are reappearances, not
+    /// openings.
+    seen_at: HashMap<String, u64>,
     /// Discovery's cold-start baseline has landed (one successful
     /// snapshot): tabs may pop for mid-run arrivals only — the boot
     /// snapshot registers every already-advertised session without opening
@@ -2670,7 +2679,7 @@ impl Driver {
             next_discovery_at: 0,
             discovery_probe: true,
             closed_sessions: HashMap::new(),
-            seen_sessions: HashSet::new(),
+            seen_at: HashMap::new(),
             discovery_baselined: false,
             tabs: Vec::new(),
             active_tab: None,
@@ -2782,10 +2791,10 @@ impl Driver {
         id
     }
 
-    fn close_tab(&mut self, id: u64) {
+    fn close_tab(&mut self, id: u64, now: u64) {
         // Mark + close without holding the tab borrow across the mutations.
-        // A closed TAB is not a remote open: its session ids go into the
-        // seen set so the remote-open watch never pops a tab back for a
+        // A closed TAB is not a remote open: stamp its session ids freshly
+        // seen so the remote-open watch never pops a tab back for a
         // conversation whose id has not reached discovery yet (our own
         // new/resumed session inside the heartbeat + poll lag, up to ~25s).
         let (conn, held): (Option<_>, Vec<String>) = match self.tab(id) {
@@ -2799,7 +2808,7 @@ impl Driver {
             None => (None, Vec::new()),
         };
         for sid in held {
-            self.seen_sessions.insert(sid);
+            self.seen_at.insert(sid, now);
         }
         if let Some(conn) = conn {
             self.closing.insert(id);
@@ -2921,7 +2930,7 @@ impl Driver {
             .map(|t| t.id)
             .collect();
         for id in holders {
-            self.close_tab(id);
+            self.close_tab(id, now);
         }
         let last_session_gone = self.instances.iter().any(|i| {
             i.id == instance_id && i.origin == InstanceOrigin::Serve && i.sessions.is_empty()
@@ -2970,20 +2979,25 @@ impl Driver {
                     .retain(|_, at| now.saturating_sub(*at) < CLOSE_TOMBSTONE_MS);
                 let list = self.filter_closed_sessions(list, now);
                 // Remote-open watch (2026-10-24, amending the 2026-10-22
-                // quiet rule): a session that first appears in a LATER
-                // snapshot — a phone create, a remote resume, any client's
-                // new conversation — pops an ATTACHING tab. The attached
-                // client is what keeps the hosting serve bridge alive: its
-                // idle self-exit only counts idle time with zero clients
-                // attached, so without a tab a remotely-opened session died
-                // ~10min after the remote client walked away. Cold start
-                // stays quiet (the 2026-10-22 half): the first snapshot is
-                // the baseline. Sessions a tab already holds (our own
-                // attach/resume in flight) are not remote opens.
+                // quiet rule): a session a snapshot carries that was never
+                // seen or has been absent past REMOTE_OPEN_REAPPEAR_MS — a
+                // phone create, a resume after the bridge's idle death —
+                // pops an ATTACHING tab. The attached client is what keeps
+                // the hosting serve bridge alive: its idle self-exit only
+                // counts idle time with zero clients attached, so without a
+                // tab a remotely-opened session died ~10min after the remote
+                // client walked away. Cold start stays quiet (the
+                // 2026-10-22 half): the first snapshot is the baseline.
+                // Sessions a tab already holds (our own attach/resume in
+                // flight) are not remote opens.
                 let arrivals: Vec<(String, String, String)> = if self.discovery_baselined {
                     list.iter()
                         .flat_map(|inst| inst.sessions.iter().map(move |s| (inst, s)))
-                        .filter(|(_, s)| !self.seen_sessions.contains(&s.session_id))
+                        .filter(|(_, s)| {
+                            self.seen_at.get(&s.session_id).is_none_or(|at| {
+                                now.saturating_sub(*at) >= REMOTE_OPEN_REAPPEAR_MS
+                            })
+                        })
                         .filter(|(_, s)| {
                             !self.tabs.iter().any(|t| {
                                 t.target.as_deref() == Some(s.session_id.as_str())
@@ -3007,7 +3021,7 @@ impl Driver {
                 };
                 for inst in &list {
                     for s in &inst.sessions {
-                        self.seen_sessions.insert(s.session_id.clone());
+                        self.seen_at.insert(s.session_id.clone(), now);
                     }
                 }
                 self.discovery_baselined = true;
@@ -6996,7 +7010,7 @@ impl Driver {
                 }
             }
             UiCommand::CloseTab { id } => {
-                self.close_tab(id);
+                self.close_tab(id, now);
             }
             UiCommand::MoveTab { id, before_id } => {
                 // A drop on the dragged tab's own slot is a no-op; without
@@ -7021,7 +7035,7 @@ impl Driver {
                     let others: Vec<u64> =
                         self.tabs.iter().filter(|t| t.id != id).map(|t| t.id).collect();
                     for other in others {
-                        self.close_tab(other);
+                        self.close_tab(other, now);
                     }
                     self.refocus_batch_close(id, was_active);
                 }
@@ -7033,7 +7047,7 @@ impl Driver {
                     None => Vec::new(),
                 };
                 for rid in right {
-                    self.close_tab(rid);
+                    self.close_tab(rid, now);
                 }
                 self.refocus_batch_close(id, was_active);
             }
@@ -9347,7 +9361,7 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         // row the old hub never carried as a mid-run arrival and pop tabs
         // for all of them — the mass-open the cold-start baseline exists to
         // prevent. The next successful discovery re-baselines quietly.
-        d.seen_sessions.clear();
+        d.seen_at.clear();
         d.discovery_baselined = false;
         d.config_notice = None;
         d.pending_restart = false;
@@ -9710,12 +9724,17 @@ mod tests {
     /// can re-advertise a retired conversation), so the poll that REPLACES
     /// `instances` resurrected the row — gone, back, then lingering. The
     /// tombstone hides it for CLOSE_TOMBSTONE_MS; the window lapsing lets a
-    /// genuinely reused session back in (ADR-0006's re-arm) — and under the
-    /// remote-open watch that re-admission is a mid-run arrival, so it pops
-    /// an attaching tab like any other remote open.
+    /// genuinely reused session back in (ADR-0006's re-arm) — a recent
+    /// sighting, so the remote-open watch stays quiet for it.
     #[tokio::test]
     async fn a_closed_session_is_not_resurrected_by_a_discovery_refresh() {
         let mut d = driver();
+        // The row was live and advertised before the close (the production
+        // shape — the remote-open watch has seen it).
+        d.on_discovery(
+            Ok(vec![instance("i-edit", Some("/e"), vec![session("s1", None), session("s2", None)])]),
+            500,
+        );
         d.handle_loop_event(
             LoopEvent::SessionClosed {
                 instance_id: "i-edit".to_string(),
@@ -9760,14 +9779,12 @@ mod tests {
                 .any(|s| s.session_id == "s1")),
             "an expired tombstone re-admits the row"
         );
-        // The re-admitted row is a never-seen mid-run arrival: the remote-open
-        // watch attaches to it (someone genuinely reused the conversation).
-        assert_eq!(
-            d.tabs.len(),
-            1,
-            "the re-admitted session pops an attaching tab"
+        // The re-admission is half a minute after the last sighting — inside
+        // the remote-open window, a reappearance rather than an opening.
+        assert!(
+            d.tabs.is_empty(),
+            "a recently-seen re-admitted row does not pop a tab"
         );
-        assert_eq!(d.tabs[0].target.as_deref(), Some("s1"));
     }
 
     /// The bridge's `$/zcode/session_closed` broadcast (another client
@@ -9924,21 +9941,41 @@ mod tests {
         assert_eq!(d.tabs.len(), 1, "a seen id re-advertised is not an opening");
 
         // The remote close retires the tab; a stubborn row riding past the
-        // tombstone window back into the list is a REAPPEARANCE — no pop.
+        // tombstone window back into the list is a REAPPEARANCE inside the
+        // remote-open window — seen recently, no pop.
         let tab_id = d.tabs[0].id;
         d.handle_loop_event(
             LoopEvent::SessionClosedRemotely { tab: tab_id, session_id: "s_new".to_string() },
             32_000,
         );
         assert!(d.tabs.is_empty(), "the retirement closed the holding tab");
+        let relapse = 32_000 + super::CLOSE_TOMBSTONE_MS + 1;
         d.on_discovery(
             Ok(vec![instance("i", Some("/w"), vec![
                 session("s0", None),
                 session("s_new", None),
             ])]),
-            32_000 + super::CLOSE_TOMBSTONE_MS + 1,
+            relapse,
         );
-        assert!(d.tabs.is_empty(), "an already-seen id never re-pops");
+        assert!(d.tabs.is_empty(), "a recently-seen id re-admitted past the tombstone never pops");
+
+        // The resume cycle: the bridge idle-dies and the row leaves
+        // discovery entirely (polls in between keep the surviving rows'
+        // stamps fresh), then a remote client resumes — the row's return IS
+        // a remote open and attaches again.
+        let gone = relapse + 60_000;
+        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), gone);
+        assert!(d.tabs.is_empty());
+        let back = relapse + super::REMOTE_OPEN_REAPPEAR_MS + 30_000;
+        d.on_discovery(
+            Ok(vec![instance("i", Some("/w"), vec![
+                session("s0", None),
+                session("s_new", None),
+            ])]),
+            back,
+        );
+        assert_eq!(d.tabs.len(), 1, "a resumed-after-idle-death session re-attaches");
+        assert_eq!(d.tabs[0].target.as_deref(), Some("s_new"));
     }
 
     /// A session a tab already holds is not a remote open: the desktop's own
@@ -9975,7 +10012,7 @@ mod tests {
         let mut d = driver();
         d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
         let tab = d.open_tab("i".to_string(), Some("s_mine".to_string()), "/w".to_string());
-        d.close_tab(tab);
+        d.close_tab(tab, 1_500);
         assert!(d.tabs.is_empty());
 
         d.on_discovery(
