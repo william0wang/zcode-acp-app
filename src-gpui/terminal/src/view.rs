@@ -50,10 +50,14 @@
 use crate::colors::ColorPalette;
 use crate::event::{GpuiEventProxy, TerminalEvent};
 use crate::input::keystroke_to_bytes;
+use crate::mouse::{pixel_to_cell, selection_type_from_clicks, url_span_at, Selection};
 use crate::render::TerminalRenderer;
 use crate::terminal::TerminalState;
-use gpui::{Edges, *};
+use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+use alacritty_terminal::term::cell::Flags as CellFlags;
+use gpui::{Edges, prelude::FluentBuilder as _, *};
 use std::io::{Read, Write};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
@@ -411,6 +415,38 @@ pub struct TerminalView {
 
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
+
+    /// The last painted canvas bounds, written by the render's paint pass —
+    /// the mouse handlers' pixel→cell math needs the grid origin, and
+    /// handlers have no other way to reach the element's bounds.
+    view_bounds: Arc<parking_lot::Mutex<Option<Bounds<Pixels>>>>,
+
+    /// The active text selection (buffer coordinates: lines may reach into
+    /// scrollback, exactly the coordinates the grid indexes with).
+    selection: Option<Selection>,
+
+    /// True between the selection's mouse-down and its mouse-up.
+    selecting: bool,
+
+    /// The selection's fixed side — the (possibly word/line-expanded) span
+    /// the mouse-down anchored; the drag moves only the other end.
+    select_anchor: Option<(AlacPoint, AlacPoint)>,
+
+    /// The URL under the pointer, if any (buffer line + column span).
+    hover_link: Option<HoverLink>,
+
+    /// A link press in flight: opens on mouse-up if the pointer never left
+    /// the span (a drag off the link cancels the open).
+    pressed_link: Option<String>,
+}
+
+/// A URL the pointer sits on: where it paints (buffer line + column span)
+/// and what a click opens.
+#[derive(Debug, Clone, PartialEq)]
+struct HoverLink {
+    line: i32,
+    cols: Range<usize>,
+    url: String,
 }
 
 impl TerminalView {
@@ -537,6 +573,12 @@ impl TerminalView {
             title_callback: None,
             clipboard_store_callback: None,
             exit_callback: None,
+            view_bounds: Arc::new(parking_lot::Mutex::new(None)),
+            selection: None,
+            selecting: false,
+            select_anchor: None,
+            hover_link: None,
+            pressed_link: None,
         }
     }
 
@@ -754,7 +796,27 @@ impl TerminalView {
             return;
         }
 
+        // Copy: platform+C on macOS, ctrl+shift+C elsewhere. A selection
+        // copies and swallows the key; with nothing selected the shell
+        // keeps its ^C (the terminal convention).
+        let copy = event.keystroke.key == "c"
+            && if cfg!(target_os = "macos") {
+                modifiers.platform && !modifiers.control
+            } else {
+                modifiers.control && modifiers.shift
+            };
+        if copy {
+            let text = self.selection_text();
+            if !text.is_empty() {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+            // Typing invalidates the selection, as in every terminal.
+            self.selection = None;
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();
@@ -762,51 +824,111 @@ impl TerminalView {
         }
     }
 
-    /// Handle mouse down events.
-    ///
-    /// Currently a placeholder for future mouse selection and interaction support.
+    /// Handle mouse down events: focus, start a selection (or arm a link
+    /// press — links win over selection), and report to the shell when it
+    /// asked for mouse tracking (TODO upstream; SGR helpers exist in
+    /// `mouse`).
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         // Request focus when clicking the terminal
         window.focus(&self.focus_handle, cx);
-        cx.notify();
 
-        // TODO: Implement mouse selection
-        // - Convert pixel coordinates to cell coordinates
-        // - Start selection at clicked cell
-        // - Send mouse reports if mouse tracking is enabled
+        if event.button != MouseButton::Left {
+            cx.notify();
+            return;
+        }
+        if let Some(link) = self.link_at(event.position) {
+            self.pressed_link = Some(link.url);
+            self.selection = None;
+            self.selecting = false;
+        } else {
+            self.pressed_link = None;
+            if let Some(cell) = self.cell_at(event.position) {
+                let ty = selection_type_from_clicks(event.click_count);
+                let (start, end) = match ty {
+                    crate::mouse::SelectionType::Simple => (cell, cell),
+                    _ => self.expand_selection(cell, ty),
+                };
+                self.select_anchor = Some((start, end));
+                self.selection = Some(Selection::new(start, end, ty));
+                self.selecting = true;
+            } else {
+                self.selection = None;
+                self.selecting = false;
+                self.select_anchor = None;
+            }
+        }
+        cx.notify();
     }
 
-    /// Handle mouse up events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Handle mouse up events: end the drag, open an armed link if the
+    /// pointer never left it, and collapse an empty selection (a plain
+    /// click is not a selection).
     fn on_mouse_up(
         &mut self,
         _event: &MouseUpEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - End selection at released cell
-        // - Copy selection to clipboard if configured
+        self.selecting = false;
+        if let Some(url) = self.pressed_link.take() {
+            if self.hover_link.as_ref().is_some_and(|l| l.url == url) {
+                cx.open_url(&url);
+            }
+        }
+        let collapsed = self.selection.as_ref().is_some_and(|sel| {
+            sel.start == sel.end
+                && sel.selection_type == crate::mouse::SelectionType::Simple
+        });
+        if collapsed {
+            self.selection = None;
+        }
+        cx.notify();
     }
 
-    /// Handle mouse move events.
-    ///
-    /// Currently a placeholder for future mouse selection support.
+    /// Handle mouse move events: extend the selection while dragging, and
+    /// keep the hovered URL (pointer cursor + underline) in step.
     fn on_mouse_move(
         &mut self,
-        _event: &MouseMoveEvent,
+        event: &MouseMoveEvent,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        // TODO: Implement mouse selection
-        // - Update selection range while dragging
-        // - Send mouse motion reports if mouse tracking is enabled
+        let mut changed = false;
+        if self.selecting {
+            if let (Some(cell), Some((a0, a1))) =
+                (self.cell_at(event.position), self.select_anchor)
+            {
+                if let Some(sel) = self.selection.as_ref() {
+                    // The anchor side stays; only the dragged end moves.
+                    // Word/line drags snap the moving end to its boundary
+                    // and take the hull of the two spans.
+                    let (start, end) = match sel.selection_type {
+                        crate::mouse::SelectionType::Simple => {
+                            if cell < a0 { (cell, a0) } else { (a0, cell) }
+                        }
+                        ty => {
+                            let (b0, b1) = self.expand_selection(cell, ty);
+                            (a0.min(b0), a1.max(b1))
+                        }
+                    };
+                    self.selection = Some(Selection::new(start, end, sel.selection_type));
+                    changed = true;
+                }
+            }
+        }
+        let link = self.link_at(event.position);
+        if link != self.hover_link {
+            self.hover_link = link;
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
     }
 
     /// Handle scroll events.
@@ -911,6 +1033,132 @@ impl TerminalView {
         &self.config
     }
 
+    // -- selection & links ---------------------------------------------------
+
+    /// A window point → grid cell in BUFFER coordinates (the viewport row
+    /// shifted by the scrollback the frame renders at, matching the paint
+    /// loop's own indexing). None before the first paint leaves no bounds.
+    fn cell_at(&self, position: Point<Pixels>) -> Option<AlacPoint> {
+        let guard = self.view_bounds.lock();
+        let Some(bounds) = *guard else {
+            return None;
+        };
+        let origin = point(
+            bounds.origin.x + self.config.padding.left,
+            bounds.origin.y + self.config.padding.top,
+        );
+        let cell =
+            pixel_to_cell(position, origin, self.renderer.cell_width, self.renderer.cell_height);
+        let display_offset = self.state.with_term(|t| t.renderable_content().display_offset) as i32;
+        Some(AlacPoint::new(Line(cell.line.0 - display_offset), cell.column))
+    }
+
+    /// The URL at a window point, if the cell's line holds one over it.
+    fn link_at(&self, position: Point<Pixels>) -> Option<HoverLink> {
+        let cell = self.cell_at(position)?;
+        let text = self.line_text(cell.line.0);
+        let (span, url) = url_span_at(&text, cell.column.0)?;
+        Some(HoverLink {
+            line: cell.line.0,
+            cols: span,
+            url,
+        })
+    }
+
+    /// One grid line's text. Column mapping is 1:1 with chars — wide-char
+    /// spacers are skipped, which can skew spans on CJK-heavy lines; URLs
+    /// are ASCII, so the mapping holds where it matters.
+    fn line_text(&self, line: i32) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        self.state.with_term(|term| {
+            let grid = term.grid();
+            let line = line.clamp(grid.topmost_line().0, grid.bottommost_line().0);
+            let mut text = String::new();
+            for col in 0..grid.columns() {
+                let cell = &grid[AlacPoint::new(Line(line), Column(col))];
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                text.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
+            text
+        })
+    }
+
+    /// Expand a point to its word (the non-blank run) or its whole line —
+    /// double- and triple-click selections.
+    fn expand_selection(
+        &self,
+        point: AlacPoint,
+        ty: crate::mouse::SelectionType,
+    ) -> (AlacPoint, AlacPoint) {
+        use alacritty_terminal::grid::Dimensions;
+        self.state.with_term(|term| {
+            let grid = term.grid();
+            let blank =
+                |p: AlacPoint| matches!(grid[p].c, ' ' | '\0');
+            match ty {
+                crate::mouse::SelectionType::Line => {
+                    let last = grid.columns() - 1;
+                    (
+                        AlacPoint::new(point.line, Column(0)),
+                        AlacPoint::new(point.line, Column(last)),
+                    )
+                }
+                _ => {
+                    let mut start = point.column.0;
+                    while start > 0 && !blank(AlacPoint::new(point.line, Column(start - 1))) {
+                        start -= 1;
+                    }
+                    let mut end = point.column.0;
+                    while end + 1 < grid.columns()
+                        && !blank(AlacPoint::new(point.line, Column(end + 1)))
+                    {
+                        end += 1;
+                    }
+                    (
+                        AlacPoint::new(point.line, Column(start)),
+                        AlacPoint::new(point.line, Column(end)),
+                    )
+                }
+            }
+        })
+    }
+
+    /// The selection's text (trailing blanks trimmed per row, rows joined
+    /// with newlines) — ⌘C's payload; empty with no selection.
+    fn selection_text(&self) -> String {
+        use alacritty_terminal::grid::Dimensions;
+        let Some(sel) = self.selection.as_ref() else {
+            return String::new();
+        };
+        let (start, end) = if sel.start < sel.end {
+            (sel.start, sel.end)
+        } else {
+            (sel.end, sel.start)
+        };
+        self.state.with_term(|term| {
+            let grid = term.grid();
+            let cols = grid.columns();
+            let first = start.line.0.max(grid.topmost_line().0);
+            let mut rows: Vec<String> = Vec::new();
+            for line in first..=end.line.0 {
+                let from = if line == start.line.0 { start.column.0 } else { 0 };
+                let to = if line == end.line.0 { end.column.0 } else { cols - 1 };
+                let mut row = String::new();
+                for col in from..=to.min(cols - 1) {
+                    let cell = &grid[AlacPoint::new(Line(line), Column(col))];
+                    if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    row.push(if cell.c == '\0' { ' ' } else { cell.c });
+                }
+                rows.push(row.trim_end().to_string());
+            }
+            rows.join("\n")
+        })
+    }
+
     /// Get the focus handle for this terminal view.
     ///
     /// # Returns
@@ -964,16 +1212,35 @@ impl Render for TerminalView {
         // Process any pending events
         self.process_events(window, cx);
 
+        // Measure HERE as well: the paint below measures only its own
+        // clone, and the mouse handlers map pixels through self.renderer's
+        // cells — without this they would use the font-agnostic defaults.
+        self.renderer.measure_cell(window);
+
         // Get terminal state and renderer for rendering
         let state_arc = self.state.term_arc();
         let renderer = self.renderer.clone();
         let resize_callback = self.resize_callback.clone();
         let padding = self.config.padding;
+        let selection = self.selection.clone();
+        let hover = self
+            .hover_link
+            .as_ref()
+            .map(|link| (link.line, link.cols.clone()));
+        let bounds_sink = self.view_bounds.clone();
+        let hover_active = self.hover_link.is_some();
 
         div()
             .size_full()
             .bg(rgb(0x1e1e1e))
             .track_focus(&self.focus_handle)
+            .map(|this| {
+                if hover_active {
+                    this.cursor_pointer()
+                } else {
+                    this
+                }
+            })
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -984,6 +1251,9 @@ impl Render for TerminalView {
                     move |bounds, _window, _cx| bounds,
                     move |bounds, _, window, cx| {
                         use alacritty_terminal::grid::Dimensions;
+
+                        // The mouse handlers' pixel→cell math reads these.
+                        *bounds_sink.lock() = Some(bounds);
 
                         // Measure actual cell dimensions from the font
                         let mut measured_renderer = renderer.clone();
@@ -1039,7 +1309,15 @@ impl Render for TerminalView {
                         }
 
                         // Paint the terminal with measured dimensions
-                        measured_renderer.paint(bounds, padding, &term, window, cx);
+                        measured_renderer.paint(
+                            bounds,
+                            padding,
+                            &term,
+                            selection.as_ref(),
+                            hover.as_ref(),
+                            window,
+                            cx,
+                        );
                     },
                 )
                 .size_full(),

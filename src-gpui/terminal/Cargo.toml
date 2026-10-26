@@ -15,7 +15,12 @@ description = "Vendored terminal emulator component for gpui (upstream zortax/gp
 #     gpui distribution, pinned by the kit — never a second crate identity);
 #   - mouse-wheel scrollback (alacritty display_offset) and paste
 #     (platform+v / ctrl+shift+v from the host clipboard) are implemented,
-#     both "planned" upstream.
+#     both "planned" upstream;
+#   - text selection (drag/double/triple click, cmd+C copy) and clickable
+#     links (URL autodetection, hover underline, open via the host) are
+#     implemented — upstream ships TODO placeholders for both;
+#   - `dimensions()` reads the live grid (the render path resizes the term
+#     behind TerminalState's back, so its cols/rows fields go stale);
 #   - unused upstream deps (ropey, anyhow) are dropped.
 
 [dependencies]

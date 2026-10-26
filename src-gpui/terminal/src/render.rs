@@ -63,6 +63,7 @@
 use crate::box_drawing;
 use crate::colors::ColorPalette;
 use crate::event::GpuiEventProxy;
+use crate::mouse::Selection;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point as AlacPoint};
 use alacritty_terminal::term::Term;
@@ -71,8 +72,14 @@ use alacritty_terminal::term::color::Colors;
 use alacritty_terminal::vte::ansi::Color;
 use gpui::{
     App, Bounds, Edges, Font, FontFeatures, FontStyle, FontWeight, Hsla, Pixels, Point,
-    SharedString, Size, TextAlign, TextRun, UnderlineStyle, Window, px, quad, transparent_black,
+    SharedString, Size, TextAlign, TextRun, UnderlineStyle, Window, hsla, px, quad,
+    transparent_black,
 };
+
+/// The selection's translucent wash over the glyphs (a soft blue).
+const SELECTION_WASH: Hsla = hsla(210. / 360., 0.55, 0.62, 0.32);
+/// The hovered link's underline.
+const LINK_UNDERLINE: Hsla = hsla(210. / 360., 0.75, 0.72, 0.9);
 
 /// A batched run of text with consistent styling.
 ///
@@ -455,6 +462,8 @@ impl TerminalRenderer {
         bounds: Bounds<Pixels>,
         padding: Edges<Pixels>,
         term: &Term<GpuiEventProxy>,
+        selection: Option<&Selection>,
+        hover: Option<&(i32, std::ops::Range<usize>)>,
         window: &mut Window,
         _cx: &mut App,
     ) {
@@ -757,6 +766,78 @@ impl TerminalRenderer {
                 transparent_black(),
                 Default::default(),
             ));
+        }
+
+        // The selection wash and the hovered link's underline ride ON TOP of
+        // the painted text: translucent over the glyphs, the way every
+        // terminal renders a selection.
+        if let Some(sel) = selection {
+            let (start, end) = if sel.start < sel.end {
+                (sel.start, sel.end)
+            } else {
+                (sel.end, sel.start)
+            };
+            for line_idx in 0..num_lines {
+                let buf = line_idx as i32 - display_offset as i32;
+                if buf < start.line.0 || buf > end.line.0 {
+                    continue;
+                }
+                let from = if buf == start.line.0 {
+                    start.column.0
+                } else {
+                    0
+                };
+                let to = (if buf == end.line.0 {
+                    end.column.0 + 1
+                } else {
+                    num_cols
+                })
+                .min(num_cols);
+                if from >= to {
+                    continue;
+                }
+                let rect = Bounds {
+                    origin: Point {
+                        x: origin.x + self.cell_width * (from as f32),
+                        y: origin.y + self.cell_height * (line_idx as f32),
+                    },
+                    size: Size {
+                        width: self.cell_width * ((to - from) as f32),
+                        height: self.cell_height,
+                    },
+                };
+                window.paint_quad(quad(
+                    rect,
+                    px(0.0),
+                    SELECTION_WASH,
+                    Edges::<Pixels>::default(),
+                    transparent_black(),
+                    Default::default(),
+                ));
+            }
+        }
+        if let Some((line, cols)) = hover {
+            let line_idx = *line + display_offset as i32;
+            if line_idx >= 0 && (line_idx as usize) < num_lines {
+                let rect = Bounds {
+                    origin: Point {
+                        x: origin.x + self.cell_width * (cols.start as f32),
+                        y: origin.y + self.cell_height * (line_idx as f32 + 1.0) - px(1.),
+                    },
+                    size: Size {
+                        width: self.cell_width * ((cols.end - cols.start) as f32),
+                        height: px(1.),
+                    },
+                };
+                window.paint_quad(quad(
+                    rect,
+                    px(0.0),
+                    LINK_UNDERLINE,
+                    Edges::<Pixels>::default(),
+                    transparent_black(),
+                    Default::default(),
+                ));
+            }
         }
     }
 }

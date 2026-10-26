@@ -709,3 +709,81 @@ mod tests {
         assert_eq!(bytes, expected);
     }
 }
+
+/// The URL token under (or near) a character index on a terminal line, as
+/// `(column span, url)`. Most CLI output prints bare URLs (git, gh, ls) —
+/// OSC 8 hyperlinks are rare — so the span is found by whitespace-delimited
+/// token scan: a token counts when it contains "://" or starts with "www.".
+/// A `www.` token is opened as https.
+///
+/// The index is a CHARACTER index into `line`; the returned span is in the
+/// same units (terminal cells are 1:1 with chars for the URLs this matches).
+pub fn url_span_at(line: &str, at: usize) -> Option<(std::ops::Range<usize>, String)> {
+    let bytes = line.as_bytes();
+    if at >= bytes.len() {
+        return None;
+    }
+    let mut start = at.min(bytes.len() - 1);
+    while start > 0 && !bytes[start].is_ascii_whitespace() {
+        start -= 1;
+    }
+    if bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    let mut end = at;
+    while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+        end += 1;
+    }
+    if start >= end {
+        return None;
+    }
+    let token = &line[start..end];
+    let is_url = token.contains("://") || token.starts_with("www.");
+    if !is_url {
+        return None;
+    }
+    // Trailing sentence punctuation is not part of the URL.
+    let mut trimmed_end = end;
+    while trimmed_end > start && matches!(bytes[trimmed_end - 1], b'.' | b',' | b';' | b')' | b']') {
+        trimmed_end -= 1;
+    }
+    let token = &line[start..trimmed_end];
+    if token.is_empty() {
+        return None;
+    }
+    let url = if token.starts_with("www.") {
+        format!("https://{token}")
+    } else {
+        token.to_string()
+    };
+    Some((start..trimmed_end, url))
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::url_span_at;
+
+    #[test]
+    fn finds_an_inline_url() {
+        let (span, url) = url_span_at("see https://example.com/a?b=1 for details", 8).unwrap();
+        assert_eq!(span, 4..29);
+        assert_eq!(url, "https://example.com/a?b=1");
+    }
+
+    #[test]
+    fn opens_www_tokens_as_https() {
+        let (_, url) = url_span_at("go to www.example.com now", 10).unwrap();
+        assert_eq!(url, "https://www.example.com");
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_the_url() {
+        let (_, url) = url_span_at("docs: https://example.com/x.", 10).unwrap();
+        assert_eq!(url, "https://example.com/x");
+    }
+
+    #[test]
+    fn plain_text_has_no_span() {
+        assert!(url_span_at("just some words here", 6).is_none());
+    }
+}
