@@ -5963,11 +5963,18 @@ fn render_assistant_row(
             let run = &row.parts[start..part_index];
             column = column.child(if run.len() > 1 {
                 // Absent = never toggled: a live run stays open so its calls
-                // are watchable, a settled one folds away.
+                // are watchable, a settled one folds away. While the turn is
+                // running, the live row's TAIL run stays latched open as
+                // well: the desktop renders every protocol update on its
+                // own, so in the gap between one call's result and the next
+                // call's request "any call in flight" briefly reads false
+                // and the card flaps shut then reopens (the mobile app
+                // batches those updates and never shows the gap).
+                let live_tail = running && is_last_row && part_index == row.parts.len();
                 let open = tool_run_open
                     .get(&(row.id.clone(), start))
                     .copied()
-                    .unwrap_or_else(|| tool_run_summary(run).1);
+                    .unwrap_or_else(|| tool_run_summary(run).1 || live_tail);
                 render_tool_run(&row.id, start, run, open, wb, theme)
             } else {
                 render_tool_card(&row.id, start, &run[0], wb, theme)
