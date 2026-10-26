@@ -4,7 +4,7 @@
 //! pattern turned vertical).
 //!
 //! This module owns everything shell-side — the portable-pty PTY pair, the
-//! login shell spawn (cwd = the active session's workspace), the resize
+//! login shell spawn (cwd = the owning tab's session workspace), the resize
 //! plumbing, and the OSC 52 clipboard store — while `workbench.rs` only
 //! toggles, renders, and yields Esc. The terminal is view-local layout
 //! state, never wire state: hiding keeps the shell, while a shell exit or
@@ -186,6 +186,11 @@ pub(crate) fn render_terminal_panel(
         .test_support()
         .flex()
         .flex_col()
+        // flex_1: the resizable panel's root is a ROW-direction flex box —
+        // a child without a grow/width of its own shrinks to its min-content
+        // (the header's ~153px) instead of spanning the column. The chat
+        // stack above the split grows the same way.
+        .flex_1()
         .min_h_0()
         .min_w_0()
         .border_t_1()

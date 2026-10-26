@@ -214,13 +214,18 @@ pub struct Workbench {
     /// like the left dock, with its own splitter.
     session_panel_open: bool,
     session_dock_sizes: Entity<ResizableState>,
-    /// The embedded terminal dock (view-local, never wire state): spawned
-    /// lazily on the first open — the active session's workspace is the
-    /// shell's cwd — and kept alive across hide/show. `None` also under
-    /// test (cfg!(test)): the suite must not leak real shell processes.
-    terminal_dock: Option<terminal_panel::TerminalDock>,
-    terminal_open: bool,
-    /// The chat ↔ terminal vertical split's sizes.
+    /// Per-tab embedded terminals (view-local, never wire state): each tab
+    /// owns its own dock, spawned lazily on that tab's first open — the
+    /// tab's session workspace is the shell's cwd — and kept alive across
+    /// hide/show and tab switches. Closing the tab drops its dock, which
+    /// kills the shell (`TerminalDock::drop`). Under test (cfg!(test)) no
+    /// dock ever spawns; only the open flags flip.
+    tab_terminals: std::collections::HashMap<u64, terminal_panel::TerminalDock>,
+    /// Tabs whose terminal dock is shown (`tab_terminals` keeps the shell
+    /// alive while hidden — the flag only paints).
+    tab_terminal_open: std::collections::HashSet<u64>,
+    /// The chat ↔ terminal vertical split's sizes (shared: the panel height
+    /// is a layout fact, not per-tab state).
     terminal_sizes: Entity<ResizableState>,
     /// The font ladder (TS `fontSize`): scales the reading text through the
     /// chat px pairs and every other UI role through the paint-time factor
@@ -1153,8 +1158,8 @@ impl Workbench {
             drawer: None,
             session_panel_open: false,
             files_panel_session: None,
-            terminal_dock: None,
-            terminal_open: false,
+            tab_terminals: std::collections::HashMap::new(),
+            tab_terminal_open: std::collections::HashSet::new(),
             terminal_sizes,
             font_scale: crate::ui_prefs::load_font_size()
                 .unwrap_or(crate::ui_prefs::FontScale::Medium),
@@ -1293,31 +1298,42 @@ impl Workbench {
     // -- embedded terminal ---------------------------------------------------
 
     /// View-local toggle (the drawers' shape): the dock spawns lazily on
-    /// the first open — in the ACTIVE session's workspace — and survives
-    /// hide/show; reopening never respawns a live shell.
+    /// the first open — in the ACTIVE tab's session workspace — and survives
+    /// hide/show and tab switches; reopening never respawns a live shell.
+    /// Each tab's terminal is its own (a shell in tab A never follows the
+    /// switch to tab B); with no active tab there is nothing to toggle.
     pub(crate) fn toggle_terminal(&mut self, cx: &mut Context<Self>) {
-        self.terminal_open = !self.terminal_open;
-        if self.terminal_open && self.terminal_dock.is_none() && !cfg!(test) {
-            self.spawn_terminal(cx);
+        let Some(id) = self.snap.active_tab else {
+            return;
+        };
+        if self.tab_terminal_open.contains(&id) {
+            self.tab_terminal_open.remove(&id);
+        } else {
+            self.tab_terminal_open.insert(id);
+            if !self.tab_terminals.contains_key(&id) && !cfg!(test) {
+                self.spawn_terminal(cx);
+            }
         }
         cx.notify();
     }
 
     /// The exit callback's deferred close (terminal_panel is a sibling
     /// module, so the fields stay private). `exited` is the view that saw
-    /// the EOF: a shell the restart already replaced still lives in the
-    /// previous frame's element tree for one draw, and its late exit must
-    /// not close the fresh dock.
+    /// the EOF — it may be ANY tab's dock (a parked tab's shell dying while
+    /// hidden), not just the active one's, and a shell the restart already
+    /// replaced still lives in the previous frame's element tree for one
+    /// draw, its late exit closing nothing.
     pub(crate) fn close_terminal(&mut self, exited: gpui::EntityId, cx: &mut Context<Self>) {
-        let current = self
-            .terminal_dock
-            .as_ref()
-            .is_some_and(|dock| dock.view.entity_id() == exited);
-        if !current {
+        let hit = self
+            .tab_terminals
+            .iter()
+            .find(|(_, dock)| dock.view.entity_id() == exited)
+            .map(|(id, _)| *id);
+        let Some(id) = hit else {
             return;
-        }
-        self.terminal_dock = None;
-        self.terminal_open = false;
+        };
+        self.tab_terminals.remove(&id);
+        self.tab_terminal_open.remove(&id);
         cx.notify();
     }
 
@@ -1330,8 +1346,14 @@ impl Workbench {
         self.toggle_terminal(cx);
         // Opening hands the keyboard to the shell at once; closing leaves
         // the focus where the terminal had it (VS Code's behavior).
-        if let Some(dock) = self.terminal_dock.as_ref().filter(|_| self.terminal_open) {
-            window.focus(&dock.focus, cx);
+        if let Some(id) = self.snap.active_tab {
+            if let Some(dock) = self
+                .tab_terminals
+                .get(&id)
+                .filter(|_| self.tab_terminal_open.contains(&id))
+            {
+                window.focus(&dock.focus, cx);
+            }
         }
     }
 
@@ -1339,18 +1361,28 @@ impl Workbench {
     /// workspace — the point of the restart button (a `cd` elsewhere in the
     /// old shell is not undone, it is abandoned).
     pub(crate) fn restart_terminal(&mut self, cx: &mut Context<Self>) {
-        self.terminal_dock = None;
-        if !cfg!(test) {
-            self.spawn_terminal(cx);
+        let Some(id) = self.snap.active_tab else {
+            return;
+        };
+        if self.tab_terminals.remove(&id).is_some() {
+            self.tab_terminal_open.insert(id);
+            if !cfg!(test) {
+                self.spawn_terminal(cx);
+            }
+            cx.notify();
         }
-        cx.notify();
     }
 
     fn spawn_terminal(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.snap.active_tab else {
+            return;
+        };
         let cwd = self.active_workspace();
         let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
         match dock {
-            Ok(dock) => self.terminal_dock = Some(dock),
+            Ok(dock) => {
+                self.tab_terminals.insert(id, dock);
+            }
             Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
         }
     }
@@ -1368,15 +1400,18 @@ impl Workbench {
     }
 
     /// Whether the embedded terminal owns the keyboard right now. The
-    /// `terminal_open` gate matters on HIDE: gpui keeps a hidden handle's
+    /// open-flag gate matters on HIDE: gpui keeps a hidden handle's
     /// focus until something else takes it, so without the gate Esc would
     /// keep yielding to an invisible shell — the whole app's Esc ladder
     /// (sheet, drawer, cancel turn) dead until the next click.
     fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
-        self.terminal_open
+        let Some(id) = self.snap.active_tab else {
+            return false;
+        };
+        self.tab_terminal_open.contains(&id)
             && self
-                .terminal_dock
-                .as_ref()
+                .tab_terminals
+                .get(&id)
                 .is_some_and(|dock| window.focused(cx) == Some(dock.focus.clone()))
     }
 
@@ -1655,10 +1690,13 @@ impl Workbench {
                 }
                 self.snap = snap;
                 // Closed tabs' parked drafts go with them — the decoded
-                // rasters they hold are not small.
+                // rasters they hold are not small — and their terminals
+                // too: dropping the dock kills the shell.
                 let live: std::collections::HashSet<u64> =
                     self.snap.tabs.iter().map(|t| t.id).collect();
                 self.tab_drafts.retain(|id, _| live.contains(id));
+                self.tab_terminals.retain(|id, _| live.contains(id));
+                self.tab_terminal_open.retain(|id| live.contains(id));
                 // Full config pages replace the drawer's navigation context —
                 // their entries live IN the drawer, so the page taking over
                 // below closes it. The drawer itself is view-local, so
@@ -2419,6 +2457,10 @@ impl Workbench {
             "Plan quota — allowance windows and reset cards",
             cx,
         ));
+        // The terminal's visible door: the ⌃` binding alone left the dock
+        // undiscoverable. Painted as selected while the ACTIVE tab's
+        // terminal is open (the dock is per-tab, the door is one slot).
+        rail = rail.child(self.render_rail_terminal(cx));
 
         if !self.dock_open {
             // Collapsed: the rail plus the chat area at full width.
@@ -2543,7 +2585,13 @@ impl Workbench {
                 this.child(render_toast_strip(&runtime, &text, &theme))
             })
             .child(self.render_composer(cx));
-        if !self.terminal_open {
+        // The active tab's terminal dock: per-tab open flag, per-tab shell
+        // (a dock exists while hidden too — the flag only paints).
+        let open_terminal = self
+            .snap
+            .active_tab
+            .filter(|id| self.tab_terminal_open.contains(id));
+        if open_terminal.is_none() {
             // The plain column: the stack fills it as before.
             return div()
                 .flex()
@@ -2579,9 +2627,8 @@ impl Workbench {
                         resizable_panel()
                             .size(px(240.))
                             .size_range(px(80.)..px(2000.))
-                            .flex_grow_0()
                             .child(terminal_panel::render_terminal_panel(
-                                self.terminal_dock.as_ref(),
+                                open_terminal.and_then(|id| self.tab_terminals.get(&id)),
                                 self.active_workspace()
                                     .as_deref()
                                     .map(crate::file_browser::root_name)
@@ -2725,6 +2772,40 @@ impl Workbench {
             .test_support()
             .on_click(move |_, _, cx| {
                 wb.update(cx, |wb, cx| wb.toggle_dock(cx));
+            })
+    }
+
+    /// A rail toggle for the ACTIVE tab's terminal dock —
+    /// `render_rail_button`'s shape with the terminal's own state and
+    /// action (the dock is a chat-column surface, not the sessions dock).
+    fn render_rail_terminal(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let active = self
+            .snap
+            .active_tab
+            .is_some_and(|id| self.tab_terminal_open.contains(&id));
+        let color = if active {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        let label = t!("terminal.toggle").into_owned();
+        div()
+            .id("dock-rail-terminal")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size_8()
+            .rounded_md()
+            .cursor_pointer()
+            .when(active, |this| this.bg(theme.secondary))
+            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .child(Icon::new(KitIconName::Terminal).size_4().text_color(color))
+            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .test_support()
+            .on_click(move |_, _, cx| {
+                wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
             })
     }
 
@@ -7896,6 +7977,173 @@ mod ui_tests {
                 window.try_find("terminal-panel").is_none(),
                 "the second toggle unmounts the panel"
             );
+        })
+        .unwrap();
+    }
+
+    /// The rail carries the terminal's visible door, and each tab owns its
+    /// OWN terminal: opening on one tab never opens another's, a switch
+    /// shows the incoming tab's state, and closing a tab drops its terminal
+    /// (the dock — the shell — goes with it).
+    #[gpui_kit::test]
+    fn each_tab_owns_its_terminal(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let two_tabs = |active: Option<u64>, keep_7: bool| {
+            let mut snap = WorkbenchSnapshot::initial();
+            snap.phase = Phase::Connected;
+            if keep_7 {
+                snap.tabs.push(TabSummary {
+                    id: 7,
+                    session_id: Some("sess_1".to_string()),
+                    workspace: Some("/repo-a".to_string()),
+                    session_title: None,
+                    phase: TabPhase::Connected,
+                    running: false,
+                    pending: 0,
+                    awaiting: false,
+                });
+            }
+            snap.tabs.push(TabSummary {
+                id: 8,
+                session_id: Some("sess_8".to_string()),
+                workspace: Some("/repo-b".to_string()),
+                session_title: None,
+                phase: TabPhase::Connected,
+                running: false,
+                pending: 0,
+                awaiting: false,
+            });
+            snap.active_tab = active;
+            snap
+        };
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, two_tabs(Some(7), true), 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("dock-rail-terminal", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("terminal-panel").visible(),
+                "the rail click opens the active tab's terminal"
+            );
+            // Switch to tab 8: its terminal was never opened — the dock
+            // stays with tab 7, parked.
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::Snapshot(two_tabs(Some(8), true)), cx)
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "the incoming tab's terminal is its own, unopened"
+            );
+            let mut open: Vec<u64> =
+                wb.update(cx, |wb, _| wb.tab_terminal_open.iter().copied().collect());
+            open.sort_unstable();
+            assert_eq!(open, [7u64]);
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            // Tab 8 opens its own; both flags now live side by side.
+            window.click("dock-rail-terminal", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("terminal-panel").visible());
+            let mut open: Vec<u64> =
+                wb.update(cx, |wb, _| wb.tab_terminal_open.iter().copied().collect());
+            open.sort_unstable();
+            assert_eq!(open, [7u64, 8u64]);
+            // Tab 7 closes: its terminal state goes with it — the shell
+            // would be dropped (killed) with the dock.
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::Snapshot(two_tabs(Some(8), false)), cx)
+            });
+            window.draw(cx).clear(cx);
+            assert!(window.find("terminal-panel").visible());
+            let mut open: Vec<u64> =
+                wb.update(cx, |wb, _| wb.tab_terminal_open.iter().copied().collect());
+            open.sort_unstable();
+            assert_eq!(open, [8u64], "a closed tab's terminal state is pruned");
+        })
+        .unwrap();
+    }
+
+    /// The quiet-dark polish (main.rs `apply_quiet_dark`) swaps the kit's
+    /// editor-grade syntax palette for the chat's muted one: inline code
+    /// spans, literals, and titles carry no token colour at all (the prose
+    /// colour), while code tokens stay tinted (github-dark).
+    #[gpui_kit::test]
+    fn quiet_dark_mutes_the_chat_syntax_palette(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+            crate::apply_quiet_dark(cx);
+            let syntax = &gpui_kit::component::Theme::global(cx)
+                .highlight_theme
+                .style
+                .syntax;
+            assert!(
+                syntax.text_code_span.is_none(),
+                "inline code keeps the prose colour"
+            );
+            assert!(
+                syntax.text_literal.is_none() && syntax.title.is_none(),
+                "literals and headings carry no token colour"
+            );
+            assert!(
+                syntax.keyword.is_some() && syntax.string.is_some(),
+                "code tokens stay tinted (github-dark)"
+            );
+        });
+    }
+
+    /// A REAL dock (live PTY and view, not the test placeholder) must fit
+    /// its grid to the panel it sits in: the panel root carries `flex_1`
+    /// because the resizable panel's root is a ROW-direction flex box — a
+    /// child without it shrinks to its min-content width (the header's
+    /// ~150px) and the shell wraps at the spawn-time 80 columns.
+    #[gpui_kit::test]
+    fn the_terminal_grid_fits_the_panel_width(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, connected_snapshot(), 1400.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            // The test-mode toggle mounts the placeholder only; mount the
+            // real dock by hand (the production spawn path).
+            wb.update(cx, |wb, cx| {
+                let dock =
+                    crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx).expect("spawn");
+                wb.tab_terminals.insert(7, dock);
+                wb.tab_terminal_open.insert(7);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            let panel = window.find("terminal-panel");
+            let panel_w = f32::from(panel.bounds().size.width);
+            let (cols, rows) = wb.update(cx, |wb, cx| {
+                wb.tab_terminals
+                    .get(&7)
+                    .expect("the dock stays mounted")
+                    .view
+                    .read(cx)
+                    .dimensions()
+            });
+            // 1400px window minus the ~280px dock + rail leaves the chat
+            // column ~1080px wide — far more than the 80-column default.
+            assert!(
+                panel_w > 900.,
+                "the panel must span the chat column, not shrink to its content (w={panel_w})"
+            );
+            assert!(
+                cols > 100,
+                "the grid must follow the panel width, not the spawn default (cols={cols})"
+            );
+            assert!(rows > 1, "the grid must follow the panel height too");
         })
         .unwrap();
     }

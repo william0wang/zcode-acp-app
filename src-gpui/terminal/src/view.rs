@@ -881,7 +881,12 @@ impl TerminalView {
     ///
     /// A tuple of (columns, rows).
     pub fn dimensions(&self) -> (usize, usize) {
-        (self.state.cols(), self.state.rows())
+        // The live grid, not TerminalState's cols/rows fields: the render
+        // path resizes the term directly through `term_arc` (bypassing
+        // `state.resize`), so those fields hold the spawn defaults forever.
+        use alacritty_terminal::grid::Dimensions;
+        self.state
+            .with_term(|term| (term.columns(), term.screen_lines()))
     }
 
     /// Resize the terminal to new dimensions.
