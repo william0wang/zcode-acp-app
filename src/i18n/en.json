@@ -493,6 +493,8 @@
     "title": "Terminal",
     "toggle": "Toggle the embedded terminal (⌃`)",
     "restart": "Restart in the session's directory",
+    "split": "Split: add a terminal pane (max 3)",
+    "closePane": "Close this pane",
     "hide": "Hide the terminal",
     "spawnFailed": "Failed to start the terminal",
     "testPlaceholder": "terminal (test build — no shell)"

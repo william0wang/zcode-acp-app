@@ -17,7 +17,9 @@ use gpui::{div, px, AnyElement, Context, Entity, FocusHandle, WeakEntity};
 // The kit's root glob carries the `gpui` alias (`pub use crate as gpui`) —
 // the app's one-gpui-identity trick every sibling module shares.
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _};
+use gpui_kit::component::{
+    h_resizable, resizable_panel, ActiveTheme as _, Disableable as _, Icon, Sizable as _,
+};
 use gpui_kit::*;
 use gpui_kit::{assets::IconName as KitIconName, TestSupportExt as _};
 use gpui_terminal::{ColorPalette, TerminalConfig, TerminalView};
@@ -166,12 +168,19 @@ fn terminal_palette() -> ColorPalette {
         .build()
 }
 
-/// The panel: a header strip (title + workspace leaf, restart, close) over
-/// the terminal view — the drawer frame's shape at dock scale. `None` dock
-/// paints the quiet stand-in (tests never spawn a real shell; a failed
-/// spawn reads the same until retried).
+/// How many side-by-side panes one tab's terminal dock may hold. The split
+/// button disables at the cap; three ~300px panes are the practical floor
+/// for a usable shell on a laptop window.
+pub(crate) const MAX_TERMINAL_PANES: usize = 3;
+
+/// The panel: a header strip (title + workspace leaf, split, close) over
+/// the pane row. One pane renders bare (today's single dock); two or more
+/// lay out in a horizontal resizable keyed by the tab id (each tab's split
+/// sizes are its own). No pane at all paints the quiet stand-in (tests
+/// before the first split; a failed spawn reads the same until retried).
 pub(crate) fn render_terminal_panel(
-    dock: Option<&TerminalDock>,
+    panes: Option<&[TerminalDock]>,
+    tab: Option<u64>,
     workspace_leaf: Option<&str>,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -181,6 +190,9 @@ pub(crate) fn render_terminal_panel(
         Some(leaf) => format!("{} · {}", t!("terminal.title"), leaf),
         None => t!("terminal.title").into_owned(),
     };
+    let at_cap = panes
+        .map(|panes| panes.len() >= MAX_TERMINAL_PANES)
+        .unwrap_or(false);
     div()
         .id("terminal-panel")
         .test_support()
@@ -222,15 +234,16 @@ pub(crate) fn render_terminal_panel(
                         .child(title),
                 )
                 .child(
-                    Button::new("terminal-restart")
+                    Button::new("terminal-split-add")
                         .ghost()
                         .xsmall()
-                        .icon(KitIconName::RotateCcw)
-                        .tooltip(t!("terminal.restart").into_owned())
+                        .icon(KitIconName::Columns2)
+                        .tooltip(t!("terminal.split").into_owned())
+                        .disabled(at_cap)
                         .on_click({
                             let wb = wb.clone();
-                            move |_, _, cx| {
-                                wb.update(cx, |wb, cx| wb.restart_terminal(cx));
+                            move |_, window, cx| {
+                                wb.update(cx, |wb, cx| wb.split_terminal(window, cx));
                             }
                         }),
                 )
@@ -240,18 +253,35 @@ pub(crate) fn render_terminal_panel(
                         .xsmall()
                         .icon(KitIconName::X)
                         .tooltip(t!("terminal.hide").into_owned())
-                        .on_click(move |_, _, cx| {
-                            wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
+                        .on_click({
+                            let wb = wb.clone();
+                            move |_, window, cx| {
+                                wb.update(cx, |wb, cx| wb.toggle_terminal(window, cx));
+                            }
                         }),
                 ),
         )
-        .child(match dock {
-            Some(dock) => div()
+        .child(match panes {
+            Some([one]) => div()
                 .flex_1()
                 .min_h_0()
-                .child(dock.view.clone())
+                .child(one.view.clone())
                 .into_any_element(),
-            None => div()
+            Some(panes) if panes.len() >= 2 => div()
+                .flex_1()
+                .min_h_0()
+                .child(
+                    h_resizable(("terminal-panes", tab.unwrap_or(0))).children(
+                        panes.iter().enumerate().map(|(ix, pane)| {
+                            resizable_panel()
+                                .size(px(400.))
+                                .size_range(px(160.)..px(6000.))
+                                .child(render_pane(pane, ix, &wb, theme))
+                        }),
+                    ),
+                )
+                .into_any_element(),
+            _ => div()
                 .id("terminal-placeholder")
                 .test_support()
                 .flex_1()
@@ -265,4 +295,72 @@ pub(crate) fn render_terminal_panel(
                 .into_any_element(),
         })
         .into_any_element()
+}
+
+/// One pane in the split row: a slim strip (index + restart + close) over
+/// the view. The strip exists only in the multi-pane layout — a lone dock
+/// stays chromeless like before.
+fn render_pane(
+    pane: &TerminalDock,
+    ix: usize,
+    wb: &Entity<Workbench>,
+    theme: &gpui_kit::component::Theme,
+) -> impl IntoElement {
+    let entity = pane.view.entity_id();
+    div()
+        .id(("terminal-pane", ix))
+        .flex()
+        .flex_col()
+        // flex_1: the resizable panel root is a ROW flex box — without a
+        // grow the pane collapses to its min-content width.
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h_6()
+                .px_2()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(ui_text(11.))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{} {}", t!("terminal.title"), ix + 1)),
+                )
+                .child(
+                    Button::new(("terminal-pane-restart", ix))
+                        .ghost()
+                        .xsmall()
+                        .icon(KitIconName::RotateCcw)
+                        .tooltip(t!("terminal.restart").into_owned())
+                        .on_click({
+                            let wb = wb.clone();
+                            move |_, _, cx| {
+                                wb.update(cx, |wb, cx| wb.restart_terminal(entity, cx));
+                            }
+                        }),
+                )
+                .child(
+                    Button::new(("terminal-pane-close", ix))
+                        .ghost()
+                        .xsmall()
+                        .icon(KitIconName::X)
+                        .tooltip(t!("terminal.closePane").into_owned())
+                        .on_click({
+                            let wb = wb.clone();
+                            move |_, _, cx| {
+                                wb.update(cx, |wb, cx| wb.close_terminal(entity, cx));
+                            }
+                        }),
+                ),
+        )
+        .child(div().flex_1().min_h_0().child(pane.view.clone()))
 }

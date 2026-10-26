@@ -218,9 +218,12 @@ pub struct Workbench {
     /// owns its own dock, spawned lazily on that tab's first open — the
     /// tab's session workspace is the shell's cwd — and kept alive across
     /// hide/show and tab switches. Closing the tab drops its dock, which
-    /// kills the shell (`TerminalDock::drop`). Under test (cfg!(test)) no
-    /// dock ever spawns; only the open flags flip.
-    tab_terminals: std::collections::HashMap<u64, terminal_panel::TerminalDock>,
+    /// kills the shell (`TerminalDock::drop`). The vec is the tab's pane
+    /// row (split terminals): each pane is a full dock; the cap lives in
+    /// terminal_panel (`MAX_TERMINAL_PANES`). Under test (cfg!(test)) the
+    /// rail toggle never spawns (placeholder only) — `split_terminal`
+    /// does, so pane logic stays testable.
+    tab_terminals: std::collections::HashMap<u64, Vec<terminal_panel::TerminalDock>>,
     /// Tabs whose terminal dock is shown (`tab_terminals` keeps the shell
     /// alive while hidden — the flag only paints).
     tab_terminal_open: std::collections::HashSet<u64>,
@@ -1302,38 +1305,95 @@ impl Workbench {
     /// hide/show and tab switches; reopening never respawns a live shell.
     /// Each tab's terminal is its own (a shell in tab A never follows the
     /// switch to tab B); with no active tab there is nothing to toggle.
-    pub(crate) fn toggle_terminal(&mut self, cx: &mut Context<Self>) {
+    /// Closing returns the keyboard to the composer when a shell view held
+    /// it: a hidden handle KEEPS focus in gpui, and keys dispatched from a
+    /// focus that is no longer in the rendered frame silently go nowhere —
+    /// ⌃` itself would stop reopening the panel.
+    pub(crate) fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.snap.active_tab else {
             return;
         };
         if self.tab_terminal_open.contains(&id) {
             self.tab_terminal_open.remove(&id);
+            let focused_terminal = self.tab_terminals.values().flatten().any(|dock| {
+                window.focused(cx) == Some(dock.focus.clone())
+            });
+            if focused_terminal {
+                let composer = self.composer.read(cx).focus_handle(cx).clone();
+                window.focus(&composer, cx);
+            }
         } else {
             self.tab_terminal_open.insert(id);
-            if !self.tab_terminals.contains_key(&id) && !cfg!(test) {
+            let no_panes = self
+                .tab_terminals
+                .get(&id)
+                .is_none_or(|panes| panes.is_empty());
+            if no_panes && !cfg!(test) {
                 self.spawn_terminal(cx);
             }
         }
         cx.notify();
     }
 
-    /// The exit callback's deferred close (terminal_panel is a sibling
-    /// module, so the fields stay private). `exited` is the view that saw
-    /// the EOF — it may be ANY tab's dock (a parked tab's shell dying while
-    /// hidden), not just the active one's, and a shell the restart already
-    /// replaced still lives in the previous frame's element tree for one
-    /// draw, its late exit closing nothing.
-    pub(crate) fn close_terminal(&mut self, exited: gpui::EntityId, cx: &mut Context<Self>) {
-        let hit = self
-            .tab_terminals
-            .iter()
-            .find(|(_, dock)| dock.view.entity_id() == exited)
-            .map(|(id, _)| *id);
-        let Some(id) = hit else {
+    /// The split button: append a pane to the ACTIVE tab's row (fresh shell
+    /// in the same session workspace), up to the cap. Unlike the rail
+    /// toggle this spawns under test too — pane logic stays testable; the
+    /// placeholder never paints once a pane exists.
+    pub(crate) fn split_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.snap.active_tab else {
             return;
         };
-        self.tab_terminals.remove(&id);
-        self.tab_terminal_open.remove(&id);
+        if self
+            .tab_terminals
+            .get(&id)
+            .is_some_and(|panes| panes.len() >= terminal_panel::MAX_TERMINAL_PANES)
+        {
+            return;
+        }
+        let cwd = self.active_workspace();
+        let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
+        match dock {
+            Ok(dock) => {
+                let focus = dock.focus.clone();
+                self.tab_terminals.entry(id).or_default().push(dock);
+                self.tab_terminal_open.insert(id);
+                // The new pane takes the keyboard — it is what the click
+                // asked for.
+                window.focus(&focus, cx);
+                cx.notify();
+            }
+            Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
+        }
+    }
+
+    /// One pane leaves — the shell-exit callback's deferred close AND the
+    /// pane's × button (same outcome: that shell goes away). `exited` is
+    /// the view that owns the shell — it may be ANY tab's pane (a parked
+    /// tab's shell dying while hidden), and a shell the restart already
+    /// replaced still lives in the previous frame's element tree for one
+    /// draw, its late exit closing nothing. The LAST pane takes the panel
+    /// with it (the old single-dock behavior).
+    pub(crate) fn close_terminal(&mut self, exited: gpui::EntityId, cx: &mut Context<Self>) {
+        let mut hit = None;
+        for (id, panes) in self.tab_terminals.iter() {
+            if let Some(ix) = panes.iter().position(|d| d.view.entity_id() == exited) {
+                hit = Some((*id, ix));
+                break;
+            }
+        }
+        let Some((id, ix)) = hit else {
+            return;
+        };
+        let emptied = self.tab_terminals.get_mut(&id).is_some_and(|panes| {
+            if ix < panes.len() {
+                panes.remove(ix);
+            }
+            panes.is_empty()
+        });
+        if emptied {
+            self.tab_terminals.remove(&id);
+            self.tab_terminal_open.remove(&id);
+        }
         cx.notify();
     }
 
@@ -1343,33 +1403,54 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.toggle_terminal(cx);
-        // Opening hands the keyboard to the shell at once; closing leaves
-        // the focus where the terminal had it (VS Code's behavior).
+        self.toggle_terminal(window, cx);
+        // Opening hands the keyboard to the shell at once; closing has
+        // already returned the focus to the composer (toggle_terminal).
         if let Some(id) = self.snap.active_tab {
             if let Some(dock) = self
                 .tab_terminals
                 .get(&id)
                 .filter(|_| self.tab_terminal_open.contains(&id))
+                .and_then(|panes| panes.last())
             {
                 window.focus(&dock.focus, cx);
             }
         }
     }
 
-    /// Kill the shell and spawn a fresh one in the CURRENT session's
-    /// workspace — the point of the restart button (a `cd` elsewhere in the
-    /// old shell is not undone, it is abandoned).
-    pub(crate) fn restart_terminal(&mut self, cx: &mut Context<Self>) {
+    /// Kill ONE pane's shell and spawn a fresh one in its place (same
+    /// index, CURRENT session's workspace) — the point of the pane's
+    /// restart button (a `cd` elsewhere in the old shell is not undone, it
+    /// is abandoned).
+    pub(crate) fn restart_terminal(
+        &mut self,
+        pane: gpui::EntityId,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.snap.active_tab else {
             return;
         };
-        if self.tab_terminals.remove(&id).is_some() {
-            self.tab_terminal_open.insert(id);
-            if !cfg!(test) {
-                self.spawn_terminal(cx);
+        let Some(ix) = self
+            .tab_terminals
+            .get(&id)
+            .and_then(|panes| panes.iter().position(|d| d.view.entity_id() == pane))
+        else {
+            return;
+        };
+        let cwd = self.active_workspace();
+        let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
+        match dock {
+            Ok(dock) => {
+                if let Some(panes) = self.tab_terminals.get_mut(&id) {
+                    if ix < panes.len() {
+                        // Replace in place: the assignment drops the old
+                        // dock, which kills its shell.
+                        panes[ix] = dock;
+                    }
+                }
+                cx.notify();
             }
-            cx.notify();
+            Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
         }
     }
 
@@ -1381,7 +1462,7 @@ impl Workbench {
         let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
         match dock {
             Ok(dock) => {
-                self.tab_terminals.insert(id, dock);
+                self.tab_terminals.entry(id).or_default().push(dock);
             }
             Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
         }
@@ -1409,10 +1490,11 @@ impl Workbench {
             return false;
         };
         self.tab_terminal_open.contains(&id)
-            && self
-                .tab_terminals
-                .get(&id)
-                .is_some_and(|dock| window.focused(cx) == Some(dock.focus.clone()))
+            && self.tab_terminals.get(&id).is_some_and(|panes| {
+                panes
+                    .iter()
+                    .any(|dock| window.focused(cx) == Some(dock.focus.clone()))
+            })
     }
 
     /// Rail toggle for the overlay drawer: one slot, so opening a surface
@@ -2628,7 +2710,10 @@ impl Workbench {
                             .size(px(240.))
                             .size_range(px(80.)..px(2000.))
                             .child(terminal_panel::render_terminal_panel(
-                                open_terminal.and_then(|id| self.tab_terminals.get(&id)),
+                                open_terminal
+                                    .and_then(|id| self.tab_terminals.get(&id))
+                                    .map(|panes| panes.as_slice()),
+                                open_terminal,
                                 self.active_workspace()
                                     .as_deref()
                                     .map(crate::file_browser::root_name)
@@ -2804,8 +2889,8 @@ impl Workbench {
             .child(Icon::new(KitIconName::Terminal).size_4().text_color(color))
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
             .test_support()
-            .on_click(move |_, _, cx| {
-                wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
+            .on_click(move |_, window, cx| {
+                wb.update(cx, |wb, cx| wb.toggle_terminal(window, cx));
             })
     }
 
@@ -7964,14 +8049,14 @@ mod ui_tests {
                 window.try_find("terminal-panel").is_none(),
                 "the dock starts hidden"
             );
-            wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
+            wb.update(cx, |wb, cx| wb.toggle_terminal(window, cx));
             window.draw(cx).clear(cx);
             assert!(window.find("terminal-panel").visible());
             assert!(
                 window.find("terminal-placeholder").visible(),
                 "the test build paints the placeholder, not a live shell"
             );
-            wb.update(cx, |wb, cx| wb.toggle_terminal(cx));
+            wb.update(cx, |wb, cx| wb.toggle_terminal(window, cx));
             window.draw(cx).clear(cx);
             assert!(
                 window.try_find("terminal-panel").is_none(),
@@ -8098,6 +8183,157 @@ mod ui_tests {
         });
     }
 
+    /// The split button grows the ACTIVE tab's pane row — real panes even
+    /// under test (split_terminal spawns; only the rail toggle keeps the
+    /// placeholder) — up to the cap. A pane's close takes just that pane;
+    /// the last one takes the panel with it (the exit callback rides the
+    /// same close path).
+    #[gpui_kit::test]
+    fn splitting_the_terminal_adds_side_by_side_panes(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, connected_snapshot(), 1400.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            fn pane_count(wb: &Entity<Workbench>, cx: &mut App) -> usize {
+                wb.update(cx, |wb, _| {
+                    wb.tab_terminals.get(&7).map(|p| p.len()).unwrap_or(0)
+                })
+            }
+            // Open via the rail (test: placeholder), then split — the
+            // button spawns for real.
+            window.click("dock-rail-terminal", cx);
+            window.draw(cx).clear(cx);
+            assert!(window.find("terminal-placeholder").visible());
+            window.click("terminal-split-add", cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                pane_count(&wb, cx),
+                1,
+                "the first split spawns the first pane"
+            );
+            assert!(
+                window.try_find("terminal-placeholder").is_none(),
+                "a real pane replaces the placeholder"
+            );
+            // The second pane shows the per-pane strips.
+            window.click("terminal-split-add", cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(pane_count(&wb, cx), 2);
+            assert!(window.find(("terminal-pane-close", 0usize)).visible());
+            assert!(window.find(("terminal-pane-close", 1usize)).visible());
+            // The cap: a third pane fits, a fourth does not.
+            window.click("terminal-split-add", cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(pane_count(&wb, cx), 3);
+            window.click("terminal-split-add", cx);
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                pane_count(&wb, cx),
+                3,
+                "the row caps at MAX_TERMINAL_PANES"
+            );
+            // Closing one pane keeps the panel and its siblings; closing
+            // them all takes the panel down.
+            let second = wb.update(cx, |wb, _| wb.tab_terminals[&7][1].view.entity_id());
+            wb.update(cx, |wb, cx| wb.close_terminal(second, cx));
+            window.draw(cx).clear(cx);
+            assert_eq!(pane_count(&wb, cx), 2);
+            assert!(window.find("terminal-panel").visible());
+            let all: Vec<_> = wb.update(cx, |wb, _| {
+                wb.tab_terminals[&7]
+                    .iter()
+                    .map(|p| p.view.entity_id())
+                    .collect()
+            });
+            for pane in all {
+                wb.update(cx, |wb, cx| wb.close_terminal(pane, cx));
+            }
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "the last pane takes the panel with it"
+            );
+            assert!(
+                !wb.update(cx, |wb, _| wb.tab_terminal_open.contains(&7)),
+                "and clears the open flag"
+            );
+        })
+        .unwrap();
+    }
+
+    /// ⌃` is a GLOBAL binding (main.rs, no action context): it must toggle
+    /// the terminal no matter what owns the keyboard — from the rail button
+    /// (a generic non-composer focus) AND from INSIDE a focused terminal
+    /// pane, the strictest case (the view writes most keys to its shell).
+    /// The raw dispatch_keystroke keeps the harness's observed-focus guard
+    /// out of the way for the unobserved terminal focus.
+    #[gpui_kit::test]
+    fn ctrl_backquote_toggles_the_terminal_from_any_focus(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+            crate::install_keybindings(cx);
+        });
+        let (handle, _wb, _rt) = cx.update(|cx| open(cx, connected_snapshot(), 1000.));
+        let ctrl_backquote =
+            || gpui_kit::Keystroke::parse("ctrl-`").expect("the binding's own spelling parses");
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            // Focus 1: the rail button (a non-composer focus path).
+            window.click("dock-rail-terminal", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("terminal-panel").visible(),
+                "the rail click opens the terminal"
+            );
+            window.press("ctrl-`", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "⌃` closes the terminal from a non-composer focus"
+            );
+            // Focus 2: a REAL pane's shell view — the deepest focus there
+            // is, and the one whose on_key_down writes to the PTY.
+            _wb.update(cx, |wb, cx| {
+                let dock = crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx)
+                    .expect("spawn");
+                wb.tab_terminals.insert(7, vec![dock]);
+                wb.tab_terminal_open.insert(7);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            let focus = _wb.update(cx, |wb, cx| {
+                wb.tab_terminals[&7][0].focus.clone()
+            });
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("terminal-panel").visible(),
+                "⌃` reopened the terminal while focus sat in the composer"
+            );
+            window.dispatch_keystroke(ctrl_backquote(), cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "⌃` closes the terminal even while the shell view owns focus"
+            );
+            // The close returned focus to the composer — the reopen must
+            // work from there too (the lingering-hidden-focus trap).
+            window.dispatch_keystroke(ctrl_backquote(), cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("terminal-panel").visible(),
+                "⌃` reopens after the close returned focus to the composer"
+            );
+        })
+        .unwrap();
+    }
+
     /// A REAL dock (live PTY and view, not the test placeholder) must fit
     /// its grid to the panel it sits in: the panel root carries `flex_1`
     /// because the resizable panel's root is a ROW-direction flex box — a
@@ -8117,7 +8353,7 @@ mod ui_tests {
             wb.update(cx, |wb, cx| {
                 let dock =
                     crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx).expect("spawn");
-                wb.tab_terminals.insert(7, dock);
+                wb.tab_terminals.insert(7, vec![dock]);
                 wb.tab_terminal_open.insert(7);
                 cx.notify();
             });
@@ -8126,12 +8362,13 @@ mod ui_tests {
             let panel = window.find("terminal-panel");
             let panel_w = f32::from(panel.bounds().size.width);
             let (cols, rows) = wb.update(cx, |wb, cx| {
-                wb.tab_terminals
+                let pane = wb
+                    .tab_terminals
                     .get(&7)
                     .expect("the dock stays mounted")
-                    .view
-                    .read(cx)
-                    .dimensions()
+                    .first()
+                    .expect("the tab keeps its pane");
+                pane.view.read(cx).dimensions()
             });
             // 1400px window minus the ~280px dock + rail leaves the chat
             // column ~1080px wide — far more than the 80-column default.

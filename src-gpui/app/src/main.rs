@@ -137,6 +137,36 @@ fn muted_chat_syntax() -> SyntaxColors {
     serde_json::from_str(MUTED_CHAT_SYNTAX).expect("the muted chat palette is static JSON")
 }
 
+/// The workbench's global key bindings. App bootstrap registers them; the
+/// ui_tests register the same set so focus-path behavior (⌃` from ANY
+/// focus, not only the composer's) is testable headlessly.
+fn install_keybindings(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-q", QuitApp, None),
+        KeyBinding::new("ctrl-q", QuitApp, None),
+        // The basic desktop shortcuts (requirements §4): ⌘K focuses
+        // the sessions panel's search field; ⌘1..9 select the tab
+        // strip's nth tab; Esc stops the running turn (ChatView's
+        // Cancel — the workbench also closes the new-session sheet
+        // with it first). (Enter-send lives in the composer.)
+        KeyBinding::new("cmd-k", FocusSessionSearch, None),
+        KeyBinding::new("ctrl-k", FocusSessionSearch, None),
+        KeyBinding::new("escape", StopTurn, None),
+        // The embedded terminal dock (⌃` — VS Code's binding; ⌘`
+        // is macOS window cycling).
+        KeyBinding::new("ctrl-`", ToggleTerminal, None),
+        KeyBinding::new("cmd-1", SelectTab1, None),
+        KeyBinding::new("cmd-2", SelectTab2, None),
+        KeyBinding::new("cmd-3", SelectTab3, None),
+        KeyBinding::new("cmd-4", SelectTab4, None),
+        KeyBinding::new("cmd-5", SelectTab5, None),
+        KeyBinding::new("cmd-6", SelectTab6, None),
+        KeyBinding::new("cmd-7", SelectTab7, None),
+        KeyBinding::new("cmd-8", SelectTab8, None),
+        KeyBinding::new("cmd-9", SelectTab9, None),
+    ]);
+}
+
 fn main() {
     // Full Lucide catalog: the composer's attachment controls (ImagePlus)
     // live outside the default icon subset.
@@ -166,30 +196,7 @@ fn main() {
             // handles through the quit guard. The menu item gives macOS its
             // conventional application-menu Quit (key equivalent derived
             // from the binding).
-            cx.bind_keys([
-                KeyBinding::new("cmd-q", QuitApp, None),
-                KeyBinding::new("ctrl-q", QuitApp, None),
-                // The basic desktop shortcuts (requirements §4): ⌘K focuses
-                // the sessions panel's search field; ⌘1..9 select the tab
-                // strip's nth tab; Esc stops the running turn (ChatView's
-                // Cancel — the workbench also closes the new-session sheet
-                // with it first). (Enter-send lives in the composer.)
-                KeyBinding::new("cmd-k", FocusSessionSearch, None),
-                KeyBinding::new("ctrl-k", FocusSessionSearch, None),
-                KeyBinding::new("escape", StopTurn, None),
-                // The embedded terminal dock (⌃` — VS Code's binding; ⌘`
-                // is macOS window cycling).
-                KeyBinding::new("ctrl-`", ToggleTerminal, None),
-                KeyBinding::new("cmd-1", SelectTab1, None),
-                KeyBinding::new("cmd-2", SelectTab2, None),
-                KeyBinding::new("cmd-3", SelectTab3, None),
-                KeyBinding::new("cmd-4", SelectTab4, None),
-                KeyBinding::new("cmd-5", SelectTab5, None),
-                KeyBinding::new("cmd-6", SelectTab6, None),
-                KeyBinding::new("cmd-7", SelectTab7, None),
-                KeyBinding::new("cmd-8", SelectTab8, None),
-                KeyBinding::new("cmd-9", SelectTab9, None),
-            ]);
+            install_keybindings(cx);
             cx.set_menus(vec![
                 Menu::new("ZCode ACP").items([MenuItem::action("Quit ZCode ACP", QuitApp)])
             ]);
