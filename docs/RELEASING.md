@@ -1,8 +1,10 @@
 # Releasing
 
-The two product lines release differently: the Android/Web line publishes a
-signed APK to GitHub Releases from the maintainer's machine, while the desktop
-workbench is a local unsigned build with no artifact channel.
+A release publishes exactly one artifact: the signed Android APK, built on
+the maintainer's machine and attached to a GitHub Release. The desktop
+workbench is a local unsigned build with no artifact channel, and the web SPA
+is never deployed by this project — there is no hosted instance and no CI
+deploy; anyone who wants the web build hosts it themselves (see the README).
 
 ## Desktop workbench
 
@@ -14,12 +16,13 @@ lines never report different numbers. There is no tag, no upload, and no
 signing: the bundle runs on the build machine and needs a one-time
 right-click → Open elsewhere.
 
-## Android / Web
+## Android
 
 Manual and local-first: release APKs are built on the maintainer's machine
 (the Android signing key lives in gitignored `.signing/`), and
 `scripts/release.sh` turns a version number into a tag, a push and a GitHub
-Release carrying the APK. There is no CI release pipeline.
+Release carrying the APK. There is no CI pipeline of any kind — neither for
+the release nor for deploying the web bundle.
 
 ## Versioning
 
