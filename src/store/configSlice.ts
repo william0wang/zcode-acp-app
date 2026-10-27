@@ -289,9 +289,26 @@ export const configSliceState: ConfigSliceState = {
  * (dropped response, double tap) answers the same outcome instead of burning a
  * second card. Generate it ONCE per user gesture and reuse it on every retry —
  * a fresh key per attempt is exactly what defeats the protection.
+ *
+ * The backend contract fixes the shape at a UUID and refuses anything else as
+ * coding_plan_reset_api_error:3001. Minted from getRandomValues (unlike
+ * randomUUID it also exists in plain-http browser contexts); Math.random is
+ * the last-ditch fallback.
  */
 function newIdempotencyKey(): string {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  const bytes = new Uint8Array(16);
+  if (typeof crypto !== "undefined" && typeof crypto.getRandomValues === "function") {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) {
+      bytes[i] = Math.floor(Math.random() * 256);
+    }
+  }
+  // Version 4, RFC 4122 variant.
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 /**

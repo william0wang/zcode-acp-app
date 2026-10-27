@@ -54,7 +54,7 @@ use protocol::clock::{Clock, TokioClock};
 use protocol::config_decode::ModelsPayload;
 use protocol::config_store::{
     NOTICE_NEEDS_RESTART, NOTICE_RESET_SPEND_FAILED, NOTICE_RESET_SPENT, NOTICE_RESET_STALE,
-    NOTICE_RESTARTED, NOTICE_RESTART_FAILED,
+    NOTICE_RESTARTED, NOTICE_RESTART_FAILED, new_idempotency_key,
 };
 use protocol::quota::{AccountUsageStats, QuotaItem};
 use protocol::settings::{
@@ -5573,7 +5573,7 @@ impl Driver {
                 // Minted HERE, with the nonce it belongs to, so a spend's
                 // every retry sends the same key (a fresh key per attempt
                 // defeats the backend's dedupe and can burn a second card).
-                self.quota.idempotency_key = Some(new_reset_idempotency_key());
+                self.quota.idempotency_key = Some(new_idempotency_key());
                 // The unread-badge clear (QuotaPage's mount effect): purely
                 // cosmetic, then the reload clears the flag; a failure is
                 // not worth a toast.
@@ -5635,7 +5635,7 @@ impl Driver {
             .quota
             .idempotency_key
             .clone()
-            .unwrap_or_else(new_reset_idempotency_key);
+            .unwrap_or_else(new_idempotency_key);
         let hub = self.settings_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
@@ -9223,35 +9223,6 @@ fn models_signature(payload: &ModelsPayload) -> u64 {
 // ---------------------------------------------------------------------------
 // Plan-quota helpers
 // ---------------------------------------------------------------------------
-
-/// Idempotency key for one reset-card GESTURE (the configSlice mint): a
-/// spent card is gone, so the backend keys the spend on this value — one
-/// key per gesture, reused on every retry. Same base36 shape as the TS
-/// mint; the entropy source is a process-wide sequence, which is uniqueness
-/// enough for keys that live between two calls.
-fn new_reset_idempotency_key() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{}-{}", to_base36(now.as_millis() as u64), to_base36(seq))
-}
-
-fn to_base36(mut value: u64) -> String {
-    if value == 0 {
-        return "0".to_string();
-    }
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut out = Vec::new();
-    while value > 0 {
-        out.push(DIGITS[(value % 36) as usize]);
-        value /= 36;
-    }
-    out.reverse();
-    String::from_utf8(out).expect("base36 digits are ascii")
-}
 
 /// FNV-1a fold of a serialized payload — the fingerprint's content
 /// signature for the quota section.

@@ -16,6 +16,8 @@
 //! config state (capability verdict, payloads, reset-card session,
 //! pending-restart flag) is re-probed on the next hub, never carried over.
 
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -188,30 +190,45 @@ impl ConfigState {
 /// the backend keys a spend on this value: a retry (dropped response,
 /// double tap) answers the same outcome instead of burning a second card.
 /// Generated ONCE per gesture and reused on every retry.
-fn new_idempotency_key() -> String {
+///
+/// The backend contract fixes the shape at a UUID and refuses anything
+/// else as code 3001 (parameter error), so the key is minted as
+/// RFC 4122 v4.
+pub fn new_idempotency_key() -> String {
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    // Same shape as the TS mint (base36 timestamp + entropy); the entropy
-    // source here is a process-wide sequence, which is uniqueness enough
-    // for keys that live between two calls.
-    format!("{}-{}", to_base36(now.as_millis() as u64), to_base36(seq))
-}
-
-fn to_base36(mut value: u64) -> String {
-    if value == 0 {
-        return "0".to_string();
-    }
-    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
-    let mut out = Vec::new();
-    while value > 0 {
-        out.push(DIGITS[(value % 36) as usize]);
-        value /= 36;
-    }
-    out.reverse();
-    String::from_utf8(out).expect("base36 digits are ascii")
+    // RandomState seeds from the OS once per thread; hashing the clock and
+    // the sequence through two fresh hashers (input order swapped) fills
+    // the 16 bytes without pulling an RNG crate into the pure-logic layer.
+    let seeded = |swap: bool| {
+        let mut hasher = RandomState::new().build_hasher();
+        if swap {
+            seq.hash(&mut hasher);
+            now.as_nanos().hash(&mut hasher);
+        } else {
+            now.as_nanos().hash(&mut hasher);
+            seq.hash(&mut hasher);
+        }
+        hasher.finish()
+    };
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&seeded(false).to_be_bytes());
+    bytes[8..].copy_from_slice(&seeded(true).to_be_bytes());
+    // Version 4, RFC 4122 variant.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
 }
 
 /// The configuration store over a shared Settings API client. Actions
