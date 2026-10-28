@@ -122,7 +122,17 @@ impl WsFactory for TungsteniteWsFactory {
 
             use futures_util::{SinkExt, StreamExt};
             let (mut sink, mut stream) = socket.split();
-            let (out_tx, mut out_rx) = mpsc::channel::<String>(64);
+            // UNBOUNDED on purpose. `WsStream::send` is sync fire-and-forget
+            // with browser-WS semantics (a browser `send` never drops), and a
+            // bounded feed here silently dropped the frame that overflowed it:
+            // while the writer stalled on a slow link (a base64-image prompt
+            // backpressures the socket for seconds), the 65th queued frame —
+            // a `session/cancel` is exactly that frame — vanished, which read
+            // on screen as "stop sometimes does nothing" (observed 2026-10-28,
+            // the same incident class the reader feed fixed 2026-10-21). Only
+            // user-initiated frames enter this feed, so the buffer stays tiny;
+            // the writer drains it at socket speed.
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
             let (close_tx, mut close_rx) = tokio::sync::watch::channel(false);
             let (event_tx, event_rx) = mpsc::channel::<WsEvent>(64);
 
@@ -205,13 +215,13 @@ impl WsFactory for TungsteniteWsFactory {
 }
 
 struct TungsteniteWsHandle {
-    out_tx: mpsc::Sender<String>,
+    out_tx: mpsc::UnboundedSender<String>,
     close_tx: tokio::sync::watch::Sender<bool>,
 }
 
 impl WsStream for TungsteniteWsHandle {
     fn send(&self, text: &str) {
-        let _ = self.out_tx.try_send(text.to_string());
+        let _ = self.out_tx.send(text.to_string());
     }
 
     fn close(&self) {
@@ -473,5 +483,57 @@ mod tests {
             events.try_recv().is_err() || matches!(events.try_recv(), Ok(WsEvent::Closed)),
             "no unexpected frame after the burst"
         );
+    }
+
+    /// Regression (found live, 2026-10-28 — "stop sometimes does nothing"):
+    /// the outbound feed used a bounded 64-slot channel with `try_send`, so a
+    /// frame queued while the writer was stalled on a slow link was silently
+    /// dropped — a `session/cancel` queued behind a big draining prompt
+    /// vanished and the turn kept running. The browser WS the TS client rides
+    /// buffers sends instead, which is why the phone stopped the same turn
+    /// fine. Every queued frame must survive however far past the old
+    /// capacity the burst runs.
+    #[tokio::test]
+    async fn real_factory_outlives_a_send_burst_the_server_wont_read_yet() {
+        use futures_util::StreamExt;
+        const FRAMES: usize = 300; // > the old 64-slot outbound feed
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        // Server: handshake, then stall without reading while the client
+        // queues its burst, and only then drain — the stalled-writer window
+        // the old bounded feed dropped frames in.
+        tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let mut seen = 0;
+            while seen < FRAMES {
+                match ws.next().await {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        assert_eq!(text, format!(r#"{{"n":{seen}}}"#), "frame {seen} lost/reordered");
+                        seen += 1;
+                    }
+                    _ => break,
+                }
+            }
+            assert_eq!(seen, FRAMES, "the server never saw the whole burst");
+            while ws.next().await.is_some() {}
+        });
+
+        let factory = TungsteniteWsFactory;
+        let (stream, mut events) = factory
+            .connect(&format!("ws://127.0.0.1:{port}/acp?instance=i1"), "tok")
+            .await
+            .expect("handshake");
+        assert_eq!(events.recv().await, Some(WsEvent::Open));
+
+        for i in 0..FRAMES {
+            stream.send(&format!(r#"{{"n":{i}}}"#));
+        }
+        stream.close();
+        // The writer must deliver the queued burst; Closed ends the feed.
+        assert_eq!(events.recv().await, Some(WsEvent::Closed));
     }
 }
