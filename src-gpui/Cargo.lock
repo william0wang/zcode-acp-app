@@ -214,7 +214,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app"
-version = "0.34.1"
+version = "0.35.0"
 dependencies = [
  "gpui-kit",
  "gpui-terminal",
@@ -5416,7 +5416,7 @@ dependencies = [
 
 [[package]]
 name = "protocol"
-version = "0.34.1"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
