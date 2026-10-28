@@ -54,7 +54,8 @@
 //!    (types.ts:118). Server ALSO answers "fingerprint"
 //!    (hub-server.ts:1098-1103 — the content-fingerprint check runs FIRST).
 //!    Rust: 4-value enum `UpgradeReason` (fixtures/upgrade.json pins
-//!    "fingerprint").
+//!    "fingerprint"; upgrade-up-to-date.json pins the hyphenated "up-to-date"
+//!    — the COMMON answer a plain lowercase rename would reject).
 //! 2. `QuotaItem.leftPercent` — TS lacks the field (types.ts:165-173);
 //!    server always sends it (quota/types.ts:46). Rust adds it, optional so
 //!    older-hub payloads still decode (fixtures/quota.json carries it).
@@ -299,6 +300,15 @@ fn projects_sessions_round_trip() {
 fn upgrade_round_trip() {
     // Divergence #1: reason "fingerprint" exists only on the server side.
     assert_round_trip::<HubUpgradeResult>("upgrade.json");
+}
+
+/// The COMMON verdict (nothing newer on disk): the server hyphenates
+/// "up-to-date", so this fixture pins the spelling a plain lowercase enum
+/// rename would reject — the desktop's upgrade check errored on every
+/// up-to-date hub before the explicit `rename`.
+#[test]
+fn upgrade_up_to_date_round_trip() {
+    assert_round_trip::<HubUpgradeResult>("upgrade-up-to-date.json");
 }
 
 #[test]

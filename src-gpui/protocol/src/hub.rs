@@ -258,13 +258,17 @@ pub struct SavedServer {
 /// Divergence note (server wins): the TS type lists only
 /// "version" | "mtime" | "up-to-date", but the server also answers
 /// "fingerprint" (hub-server.ts `diskCodeIsNewer`) when a content-fingerprint
-/// mismatch is detected. All four spellings are modeled here.
+/// mismatch is detected. All four spellings are modeled here — note the
+/// hyphenated "up-to-date": `rename_all = "lowercase"` would yield
+/// "uptodate" and reject the COMMON answer (nothing newer on disk),
+/// erroring the whole upgrade check on every up-to-date hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpgradeReason {
     Fingerprint,
     Version,
     Mtime,
+    #[serde(rename = "up-to-date")]
     UpToDate,
 }
 
