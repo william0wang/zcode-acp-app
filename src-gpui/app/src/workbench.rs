@@ -2362,17 +2362,21 @@ impl Workbench {
         };
 
         // Left cluster (batch U — user: "the left side carried nothing
-        // actionable"): the bridge's version while connected (the phase label
-        // only while there is no bridge to name), the running-session count
+        // actionable"): the hub's version while connected (the phase label
+        // only while there is no hub to name), the running-session count
         // (the quit guard's number) or the active turn, then any transient
         // note. The hub address left the bar — it lives in the settings
-        // drawer's server book, where it can be acted on.
-        let bridge = self
-            .tab
-            .as_ref()
-            .and_then(|t| t.agent_version.as_deref())
+        // drawer's server book, where it can be acted on. The number is the
+        // HUB's, not the active tab's bridge: bridges outlive a hub
+        // self-upgrade (they re-register by heartbeat), so a tab-scoped
+        // version read stale right after an upgrade and swapped per tab —
+        // a global bar wants a global number (user, 2026-10-28).
+        let hub = self
+            .snap
+            .hub_version
+            .as_deref()
             .filter(|_| matches!(self.snap.phase, Phase::Connected))
-            .map(|agent| format!("bridge {agent}"));
+            .map(|v| format!("hub {v}"));
         let activity = if self.snap.running_session_count > 0 {
             Some(format!(
                 "{} session{} running",
@@ -2411,13 +2415,13 @@ impl Workbench {
                     .min_w_0()
                     .child(
                         div()
-                            .id("status-bridge")
+                            .id("status-hub")
                             .test_support()
                             .min_w_0()
                             .truncate()
                             .text_size(ui_text(11.))
                             .text_color(theme.foreground)
-                            .child(bridge.unwrap_or_else(|| label.to_string())),
+                            .child(hub.unwrap_or_else(|| label.to_string())),
                     )
                     .when_some(activity, |this, text| {
                         this.child(
@@ -7974,6 +7978,7 @@ mod ui_tests {
     fn connected_snapshot() -> WorkbenchSnapshot {
         let mut snap = WorkbenchSnapshot::initial();
         snap.phase = Phase::Connected;
+        snap.hub_version = Some("0.78.0".to_string());
         snap.tabs = vec![TabSummary {
             id: 7,
             session_id: Some("sess_1".to_string()),
@@ -8789,7 +8794,7 @@ mod ui_tests {
 
     /// The quota line takes the width the left cluster leaves free instead
     /// of clipping at a fixed cap — and still stops at 60% of the bar, so
-    /// an absurd line cannot squeeze the bridge label out.
+    /// an absurd line cannot squeeze the hub label out.
     #[gpui_kit::test]
     fn status_bar_quota_line_uses_the_free_width(cx: &mut TestAppContext) {
         let _windows = super::window_test_lock();
@@ -8810,7 +8815,7 @@ mod ui_tests {
                 "a long line must run past the old 340px cap, got {:?}",
                 dock.size.width
             );
-            assert!(window.find("status-bridge").visible());
+            assert!(window.find("status-hub").visible());
         })
         .unwrap();
 
@@ -8825,11 +8830,8 @@ mod ui_tests {
                 "the line must stop at 60% of the bar, got {:?}",
                 dock.size.width
             );
-            let bridge = window.find("status-bridge").bounds();
-            assert!(
-                bridge.right() <= dock.left(),
-                "the bridge label keeps its place"
-            );
+            let hub = window.find("status-hub").bounds();
+            assert!(hub.right() <= dock.left(), "the hub label keeps its place");
         })
         .unwrap();
     }
@@ -9066,7 +9068,6 @@ mod ui_tests {
         let mut snap = connected_snapshot();
         let mut active = crate::runtime::TabView {
             session_id: Some("sess_1".to_string()),
-            agent_version: None,
             phase: TabPhase::Connected,
             running: false,
             loading_session: false,

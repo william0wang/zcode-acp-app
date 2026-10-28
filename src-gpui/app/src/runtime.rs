@@ -902,7 +902,6 @@ pub struct FsBrowseView {
 #[derive(Debug, Clone)]
 pub struct TabView {
     pub session_id: Option<String>,
-    pub agent_version: Option<String>,
     pub phase: TabPhase,
     pub running: bool,
     pub loading_session: bool,
@@ -1356,6 +1355,10 @@ pub struct WorkbenchSnapshot {
     /// The hub's preformatted quota dock line (ADR-0021) — the top status
     /// bar's rightmost segment. `None` = no quota data (hide, not an error).
     pub quota_dock: Option<String>,
+    /// The hub's own version (`/api/system-stats` `hub.version`) — the
+    /// status bar's global `hub {version}` chip. `None` hides it (no read
+    /// yet, or a hub predating the route).
+    pub hub_version: Option<String>,
     /// Config-screen notice (TS `notice`): a `notice.*` i18n key or plain
     /// failure text, rendered by every config page's frame.
     pub config_notice: Option<String>,
@@ -1438,6 +1441,7 @@ impl WorkbenchSnapshot {
             hub_upgrade_busy: false,
             hub_upgrade_note: None,
             quota_dock: None,
+            hub_version: None,
         }
     }
 }
@@ -1574,6 +1578,9 @@ enum LoopEvent {
     },
     // ---- config pages (no tab) ----
     SystemStats(Result<SystemStatsResponse, HubApiError>),
+    /// The status bar's hub-version read (same route as `SystemStats`,
+    /// fired once per connect cycle instead of polled).
+    HubVersion(Result<SystemStatsResponse, HubApiError>),
     BackendRestart(Result<BackendRestartResult, HubApiError>),
     /// The /settings/all capability probe settled (the verdict half of TS
     /// `loadConfigAll`).
@@ -1949,8 +1956,6 @@ struct Tab {
     responders: HashMap<u64, ServerResponder>,
     conn: Option<AcpConnection>,
     state: TabPhase,
-    /// The bridge's advertised agent version (status bar parity with M1).
-    agent_version: Option<String>,
     /// Epoch-ms when a Reconnecting tab reconnects.
     retry_at: Option<u64>,
     /// Consecutive failed reconnect attempts; drives the exponential backoff
@@ -2607,6 +2612,12 @@ struct Driver {
     /// switch so a dock read minted for the OLD hub drops on arrival instead
     /// of painting the wrong account's line over the new hub's.
     quota_dock_gen: u64,
+    /// The hub's own version (`/api/system-stats` `hub.version`) — the status
+    /// bar's global chip. Refetched on every (re)connect: a hub self-upgrade
+    /// restarts the hub (phase dips to Reconnecting and climbs back), so the
+    /// chip follows upgrades without a poll. A failed read keeps the last
+    /// value; hubs predating the route never set it.
+    hub_version: Option<String>,
     /// The Usage config page (see [`UsagePanel`]).
     usage: UsagePanel,
     /// The six ZCode-config section pages (batch I, see
@@ -2704,6 +2715,7 @@ impl Driver {
             quota_dock: None,
             quota_dock_loading: false,
             quota_dock_gen: 0,
+            hub_version: None,
             usage: UsagePanel::new(),
             sections: Default::default(),
             update_channel: crate::ui_prefs::load_update_channel()
@@ -2781,7 +2793,6 @@ impl Driver {
             responders: HashMap::new(),
             conn: None,
             state: TabPhase::Connecting,
-            agent_version: None,
             retry_at: None,
             reconnect_attempts: 0,
             reincubated_at: None,
@@ -3042,6 +3053,10 @@ impl Driver {
                 self.discovery_probe = false;
                 if self.phase == Phase::Discovering || self.phase == Phase::Reconnecting {
                     self.phase = Phase::Connected;
+                    // Fresh connect cycle — the one moment the hub's version
+                    // may have changed (a self-upgrade restarts the hub and
+                    // drops every socket through here).
+                    self.spawn_hub_version();
                 }
                 // The hub just answered — seed the status bar's quota dock
                 // line. Refires on later ticks only while nothing has landed
@@ -3522,6 +3537,26 @@ impl Driver {
         });
     }
 
+    /// One `/api/system-stats` read for the status bar's global version chip.
+    /// Fired only on the Discovering/Reconnecting → Connected transition —
+    /// exactly the moments the hub's version may have changed — so there is
+    /// no poll and no dedup state.
+    fn spawn_hub_version(&mut self) {
+        let hub = self.hub_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(LoopEvent::HubVersion(hub.system_stats().await));
+        });
+    }
+
+    /// The version read landed: Ok replaces the chip's number; any failure
+    /// keeps the last one (a 404 hub predates the route and never sets it).
+    fn on_hub_version(&mut self, result: Result<SystemStatsResponse, HubApiError>) {
+        if let Ok(stats) = result {
+            self.hub_version = Some(stats.hub.version);
+        }
+    }
+
     /// The read landed (TS loadSystemStats's error doctrine): success
     /// replaces the snapshot; a 404 retires THIS page alone; anything else
     /// is a blip that keeps the last snapshot, except the FIRST load of a
@@ -3530,6 +3565,9 @@ impl Driver {
         self.system.loading = false;
         match result {
             Ok(stats) => {
+                // The page's 5s poll keeps the status-bar chip fresh for free
+                // while it is open.
+                self.hub_version = Some(stats.hub.version.clone());
                 self.system.stats = Some(stats);
                 self.system.error = None;
             }
@@ -6542,6 +6580,7 @@ impl Driver {
             }
             // ---- config pages ----
             LoopEvent::SystemStats(result) => self.on_system_stats(result),
+            LoopEvent::HubVersion(result) => self.on_hub_version(result),
             LoopEvent::BackendRestart(result) => self.on_backend_restart(result),
             LoopEvent::ConfigProbe(result) => self.on_config_probe(result),
             LoopEvent::ModelsLoaded(result) => self.on_models_loaded(result),
@@ -6712,7 +6751,6 @@ impl Driver {
                         init.agent_version().unwrap_or("<unknown>")
                     );
                     t.core.on_initialize(init.agent_version());
-                    t.agent_version = init.agent_version().map(str::to_string);
                     t.fs_capable = init.fs_capability();
                     t.core.conn_open = true;
                     t.reconnect_attempts = 0;
@@ -8188,7 +8226,6 @@ impl Driver {
             .unwrap_or_default();
         TabView {
             session_id: tab.core.active_session_id.clone(),
-            agent_version: tab.agent_version(),
             phase: tab.state.clone(),
             running: tab.core.is_running,
             loading_session: tab.core.loading_session,
@@ -8559,6 +8596,11 @@ impl Driver {
             self.quota_dock.as_ref().map(|n| fold_str(n)).unwrap_or(u64::MAX),
             &mut sig,
         );
+        // The status bar's global hub-version chip.
+        mix(
+            self.hub_version.as_ref().map(|n| fold_str(n)).unwrap_or(u64::MAX),
+            &mut sig,
+        );
         mix(self.hub_upgrade_busy as u64, &mut sig);
         mix(
             self.hub_upgrade_note
@@ -8924,6 +8966,7 @@ impl Driver {
                 usage_stats_at: self.quota.usage_stats_at,
             },
             quota_dock: self.quota_dock.clone(),
+            hub_version: self.hub_version.clone(),
             config_notice: self.config_notice.clone(),
             pending_restart: self.pending_restart,
             model_tests: self.model_tests.clone(),
@@ -9002,14 +9045,6 @@ impl Driver {
             hub_upgrade_busy: self.hub_upgrade_busy,
             hub_upgrade_note: self.hub_upgrade_note.clone(),
         }));
-    }
-}
-
-impl Tab {
-    fn agent_version(&self) -> Option<String> {
-        // The core learns it per (re)connect through on_initialize; keep the
-        // snapshot field for the status bar parity with M1.
-        self.agent_version.clone()
     }
 }
 
@@ -9376,6 +9411,10 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         d.quota_dock = None;
         d.quota_dock_loading = false;
         d.quota_dock_gen += 1;
+        // The version chip names the OLD hub; the next hub's connect cycle
+        // re-reads it (a stale read in flight has nowhere to land — the
+        // handler only ever sets, and the next spawn re-reads anyway).
+        d.hub_version = None;
         // Session Files belong to a (hub, instance, session) triple — a new
         // lifecycle means a new machine's paths; nothing survives.
         d.files.reset();
@@ -10479,6 +10518,59 @@ mod tests {
         assert!(
             d.quota_dock_loading,
             "a quota refresh must also kick the dock line read"
+        );
+    }
+
+    /// The status bar's version chip is the HUB's number, not the active
+    /// tab's bridge (user, 2026-10-28: "the top-left is global"): bridges
+    /// outlive a hub self-upgrade, so a tab-scoped version read 0.76.3
+    /// after the hub had restarted onto 0.78.0, and swapped per tab. A
+    /// successful read sets it, a failure keeps the resident number (the
+    /// restart window answers nothing), and the System Status page's poll
+    /// feeds the same slot.
+    #[test]
+    fn hub_version_chip_follows_reads_and_stays_put_on_failure() {
+        let stats = |version: &str| {
+            serde_json::from_value::<protocol::system_stats::SystemStatsResponse>(
+                serde_json::json!({
+                    "collectedAt": 1,
+                    "host": { "hostname": "hub-host" },
+                    "uptimeS": 2,
+                    "cpu": { "cores": 8, "loadAvg": [0.0, 0.0, 0.0] },
+                    "memory": { "totalBytes": 1 },
+                    "storage": {},
+                    "battery": { "present": false },
+                    "power": { "sleepHolders": [] },
+                    "network": { "addresses": [] },
+                    "processes": { "hub": { "pid": 1, "rssBytes": 1 }, "bridges": [] },
+                    "hub": { "version": version, "uptimeS": 9, "instances": 1 }
+                }),
+            )
+            .unwrap()
+        };
+        let mut d = driver();
+        assert_eq!(d.hub_version, None, "hidden until the first read lands");
+        d.on_hub_version(Ok(stats("0.76.3")));
+        assert_eq!(d.hub_version.as_deref(), Some("0.76.3"));
+        // The reconnect cycle after a self-upgrade re-reads the new hub.
+        d.on_hub_version(Ok(stats("0.78.0")));
+        assert_eq!(d.hub_version.as_deref(), Some("0.78.0"));
+        d.on_hub_version(Err(HubApiError {
+            message: "hub restarting".to_string(),
+            status: None,
+            network: true,
+            instance_dead: false,
+        }));
+        assert_eq!(
+            d.hub_version.as_deref(),
+            Some("0.78.0"),
+            "a failed read keeps the resident number"
+        );
+        d.on_system_stats(Ok(stats("0.79.0")));
+        assert_eq!(
+            d.hub_version.as_deref(),
+            Some("0.79.0"),
+            "the System Status poll refreshes the chip too"
         );
     }
 
