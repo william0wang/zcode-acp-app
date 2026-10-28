@@ -36,6 +36,11 @@ export interface AcpHandlers {
   // directory watch fired — a workflow was saved/deleted/moved by any means
   // on the connected instance.
   onWorkflowListChanged?: () => void;
+  // Bridge extension `$/zcode/session_closed` (ADR-0006): another client
+  // retired this conversation through the hub (one copy per session alias
+  // reaches every attached socket). The receiver retires it locally the
+  // same way its own close would — never a resume.
+  onSessionClosed?: (sessionId: string) => void;
 }
 
 interface PendingEntry {
@@ -236,6 +241,9 @@ export class AcpConnection {
         }
       } else if (msg.method === "$/zcode/workflowListChanged") {
         this.handlers.onWorkflowListChanged?.();
+      } else if (msg.method === "$/zcode/session_closed") {
+        const sid = (msg.params as { sessionId?: unknown } | undefined)?.sessionId;
+        if (typeof sid === "string" && sid) this.handlers.onSessionClosed?.(sid);
       } else if (msg.method === "$/cancel_request") {
         const id = (msg.params as { id?: number } | undefined)?.id;
         if (typeof id === "number") this.handlers.onCancelRequest(id);

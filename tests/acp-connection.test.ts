@@ -151,6 +151,24 @@ test("$/cancel_request routes to onCancelRequest", async () => {
   expect(h.onCancelRequest).toHaveBeenCalledWith(9);
 });
 
+test("$/zcode/session_closed routes the sid to onSessionClosed; a malformed copy is dropped", async () => {
+  // The bridge's cross-client retirement broadcast (ADR-0006): one copy per
+  // session alias reaches every attached socket. The handler is optional —
+  // a connection built without one must not throw on the frame.
+  const { h, ws } = await opened();
+  const onSessionClosed = vi.fn();
+  (h as Record<string, unknown>).onSessionClosed = onSessionClosed;
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/session_closed",
+    params: { sessionId: "sess_gone" },
+  });
+  expect(onSessionClosed).toHaveBeenCalledWith("sess_gone");
+  ws.server({ jsonrpc: "2.0", method: "$/zcode/session_closed", params: {} });
+  ws.server({ jsonrpc: "2.0", method: "$/zcode/session_closed", params: { sessionId: "" } });
+  expect(onSessionClosed).toHaveBeenCalledTimes(1);
+});
+
 test("session/update forwards the update and the notification-level _meta", async () => {
   const { h, ws } = await opened();
   ws.server({

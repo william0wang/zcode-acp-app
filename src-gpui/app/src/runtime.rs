@@ -2878,16 +2878,19 @@ impl Driver {
     /// Re-incubate a dead tab's backend (POST /api/instances, the resume
     /// form): the desktop-stamped call reuses the workspace's live serve
     /// bridge or headless-spawns one (server ADR-0010 amendment), and
-    /// [`LoopEvent::TabReincubated`] re-points the tab at the answer.
+    /// [`LoopEvent::TabReincubated`] re-points the tab at the answer. A
+    /// session-bearing revive rides `intent: "auto"` — the hub's close
+    /// tombstone may answer 409 (session closed remotely).
     fn spawn_reincubate(&mut self, tab: u64, workspace_path: String, session_id: Option<String>) {
         let hub = self.hub_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
             // No client-side deadline: incubation is slow by design (the
             // resume flow's contract).
-            let result = hub
-                .create_instance(&workspace_path, session_id.as_deref())
-                .await;
+            let result = match session_id.as_deref() {
+                Some(sid) => hub.reincubate_instance(&workspace_path, sid).await,
+                None => hub.create_instance(&workspace_path, None).await,
+            };
             let _ = tx.send(LoopEvent::TabReincubated { tab, result });
         });
     }
@@ -6013,6 +6016,31 @@ impl Driver {
                         self.spawn_connect(tab);
                     }
                 }
+                Err(e) if e.session_closed() => {
+                    // The hub's remote-close tombstone refused the ladder's
+                    // auto resume: this session was closed from another
+                    // surface and the broadcast missed us (or raced the
+                    // ladder). Retire exactly like the broadcast path — tab,
+                    // row, tombstone — instead of parking in Failed, which
+                    // the user would have to dismiss for a close they made
+                    // elsewhere.
+                    let holder = self.tab(tab).and_then(|t| {
+                        let sid = t
+                            .core
+                            .active_session_id
+                            .clone()
+                            .or_else(|| t.target.clone());
+                        Some((t.instance_id.clone(), sid?))
+                    });
+                    if let Some((instance_id, sid)) = holder {
+                        traceln!(
+                            "[driver] tab {tab}: auto resume refused (session closed) — retiring {sid}"
+                        );
+                        self.retire_closed_session(&instance_id, &sid, now);
+                    } else if let Some(t) = self.tab_mut(tab) {
+                        t.state = TabPhase::Failed(format!("backend restart failed: {e}"));
+                    }
+                }
                 Err(e) => {
                     // The revival itself failed (unknown project, hub
                     // refusing): parking in Failed is more honest than an
@@ -6350,7 +6378,8 @@ impl Driver {
                     self.toast.notify(now, &msg);
                 }
             },
-            LoopEvent::SessionClosedRemotely { tab: _, session_id } => {
+            LoopEvent::SessionClosedRemotely { tab, session_id } => {
+                traceln!("[driver] session {session_id} closed remotely (broadcast via tab {tab})");
                 // The bridge's `$/zcode/session_closed` broadcast (martty's
                 // quit-cleanly contract): someone retired this conversation.
                 // Retire locally exactly like an own close — tab, row,
@@ -9870,6 +9899,51 @@ mod tests {
             d.tabs.iter().all(|t| t.reincubated_at.is_none()),
             "a tombstoned session must not revive"
         );
+    }
+
+    /// The hub's close tombstone refusing the ladder's auto resume (409) is
+    /// the authoritative "closed remotely" verdict for a tab whose broadcast
+    /// copy never arrived (or raced the ladder): retire it — tab gone, row
+    /// tombstoned — instead of parking in Failed for a close the user
+    /// already made elsewhere. Any other refusal keeps the honest Failed.
+    #[tokio::test]
+    async fn a_refused_auto_resume_retires_the_tab_as_closed_remotely() {
+        let mut d = driver();
+        let mut serve = instance("i-serve", Some("/w"), vec![session("sess_1", None)]);
+        serve.origin = InstanceOrigin::Serve;
+        d.instances.push(serve);
+        let tab = d.open_tab("i-serve".to_string(), Some("sess_1".to_string()), "/w".to_string());
+        let refused = |status: u16| HubApiError {
+            message: format!("HTTP {status}"),
+            status: Some(status),
+            network: false,
+            instance_dead: false,
+        };
+        d.handle_loop_event(
+            LoopEvent::TabReincubated { tab, result: Err(refused(409)) },
+            1_000,
+        );
+        assert!(d.tabs.is_empty(), "the 409 retires the holding tab");
+        assert!(
+            d.closed_sessions
+                .contains_key(&("i-serve".to_string(), "sess_1".to_string())),
+            "the row tombstones against the next discovery poll"
+        );
+
+        let tab2 = d.open_tab("i-dead".to_string(), Some("sess_2".to_string()), "/w".to_string());
+        d.handle_loop_event(
+            LoopEvent::TabReincubated { tab: tab2, result: Err(refused(502)) },
+            2_000,
+        );
+        let parked = d.tabs.iter().find(|t| t.id == tab2).expect("a non-close refusal keeps the tab");
+        assert!(
+            matches!(parked.state, super::TabPhase::Failed(_)),
+            "a non-close refusal parks in Failed, got {:?}",
+            parked.state
+        );
+        assert!(!d
+            .closed_sessions
+            .contains_key(&("i-dead".to_string(), "sess_2".to_string())));
     }
 
     /// Remote-opened sessions pop a tab (2026-10-24, amending the

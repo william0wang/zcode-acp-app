@@ -298,6 +298,58 @@ async fn forced_close_session_carries_force_true() {
 }
 
 #[tokio::test]
+async fn reincubate_carries_auto_intent_and_surfaces_the_close_tombstone() {
+    // The reconnect ladder's resume is the TAB re-incubating itself, so it
+    // rides the hub's `intent: "auto"` channel; the tombstone refusal (409)
+    // must be distinguishable from any other failure — the ladder retires
+    // the tab on it instead of parking in Failed.
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push(res_text(409, "session closed", &[("content-type", "text/plain")]));
+    let err = client(http.clone(), clock)
+        .reincubate_instance("/w", "sess_1")
+        .await
+        .unwrap_err();
+    assert_eq!(err.status, Some(409));
+    assert!(err.session_closed());
+    let calls = http.requested.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[0].body.clone().unwrap()).unwrap(),
+        json!({ "workspacePath": "/w", "sessionId": "sess_1", "intent": "auto" })
+    );
+
+    // Any other refusal is NOT a close verdict.
+    let other_http = Arc::new(ScriptedHttp::default());
+    let other_clock = Arc::new(MockClock::new());
+    other_http.push(res_text(502, "bridge unreachable", &[]));
+    let other = client(other_http, other_clock)
+        .reincubate_instance("/w", "sess_1")
+        .await
+        .unwrap_err();
+    assert!(!other.session_closed());
+}
+
+#[tokio::test]
+async fn create_instance_resume_keeps_the_default_user_intent() {
+    // A human picking the session: no intent key (older-hub compatible), so
+    // the hub's close tombstone never refuses a manual re-launch.
+    let http = Arc::new(ScriptedHttp::default());
+    let clock = Arc::new(MockClock::new());
+    http.push(res_json(200, json!({ "id": "i1", "reused": false })));
+    client(http.clone(), clock)
+        .create_instance("/w", Some("sess_1"))
+        .await
+        .unwrap();
+    let calls = http.requested.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(&calls[0].body.clone().unwrap()).unwrap(),
+        json!({ "workspacePath": "/w", "sessionId": "sess_1" })
+    );
+}
+
+#[tokio::test]
 async fn rename_session_posts_the_title_body() {
     let http = Arc::new(ScriptedHttp::default());
     let clock = Arc::new(MockClock::new());

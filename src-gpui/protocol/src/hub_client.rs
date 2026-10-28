@@ -51,6 +51,15 @@ impl HubApiError {
             instance_dead: false,
         }
     }
+
+    /// `POST /api/instances` answered 409: the hub's remote-close tombstone
+    /// refused an AUTO resume (the server's `intent` channel) — the session
+    /// was closed from another surface and the caller's reconnect ladder
+    /// must retire it, not retry. That route's only 409 is the tombstone,
+    /// so the status alone is the verdict.
+    pub fn session_closed(&self) -> bool {
+        self.status == Some(409)
+    }
 }
 
 impl std::fmt::Display for HubApiError {
@@ -260,15 +269,42 @@ impl HubClient {
     /// the spawn opens a visible terminal REPL (~20s registration budget) —
     /// no client-side deadline. `session_id` boots the spawned bridge
     /// straight into that session (resume); the answer is always the NEW
-    /// instance.
+    /// instance. The resume rides the default `intent: "user"` channel — a
+    /// human picked the session, so the hub's close tombstone never refuses
+    /// it (manual re-launch after a close stays open).
     pub async fn create_instance(
         &self,
         workspace_path: &str,
         session_id: Option<&str>,
     ) -> Result<HubCreateInstanceResult, HubApiError> {
+        self.post_instance(workspace_path, session_id, false).await
+    }
+
+    /// The reconnect-ladder form of [`Self::create_instance`]: the resume is
+    /// the TAB re-incubating itself, not a human choice, so the POST carries
+    /// `intent: "auto"` and the hub's remote-close tombstone may refuse it
+    /// with 409 (see [`HubApiError::session_closed`]) — the ladder must not
+    /// resurrect a session the user closed from another surface.
+    pub async fn reincubate_instance(
+        &self,
+        workspace_path: &str,
+        session_id: &str,
+    ) -> Result<HubCreateInstanceResult, HubApiError> {
+        self.post_instance(workspace_path, Some(session_id), true).await
+    }
+
+    async fn post_instance(
+        &self,
+        workspace_path: &str,
+        session_id: Option<&str>,
+        auto_intent: bool,
+    ) -> Result<HubCreateInstanceResult, HubApiError> {
         let mut body = serde_json::json!({ "workspacePath": workspace_path });
         if let Some(sid) = session_id {
             body["sessionId"] = Value::String(sid.to_string());
+        }
+        if auto_intent {
+            body["intent"] = Value::String("auto".to_string());
         }
         let res = self
             .fetch(

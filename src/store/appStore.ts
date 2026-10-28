@@ -602,6 +602,45 @@ const WIRE_ACTIVITY_FRESH_MS = 30_000;
 let discoveryFailures = 0;
 const DISCOVERY_FAIL_THRESHOLD = 3;
 
+// Locally retired sessions (a close from this client or the
+// $/zcode/session_closed broadcast): sessionId → closed-at. The 4s
+// discovery poll wholesale-replaces the list, and the hub's cache can
+// still carry the sid for one heartbeat (or an in-flight poll answered
+// before the close landed) — without the tombstone the row paints back as
+// a ghost. The reconnect replay consults it too: reloading a closed
+// session would re-advertise it (ADR-0006's markSessionActive self-heal) —
+// the resurrection this gate exists to prevent. A tombstone lapsing (or a
+// USER resume clearing it) lets the session back in.
+const closedSessionTombstones = new Map<string, number>();
+const CLOSE_TOMBSTONE_MS = 60_000;
+
+function isSessionTombstoned(sessionId: string): boolean {
+  const closedAt = closedSessionTombstones.get(sessionId);
+  if (closedAt === undefined) return false;
+  if (Date.now() - closedAt >= CLOSE_TOMBSTONE_MS) {
+    closedSessionTombstones.delete(sessionId);
+    return false;
+  }
+  return true;
+}
+
+// Hide tombstoned closes from an incoming discovery list (see the
+// tombstone's comment). Instances whose sessions all filter out keep their
+// row — the hub owns membership; this only hides retired conversations.
+function filterClosedSessions(list: HubInstance[]): HubInstance[] {
+  if (closedSessionTombstones.size === 0) return list;
+  let any = false;
+  for (const sid of closedSessionTombstones.keys()) {
+    if (!isSessionTombstoned(sid)) continue;
+    any = true;
+  }
+  if (!any) return list;
+  return list.map((i) => ({
+    ...i,
+    sessions: (i.sessions ?? []).filter((s) => !isSessionTombstoned(s.sessionId)),
+  }));
+}
+
 // Connection-level failures are transient by design: the reconnect loop
 // (and its banner) own that story, and a successful reconnect replays the
 // session back to freshness. Only settled failures deserve a notice.
@@ -1164,8 +1203,25 @@ export const useAppStore = create<AppState>((set, get) => {
     return { sessionId, message, fields };
   }
 
-  function scheduleReconnect(): void {
-    const s = get();
+  // The local half of a remote close — ours (closeRemoteSession) or another
+  // client's ($/zcode/session_closed broadcast): tombstone the sid, drop its
+  // discovery row, leave the conversation if we are looking at it, forget
+  // its cache. Idempotent, so the broadcast racing our own close's response
+  // is harmless.
+  function retireSessionLocally(sessionId: string): void {
+    closedSessionTombstones.set(sessionId, Date.now());
+    set((state) => ({
+      instances: state.instances.map((i) => ({
+        ...i,
+        sessions: (i.sessions ?? []).filter((s) => s.sessionId !== sessionId),
+      })),
+    }));
+    if (get().activeSessionId === sessionId) get().closeSession();
+    set({ notice: "notice.sessionClosed" });
+    removeSessionCache(sessionId);
+  }
+
+  function scheduleReconnect(): void {    const s = get();
     if (!s.profile || !s.instanceId) return;
     stopReconnect();
     const delay = Math.min(30000, 1000 * 2 ** reconnectAttempt++);
@@ -1452,6 +1508,10 @@ export const useAppStore = create<AppState>((set, get) => {
         if (stale()) return;
         get().refreshWorkflowHubIfLoaded();
       },
+      onSessionClosed: (sessionId) => {
+        if (stale()) return;
+        retireSessionLocally(sessionId);
+      },
       onServerRequest: (req, respond) => {
         if (stale()) return;
         if (req.method === "session/request_permission") {
@@ -1554,7 +1614,13 @@ export const useAppStore = create<AppState>((set, get) => {
         ),
       });
       const active = get().activeSessionId;
-      if (active) {
+      if (active && isSessionTombstoned(active)) {
+        // The conversation was closed while the socket was down (the
+        // broadcast landed, or our own close did). A replay IS a load, and a
+        // load re-advertises the session (ADR-0006 self-heal) — the
+        // resurrection the tombstone exists to prevent. Leave it instead.
+        get().closeSession();
+      } else if (active) {
         // Replay is the catch-up mechanism after any disconnect.
         await get().loadSession(active);
       }
@@ -1792,7 +1858,7 @@ export const useAppStore = create<AppState>((set, get) => {
         const instances = await client.instances(opts?.probe === true);
         if (get().profile !== profile) return; // hub changed mid-flight
         discoveryFailures = 0;
-        set({ instances, instancesError: null, hubOffline: false });
+        set({ instances: filterClosedSessions(instances), instancesError: null, hubOffline: false });
       } catch (e) {
         if (get().profile !== profile) return;
         if (e instanceof HubApiError && e.network) {
@@ -1964,6 +2030,10 @@ export const useAppStore = create<AppState>((set, get) => {
     resumeProjectSession: async (workspacePath, sessionId) => {
       const client = hub();
       if (!client) return false;
+      // Manual re-launch from history (user intent — the hub's own close
+      // tombstone passes it too): drop the local tombstone so the resumed
+      // row renders instead of being filtered as a stale ghost.
+      closedSessionTombstones.delete(sessionId);
       let created: HubCreateInstanceResult;
       try {
         created = await client.createInstance(workspacePath, sessionId);
@@ -1998,6 +2068,9 @@ export const useAppStore = create<AppState>((set, get) => {
     openSession: async (instanceId, sessionId) => {
       const s = get();
       if (!s.profile) return;
+      // A human picked the session: a close tombstone must not hide what
+      // they just reopened (close retires, it never deletes).
+      closedSessionTombstones.delete(sessionId);
       if (s.instanceId === instanceId && s.connState === "open") {
         if (s.activeSessionId !== sessionId) await get().loadSession(sessionId);
         return;
@@ -2024,24 +2097,10 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         return;
       }
-      // Drop the row locally; the heartbeat list aligns within ~10s.
-      set((state) => ({
-        instances: state.instances.map((i) =>
-          i.id === instanceId
-            ? {
-                ...i,
-                sessions: (i.sessions ?? []).filter((s) => s.sessionId !== sessionId),
-              }
-            : i,
-        ),
-      }));
-      // Closing the conversation we're looking at returns to the list
-      // (connection stays, closeSession handles the session-scoped reset).
-      if (get().instanceId === instanceId && get().activeSessionId === sessionId) {
-        get().closeSession();
-      }
-      set({ notice: "notice.sessionClosed" });
-      removeSessionCache(sessionId);
+      // The local half of the close: tombstone + row drop + leaving the
+      // conversation if it is the one on screen (the connection stays). The
+      // bridge's own broadcast reaches us too and does the same — idempotent.
+      retireSessionLocally(sessionId);
     },
 
     shutdownInstance: async (instanceId) => {
