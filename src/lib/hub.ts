@@ -13,6 +13,7 @@ import type {
   McpServerUpsert,
   ModelUpsert,
   ResetCardStatus,
+  SessionIntent,
   SettingsAll,
   SystemStatsResponse,
   AmendRunSettingsResponse,
@@ -230,15 +231,25 @@ export class HubClient {
    * straight into that session instead of a fresh conversation; without
    * Desktop Presence the answer is always the NEW instance (resume never
    * reuses a live serve bridge).
+   *
+   * `intent` (close tombstone): "auto" declares a CLIENT-AUTOMATIC respawn
+   * (the dead-bridge revive) — the hub refuses it with 409 "session closed"
+   * when the conversation was closed remotely from another surface; absent
+   * (or "user") is a human re-launch and always passes, clearing the stone.
    */
   async createInstance(
     workspacePath: string,
     sessionId?: string,
+    intent?: SessionIntent,
   ): Promise<HubCreateInstanceResult> {
     const res = await this.fetch(
       "/api/instances",
       "POST",
-      { workspacePath, ...(sessionId ? { sessionId } : {}) },
+      {
+        workspacePath,
+        ...(sessionId ? { sessionId } : {}),
+        ...(intent === "auto" ? { intent } : {}),
+      },
       { timeoutMs: null },
     );
     return (await res.json()) as HubCreateInstanceResult;

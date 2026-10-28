@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::acp::{ConfigOption, SessionUpdate};
 use crate::clock::{BoxFuture, Clock};
+use crate::session::LoadIntent;
 use crate::ws::{WsEvent, WsFactory, WsStream};
 
 /// The Desktop Presence identity (server hub-server.ts `DESKTOP_CLIENT_NAME`).
@@ -605,14 +606,37 @@ pub fn session_new_params(cwd: &str) -> Value {
 /// the bridge ignores the value on load (roots are backend-authoritative),
 /// so an unknown workspace sends a "/" placeholder. The tail-replay limit
 /// rides in `_meta` (top-level unknown keys are stripped by the SDK schema);
-/// limit 0 is the bridge's metadata-only attach.
-pub fn session_load_params(session_id: &str, cwd: &str, limit: u64) -> Value {
+/// limit 0 is the bridge's metadata-only attach. `intent` (see
+/// [`crate::session::LoadIntent`]): only `Auto` is sent — `User` keeps the
+/// old wire shape (the field's absence is the bridge's "user" default).
+pub fn session_load_params(
+    session_id: &str,
+    cwd: &str,
+    limit: u64,
+    intent: LoadIntent,
+) -> Value {
+    let mut zcode = json!({ "limit": limit });
+    if intent == LoadIntent::Auto {
+        zcode["intent"] = json!("auto");
+    }
     json!({
         "sessionId": session_id,
         "cwd": cwd,
         "mcpServers": [],
-        "_meta": { "zcode": { "limit": limit } },
+        "_meta": { "zcode": zcode },
     })
+}
+
+/// The `_meta.zcode.sessionClosed` flag on a `session/load` answer: the
+/// bridge retired this conversation on a remote close and — because the load
+/// declared `auto` intent — replayed the history without re-arming
+/// discovery. The caller retires its tab locally and does not retry
+/// (REMOTE-CLIENTS "Closing a session").
+pub fn load_result_session_closed(result: &Value) -> bool {
+    result
+        .pointer("/_meta/zcode/sessionClosed")
+        .and_then(Value::as_bool)
+        == Some(true)
 }
 
 /// The attach response's `replayMeta` (bridge additive; src/store/replay.ts

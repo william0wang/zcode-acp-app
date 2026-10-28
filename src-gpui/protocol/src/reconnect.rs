@@ -30,6 +30,7 @@ use crate::clock::Clock;
 use crate::hub::{ConnectionProfile, HubInstance};
 use crate::hub_client::HubClient;
 use crate::http::HttpTransport;
+use crate::session::LoadIntent;
 use crate::ws::WsFactory;
 
 /// A reconnect attempt that outlived every legitimate budget (10s discovery
@@ -399,7 +400,9 @@ impl Sup {
         };
         let request = conn.request(
             "session/load",
-            session_load_params(session_id, &cwd, REPLAY_TAIL_LIMIT),
+            // Auto intent: this IS the client-automatic re-attach (a closed
+            // conversation answers sessionClosed instead of re-arming).
+            session_load_params(session_id, &cwd, REPLAY_TAIL_LIMIT, LoadIntent::Auto),
         );
         match request.await {
             Ok(result) => {

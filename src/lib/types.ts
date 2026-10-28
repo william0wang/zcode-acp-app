@@ -133,6 +133,14 @@ export interface FsListing {
   truncated: boolean;
 }
 
+// Client intent behind a session attach. The hub's POST /api/instances
+// `intent` and the bridge's session/load `_meta.zcode.intent` share the
+// spelling and the default: "auto" is a CLIENT-AUTOMATIC re-attach (reconnect
+// replay, dead-bridge revive) that must not resurrect a remotely closed
+// conversation; "user" — the default when the field is absent — is a human
+// picking the session (close retires, it never deletes).
+export type SessionIntent = "auto" | "user";
+
 // Session config (session/load result + config_option_update). Shape matches
 // the bridge's buildConfigOptions output (id: model | mode | thought).
 export interface ConfigOption {

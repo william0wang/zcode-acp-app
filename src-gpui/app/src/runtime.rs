@@ -43,9 +43,9 @@ use gpui_kit::{Image, ImageFormat};
 
 use protocol::acp::SessionUpdate;
 use protocol::acp_client::{
-    parse_session_new_result, session_load_params, session_new_params, AcpConnection,
-    AcpConnectionState, AcpHandlers, AcpInitializeResult, ServerRequest, ServerResponder,
-    SessionAttachInfo, TurnStateInfo,
+    load_result_session_closed, parse_session_new_result, session_load_params,
+    session_new_params, AcpConnection, AcpConnectionState, AcpHandlers, AcpInitializeResult,
+    ServerRequest, ServerResponder, SessionAttachInfo, TurnStateInfo,
 };
 use protocol::approval::{ApprovalCore, ElicitAnswers, IncomingAsk, PendingAsk};
 use protocol::bootstrap::{assess_local_hub, dial_host, ensure_hub, BootstrapEnv, EnsureOptions};
@@ -68,7 +68,9 @@ use protocol::hub::{
     HubHistoryPage, HubHistorySession, HubInstance, HubProject, HubUpgradeResult, InstanceOrigin,
 };
 use protocol::hub_client::{HubApiError, HubClient};
-use protocol::session::{LoadEarlierRequest, PromptRequest, SessionCore, WireRequest};
+use protocol::session::{
+    LoadEarlierRequest, LoadIntent, PromptRequest, SessionCore, WireRequest,
+};
 use protocol::settings::BackendRestartResult;
 use protocol::settings_client::{HubApiError as SettingsApiError, HubHttpClient};
 use rust_i18n::t;
@@ -5880,7 +5882,7 @@ impl Driver {
             match wire {
                 WireRequest::Load(req) => {
                     let conn = conn.clone();
-                    let params = session_load_params(&req.session_id, &cwd, req.limit as u64);
+                    let params = session_load_params(&req.session_id, &cwd, req.limit as u64, req.intent);
                     tokio::spawn(async move {
                         let res = conn.request("session/load", params).await.map_err(|e| e.0);
                         let _ = tx.send(LoopEvent::LoadResult {
@@ -6134,7 +6136,22 @@ impl Driver {
                 }
             },
             LoopEvent::LoadResult { tab, req, result } => {
-                if let Some(t) = self.tab_mut(tab) {
+                // The bridge's sessionClosed disclosure (auto re-attach of a
+                // conversation it retired on a remote close): the history was
+                // replayed as asked, discovery was NOT re-armed — the close is
+                // the answer, not a failure. Retire the tab instead of
+                // parking it Failed or retrying into a resurrect.
+                if result.as_ref().is_ok_and(load_result_session_closed) {
+                    traceln!(
+                        "[driver] session {} closed remotely (auto re-attach answer via tab {tab})",
+                        req.session_id
+                    );
+                    if let Some(instance_id) =
+                        self.tab(tab).map(|t| t.instance_id.clone())
+                    {
+                        self.retire_closed_session(&instance_id, &req.session_id, now);
+                    }
+                } else if let Some(t) = self.tab_mut(tab) {
                     match result {
                         Ok(value) => t.core.on_load_result(now, &req, &value),
                         Err(_) => t.core.on_load_failed(&req),
@@ -6704,10 +6721,19 @@ impl Driver {
                     // below (appStore.ts "open" resets sessionStates).
                     t.core.session_states.clear();
                     t.state = TabPhase::Connected;
-                    // Attach: an already-active session (reconnect) replays;
-                    // otherwise the tab's target, else a fresh session/new.
-                    match t.core.active_session_id.clone().or_else(|| t.target.clone()) {
-                        Some(sid) => {
+                    // Attach: an already-active session (reconnect) replays —
+                    // CLIENT-automatic, so the load declares auto intent (the
+                    // conversation may have been closed elsewhere while this
+                    // socket was down; the bridge then answers sessionClosed
+                    // instead of re-arming it — see LoadResult); otherwise the
+                    // tab's target (a human opened it: user intent), else a
+                    // fresh session/new.
+                    let attach = match t.core.active_session_id.clone() {
+                        Some(sid) => Some((sid, LoadIntent::Auto)),
+                        None => t.target.clone().map(|sid| (sid, LoadIntent::User)),
+                    };
+                    match attach {
+                        Some((sid, intent)) => {
                             // The restored drafts ride the queue; the load's
                             // settle flushes them exactly like drafts queued
                             // before a reconnect (SessionCore::flush_pending).
@@ -6720,7 +6746,7 @@ impl Driver {
                                     queue.len()
                                 );
                             }
-                            t.core.load_session(&sid);
+                            t.core.load_session_as(&sid, intent);
                             // None-gated seeding: a warm in-memory snapshot
                             // already restored fresher readouts inside
                             // load_session, and the load result's usage
@@ -9614,7 +9640,7 @@ type _TabViewMap = HashMap<u64, ()>;
 mod tests {
     // Plain #[test] with explicit imports — this file has no kit glob, but
     // the sibling test modules' explicit-import shape is the convention.
-    use super::{fold_session_runs, max_run_sequence, merge_run_events, LoopEvent};
+    use super::{fold_session_runs, max_run_sequence, merge_run_events, LoadIntent, LoopEvent};
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
     use protocol::hub_client::HubApiError;
     use protocol::workflow::WorkflowRunEvent;
@@ -9944,6 +9970,65 @@ mod tests {
         assert!(!d
             .closed_sessions
             .contains_key(&("i-dead".to_string(), "sess_2".to_string())));
+    }
+
+    /// The reconnect re-attach of a remotely closed conversation (ADR-0006
+    /// follow-up): the tab's socket dropped, the close happened elsewhere,
+    /// the broadcast never reached us. The re-attach's AUTO session/load
+    /// answers `_meta.zcode.sessionClosed` — the disclosure retires the tab
+    /// exactly like the 409 ladder refusal, instead of letting the replay
+    /// re-arm the conversation into a resurrect.
+    #[tokio::test]
+    async fn an_auto_reattach_answer_disclosing_closure_retires_the_tab() {
+        let mut d = driver();
+        let mut serve = instance("i-serve", Some("/w"), vec![session("sess_1", None)]);
+        serve.origin = InstanceOrigin::Serve;
+        d.instances.push(serve);
+        let tab = d.open_tab("i-serve".to_string(), Some("sess_1".to_string()), "/w".to_string());
+        // The reconnect re-attach shape: the session was already active.
+        if let Some(t) = d.tabs.iter_mut().find(|t| t.id == tab) {
+            t.core.active_session_id = Some("sess_1".to_string());
+        }
+        d.handle_loop_event(
+            LoopEvent::LoadResult {
+                tab,
+                req: protocol::session::LoadRequest {
+                    session_id: "sess_1".to_string(),
+                    limit: protocol::REPLAY_TAIL_LIMIT,
+                    seq: 1,
+                    intent: LoadIntent::Auto,
+                },
+                result: Ok(serde_json::json!({
+                    "replayMeta": { "cursor": "c", "hasMore": false, "totalMessages": 2 },
+                    "_meta": { "zcode": { "sessionClosed": true } },
+                })),
+            },
+            1_000,
+        );
+        assert!(d.tabs.is_empty(), "the disclosure retires the holding tab");
+        assert!(
+            d.closed_sessions
+                .contains_key(&("i-serve".to_string(), "sess_1".to_string())),
+            "the row tombstones against the next discovery poll"
+        );
+
+        // A live conversation's answer (no disclosure) is a normal load: the
+        // tab keeps its place (superseded loads return early inside the core).
+        let tab2 = d.open_tab("i-live".to_string(), Some("sess_2".to_string()), "/w".to_string());
+        d.handle_loop_event(
+            LoopEvent::LoadResult {
+                tab: tab2,
+                req: protocol::session::LoadRequest {
+                    session_id: "sess_2".to_string(),
+                    limit: protocol::REPLAY_TAIL_LIMIT,
+                    seq: 1,
+                    intent: LoadIntent::User,
+                },
+                result: Ok(serde_json::json!({})),
+            },
+            2_000,
+        );
+        assert!(d.tabs.iter().any(|t| t.id == tab2), "a normal answer keeps the tab");
     }
 
     /// Remote-opened sessions pop a tab (2026-10-24, amending the

@@ -16,10 +16,14 @@ interface Frame {
 }
 
 // Minimal WS double: OPEN from birth, answers initialize and settles every
-// session/load at once with an empty history.
+// session/load at once with an empty history. Loads carrying
+// `_meta.zcode.intent: "auto"` for a sid in `retired` answer the bridge's
+// close disclosure (`_meta.zcode.sessionClosed`) instead — the wire contract
+// of REMOTE-CLIENTS "Closing a session"; user-intent loads re-arm normally.
 class FakeWebSocket {
   static OPEN = 1;
   static current: FakeWebSocket | null = null;
+  static retired = new Set<string>();
   readyState = FakeWebSocket.OPEN;
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
@@ -42,8 +46,12 @@ class FakeWebSocket {
         agentInfo: { name: "zcode-acp-server", version: "0.44.1" },
       });
     } else if (frame.method === "session/load") {
+      const intent = (frame.params?._meta as { zcode?: { intent?: unknown } } | undefined)
+        ?.zcode?.intent;
+      const autoClosed = intent === "auto" && FakeWebSocket.retired.has(String(frame.params?.sessionId));
       this.reply(frame.id, {
         replayMeta: { cursor: "end", hasMore: false, totalMessages: 0, turnActive: false },
+        ...(autoClosed ? { _meta: { zcode: { sessionClosed: true } } } : {}),
       });
     }
   }
@@ -150,6 +158,59 @@ test("the session_closed broadcast retires the row and leaves the conversation; 
 
   // A human re-opens sess_1 (user intent): the tombstone clears, the load
   // goes out, and the next poll shows the row again.
+  void store.getState().openSession("inst1", "sess_1");
+  await vi.waitFor(() => expect(store.getState().activeSessionId).toBe("sess_1"));
+  await vi.waitFor(() => expect(store.getState().loadingSession).toBe(false));
+  await store.getState().refreshInstances();
+  expect(sids()).toEqual(["sess_1", "sess_2"]);
+
+  // The user default stays implicit: a picked session's load carries no
+  // intent key at all (the old wire shape an old bridge expects).
+  const userLoad = FakeWebSocket.current!.sent.find(
+    (f) => f.method === "session/load" && f.params?.sessionId === "sess_1",
+  )!;
+  expect(
+    (userLoad.params?._meta as { zcode?: Record<string, unknown> })?.zcode?.intent,
+  ).toBeUndefined();
+});
+
+test("a missed broadcast is caught by the AUTO reconnect replay: sessionClosed retires instead of resurrecting", async () => {
+  const { useAppStore } = await import("../src/store/appStore");
+  const store = useAppStore;
+  // sess_1 is active on inst1 from the previous test. The conversation gets
+  // closed from another surface while our socket is down (deep sleep): the
+  // broadcast never reaches us — the bridge's retirement is the only truth.
+  FakeWebSocket.retired.add("sess_1");
+  const sids = () =>
+    store
+      .getState()
+      .instances.flatMap((i) => (i.sessions ?? []).map((s) => s.sessionId))
+      .sort();
+  FakeWebSocket.current!.onclose?.(); // zombie socket drops — reconnect ladder
+
+  // The reconnect replays the active session as an AUTO load...
+  await vi.waitFor(
+    () =>
+      expect(
+        FakeWebSocket.current!.sent.some(
+          (f) =>
+            f.method === "session/load" &&
+            f.params?.sessionId === "sess_1" &&
+            (f.params?._meta as { zcode?: { intent?: string } })?.zcode?.intent === "auto",
+        ),
+      ).toBe(true),
+    { timeout: 5000 },
+  );
+  // ...and the bridge's sessionClosed disclosure retires it locally: the
+  // conversation closes, the row drops, and the stale hub listing (still
+  // carrying sess_1) cannot paint the ghost back.
+  await vi.waitFor(() => expect(store.getState().activeSessionId).toBeNull());
+  expect(store.getState().notice).toBe("notice.sessionClosed");
+  await store.getState().refreshInstances();
+  expect(sids()).toEqual(["sess_2"]);
+
+  // Manual re-launch still works: a user open clears the tombstone and the
+  // user-intent load re-arms (no disclosure on the answer).
   void store.getState().openSession("inst1", "sess_1");
   await vi.waitFor(() => expect(store.getState().activeSessionId).toBe("sess_1"));
   await vi.waitFor(() => expect(store.getState().loadingSession).toBe(false));

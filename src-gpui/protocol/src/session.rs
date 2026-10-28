@@ -61,6 +61,20 @@ pub enum WireRequest {
     },
 }
 
+/// Why a `session/load` is issued — rides as `_meta.zcode.intent`
+/// (REMOTE-CLIENTS "Closing a session"). `Auto` marks a CLIENT-AUTOMATIC
+/// load (the reconnect re-attach of a tab's own session): for a conversation
+/// the bridge retired on a remote close, it replays the history asked for
+/// but does NOT re-arm discovery, answering `_meta.zcode.sessionClosed:
+/// true` so the tab retires instead of resurrecting what someone closed
+/// elsewhere. `User` — a human picking the session — keeps ADR-0006's
+/// re-arm and is the wire default (no key sent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadIntent {
+    Auto,
+    User,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LoadRequest {
     pub session_id: String,
@@ -68,6 +82,7 @@ pub struct LoadRequest {
     /// Correlation token: only the currently in-flight load's response is
     /// applied (a newer load_session supersedes an older in-flight one).
     pub seq: u64,
+    pub intent: LoadIntent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -833,8 +848,15 @@ impl SessionCore {
     /// `session/load`: replay is the catch-up mechanism after any
     /// disconnect. A cache hit paints the snapshot right away (the composer
     /// stays locked via loading_session) and issues a metadata-only
-    /// reconcile (limit 0) instead of replaying the tail from scratch.
+    /// reconcile (limit 0) instead of replaying the tail from scratch. A
+    /// human picked the session: user intent (see [`LoadIntent`]).
     pub fn load_session(&mut self, session_id: &str) {
+        self.load_session_as(session_id, LoadIntent::User);
+    }
+
+    /// [`Self::load_session`] with an explicit [`LoadIntent`] — the reconnect
+    /// re-attach of a tab's own session passes `Auto`.
+    pub fn load_session_as(&mut self, session_id: &str, intent: LoadIntent) {
         if !self.conn_open {
             return;
         }
@@ -888,6 +910,7 @@ impl SessionCore {
             session_id: session_id.to_owned(),
             limit,
             seq: self.load_seq,
+            intent,
         }));
     }
 
@@ -963,6 +986,8 @@ impl SessionCore {
                 self.total_messages = None;
             }
             // Issue the full tail replay; its own response applies below.
+            // Same intent as the reconcile that triggered it (an auto
+            // re-attach stays auto — its answer carries the disclosure too).
             self.load_seq += 1;
             let session_id = req.session_id.clone();
             self.pending_load = Some(PendingLoad {
@@ -974,6 +999,7 @@ impl SessionCore {
                 session_id,
                 limit: REPLAY_TAIL_LIMIT,
                 seq: self.load_seq,
+                intent: req.intent,
             }));
             return;
         }
@@ -1914,6 +1940,48 @@ mod tests {
             &json!({ "replayMeta": { "cursor": "end", "hasMore": false, "totalMessages": 100, "turnActive": false } }),
         );
         assert!(!core.loading_session);
+    }
+
+    /// The AUTO intent (the reconnect re-attach) rides the whole cache-
+    /// reconcile flow: the follow-up tail replay a moved history triggers
+    /// inherits it — its answer carries the close disclosure too. A
+    /// human-picked session's loads never carry it (the wire default).
+    #[test]
+    fn load_intent_rides_the_reconcile_tail_replay() {
+        let mut core = SessionCore::new();
+        core.conn_open = true;
+        core.on_initialize(Some("0.44.1"));
+
+        // Seed the cache with one replayed message.
+        core.load_session("sess_1");
+        let req30 = expect_load(&mut core);
+        assert_eq!(req30.intent, LoadIntent::User, "a picked session is user");
+        core.on_update(
+            1000,
+            "sess_1",
+            text_update("agent_message_chunk", Some("m_SEED"), "SEED"),
+            None,
+        );
+        core.on_load_result(
+            1001,
+            &req30,
+            &json!({ "replayMeta": { "cursor": "c0", "hasMore": true, "totalMessages": 9 } }),
+        );
+
+        // Wake-reconnect re-attach (auto): the reconcile is auto, and the
+        // tail replay the moved history triggers inherits it.
+        core.load_session_as("sess_1", LoadIntent::Auto);
+        let req0 = expect_load(&mut core);
+        assert_eq!(req0.limit, 0);
+        assert_eq!(req0.intent, LoadIntent::Auto);
+        core.on_load_result(
+            1100,
+            &req0,
+            &json!({ "replayMeta": { "cursor": "end", "hasMore": true, "totalMessages": 10 } }),
+        );
+        let req30b = expect_load(&mut core);
+        assert_eq!(req30b.limit, REPLAY_TAIL_LIMIT);
+        assert_eq!(req30b.intent, LoadIntent::Auto, "the tail replay stays auto");
     }
 
     #[test]

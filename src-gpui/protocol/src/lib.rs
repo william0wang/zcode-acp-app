@@ -106,4 +106,4 @@ pub use replay::{
     bridge_supports_page_marker, read_replay_meta, snapshot_tail_id, EARLIER_PAGE_LIMIT,
     REPLAY_TAIL_LIMIT,
 };
-pub use session::{SessionCore, WireRequest};
+pub use session::{LoadIntent, SessionCore, WireRequest};

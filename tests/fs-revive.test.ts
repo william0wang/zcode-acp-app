@@ -54,8 +54,12 @@ class FakeWebSocket {
 (globalThis as Record<string, unknown>).WebSocket = FakeWebSocket;
 
 let createPosts = 0;
+let createBodies: Record<string, unknown>[] = [];
 let fsCalls: string[] = [];
 let createFails = false;
+// The hub's close tombstone: an AUTO respawn of a remotely closed session is
+// refused with 409 "session closed" (REMOTE-CLIENTS "Closing a session").
+let createClosed = false;
 // Discovery rows: connectToHub's background refresh OVERWRITES instances, so
 // the route must carry the dead instance too — otherwise the 400ms fs-retry
 // window races the refresh and erases the workspace the respawn needs.
@@ -63,8 +67,10 @@ let discoveryRows: unknown[] = [{ id: "i1", workspace: "/w" }];
 
 beforeEach(() => {
   createPosts = 0;
+  createBodies = [];
   fsCalls = [];
   createFails = false;
+  createClosed = false;
   discoveryRows = [{ id: "i1", workspace: "/w" }];
   const backing = new Map<string, string>();
   (globalThis as Record<string, unknown>).localStorage = {
@@ -93,7 +99,9 @@ beforeEach(() => {
     }
     if (url.endsWith("/api/instances") && init?.method === "POST") {
       createPosts++;
+      createBodies.push(JSON.parse(String(init.body)) as Record<string, unknown>);
       if (createFails) return new Response("boom", { status: 500 });
+      if (createClosed) return new Response("session closed", { status: 409 });
       return Response.json({ id: "i2", reused: false });
     }
     if (url.includes("/api/instances")) return Response.json(discoveryRows);
@@ -162,4 +170,43 @@ test("without the dead instance's workspace there is no respawn", async () => {
 
   await expect(useAppStore.getState().fsList("src")).resolves.toBeNull();
   expect(createPosts).toBe(0);
+});
+
+test("the respawn declares AUTO intent — the hub's tombstone may refuse it", async () => {
+  const useAppStore = await connectedStore();
+
+  const listing = await useAppStore.getState().fsList("src");
+
+  expect(listing).toEqual({ root: "/w", entries: [], truncated: false });
+  expect(createBodies[0]).toEqual({
+    workspacePath: "/w",
+    sessionId: "sess1",
+    intent: "auto",
+  });
+});
+
+test("a 409 \"session closed\" retires the conversation instead of respawning it", async () => {
+  createClosed = true;
+  const useAppStore = await connectedStore();
+
+  const listing = await useAppStore.getState().fsList("src");
+
+  // The refusal is the answer, not a failure: the conversation closes with
+  // the close notice, no retry loop, no instance switch.
+  expect(listing).toBeNull();
+  expect(createPosts).toBe(1);
+  expect(useAppStore.getState().instanceId).toBe("i1");
+  expect(useAppStore.getState().activeSessionId).toBeNull();
+  expect(useAppStore.getState().notice).toBe("notice.sessionClosed");
+});
+
+test("a manual resume keeps the default USER intent (no intent key on the wire)", async () => {
+  const useAppStore = await store();
+  useAppStore.getState().connectToHub({ hubUrl: "http://hub/", token: "t" });
+
+  // POST + attach; the answer's i2 connection fails in this harness (no WS
+  // for it) — the request shape is what this test pins.
+  await useAppStore.getState().resumeProjectSession("/w", "sess1");
+
+  expect(createBodies[0]).toEqual({ workspacePath: "/w", sessionId: "sess1" });
 });

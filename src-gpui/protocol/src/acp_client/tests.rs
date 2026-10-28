@@ -10,11 +10,12 @@ use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 
 use super::{
-    parse_session_load_result, parse_session_new_result, replay_meta, session_load_params,
-    session_new_params, AcpConnection, AcpConnectionState, AcpHandlers, AcpInitializeResult,
-    ConnectError, DESKTOP_CLIENT_NAME, REPLAY_TAIL_LIMIT,
+    load_result_session_closed, parse_session_load_result, parse_session_new_result,
+    replay_meta, session_load_params, session_new_params, AcpConnection, AcpConnectionState,
+    AcpHandlers, AcpInitializeResult, ConnectError, DESKTOP_CLIENT_NAME, REPLAY_TAIL_LIMIT,
 };
 use crate::clock::MockClock;
+use crate::session::LoadIntent;
 use crate::ws::fake::{FakeWs, FakeWsFactory};
 
 // -- handler capture (the vi.fn() doubles) ------------------------------------
@@ -344,7 +345,9 @@ fn session_new_params_shape() {
 
 #[test]
 fn session_load_params_shape() {
-    let params = session_load_params("sess_1", "/w", REPLAY_TAIL_LIMIT);
+    // User intent is the wire default: no key at all (the old shape an old
+    // bridge expects).
+    let params = session_load_params("sess_1", "/w", REPLAY_TAIL_LIMIT, LoadIntent::User);
     assert_eq!(
         params,
         json!({
@@ -356,9 +359,37 @@ fn session_load_params_shape() {
     );
     // Metadata-only attach reconcile (limit 0) keeps the same shape.
     assert_eq!(
-        session_load_params("sess_1", "/", 0)["_meta"]["zcode"]["limit"],
+        session_load_params("sess_1", "/", 0, LoadIntent::User)["_meta"]["zcode"]["limit"],
         json!(0)
     );
+    // Auto intent rides alongside the limit (the reconnect re-attach).
+    let auto = session_load_params("sess_1", "/w", REPLAY_TAIL_LIMIT, LoadIntent::Auto);
+    assert_eq!(
+        auto["_meta"]["zcode"],
+        json!({ "limit": 30, "intent": "auto" })
+    );
+}
+
+#[test]
+fn load_result_session_closed_flag() {
+    // The disclosure (REMOTE-CLIENTS "Closing a session"): an AUTO load of a
+    // bridge-retired conversation replays history but answers
+    // `_meta.zcode.sessionClosed: true` — retire the tab, do not retry.
+    assert!(load_result_session_closed(&json!({
+        "replayMeta": { "cursor": "c", "hasMore": false, "totalMessages": 3 },
+        "_meta": { "zcode": { "sessionClosed": true } },
+    })));
+    // Absent (live conversation, or a user load — which re-arms) and
+    // misspelled/false copies read as open.
+    assert!(!load_result_session_closed(&json!({
+        "replayMeta": { "cursor": "c" },
+    })));
+    assert!(!load_result_session_closed(&json!({
+        "_meta": { "zcode": { "sessionClosed": false } },
+    })));
+    assert!(!load_result_session_closed(&json!({
+        "_meta": { "zcode": { "sessionclosed": true } },
+    })));
 }
 
 #[test]

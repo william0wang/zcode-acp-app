@@ -63,6 +63,7 @@ import {
   type PromptDraft,
   type QuotaItem,
   type SavedServer,
+  type SessionIntent,
   type SessionUpdate,
   type SlashCommand,
   type TurnStats,
@@ -416,7 +417,9 @@ export interface AppState extends ConfigSlice {
   connectInstance: (
     instanceId: string,
     attachSessionId?: string,
-    opts?: { noAttach?: boolean },
+    // `intent` rides into the attach load (default: a caller-named session is
+    // a human's pick, the "most recent" fallback is ours → auto).
+    opts?: { noAttach?: boolean; intent?: SessionIntent },
   ) => Promise<void>;
   // Remote session-create (bridge 0.17.0, ADR-0014): create/reuse a headless
   // serve bridge for a known project and open a FRESH session in it.
@@ -440,7 +443,10 @@ export interface AppState extends ConfigSlice {
   // is broadcast-only — the hub's REST discovery carries no such field);
   // re-entering a session on the same instance reuses the socket.
   closeSession: () => void;
-  loadSession: (sessionId: string) => Promise<void>;
+  // `intent: "auto"` marks a client-automatic load (the reconnect replay):
+  // the bridge then answers `_meta.zcode.sessionClosed` for a remotely closed
+  // conversation instead of re-arming it, and the store retires it locally.
+  loadSession: (sessionId: string, opts?: { intent?: SessionIntent }) => Promise<void>;
   // Retires a session from remote discovery via the hub's HTTP close
   // endpoint (ADR-0006). Close, not delete — editor-side-still-open
   // conversations self-heal back on their next use. Refused (409 notice)
@@ -607,12 +613,20 @@ const DISCOVERY_FAIL_THRESHOLD = 3;
 // discovery poll wholesale-replaces the list, and the hub's cache can
 // still carry the sid for one heartbeat (or an in-flight poll answered
 // before the close landed) — without the tombstone the row paints back as
-// a ghost. The reconnect replay consults it too: reloading a closed
-// session would re-advertise it (ADR-0006's markSessionActive self-heal) —
-// the resurrection this gate exists to prevent. A tombstone lapsing (or a
-// USER resume clearing it) lets the session back in.
+// a ghost. A tombstone lapsing (or a USER resume clearing it) lets the
+// session back in.
 const closedSessionTombstones = new Map<string, number>();
 const CLOSE_TOMBSTONE_MS = 60_000;
+
+// The bridge's answer to an "auto" session/load of a conversation it retired:
+// history was replayed as asked, but discovery was NOT re-armed — retire the
+// tab locally and do not retry (REMOTE-CLIENTS "Closing a session").
+function sessionClosedAnswer(result: unknown): boolean {
+  return (
+    (result as { _meta?: { zcode?: { sessionClosed?: unknown } } } | null)?._meta?.zcode
+      ?.sessionClosed === true
+  );
+}
 
 function isSessionTombstoned(sessionId: string): boolean {
   const closedAt = closedSessionTombstones.get(sessionId);
@@ -1221,7 +1235,8 @@ export const useAppStore = create<AppState>((set, get) => {
     removeSessionCache(sessionId);
   }
 
-  function scheduleReconnect(): void {    const s = get();
+  function scheduleReconnect(): void {
+    const s = get();
     if (!s.profile || !s.instanceId) return;
     stopReconnect();
     const delay = Math.min(30000, 1000 * 2 ** reconnectAttempt++);
@@ -1367,6 +1382,67 @@ export const useAppStore = create<AppState>((set, get) => {
   }
 
   /**
+   * The resume flow behind resumeProjectSession (user) and reviveDeadInstance
+   * (auto): POST the store id to the hub — it incubates (or, under Desktop
+   * Presence, reuses) the workspace's serve bridge — then attach on whichever
+   * instance came back. The intent decides the close-tombstone contract on
+   * both legs. A USER re-launch clears the local tombstone and passes the
+   * hub's gate (close retires, it never deletes). An AUTO respawn leaves the
+   * tombstone alone, declares itself on the POST and on the attach load, and
+   * takes the hub's 409 "session closed" as the answer — the conversation
+   * was closed from another surface, so retire it locally instead of
+   * failing or respawning it (the resurrection the stone exists to prevent).
+   */
+  async function resumeSession(
+    workspacePath: string,
+    sessionId: string,
+    intent: SessionIntent,
+  ): Promise<boolean> {
+    const client = hub();
+    if (!client) return false;
+    if (intent === "user") {
+      // Manual re-launch from history: drop the local tombstone so the
+      // resumed row renders instead of being filtered as a stale ghost.
+      closedSessionTombstones.delete(sessionId);
+    }
+    let created: HubCreateInstanceResult;
+    try {
+      created = await client.createInstance(workspacePath, sessionId, intent);
+    } catch (e) {
+      if (intent === "auto" && e instanceof HubApiError && e.status === 409) {
+        retireSessionLocally(sessionId);
+        return false;
+      }
+      set({
+        notice:
+          e instanceof HubApiError && e.status === 403
+            ? "notice.projectUnknown"
+            : `resume session failed: ${e instanceof Error ? e.message : String(e)}`,
+      });
+      return false;
+    }
+    // Discovery refresh (best-effort) so the instance shows in the lists.
+    void get()
+      .refreshInstances()
+      .catch(() => undefined);
+    await get().connectInstance(created.id, sessionId, { intent });
+    // The attach (session/load) sets activeSessionId synchronously before it
+    // issues the request, so a non-null id is the same signal the old caller
+    // used — kept explicit here rather than inferred from the route swap.
+    if (get().connState !== "open" || !get().activeSessionId) {
+      // POST succeeded but the WS never opened (or the auto attach learned
+      // the conversation was closed and retired it); scheduleReconnect owns
+      // the connection retry. Surface it or pick() silently restores its
+      // buttons — except for the retirement, which already said its piece.
+      if (!isSessionTombstoned(sessionId)) {
+        set({ notice: "resume session failed: instance connection failed" });
+      }
+      return false;
+    }
+    return true;
+  }
+
+  /**
    * Respawn the bridge behind the current session after the hub proved it
    * gone ("unknown instance" / "bridge unreachable" on a session-bound
    * call). Same path as manually re-opening the session: createInstance
@@ -1375,7 +1451,11 @@ export const useAppStore = create<AppState>((set, get) => {
    * instanceId. The stale local instance list still carries the dead
    * instance's workspace — the hub no longer lists it, so refreshing first
    * would erase the one fact the respawn needs. Single-flight: concurrent
-   * failures (e.g. a listing + a file window) share one respawn.
+   * failures (e.g. a listing + a file window) share one respawn. AUTO
+   * intent: a serve bridge self-exits right after its last session is closed
+   * remotely, which is exactly how this path gets triggered — the hub's
+   * close tombstone must refuse the respawn (409) rather than resurrect the
+   * conversation the user just closed elsewhere.
    */
   async function reviveDeadInstance(): Promise<string | null> {
     if (reviveInFlight) return reviveInFlight;
@@ -1384,8 +1464,7 @@ export const useAppStore = create<AppState>((set, get) => {
     const workspace = s.instances.find((i) => i.id === s.instanceId)?.workspace;
     if (!workspace) return null;
     const sessionId = s.activeSessionId;
-    reviveInFlight = get()
-      .resumeProjectSession(workspace, sessionId)
+    reviveInFlight = resumeSession(workspace, sessionId, "auto")
       .then((ok) => (ok ? get().instanceId : null))
       .catch(() => null);
     try {
@@ -1614,15 +1693,15 @@ export const useAppStore = create<AppState>((set, get) => {
         ),
       });
       const active = get().activeSessionId;
-      if (active && isSessionTombstoned(active)) {
-        // The conversation was closed while the socket was down (the
-        // broadcast landed, or our own close did). A replay IS a load, and a
-        // load re-advertises the session (ADR-0006 self-heal) — the
-        // resurrection the tombstone exists to prevent. Leave it instead.
-        get().closeSession();
-      } else if (active) {
-        // Replay is the catch-up mechanism after any disconnect.
-        await get().loadSession(active);
+      if (active) {
+        // Replay is the catch-up mechanism after any disconnect. It is
+        // CLIENT-automatic: the conversation may have been closed from
+        // another surface while the socket was down (the broadcast never
+        // reached us), so the load declares "auto" intent — the bridge then
+        // answers sessionClosed instead of re-arming discovery (ADR-0006's
+        // re-arm is for a human picking the session) and loadSession
+        // retires it locally.
+        await get().loadSession(active, { intent: "auto" });
       }
     } catch {
       connectingSince = 0;
@@ -1948,7 +2027,15 @@ export const useAppStore = create<AppState>((set, get) => {
           target = [...inst.sessions].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]
             .sessionId;
         }
-        if (target) await get().loadSession(target);
+        if (target) {
+          // A caller-named session is the caller's gesture (user — the
+          // dead-bridge revive passes auto); the "most recent" fallback is
+          // OUR pick from a possibly stale list, so it is auto: the bridge
+          // answers sessionClosed for a conversation closed elsewhere
+          // instead of letting the pick resurrect it.
+          const intent: SessionIntent = opts?.intent ?? (attachSessionId ? "user" : "auto");
+          await get().loadSession(target, { intent });
+        }
       }
     },
 
@@ -2026,42 +2113,10 @@ export const useAppStore = create<AppState>((set, get) => {
     // (ADR-0017) — a NEW instance, never the listing's live serve bridge,
     // unless the desktop app is present (app ADR-0010): then the hub answers
     // with the live bridge (`reused: true`) and no window opens. The attach
-    // below session/loads the same id on whichever instance came back.
-    resumeProjectSession: async (workspacePath, sessionId) => {
-      const client = hub();
-      if (!client) return false;
-      // Manual re-launch from history (user intent — the hub's own close
-      // tombstone passes it too): drop the local tombstone so the resumed
-      // row renders instead of being filtered as a stale ghost.
-      closedSessionTombstones.delete(sessionId);
-      let created: HubCreateInstanceResult;
-      try {
-        created = await client.createInstance(workspacePath, sessionId);
-      } catch (e) {
-        set({
-          notice:
-            e instanceof HubApiError && e.status === 403
-              ? "notice.projectUnknown"
-              : `resume session failed: ${e instanceof Error ? e.message : String(e)}`,
-        });
-        return false;
-      }
-      // Discovery refresh (best-effort) so the instance shows in the lists.
-      void get()
-        .refreshInstances()
-        .catch(() => undefined);
-      await get().connectInstance(created.id, sessionId);
-      // The attach (session/load) sets activeSessionId synchronously before it
-      // issues the request, so a non-null id is the same signal the old caller
-      // used — kept explicit here rather than inferred from the route swap.
-      if (get().connState !== "open" || !get().activeSessionId) {
-        // POST succeeded but the WS never opened; scheduleReconnect owns the
-        // retry. Surface it or pick() silently restores its buttons.
-        set({ notice: "resume session failed: instance connection failed" });
-        return false;
-      }
-      return true;
-    },
+    // below session/loads the same id on whichever instance came back. A
+    // human picked it: user intent (see resumeSession).
+    resumeProjectSession: (workspacePath, sessionId) =>
+      resumeSession(workspacePath, sessionId, "user"),
 
     // One tap from the flat session list: may need to switch bridge instance
     // (new WS connection) before the session/load.
@@ -2267,8 +2322,9 @@ export const useAppStore = create<AppState>((set, get) => {
       });
     },
 
-    loadSession: async (sessionId) => {
+    loadSession: async (sessionId, opts) => {
       if (!acp || get().connState !== "open") return;
+      const intent: SessionIntent = opts?.intent ?? "user";
       // Replay arrives as session/update notifications; reset first. A stale
       // local dialog for THIS session dies here (a still-pending request is
       // re-sent by the bridge after the load and lands as a fresh entry);
@@ -2332,8 +2388,11 @@ export const useAppStore = create<AppState>((set, get) => {
             // Tail replay: the limit rides in _meta (top-level unknown keys
             // are stripped by the SDK schema). Counts messages, turn-aligned.
             // limit 0 is the bridge's metadata-only attach: response metadata
-            // only, no replay notifications.
-            _meta: { zcode: { limit } },
+            // only, no replay notifications. An "auto" intent rides along
+            // (the user default stays implicit — the old wire shape): the
+            // bridge then refuses to re-arm a remotely closed conversation
+            // and flags the answer instead (sessionClosedAnswer).
+            _meta: { zcode: { limit, ...(intent === "auto" ? { intent } : {}) } },
           });
 
         if (cached) {
@@ -2349,6 +2408,10 @@ export const useAppStore = create<AppState>((set, get) => {
           // an equal count with an idle bridge turn means the history is what
           // we show.
           const result = await load(0);
+          if (sessionClosedAnswer(result)) {
+            retireSessionLocally(sessionId);
+            return;
+          }
           const meta = readReplayMeta(result);
           const serverTail = meta?.lastMessageId ?? null;
           const cachedTail = isLocalMessageId(cached.lastMessageId)
@@ -2415,6 +2478,15 @@ export const useAppStore = create<AppState>((set, get) => {
 
         replaying = true;
         const result = await load(REPLAY_TAIL_LIMIT);
+        if (sessionClosedAnswer(result)) {
+          // The bridge replayed the tail we asked for, but the conversation
+          // was closed from another surface while we were away: drop the
+          // half-applied replay with it and retire — the close is the
+          // answer, not a failure (no retry, no error notice).
+          dropQueuedUpdates();
+          retireSessionLocally(sessionId);
+          return;
+        }
         const meta = readReplayMeta(result);
         const res = result as {
           modes?: { currentModeId?: string };
