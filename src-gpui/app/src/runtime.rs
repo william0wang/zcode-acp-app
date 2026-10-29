@@ -3002,13 +3002,19 @@ impl Driver {
                 // the hosting serve bridge alive: its idle self-exit only
                 // counts idle time with zero clients attached, so without a
                 // tab a remotely-opened session died ~10min after the remote
-                // client walked away. Cold start stays quiet (the
-                // 2026-10-22 half): the first snapshot is the baseline.
-                // Sessions a tab already holds (our own attach/resume in
-                // flight) are not remote opens.
+                // client walked away. Serve-origin instances only (2026-10-29):
+                // that liveness rationale is serve-specific — an editor (Zed)
+                // conversation's home is the editor's own window, its closes
+                // never broadcast cross-client (the serve-only fan-out in the
+                // close endpoint), and mirroring it re-popped a tab on every
+                // reappearance while its lifecycle stayed the editor's. Cold
+                // start stays quiet (the 2026-10-22 half): the first snapshot
+                // is the baseline. Sessions a tab already holds (our own
+                // attach/resume in flight) are not remote opens.
                 let arrivals: Vec<(String, String, String)> = if self.discovery_baselined {
                     list.iter()
                         .flat_map(|inst| inst.sessions.iter().map(move |s| (inst, s)))
+                        .filter(|(inst, _)| inst.origin == InstanceOrigin::Serve)
                         .filter(|(_, s)| {
                             self.seen_at.get(&s.session_id).is_none_or(|at| {
                                 now.saturating_sub(*at) >= REMOTE_OPEN_REAPPEAR_MS
@@ -9735,6 +9741,18 @@ mod tests {
         }
     }
 
+    /// Serve-origin fixture — the remote-open watch's pop only applies to
+    /// serve bridges (an editor conversation's home is the editor's window).
+    fn serve_instance(
+        id: &str,
+        workspace: Option<&str>,
+        sessions: Vec<HubSessionInfo>,
+    ) -> HubInstance {
+        let mut inst = instance(id, workspace, sessions);
+        inst.origin = InstanceOrigin::Serve;
+        inst
+    }
+
     fn driver() -> super::Driver {
         let (loop_tx, _loop_rx) = unbounded_channel();
         let (_cmd_tx, cmd_rx) = unbounded_channel();
@@ -10082,13 +10100,13 @@ mod tests {
         let mut d = driver();
 
         // Cold start: everything advertised at boot is the baseline — quiet.
-        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
+        d.on_discovery(Ok(vec![serve_instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
         assert!(d.tabs.is_empty(), "cold start opens nothing");
 
         // A remote create/resume lands next to s0 — one attaching tab,
         // active, on the right instance.
         d.on_discovery(
-            Ok(vec![instance("i", Some("/w"), vec![
+            Ok(vec![serve_instance("i", Some("/w"), vec![
                 session("s0", None),
                 session("s_new", None),
             ])]),
@@ -10101,7 +10119,7 @@ mod tests {
 
         // Plain re-advertisement of the same ids never pops again.
         d.on_discovery(
-            Ok(vec![instance("i", Some("/w"), vec![
+            Ok(vec![serve_instance("i", Some("/w"), vec![
                 session("s0", None),
                 session("s_new", None),
             ])]),
@@ -10120,7 +10138,7 @@ mod tests {
         assert!(d.tabs.is_empty(), "the retirement closed the holding tab");
         let relapse = 32_000 + super::CLOSE_TOMBSTONE_MS + 1;
         d.on_discovery(
-            Ok(vec![instance("i", Some("/w"), vec![
+            Ok(vec![serve_instance("i", Some("/w"), vec![
                 session("s0", None),
                 session("s_new", None),
             ])]),
@@ -10133,11 +10151,11 @@ mod tests {
         // stamps fresh), then a remote client resumes — the row's return IS
         // a remote open and attaches again.
         let gone = relapse + 60_000;
-        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), gone);
+        d.on_discovery(Ok(vec![serve_instance("i", Some("/w"), vec![session("s0", None)])]), gone);
         assert!(d.tabs.is_empty());
         let back = relapse + super::REMOTE_OPEN_REAPPEAR_MS + 30_000;
         d.on_discovery(
-            Ok(vec![instance("i", Some("/w"), vec![
+            Ok(vec![serve_instance("i", Some("/w"), vec![
                 session("s0", None),
                 session("s_new", None),
             ])]),
@@ -10147,17 +10165,55 @@ mod tests {
         assert_eq!(d.tabs[0].target.as_deref(), Some("s_new"));
     }
 
+    /// An editor-home conversation (Zed) never pops a tab (2026-10-29): the
+    /// watch's liveness rationale is serve-specific, and an editor
+    /// conversation's lifecycle is the editor's own — closes never broadcast
+    /// cross-client for editor bridges (the serve-only fan-out in the close
+    /// endpoint), so a mirrored tab was one the desktop could neither close
+    /// remotely nor stop re-opening on every reappearance. Serve arrivals in
+    /// the same snapshot still attach.
+    #[tokio::test]
+    async fn an_editor_session_never_remote_opens_a_tab() {
+        let mut d = driver();
+
+        // Baseline: an editor bridge already advertises one conversation.
+        d.on_discovery(Ok(vec![instance("i-ed", Some("/e"), vec![session("s0", None)])]), 1_000);
+
+        // A NEW editor conversation appears next snapshot — no tab: its home
+        // is the editor's window.
+        d.on_discovery(
+            Ok(vec![instance("i-ed", Some("/e"), vec![
+                session("s0", None),
+                session("s_ed", None),
+            ])]),
+            16_000,
+        );
+        assert!(d.tabs.is_empty(), "an editor conversation never remote-opens");
+
+        // The same snapshot's serve arrival still attaches.
+        d.on_discovery(
+            Ok(vec![
+                instance("i-ed", Some("/e"), vec![session("s0", None), session("s_ed", None)]),
+                serve_instance("i-sv", Some("/w"), vec![session("s_sv", None)]),
+            ]),
+            31_000,
+        );
+        assert_eq!(d.tabs.len(), 1, "the serve arrival still attaches");
+        assert_eq!(d.tabs[0].target.as_deref(), Some("s_sv"));
+        assert_eq!(d.tabs[0].instance_id, "i-sv");
+    }
+
     /// A session a tab already holds is not a remote open: the desktop's own
     /// attach/resume in flight (the tab exists, discovery has not advertised
     /// the id before) must not pop — or activate — a second tab.
     #[tokio::test]
     async fn a_session_a_tab_already_holds_is_not_a_remote_open() {
         let mut d = driver();
-        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
+        d.on_discovery(Ok(vec![serve_instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
         let held = d.open_tab("i".to_string(), Some("s_mine".to_string()), "/w".to_string());
 
         d.on_discovery(
-            Ok(vec![instance("i", Some("/w"), vec![
+            Ok(vec![serve_instance("i", Some("/w"), vec![
                 session("s0", None),
                 session("s_mine", None),
                 session("s_other", None),
@@ -10179,7 +10235,7 @@ mod tests {
     #[tokio::test]
     async fn closing_a_tab_marks_its_session_seen_not_remote_opened() {
         let mut d = driver();
-        d.on_discovery(Ok(vec![instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
+        d.on_discovery(Ok(vec![serve_instance("i", Some("/w"), vec![session("s0", None)])]), 1_000);
         let tab = d.open_tab("i".to_string(), Some("s_mine".to_string()), "/w".to_string());
         d.close_tab(tab, 1_500);
         assert!(d.tabs.is_empty());
@@ -10623,7 +10679,7 @@ mod tests {
         );
 
         d.on_discovery(
-            Ok(vec![instance(
+            Ok(vec![serve_instance(
                 "inst-a",
                 Some("/w/a"),
                 vec![session("s_a", None)],
