@@ -210,6 +210,27 @@ function DiffBlock({ diff }: { diff: AcpDiffContent }) {
   );
 }
 
+// Copy action for an expanded ToolCard. The wire title IS the raw command
+// ("Bash: npm test"), so "command" copies it whole — same text the desktop
+// card's right-click "Copy command" writes.
+function CardCopyButton({ label, text }: { label: string; text: string }) {
+  const { t } = useTranslation();
+  const notify = useAppStore((s) => s.notify);
+  return (
+    <button
+      onClick={() => {
+        void navigator.clipboard
+          .writeText(text)
+          .then(() => notify(t("chat.copied")))
+          .catch(() => notify(t("chat.copyFailed")));
+      }}
+      className="rounded-full px-2 py-0.5 text-[10px] text-faint active:bg-white/[0.06]"
+    >
+      {label}
+    </button>
+  );
+}
+
 function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
   const { t } = useTranslation();
   const a = (part.args ?? {}) as ToolCardArgs;
@@ -263,6 +284,16 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
           {detail || "…"}
         </pre>
       )}
+      {/* Inside <details>: rides the open state, so a collapsed card — which
+          exposes nothing copyable — shows no copy affordance at all. Mobile
+          has no right-click, so the desktop card menu's Copy command/output
+          pair lands here as buttons. */}
+      <div className="flex justify-end gap-1 border-t border-hairline px-2 py-1">
+        <CardCopyButton label={t("chat.copyCommand")} text={part.toolName} />
+        {detail && (
+          <CardCopyButton label={t("chat.copyOutput")} text={detail} />
+        )}
+      </div>
     </details>
   );
 }
@@ -431,6 +462,11 @@ const UserMessage = memo(function UserMessage({
   const { t } = useTranslation();
   const notify = useAppStore((s) => s.notify);
   const [zoom, setZoom] = useState<number | null>(null);
+  // An image-only prompt has no text for the copy action to write — hide the
+  // dead button (desktop parity: workbench.rs gates the same way).
+  const hasText = useAuiState((s) =>
+    s.message.parts.some((p) => p.type === "text" && p.text.trim() !== ""),
+  );
 
   // Long-press copy: the bubble is plain text, so the rendered text is the
   // source (assistant-side copying uses ActionBarPrimitive on markdown source).
@@ -515,15 +551,17 @@ const UserMessage = memo(function UserMessage({
       </div>
       {/* Same trailing copy action as the assistant side — the bubble is
           select-none, so the button (plus long-press) is the only copy path. */}
-      <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
-        <ActionBarPrimitive.Copy
-          aria-label={t("chat.copy")}
-          className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06] group"
-        >
-          <Copy className="size-3 group-data-[copied]:hidden" />
-          <Check className="hidden size-3 text-emerald-400 group-data-[copied]:block" />
-        </ActionBarPrimitive.Copy>
-      </ActionBarPrimitive.Root>
+      {hasText && (
+        <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
+          <ActionBarPrimitive.Copy
+            aria-label={t("chat.copy")}
+            className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06] group"
+          >
+            <Copy className="size-3 group-data-[copied]:hidden" />
+            <Check className="hidden size-3 text-emerald-400 group-data-[copied]:block" />
+          </ActionBarPrimitive.Copy>
+        </ActionBarPrimitive.Root>
+      )}
       {zoom != null && images && (
         <Lightbox
           open
@@ -544,6 +582,14 @@ const UserMessage = memo(function UserMessage({
 // markdown source.
 const AssistantMessage = memo(function AssistantMessage() {
   const { t } = useTranslation();
+  // The trailing copy writes the message's TEXT blocks only (thoughts and
+  // tool cards stay out). A tool-calls-only message — the fresh card message
+  // mid-turn — has nothing to copy, and the button would sit under collapsed
+  // cards copying ""; hide it (desktop parity: workbench.rs gates the same
+  // way). The cards carry their own copy actions once expanded.
+  const hasText = useAuiState((s) =>
+    s.message.parts.some((p) => p.type === "text" && p.text.trim() !== ""),
+  );
   return (
     <MessagePrimitive.Root className="min-w-0">
       <div className="w-full text-[15px] leading-relaxed text-ink">
@@ -588,15 +634,17 @@ const AssistantMessage = memo(function AssistantMessage() {
           }}
         </MessagePrimitive.GroupedParts>
       </div>
-      <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
-        <ActionBarPrimitive.Copy
-          aria-label={t("chat.copy")}
-          className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06] group"
-        >
-          <Copy className="size-3 group-data-[copied]:hidden" />
-          <Check className="hidden size-3 text-emerald-400 group-data-[copied]:block" />
-        </ActionBarPrimitive.Copy>
-      </ActionBarPrimitive.Root>
+      {hasText && (
+        <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
+          <ActionBarPrimitive.Copy
+            aria-label={t("chat.copy")}
+            className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06] group"
+          >
+            <Copy className="size-3 group-data-[copied]:hidden" />
+            <Check className="hidden size-3 text-emerald-400 group-data-[copied]:block" />
+          </ActionBarPrimitive.Copy>
+        </ActionBarPrimitive.Root>
+      )}
     </MessagePrimitive.Root>
   );
 });

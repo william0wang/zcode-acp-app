@@ -59,6 +59,8 @@
     "copy": "Copy",
     "copied": "Copied",
     "copyFailed": "Copy failed",
+    "copyCommand": "Copy command",
+    "copyOutput": "Copy output",
     "jumpToLatest": "Jump to latest",
     "searchPlaceholder": "Search sessions",
     "noMatches": "No matching sessions",

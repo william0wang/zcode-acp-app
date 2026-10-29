@@ -58,6 +58,8 @@
     "copy": "复制",
     "copied": "已复制",
     "copyFailed": "复制失败",
+    "copyCommand": "复制命令",
+    "copyOutput": "复制输出",
     "jumpToLatest": "回到底部",
     "searchPlaceholder": "搜索会话",
     "noMatches": "没有匹配的会话",
