@@ -63,6 +63,7 @@
     "noMatches": "没有匹配的会话",
     "closeSession": "关闭会话",
     "closeSessionHint": "从列表中移除；编辑器中仍打开的会话会在下次使用时重新出现",
+    "closeServeSessionHint": "关闭这个会话（桌面端标签页也会随之关闭）。它是该项目后台 bridge 上最后一个会话时，bridge 会自行退出。",
     "shutdownInstance": "关闭实例",
     "shutdownInstanceHint": "关闭运行该会话的终端窗口（或后台 bridge）。历史保留；重新打开会话会开新窗口。",
     "renameSession": "重命名",

@@ -64,6 +64,7 @@
     "noMatches": "No matching sessions",
     "closeSession": "Close session",
     "closeSessionHint": "Removes it from this list. A conversation still open in the editor reappears on its next use.",
+    "closeServeSessionHint": "Closes this conversation everywhere (desktop tabs included). The project's background bridge exits by itself once its last conversation closes.",
     "shutdownInstance": "Shut down instance",
     "shutdownInstanceHint": "Closes the terminal window running this session (or its background bridge). History stays; re-opening a session starts a new window.",
     "renameSession": "Rename",

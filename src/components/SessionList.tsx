@@ -307,7 +307,7 @@ export function SessionList({
                   : readOnly
                     ? t("chat.deleteSessionHint")
                     : actionTarget.origin === "serve"
-                      ? t("chat.shutdownInstanceHint")
+                      ? t("chat.closeServeSessionHint")
                       : t("chat.closeSessionHint")}
               </p>
             </div>
@@ -356,35 +356,42 @@ export function SessionList({
                     {t("chat.renameSession")}
                   </button>
                 )}
-                {/* One destructive action per origin: app-incubated instances
-                    (serve) shut the whole window/bridge down — that IS the
-                    close; editor conversations only retire from this list.
-                    Delete (when offered) is a separate, always-available
-                    tombstone — it hides the conversation everywhere. */}
-                {!readOnly &&
-                  (actionTarget.origin === "serve" ? (
-                    <button
-                      onClick={() => {
-                        const { instanceId } = actionTarget;
-                        setActionTarget(null);
-                        void shutdownInstance(instanceId);
-                      }}
-                      className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/20"
-                    >
-                      {t("chat.shutdownInstance")}
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => {
-                        const { instanceId, sessionId } = actionTarget;
-                        setActionTarget(null);
-                        void closeRemoteSession(instanceId, sessionId);
-                      }}
-                      className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/20"
-                    >
-                      {t("chat.closeSession")}
-                    </button>
-                  ))}
+                {/* The close is a SESSION close for every origin: the bridge
+                    retires the conversation, broadcasts session_closed (the
+                    desktop drops its tab and tombstones it), the hub
+                    tombstones it, and a serve bridge exits by itself once its
+                    LAST conversation closes. The whole-bridge kill below is
+                    not a close: a headless serve bridge hosts EVERY session of
+                    its project (Desktop Presence), and the kill skips all of
+                    that — no retirement, no broadcast, no tombstone — so other
+                    clients read it as a crash and re-incubate the bridge (the
+                    desktop's "closed tab came back", 2026-10-28). Delete
+                    (when offered) is a separate, always-available tombstone —
+                    it hides the conversation everywhere. */}
+                {!readOnly && (
+                  <button
+                    onClick={() => {
+                      const { instanceId, sessionId } = actionTarget;
+                      setActionTarget(null);
+                      void closeRemoteSession(instanceId, sessionId);
+                    }}
+                    className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/20"
+                  >
+                    {t("chat.closeSession")}
+                  </button>
+                )}
+                {!readOnly && actionTarget.origin === "serve" && (
+                  <button
+                    onClick={() => {
+                      const { instanceId } = actionTarget;
+                      setActionTarget(null);
+                      void shutdownInstance(instanceId);
+                    }}
+                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                  >
+                    {t("chat.shutdownInstance")}
+                  </button>
+                )}
                 {onDelete && (
                   <button
                     onClick={() => {
