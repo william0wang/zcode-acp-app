@@ -171,11 +171,17 @@ const APP_UPDATE_POLL_MS: u64 = 2_000;
 /// `setTimeout(() => setUpgradeNote(null))`).
 const HUB_UPGRADE_NOTE_MS: u64 = 5_000;
 
-/// Env-gated stderr trace for the driver lifecycle (ZCODE_ACP_TRACE=1) —
-/// the slice's connection story, observable without a debugger.
+/// Env-gated stderr trace for the driver lifecycle — the slice's connection
+/// story, observable without a debugger. Rides the product family's one debug
+/// switch (`ZCODE_ACP_DEBUG=1`, the bridge's `log()` gate); `ZCODE_ACP_TRACE=1`
+/// stays accepted as the desktop's older spelling.
 fn trace() -> bool {
     static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *TRACE.get_or_init(|| std::env::var("ZCODE_ACP_TRACE").ok().as_deref() == Some("1"))
+    *TRACE.get_or_init(|| {
+        ["ZCODE_ACP_DEBUG", "ZCODE_ACP_TRACE"]
+            .iter()
+            .any(|key| std::env::var(key).ok().as_deref() == Some("1"))
+    })
 }
 
 macro_rules! traceln {
