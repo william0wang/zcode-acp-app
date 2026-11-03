@@ -22,6 +22,12 @@ pub struct ToolCallPart {
     /// distinct from `toolName` which holds the wire title "Bash: npm test".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_name: Option<String>,
+    /// Pretty-printed `tool_call.rawInput`, filled at creation (updates never
+    /// carry it). A live call with no output yet — a sub-agent dispatch
+    /// streams nothing until it finishes — shows it as the card body instead
+    /// of an empty fold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_input: Option<String>,
     /// Replay-only harness fold (`_meta.zcode.kind` on `histfold_`
     /// tool_calls, server 0.6.0): "context-handoff" | "tool-transcript".
     #[serde(default, skip_serializing_if = "Option::is_none")]

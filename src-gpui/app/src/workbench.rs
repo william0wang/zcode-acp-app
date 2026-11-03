@@ -343,10 +343,10 @@ pub struct Workbench {
     /// a settled card clips at the cap instead and this flag lifts the cap.
     thought_full: std::collections::HashSet<(String, usize)>,
     /// Manual fold verdicts for adjacent tool-call RUNS, keyed by (row id,
-    /// index of the run's first part). Absent = never toggled, so the run
-    /// follows its own state: open while a call is still in flight
-    /// (watchable as it happens), folded once every call settled. A present
-    /// entry is the user's permanent verdict (the ThoughtCard rule).
+    /// index of the run's first part). Absent = never toggled: collapsed,
+    /// live runs included — the summary header's running glyph + label carry
+    /// the progress. A present entry is the user's permanent verdict (the
+    /// ThoughtCard rule, minus the auto phase).
     tool_run_open: std::collections::HashMap<(String, usize), bool>,
     /// The files panel's dotfile toggle (F1, TS FileBrowser `showHidden`):
     /// view-local like the TS component state — the entries always arrive
@@ -481,6 +481,10 @@ enum PartView {
         detail_head: String,
         detail: String,
         fold_kind: Option<String>,
+        /// Pretty-printed `rawInput`, shown as the body while the call is in
+        /// flight with no output yet (a sub-agent dispatch carries only its
+        /// prompt until completion).
+        raw_input: String,
         expanded: bool,
         /// The ACP source blocks — the sync point's cheap change key for
         /// recomputing `diffs`.
@@ -543,6 +547,7 @@ fn new_part_view(part: &ChatPart, role: ChatRole, cx: &mut Context<Workbench>) -
             detail_head: tool_detail_head(&tc.detail),
             detail: tc.detail.clone(),
             fold_kind: tc.fold_kind.clone(),
+            raw_input: tc.raw_input.clone().unwrap_or_default(),
             expanded: false,
             diff_src: tc.diffs.clone().unwrap_or_default(),
             diffs: blocks_of(tc.diffs.as_deref().unwrap_or(&[])),
@@ -974,6 +979,7 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
                 detail_head,
                 detail,
                 fold_kind,
+                raw_input,
                 diff_src,
                 diffs,
                 ..
@@ -987,6 +993,7 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
                 && label.as_ref() == tc.tool_name
                 && *detail == tc.detail
                 && *fold_kind == tc.fold_kind
+                && *raw_input == tc.raw_input.as_deref().unwrap_or("")
                 && diff_src.as_slice() == new_diffs
             {
                 return false;
@@ -996,6 +1003,7 @@ fn sync_part_view(view: &mut PartView, part: &ChatPart, cx: &mut Context<Workben
             *detail_head = head;
             *detail = tc.detail.clone();
             *fold_kind = tc.fold_kind.clone();
+            *raw_input = tc.raw_input.clone().unwrap_or_default();
             // The LCS only re-runs when the source blocks changed (plain
             // Vec compare — no diffing to decide whether to diff).
             *diff_src = new_diffs.to_vec();
@@ -2311,9 +2319,8 @@ impl Workbench {
         }
     }
 
-    /// Pin one aggregated tool-run card open or shut. Records the MANUAL
-    /// verdict only — from here on the run stops following its own state
-    /// (the TS ToolRunCard's `manual`).
+    /// Pin one aggregated tool-run card open or shut (the TS ToolRunCard's
+    /// `open` state; runs are collapsed by default).
     fn set_tool_run_open(
         &mut self,
         row_id: &str,
@@ -5973,19 +5980,16 @@ fn render_assistant_row(
             }
             let run = &row.parts[start..part_index];
             column = column.child(if run.len() > 1 {
-                // Absent = never toggled: a live run stays open so its calls
-                // are watchable, a settled one folds away. While the turn is
-                // running, the live row's TAIL run stays latched open as
-                // well: the desktop renders every protocol update on its
-                // own, so in the gap between one call's result and the next
-                // call's request "any call in flight" briefly reads false
-                // and the card flaps shut then reopens (the mobile app
-                // batches those updates and never shows the gap).
-                let live_tail = running && is_last_row && part_index == row.parts.len();
+                // Collapsed by default, live runs included — a long turn's
+                // calls are the wall the fold exists to avoid, and the
+                // summary header's running glyph + label carry the progress.
+                // Nothing auto-opens anymore, so the between-calls status
+                // gap (one result in, next request not yet) can no longer
+                // flap the card; a manual verdict is permanent.
                 let open = tool_run_open
                     .get(&(row.id.clone(), start))
                     .copied()
-                    .unwrap_or_else(|| tool_run_summary(run).1 || live_tail);
+                    .unwrap_or(false);
                 render_tool_run(&row.id, start, run, open, wb, theme)
             } else {
                 render_tool_card(&row.id, start, &run[0], wb, theme)
@@ -6208,6 +6212,7 @@ fn render_tool_card(
         detail_head,
         detail,
         fold_kind,
+        raw_input,
         expanded,
         diff_src: _,
         diffs,
@@ -6326,17 +6331,26 @@ fn render_tool_card(
         for (bi, block) in diffs.iter().enumerate() {
             body = body.child(render_diff_block(block, row_id, part_index, bi, theme));
         }
+        // A live call with no output yet: the input is all there is to show —
+        // a sub-agent dispatch streams nothing until it finishes, so without
+        // this its expanded card is an empty fold (TS `liveInput`).
+        let live = *status == "pending" || *status == "in_progress";
+        let body_text = if !detail.is_empty() {
+            detail.clone()
+        } else if live && !raw_input.is_empty() {
+            raw_input.clone()
+        } else if live {
+            format!("{}…", t!("chat.activityRunning"))
+        } else {
+            "…".to_string()
+        };
         body = body.child(
             div()
                 .px_2()
                 .py(px(6.))
                 .text_color(theme.muted_foreground)
                 .whitespace_normal()
-                .child(if detail.is_empty() {
-                    "…".to_string()
-                } else {
-                    detail.clone()
-                }),
+                .child(body_text),
         );
         card = card.child(body.test_support());
     }
@@ -6471,6 +6485,17 @@ fn render_tool_run(
                     .text_color(theme.foreground)
                     .child(label),
             )
+            // The live run folds shut now, so the header itself must say
+            // "still executing" — accent label riding the glyph's color.
+            .when(running, |this| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .text_size(ui_text(12.))
+                        .text_color(color)
+                        .child(format!("{}…", t!("chat.activityRunning"))),
+                )
+            })
             .when(!names.is_empty(), |this| {
                 this.child(
                     div()
@@ -7865,6 +7890,7 @@ mod display_unit_tests {
             detail_head: String::new(),
             detail: String::new(),
             fold_kind: None,
+            raw_input: String::new(),
             expanded: false,
             diff_src: Vec::new(),
             diffs: Vec::new(),

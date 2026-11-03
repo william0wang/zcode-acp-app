@@ -5,6 +5,7 @@
 import {
   contentDiffBlocks,
   contentText,
+  rawInputText,
   type ChatMessage,
   type ChatPart,
   type ConfigOption,
@@ -358,6 +359,11 @@ export function applyOne(
       ...(typeof meta?.toolName === "string"
         ? { rawName: meta.toolName }
         : {}),
+      ...(() => {
+        // Filled at creation only: an update never carries rawInput.
+        const ri = rawInputText(u.rawInput);
+        return ri ? { rawInput: ri } : {};
+      })(),
       ...(() => {
         const diffs = contentDiffBlocks(u.content);
         return diffs.length ? { diffs } : {};

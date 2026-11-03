@@ -815,6 +815,7 @@ mod tests {
                 status: "pending".to_string(),
                 kind: Some("execute".to_string()),
                 raw_name: raw_name.map(str::to_string),
+                raw_input: None,
                 fold_kind: None,
                 diffs: None,
             })],

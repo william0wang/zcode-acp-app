@@ -331,6 +331,18 @@ export function contentDiffBlocks(content: unknown): AcpDiffContent[] {
   return blocks.filter(isDiffContent);
 }
 
+// `tool_call.rawInput` as display text: a string rides verbatim, anything
+// else pretty-prints as JSON (the approval dialog's `rawInputText` rule).
+export function rawInputText(rawInput: unknown): string | undefined {
+  if (rawInput == null) return undefined;
+  if (typeof rawInput === "string") return rawInput;
+  try {
+    return JSON.stringify(rawInput, null, 2);
+  } catch {
+    return String(rawInput);
+  }
+}
+
 // Internal chat model, converted to assistant-ui ThreadMessageLike at render time.
 
 export interface ToolCallPart {
@@ -345,6 +357,10 @@ export interface ToolCallPart {
   // Raw backend tool name from `_meta.claudeCode.toolName` (e.g. "Bash"),
   // distinct from `toolName` which holds the wire title "Bash: npm test".
   rawName?: string;
+  // Pretty-printed `tool_call.rawInput`, filled at creation. A live call
+  // with no output yet (a sub-agent dispatch streams nothing until it
+  // finishes) shows it as the card body instead of an empty fold.
+  rawInput?: string;
   // Replay-only harness fold (`_meta.zcode.kind` on `histfold_` tool_calls,
   // server 0.6.0): "context-handoff" | "tool-transcript". The full plumbing
   // text rides `detail` behind the card's expand.

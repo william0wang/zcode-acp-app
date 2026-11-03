@@ -138,6 +138,17 @@ fn opt_str(v: Option<&Value>) -> Option<String> {
     v.and_then(Value::as_str).map(str::to_owned)
 }
 
+/// `tool_call.rawInput` → display text (the TS `rawInputText` and the
+/// approval dialog's rule): a string rides verbatim, anything else
+/// pretty-prints as JSON.
+fn raw_input_text(v: Option<&Value>) -> Option<String> {
+    let v = v.filter(|v| !v.is_null())?;
+    Some(match v {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    })
+}
+
 fn opt_bool(v: Option<&Value>) -> Option<bool> {
     v.and_then(Value::as_bool)
 }
@@ -501,6 +512,7 @@ pub fn apply_one(
             status: js_string_or(rest.get("status"), "pending"),
             kind: opt_str(rest.get("kind")),
             raw_name: opt_str(claude_meta.and_then(|c| c.get("toolName"))),
+            raw_input: raw_input_text(rest.get("rawInput")),
             fold_kind: fold,
             diffs: if diffs.is_empty() { None } else { Some(diffs) },
         };
@@ -957,6 +969,49 @@ mod tests {
         );
         assert_eq!(msgs.len(), 2);
         assert!(matches!(&msgs[1].parts[0], ChatPart::Text { text } if text == "done"));
+    }
+
+    #[test]
+    fn a_tool_card_keeps_its_pretty_printed_raw_input() {
+        // A sub-agent dispatch streams nothing until it finishes — its prompt
+        // rides `rawInput` at creation, and the card body leans on it while
+        // the call is in flight.
+        let mut msgs = Vec::new();
+        let mut ids = factory();
+        let mut rest = serde_json::Map::new();
+        rest.insert("toolCallId".to_owned(), json!("tc_task"));
+        rest.insert("title".to_owned(), json!("Task: research"));
+        rest.insert("status".to_owned(), json!("in_progress"));
+        rest.insert(
+            "rawInput".to_owned(),
+            json!({ "prompt": "find the ADR", "subagent_type": "Explore" }),
+        );
+        apply_one(&mut msgs, &SessionUpdate::with_rest("tool_call", rest), None, &mut ids, 1);
+        let ChatPart::ToolCall(tc) = &msgs[0].parts[0] else {
+            panic!("tool card");
+        };
+        assert_eq!(tc.detail, "");
+        assert_eq!(tc.status, "in_progress");
+        assert_eq!(
+            tc.raw_input.as_deref(),
+            serde_json::to_string_pretty(&json!({
+                "prompt": "find the ADR",
+                "subagent_type": "Explore"
+            }))
+            .ok()
+            .as_deref()
+        );
+        // An update never carries rawInput — the creation copy survives.
+        let mut upd = serde_json::Map::new();
+        upd.insert("toolCallId".to_owned(), json!("tc_task"));
+        upd.insert("status".to_owned(), json!("completed"));
+        upd.insert("content".to_owned(), json!([{ "type": "text", "text": "result" }]));
+        apply_one(&mut msgs, &SessionUpdate::with_rest("tool_call_update", upd), None, &mut ids, 2);
+        let ChatPart::ToolCall(tc) = &msgs[0].parts[0] else {
+            panic!("tool card");
+        };
+        assert_eq!(tc.detail, "result");
+        assert!(tc.raw_input.is_some());
     }
 
     #[test]

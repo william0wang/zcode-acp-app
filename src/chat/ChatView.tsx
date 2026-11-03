@@ -56,7 +56,7 @@ import { useAppStore } from "../store/appStore";
 import { MarkdownText } from "../components/Markdown";
 import { Spinner } from "../components/Spinner";
 import { MAX_IMAGES, attachmentDataUrl, prepareImage } from "../lib/image";
-import { summarizeToolRun, toolNameOf, oneLine } from "./toolRun";
+import { isRunningStatus, summarizeToolRun, toolNameOf, oneLine } from "./toolRun";
 import type {
   AcpDiffContent,
   AttachmentDraft,
@@ -104,6 +104,7 @@ const convertMessage = (m: ChatMessage): ThreadMessageLike => {
           status: p.status,
           ...(p.kind ? { kind: p.kind } : {}),
           ...(p.rawName ? { rawName: p.rawName } : {}),
+          ...(p.rawInput ? { rawInput: p.rawInput } : {}),
           ...(p.foldKind ? { foldKind: p.foldKind } : {}),
           ...(p.diffs ? { diffs: JSON.stringify(p.diffs) } : {}),
         },
@@ -149,6 +150,7 @@ interface ToolCardArgs {
   detail?: string;
   kind?: string;
   rawName?: string;
+  rawInput?: string;
   title?: string;
   status?: string;
   foldKind?: string;
@@ -253,6 +255,13 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
             (a.title ?? part.toolName).split(":")[0]?.trim() ||
             part.toolName,
         );
+  // A live call with no output yet: the input is all there is to show — a
+  // sub-agent dispatch streams nothing until it finishes, so without this
+  // its expanded card is an empty fold.
+  const liveInput =
+    !foldKind && !detail && isRunningStatus(a.status ?? "")
+      ? (a.rawInput ?? null)
+      : null;
   return (
     <details className="group my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04] text-xs">
       <summary className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-dim">
@@ -273,15 +282,19 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
           {diffs.map((d, i) => (
             <DiffBlock key={`${d.path}-${i}`} diff={d} />
           ))}
-          {detail && (
+          {(detail || liveInput) && (
             <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap border-t border-hairline px-3 py-2 text-faint">
-              {detail}
+              {detail || liveInput}
             </pre>
           )}
         </div>
       ) : (
         <pre className="max-h-64 overflow-auto whitespace-pre-wrap border-t border-hairline px-3 py-2 text-faint">
-          {detail || "…"}
+          {detail ||
+            liveInput ||
+            (isRunningStatus(a.status ?? "")
+              ? `${t("chat.activityRunning")}…`
+              : "…")}
         </pre>
       )}
       {/* Inside <details>: rides the open state, so a collapsed card — which
@@ -311,10 +324,11 @@ function ToolRunCard({
   children: ReactNode;
 }) {
   const { t } = useTranslation();
-  // `null` = never toggled: follow the run's own state. A live run stays open
-  // so its calls are watchable as they happen; once settled it folds away. A
-  // manual toggle wins permanently (the ThoughtCard rule).
-  const [manual, setManual] = useState<boolean | null>(null);
+  // Collapsed by default, live runs included — a long turn's calls are the
+  // wall the fold exists to avoid, and the header's running state (pulsing
+  // icon + label) carries the progress. A manual open stays open (the
+  // ThoughtCard rule, minus the auto phase).
+  const [open, setOpen] = useState(false);
   // The message's parts give the summary its names/status; the group node
   // itself carries only indices. `indices` is a fresh array per render, so
   // the memo keys on its joined identity instead of the reference.
@@ -332,11 +346,10 @@ function ToolRunCard({
       ),
     [indexKey, parts],
   );
-  const open = manual ?? summary.running;
   return (
     <div className="my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04]">
       <button
-        onClick={() => setManual(!open)}
+        onClick={() => setOpen(!open)}
         className="flex w-full min-w-0 items-center gap-1.5 px-3 py-2 text-left"
       >
         <Wrench
@@ -351,6 +364,11 @@ function ToolRunCard({
         <span className="shrink-0 text-xs font-medium text-dim">
           {t("chat.toolRun", { count: summary.count })}
         </span>
+        {summary.running && (
+          <span className="shrink-0 text-xs text-emerald-400">
+            {t("chat.activityRunning")}…
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate text-xs text-faint">
           {summary.names.join(" · ")}
         </span>

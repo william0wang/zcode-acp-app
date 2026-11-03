@@ -57,3 +57,25 @@ test("an id-less tool card joins a trailing card run at turn start", () => {
   expect(msgs).toHaveLength(2);
   expect((msgs[1].parts[0] as { text: string }).text).toBe("done");
 });
+
+// A sub-agent dispatch streams nothing until it finishes — its prompt rides
+// `rawInput` at creation, and the card body leans on it while in flight.
+test("a tool card keeps its pretty-printed rawInput for the live body", () => {
+  const msgs = apply([], {
+    sessionUpdate: "tool_call",
+    toolCallId: "tc_task",
+    title: "Task: research the docs",
+    status: "in_progress",
+    rawInput: { prompt: "find the ADR", subagent_type: "Explore" },
+  } as unknown as SessionUpdate);
+  const part = msgs[0].parts[0] as {
+    detail: string;
+    rawInput?: string;
+    status: string;
+  };
+  expect(part.detail).toBe("");
+  expect(part.status).toBe("in_progress");
+  expect(part.rawInput).toBe(
+    JSON.stringify({ prompt: "find the ADR", subagent_type: "Explore" }, null, 2),
+  );
+});

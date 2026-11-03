@@ -22,6 +22,11 @@ export interface ToolRunSummary {
 
 const RUNNING_STATUSES = new Set(["pending", "in_progress"]);
 
+/** A call still pending or in flight (single cards as well as run summaries). */
+export function isRunningStatus(status: string): boolean {
+  return RUNNING_STATUSES.has(status);
+}
+
 export function summarizeToolRun(
   entries: readonly ToolRunEntry[],
 ): ToolRunSummary {
