@@ -12,13 +12,16 @@ import {
 // session/request_permission. Three shapes — Plan Approval, Tool Permission,
 // Question — distinguished by the matched tool_call (ADR 0003).
 
-// Common keys of tool inputs worth surfacing before the JSON fallback.
+// Common keys of tool inputs worth surfacing before the JSON fallback
+// (aligned with the bridge's describeToolInput priority list).
 const INPUT_KEYS = [
   "command",
   "file_path",
   "path",
+  "notebook_path",
   "pattern",
   "url",
+  "query",
   "description",
 ] as const;
 
@@ -173,10 +176,26 @@ export function PermissionDialog() {
             </div>
           )}
 
-          {/* Unknown tool input: keep the raw JSON reachable, folded. */}
+          {/* Tool permission the key list missed: the wire content (the
+              bridge's `inputPopupContent` — the full command, or the input
+              pretty-printed) is the detail, and it must not hide behind a
+              click. Rendered mono, not markdown: a command's `#` or `*` must
+              not turn into headings. */}
           {!isPlan &&
             !isQuestion &&
             highlights.length === 0 &&
+            ctx?.detail && (
+              <pre className="mt-2 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-black/30 px-2.5 py-1.5 font-mono text-xs text-dim">
+                {ctx.detail}
+              </pre>
+            )}
+
+          {/* Unknown tool input with no wire content either: keep the raw
+              JSON reachable, folded. */}
+          {!isPlan &&
+            !isQuestion &&
+            highlights.length === 0 &&
+            !ctx?.detail &&
             ctx?.rawInputText && (
               <details className="mt-2">
                 <summary className="cursor-pointer select-none text-xs text-faint">

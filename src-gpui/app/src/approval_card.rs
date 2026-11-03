@@ -286,7 +286,29 @@ pub fn render_approval_card(
                     );
                 }
                 if highlights.is_empty() {
-                    if let Some(raw) =
+                    // The key list missed this tool: the wire content (the
+                    // bridge's `inputPopupContent` — the full command, or the
+                    // input pretty-printed) is the detail, and it must not
+                    // hide behind a click (TS renders ctx.detail unfolded).
+                    if let Some(detail) =
+                        ctx.and_then(|c| c.detail.clone()).filter(|t| !t.is_empty())
+                    {
+                        column = column.child(
+                            div()
+                                .id("approval-detail")
+                                .max_h(px(160.))
+                                .overflow_y_scroll()
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .bg(theme.background)
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(ui_text(12.))
+                                .text_color(theme.muted_foreground)
+                                .whitespace_normal()
+                                .child(detail),
+                        );
+                    } else if let Some(raw) =
                         ctx.and_then(|c| c.raw_input_text.clone()).filter(|t| !t.is_empty())
                     {
                         // TS PermissionDialog:176-189 — the raw input folds

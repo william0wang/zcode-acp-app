@@ -43,7 +43,9 @@ pub struct ApprovalContext {
     pub kind: Option<String>,
     pub title: Option<String>,
     /// Plan text (ExitPlanMode) or question text (AskUserQuestion), from the
-    /// matched tool_call's content.
+    /// matched tool_call's content — or a tool permission's full command /
+    /// pretty-printed input (the bridge's `inputPopupContent`), shown when
+    /// the highlight key list misses the tool.
     pub detail: Option<String>,
     pub plan: Option<String>,
     /// Pretty-printed `toolCall.rawInput` — the JSON fallback surface.
@@ -145,8 +147,18 @@ pub fn permission_shape(pending: &PendingPermission) -> ApprovalShape {
 }
 
 /// Common keys of tool inputs worth surfacing before the JSON fallback
-/// (PermissionDialog.tsx `INPUT_KEYS`).
-pub const INPUT_KEYS: [&str; 6] = ["command", "file_path", "path", "pattern", "url", "description"];
+/// (PermissionDialog.tsx `INPUT_KEYS`, aligned with the bridge's
+/// `describeToolInput` priority list).
+pub const INPUT_KEYS: [&str; 8] = [
+    "command",
+    "file_path",
+    "path",
+    "notebook_path",
+    "pattern",
+    "url",
+    "query",
+    "description",
+];
 
 /// A tool-input highlight row: the input key and its string value.
 #[derive(Debug, Clone, PartialEq, Eq)]
