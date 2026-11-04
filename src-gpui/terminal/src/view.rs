@@ -199,7 +199,7 @@ pub type ResizeCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
 ///
 /// # Arguments
 ///
-/// * `event` - The key down event from GPUI
+/// * `keystroke` - The keystroke from GPUI
 ///
 /// # Returns
 ///
@@ -231,7 +231,7 @@ pub type ResizeCallback = Box<dyn Fn(usize, usize) + Send + Sync>;
 ///     false // Let terminal handle all other keys
 /// });
 /// ```
-pub type KeyHandler = Box<dyn Fn(&KeyDownEvent) -> bool + Send + Sync>;
+pub type KeyHandler = Box<dyn Fn(&Keystroke) -> bool + Send + Sync>;
 
 /// Callback for terminal bell events.
 ///
@@ -600,20 +600,20 @@ impl TerminalView {
 
     /// Set a callback to intercept key events before terminal processing.
     ///
-    /// The callback receives the key event and should return `true` to consume
+    /// The callback receives the keystroke and should return `true` to consume
     /// the event (prevent the terminal from processing it), or `false` to allow
     /// normal terminal processing.
     ///
     /// # Arguments
     ///
-    /// * `handler` - A function that receives key events and returns whether to consume them
+    /// * `handler` - A function that receives keystrokes and returns whether to consume them
     ///
     /// # Example
     ///
     /// ```ignore
-    /// terminal.with_key_handler(|event| {
+    /// terminal.with_key_handler(|keystroke| {
     ///     // Handle Ctrl++ to increase font size
-    ///     if event.keystroke.modifiers.control && event.keystroke.key == "+" {
+    ///     if keystroke.modifiers.control && keystroke.key == "+" {
     ///         // Handle the event
     ///         return true; // Consume the event
     ///     }
@@ -622,7 +622,7 @@ impl TerminalView {
     /// ```
     pub fn with_key_handler(
         mut self,
-        handler: impl Fn(&KeyDownEvent) -> bool + Send + Sync + 'static,
+        handler: impl Fn(&Keystroke) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.key_handler = Some(Arc::new(Box::new(handler)));
         self
@@ -757,27 +757,52 @@ impl TerminalView {
         }
     }
 
-    /// Handle keyboard input events.
+    /// Whether the shell should receive this keystroke.
     ///
-    /// Converts GPUI keystrokes to terminal escape sequences and writes them
-    /// to the stdin writer. If a key handler is set and returns true, the event
-    /// is consumed and not sent to the terminal. Paste pulls the host
-    /// clipboard through gpui (the vendored crate dropped upstream's arboard
-    /// dependency); every consumed key stops propagation so the host's
-    /// action bindings (an app-wide Esc, for one) never double-fire.
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    /// The host routes keystrokes into [`Self::handle_key`] BEFORE gpui
+    /// resolves keymap actions (see that method), so this is the gate that
+    /// keeps the app's own shortcuts working while the terminal is focused:
+    /// a Command (⌘) combo is the app's unless it is the copy/paste pair, and
+    /// anything [`keystroke_to_bytes`] cannot encode (⌃`, ⌘Q, …) falls through
+    /// to normal dispatch.
+    pub fn claims_keystroke(&self, keystroke: &Keystroke) -> bool {
+        let modifiers = keystroke.modifiers;
+        if modifiers.platform {
+            return keystroke.key == "v" || keystroke.key == "c";
+        }
+        keystroke_to_bytes(keystroke, self.state.mode()).is_some()
+    }
+
+    /// Handle a keystroke from the shell's keyboard.
+    ///
+    /// The host calls this from BOTH its own bubble-phase key listener and,
+    /// when the shell owns the keyboard, from a keystroke interceptor: gpui
+    /// resolves keymap actions BEFORE key listeners, so a bare `tab` would
+    /// otherwise be eaten by the app's focus-traversal binding and never reach
+    /// the PTY. Callers should gate on [`Self::claims_keystroke`] first.
+    ///
+    /// Converts the keystroke to its terminal escape sequence and writes it to
+    /// the stdin writer; a `key_handler` (when set) may consume it instead.
+    /// Paste pulls the host clipboard through gpui (the vendored crate dropped
+    /// upstream's arboard dependency). Returns whether the keystroke was
+    /// consumed — every consumed key should stop propagation so the host's
+    /// action bindings (an app-wide Esc, one for all) never double-fire.
+    pub fn handle_key(&mut self, keystroke: &Keystroke, cx: &mut Context<Self>) -> bool {
+        if !self.claims_keystroke(keystroke) {
+            return false;
+        }
+
         // Check if key handler wants to consume this event
         if let Some(ref handler) = self.key_handler
-            && handler(event)
+            && handler(keystroke)
         {
-            cx.stop_propagation();
-            return; // Event consumed by handler
+            return true; // Event consumed by handler
         }
 
         // Paste: platform+v on macOS, ctrl+shift+v elsewhere. Newlines in
         // clipboard text become CR — Enter is 0x0D on a PTY.
-        let modifiers = event.keystroke.modifiers;
-        let paste = event.keystroke.key == "v"
+        let modifiers = keystroke.modifiers;
+        let paste = keystroke.key == "v"
             && if cfg!(target_os = "macos") {
                 modifiers.platform && !modifiers.control
             } else {
@@ -792,14 +817,13 @@ impl TerminalView {
                 let _ = writer.write_all(text.as_bytes());
                 let _ = writer.flush();
             }
-            cx.stop_propagation();
-            return;
+            return true;
         }
 
         // Copy: platform+C on macOS, ctrl+shift+C elsewhere. A selection
         // copies and swallows the key; with nothing selected the shell
         // keeps its ^C (the terminal convention).
-        let copy = event.keystroke.key == "c"
+        let copy = keystroke.key == "c"
             && if cfg!(target_os = "macos") {
                 modifiers.platform && !modifiers.control
             } else {
@@ -809,17 +833,24 @@ impl TerminalView {
             let text = self.selection_text();
             if !text.is_empty() {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
-                cx.stop_propagation();
-                return;
+                return true;
             }
         }
 
-        if let Some(bytes) = keystroke_to_bytes(&event.keystroke, self.state.mode()) {
+        if let Some(bytes) = keystroke_to_bytes(keystroke, self.state.mode()) {
             // Typing invalidates the selection, as in every terminal.
             self.selection = None;
             let mut writer = self.stdin_writer.lock();
             let _ = writer.write_all(&bytes);
             let _ = writer.flush();
+            return true;
+        }
+
+        false
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_key(&event.keystroke, cx) {
             cx.stop_propagation();
         }
     }

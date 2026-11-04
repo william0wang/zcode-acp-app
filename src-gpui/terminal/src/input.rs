@@ -39,6 +39,22 @@
 //! | Insert | `\x1b[2~` |
 //! | Delete | `\x1b[3~` |
 //!
+//! ## Modified Cursor and Navigation Keys
+//!
+//! Shift/Alt/Ctrl on the arrows, Home/End and the tilde family switch to
+//! xterm's modifier form, `CSI 1;N A`-style, where
+//! `N = 1 + shift + 2*alt + 4*ctrl`. Without it Ctrl+Left (word-wise
+//! movement in readline/zsh) and the rest reach the shell as nothing at all.
+//!
+//! | Key | Sequence |
+//! |-----|----------|
+//! | Shift+Left | `\x1b[1;2D` |
+//! | Alt+Left | `\x1b[1;3D` |
+//! | Ctrl+Left | `\x1b[1;5D` |
+//! | Ctrl+Shift+Right | `\x1b[1;6C` |
+//! | Ctrl+Home | `\x1b[1;5H` |
+//! | Ctrl+Delete | `\x1b[3;5~` |
+//!
 //! ## Function Keys
 //!
 //! | Key | Sequence |
@@ -84,7 +100,44 @@
 //! ```
 
 use alacritty_terminal::term::TermMode;
-use gpui::Keystroke;
+use gpui::{Keystroke, Modifiers};
+
+/// xterm's modifier parameter for the `CSI 1;N` form:
+/// `1 + shift + 2*alt + 4*ctrl + 8*platform`. `None` when no modifier is
+/// held, so the caller can emit the plain (unparameterised) sequence.
+fn csi_modifier(modifiers: Modifiers) -> Option<u8> {
+    let n = 1
+        + u8::from(modifiers.shift)
+        + 2 * u8::from(modifiers.alt)
+        + 4 * u8::from(modifiers.control)
+        + 8 * u8::from(modifiers.platform);
+    (n > 1).then_some(n)
+}
+
+/// `CSI <final>` or `CSI 1;<n><final>` — arrows and Home/End.
+fn csi_cursor(final_byte: u8, modifiers: Modifiers) -> Vec<u8> {
+    match csi_modifier(modifiers) {
+        Some(n) => format!("\x1b[1;{n}{}", final_byte as char).into_bytes(),
+        None => vec![b'\x1b', b'[', final_byte],
+    }
+}
+
+/// `CSI <code>~` or `CSI <code>;<n>~` — the tilde family (Ins/Del/PgUp/PgDn,
+/// F5-F12).
+fn csi_tilde(code: u8, modifiers: Modifiers) -> Vec<u8> {
+    match csi_modifier(modifiers) {
+        Some(n) => format!("\x1b[{code};{n}~").into_bytes(),
+        None => format!("\x1b[{code}~").into_bytes(),
+    }
+}
+
+/// `SS3 <final>` (F1-F4) or `CSI 1;<n><final>` when modified.
+fn ss3_or_csi(final_byte: u8, modifiers: Modifiers) -> Vec<u8> {
+    match csi_modifier(modifiers) {
+        Some(n) => format!("\x1b[1;{n}{}", final_byte as char).into_bytes(),
+        None => vec![b'\x1b', b'O', final_byte],
+    }
+}
 
 /// Convert a GPUI keystroke to terminal escape sequence bytes.
 ///
@@ -134,53 +187,54 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
             return Some(b"\t".to_vec());
         }
 
-        // Arrow keys - check APP_CURSOR mode
+        // Arrow keys - APP_CURSOR picks SS3 only for the UNMODIFIED form
+        // (xterm's rule: a modified arrow always takes the CSI 1;N spelling).
         "up" => {
-            if mode.contains(TermMode::APP_CURSOR) {
+            if csi_modifier(keystroke.modifiers).is_none() && mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOA".to_vec());
             }
-            return Some(b"\x1b[A".to_vec());
+            return Some(csi_cursor(b'A', keystroke.modifiers));
         }
         "down" => {
-            if mode.contains(TermMode::APP_CURSOR) {
+            if csi_modifier(keystroke.modifiers).is_none() && mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOB".to_vec());
             }
-            return Some(b"\x1b[B".to_vec());
+            return Some(csi_cursor(b'B', keystroke.modifiers));
         }
         "right" => {
-            if mode.contains(TermMode::APP_CURSOR) {
+            if csi_modifier(keystroke.modifiers).is_none() && mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOC".to_vec());
             }
-            return Some(b"\x1b[C".to_vec());
+            return Some(csi_cursor(b'C', keystroke.modifiers));
         }
         "left" => {
-            if mode.contains(TermMode::APP_CURSOR) {
+            if csi_modifier(keystroke.modifiers).is_none() && mode.contains(TermMode::APP_CURSOR) {
                 return Some(b"\x1bOD".to_vec());
             }
-            return Some(b"\x1b[D".to_vec());
+            return Some(csi_cursor(b'D', keystroke.modifiers));
         }
 
         // Navigation keys
-        "home" => return Some(b"\x1b[H".to_vec()),
-        "end" => return Some(b"\x1b[F".to_vec()),
-        "pageup" => return Some(b"\x1b[5~".to_vec()),
-        "pagedown" => return Some(b"\x1b[6~".to_vec()),
-        "insert" => return Some(b"\x1b[2~".to_vec()),
-        "delete" => return Some(b"\x1b[3~".to_vec()),
+        "home" => return Some(csi_cursor(b'H', keystroke.modifiers)),
+        "end" => return Some(csi_cursor(b'F', keystroke.modifiers)),
+        "pageup" => return Some(csi_tilde(5, keystroke.modifiers)),
+        "pagedown" => return Some(csi_tilde(6, keystroke.modifiers)),
+        "insert" => return Some(csi_tilde(2, keystroke.modifiers)),
+        "delete" => return Some(csi_tilde(3, keystroke.modifiers)),
 
         // Function keys
-        "f1" => return Some(b"\x1bOP".to_vec()),
-        "f2" => return Some(b"\x1bOQ".to_vec()),
-        "f3" => return Some(b"\x1bOR".to_vec()),
-        "f4" => return Some(b"\x1bOS".to_vec()),
-        "f5" => return Some(b"\x1b[15~".to_vec()),
-        "f6" => return Some(b"\x1b[17~".to_vec()),
-        "f7" => return Some(b"\x1b[18~".to_vec()),
-        "f8" => return Some(b"\x1b[19~".to_vec()),
-        "f9" => return Some(b"\x1b[20~".to_vec()),
-        "f10" => return Some(b"\x1b[21~".to_vec()),
-        "f11" => return Some(b"\x1b[23~".to_vec()),
-        "f12" => return Some(b"\x1b[24~".to_vec()),
+        "f1" => return Some(ss3_or_csi(b'P', keystroke.modifiers)),
+        "f2" => return Some(ss3_or_csi(b'Q', keystroke.modifiers)),
+        "f3" => return Some(ss3_or_csi(b'R', keystroke.modifiers)),
+        "f4" => return Some(ss3_or_csi(b'S', keystroke.modifiers)),
+        "f5" => return Some(csi_tilde(15, keystroke.modifiers)),
+        "f6" => return Some(csi_tilde(17, keystroke.modifiers)),
+        "f7" => return Some(csi_tilde(18, keystroke.modifiers)),
+        "f8" => return Some(csi_tilde(19, keystroke.modifiers)),
+        "f9" => return Some(csi_tilde(20, keystroke.modifiers)),
+        "f10" => return Some(csi_tilde(21, keystroke.modifiers)),
+        "f11" => return Some(csi_tilde(23, keystroke.modifiers)),
+        "f12" => return Some(csi_tilde(24, keystroke.modifiers)),
 
         _ => {}
     }
@@ -239,7 +293,9 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
     let key = keystroke.key.as_str();
     if key.len() == 1 {
         let ch = key.chars().next().unwrap();
-        if ch.is_ascii() && !keystroke.modifiers.control {
+        // Platform (⌘) combos are the host's: without this an unhandled
+        // ⌘C would type a literal "c" into the shell.
+        if ch.is_ascii() && !keystroke.modifiers.control && !keystroke.modifiers.platform {
             // Handle shift modifier for uppercase
             let ch = if keystroke.modifiers.shift {
                 ch.to_ascii_uppercase()
@@ -249,7 +305,8 @@ pub fn keystroke_to_bytes(keystroke: &Keystroke, mode: TermMode) -> Option<Vec<u
             return Some(vec![ch as u8]);
         }
         // For non-ASCII characters, encode as UTF-8
-        if !keystroke.modifiers.control && !keystroke.modifiers.alt {
+        if !keystroke.modifiers.control && !keystroke.modifiers.alt && !keystroke.modifiers.platform
+        {
             return Some(key.as_bytes().to_vec());
         }
     }
@@ -428,5 +485,99 @@ mod tests {
 
         let space = Keystroke::parse("space").unwrap();
         assert_eq!(keystroke_to_bytes(&space, mode), Some(b" ".to_vec()));
+    }
+
+    /// Modified cursor keys take xterm's `CSI 1;N` form — Ctrl+Left is
+    /// word-wise movement in readline/zsh and is unreachable without it.
+    /// N = 1 + shift + 2*alt + 4*ctrl.
+    #[test]
+    fn test_modified_arrow_keys() {
+        let mode = TermMode::empty();
+
+        let shift_left = Keystroke::parse("shift-left").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_left, mode),
+            Some(b"\x1b[1;2D".to_vec())
+        );
+
+        let alt_right = Keystroke::parse("alt-right").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&alt_right, mode),
+            Some(b"\x1b[1;3C".to_vec())
+        );
+
+        let ctrl_left = Keystroke::parse("ctrl-left").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_left, mode),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+
+        let ctrl_shift_right = Keystroke::parse("ctrl-shift-right").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_shift_right, mode),
+            Some(b"\x1b[1;6C".to_vec())
+        );
+
+        let ctrl_up = Keystroke::parse("ctrl-up").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_up, mode),
+            Some(b"\x1b[1;5A".to_vec())
+        );
+
+        // A modified arrow overrides APP_CURSOR: xterm only uses SS3 for the
+        // bare form.
+        let ctrl_left_app = Keystroke::parse("ctrl-left").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_left_app, TermMode::APP_CURSOR),
+            Some(b"\x1b[1;5D".to_vec())
+        );
+    }
+
+    #[test]
+    fn test_modified_navigation_and_function_keys() {
+        let mode = TermMode::empty();
+
+        let ctrl_home = Keystroke::parse("ctrl-home").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_home, mode),
+            Some(b"\x1b[1;5H".to_vec())
+        );
+
+        let ctrl_delete = Keystroke::parse("ctrl-delete").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_delete, mode),
+            Some(b"\x1b[3;5~".to_vec())
+        );
+
+        let shift_pagedown = Keystroke::parse("shift-pagedown").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_pagedown, mode),
+            Some(b"\x1b[6;2~".to_vec())
+        );
+
+        let shift_f1 = Keystroke::parse("shift-f1").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&shift_f1, mode),
+            Some(b"\x1b[1;2P".to_vec())
+        );
+
+        let ctrl_f5 = Keystroke::parse("ctrl-f5").unwrap();
+        assert_eq!(
+            keystroke_to_bytes(&ctrl_f5, mode),
+            Some(b"\x1b[15;5~".to_vec())
+        );
+    }
+
+    /// Command combos belong to the host app: typing ⌘C must not insert a
+    /// literal "c" into the shell.
+    #[test]
+    fn test_platform_modified_keys_produce_nothing() {
+        let mode = TermMode::empty();
+
+        let cmd_c = Keystroke::parse("cmd-c").unwrap();
+        assert_eq!(keystroke_to_bytes(&cmd_c, mode), None);
+
+        let cmd_q = Keystroke::parse("cmd-q").unwrap();
+        assert_eq!(keystroke_to_bytes(&cmd_q, mode), None);
     }
 }

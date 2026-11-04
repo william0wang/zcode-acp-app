@@ -73,6 +73,7 @@ use crate::runtime::{
 use crate::server_form::ServerForm;
 use crate::system_status::render_system_status_page;
 use crate::terminal_panel;
+use gpui_terminal::TerminalView;
 use crate::ui_prefs::ui_text;
 use crate::usage_page::render_usage_page;
 use crate::workflows_page::{WorkflowAmendForm, WorkflowMetaForm, WorkflowStartForm};
@@ -378,6 +379,9 @@ pub struct Workbench {
     pending_slash_insert: Option<PendingSlashInsert>,
     /// Keeps the "/" menu's keystroke interceptor alive.
     _slash_key_sub: Subscription,
+    /// Keeps the terminal's keystroke interceptor alive (the shell gets keys
+    /// BEFORE the app's action bindings while it owns the keyboard).
+    _terminal_key_sub: Subscription,
     /// The open image lightbox (batch K): click a message image (or the file
     /// viewer's preview) to enlarge; Esc / backdrop closes. View-local — the
     /// raster is already in memory.
@@ -1102,6 +1106,30 @@ impl Workbench {
                 cx.stop_propagation();
             }
         });
+        // The embedded terminal's keyboard half. gpui resolves keymap actions
+        // BEFORE key listeners, and the kit's Root binds bare `tab`/`shift-tab`
+        // to focus traversal while this app binds `escape` app-wide — so a
+        // focused shell would lose Tab, Shift+Tab, Esc and every other key a
+        // binding shadows. The interceptor runs BEFORE action dispatch: while a
+        // terminal pane owns the keyboard it hands the keystroke to that pane's
+        // PTY and consumes it, so the shell sees the whole keyboard. Keys the
+        // terminal cannot encode (⌃`, ⌘Q, …) fall through untouched, which is
+        // what keeps the app's own shortcuts alive inside the dock. Visible
+        // panes only: a hidden dock keeps focus until something takes it, and
+        // `terminal_focused` already gates on the open flag.
+        let term_weak = cx.entity().downgrade();
+        let terminal_key_sub = cx.intercept_keystrokes(move |event, window, cx| {
+            let Some(wb) = term_weak.upgrade() else {
+                return;
+            };
+            let focused = wb.read(cx).focused_terminal(window, cx);
+            let Some(view) = focused else {
+                return;
+            };
+            if view.update(cx, |view, cx| view.handle_key(&event.keystroke, cx)) {
+                cx.stop_propagation();
+            }
+        });
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         // The sessions panel's search field (⌘K focuses it).
         let session_search =
@@ -1223,6 +1251,7 @@ impl Workbench {
             slash_dismissed: None,
             pending_slash_insert: None,
             _slash_key_sub: slash_key_sub,
+            _terminal_key_sub: terminal_key_sub,
             lightbox: None,
             _composer_sub: composer_sub,
         };
@@ -1494,15 +1523,20 @@ impl Workbench {
     /// keep yielding to an invisible shell — the whole app's Esc ladder
     /// (sheet, drawer, cancel turn) dead until the next click.
     fn terminal_focused(&self, window: &Window, cx: &App) -> bool {
-        let Some(id) = self.snap.active_tab else {
-            return false;
-        };
-        self.tab_terminal_open.contains(&id)
-            && self.tab_terminals.get(&id).is_some_and(|panes| {
-                panes
-                    .iter()
-                    .any(|dock| window.focused(cx) == Some(dock.focus.clone()))
-            })
+        self.focused_terminal(window, cx).is_some()
+    }
+
+    /// The focused pane's view, when the embedded terminal owns the keyboard.
+    /// The one place the open-flag + focus pair is resolved, shared by the
+    /// Esc ladder's yield and the keystroke interceptor.
+    fn focused_terminal(&self, window: &Window, cx: &App) -> Option<Entity<TerminalView>> {
+        let id = self.snap.active_tab?;
+        if !self.tab_terminal_open.contains(&id) {
+            return None;
+        }
+        self.tab_terminals.get(&id)?.iter().find_map(|dock| {
+            (window.focused(cx) == Some(dock.focus.clone())).then(|| dock.view.clone())
+        })
     }
 
     /// Rail toggle for the overlay drawer: one slot, so opening a surface
@@ -8442,6 +8476,70 @@ mod ui_tests {
                 "the grid must follow the panel width, not the spawn default (cols={cols})"
             );
             assert!(rows > 1, "the grid must follow the panel height too");
+        })
+        .unwrap();
+    }
+
+    /// The embedded shell must receive the keys a keymap binding would
+    /// otherwise steal. gpui resolves actions BEFORE key listeners and the
+    /// kit's Root binds bare `tab`/`shift-tab` to focus traversal while this
+    /// app binds Esc app-wide, so without the workbench's keystroke
+    /// interceptor those keys only moved focus or stopped the turn and never
+    /// reached the PTY. This pins the interceptor: Tab / Shift+Tab must leave
+    /// focus on the shell, and a ⌘ combo must still be the app's.
+    #[gpui_kit::test]
+    fn the_shell_keeps_tab_while_focused(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+            crate::install_keybindings(cx);
+        });
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, connected_snapshot(), 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            wb.update(cx, |wb, cx| {
+                let dock =
+                    crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx).expect("spawn");
+                wb.tab_terminals.insert(7, vec![dock]);
+                wb.tab_terminal_open.insert(7);
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            let focus = wb.update(cx, |wb, _| wb.tab_terminals[&7][0].focus.clone());
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+
+            window.dispatch_keystroke(
+                gpui_kit::Keystroke::parse("tab").expect("tab parses"),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                window.focused(cx),
+                Some(focus.clone()),
+                "Tab reaches the shell instead of tabbing a button into focus"
+            );
+
+            window.dispatch_keystroke(
+                gpui_kit::Keystroke::parse("shift-tab").expect("shift-tab parses"),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+            assert_eq!(
+                window.focused(cx),
+                Some(focus.clone()),
+                "Shift+Tab (backtab) is the shell's too"
+            );
+
+            // The app's own shortcuts still win: ⌘Q is not encodable as a
+            // terminal sequence, so the interceptor leaves it alone.
+            assert!(
+                wb.update(cx, |wb, cx| wb.tab_terminals[&7][0].view.update(cx, |view, _| {
+                    !view.claims_keystroke(&gpui_kit::Keystroke::parse("cmd-q").expect("parses"))
+                })),
+                "⌘Q stays the app's while the shell is focused"
+            );
         })
         .unwrap();
     }
