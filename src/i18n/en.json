@@ -527,7 +527,10 @@
     "configResetSpendFailed": "The card wasn't spent",
     "configResetStale": "That reset attempt expired — the card list was refreshed, try again",
     "configRestarted": "Backend restarted",
-    "configRestartFailed": "The old backend did not stop — your changes are saved but not applied yet, try again"
+    "configRestartFailed": "The old backend did not stop — your changes are saved but not applied yet, try again",
+    "queueEmpty": "Nothing queued — the message already went out",
+    "sendWhileLoading": "Still loading this session — the queued message sends when it finishes",
+    "sendWhileDisconnected": "Not connected — the queued message sends after the reconnect"
   },
   "projectDialog": {
     "title": "New session",

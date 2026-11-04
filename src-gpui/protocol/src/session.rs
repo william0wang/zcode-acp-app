@@ -38,6 +38,12 @@ use crate::replay::{
 pub const EARLIER_WINDOW_QUIET_MS: u64 = 600;
 pub const EARLIER_WINDOW_CAP_MS: u64 = 20_000;
 
+/// How long a force-send waits for its own cancelled turn to settle before
+/// declaring it gone. The bridge's cancel path answers `session/prompt` with
+/// `stopReason: "cancelled"` promptly, so a real settle lands well inside
+/// this; the window only has to be long enough not to race a slow one.
+pub const FORCE_SEND_STALL_MS: u64 = 8_000;
+
 /// A request the runtime layer must put on the wire. Responses come back
 /// through the matching `on_*_result` / `on_*_failed` method, handing the
 /// same request back for correlation.
@@ -127,19 +133,37 @@ pub enum SendOutcome {
     NoSession,
 }
 
+/// Why a force-send refused. The driver turns each into a visible notice:
+/// a refusal that paints nothing reads as a dead button (the queue stays
+/// parked and the user has no way to tell why).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceSendRefusal {
+    /// No active session — nothing owns the queue.
+    NoSession,
+    /// The session's queue is empty (the draft went out already).
+    EmptyQueue,
+    /// A replay/reconcile is in flight: there is no turn to interrupt and
+    /// the load's own settle flushes the queue.
+    Replaying,
+    /// The socket is down: run_prompt would silently swallow the draft, so
+    /// the post-reconnect flush owns the queue until then.
+    Disconnected,
+}
+
 /// What `force_send_pending` did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForceSendOutcome {
     /// Target moved to the front and our own running turn was cancelled —
-    /// the cancelled prompt's settle-flush then sends the reordered head.
+    /// the cancelled prompt's settle-flush then sends the reordered head
+    /// ([`SessionCore::poll_force_send_stall`] covers a settle that never
+    /// arrives).
     ReorderedAndCancelled,
     /// Target sent immediately: no turn was running, or the running turn
     /// was foreign/restored (cancelled first, never waited on — its settle
     /// does not come back to this connection).
     Sent,
-    /// Refused: no session, empty queue, replay in flight, or disconnected
-    /// (run_prompt would silently swallow the draft).
-    Refused,
+    /// Refused, with the reason the UI must surface.
+    Refused(ForceSendRefusal),
 }
 
 /// Outcome of feeding a `session/load_earlier` response.
@@ -242,6 +266,20 @@ pub struct SessionCore {
     outbox: Vec<WireRequest>,
     load_seq: u64,
     pending_load: Option<PendingLoad>,
+    /// The force-send stall guard: `(deadline_ms, session_id, rearms_left)`
+    /// armed when a force-send cancelled OUR OWN running turn, because that
+    /// path waits for the cancelled prompt's own settle-flush to release the
+    /// reordered head. A settle that never arrives would otherwise park the
+    /// queue forever.
+    force_send_stall: Option<(u64, String, u32)>,
+    /// The bubble id of the prompt WE put on the wire and are still waiting
+    /// on. Prompt responses carry the request back, so a settle can check it
+    /// actually owns the in-flight turn: the stall guard may have already
+    /// declared an abandoned turn settled and started the next one, and that
+    /// abandoned prompt's response then arrives late. Without this check it
+    /// settled the NEW turn — clearing its running state and re-flushing the
+    /// queue underneath it.
+    in_flight_prompt: Option<String>,
 }
 
 impl SessionCore {
@@ -551,6 +589,7 @@ impl SessionCore {
             return;
         }
         self.is_running = false;
+        self.disarm_force_send_stall();
         self.cache_active_snapshot();
         self.flush_pending(now_ms);
     }
@@ -664,6 +703,7 @@ impl SessionCore {
         }
         self.is_running = true;
         self.local_prompt_active = true;
+        self.in_flight_prompt = Some(bubble_id.clone());
         self.outbox.push(WireRequest::Prompt(PromptRequest {
             session_id: sid,
             prompt,
@@ -672,9 +712,27 @@ impl SessionCore {
         }));
     }
 
+    /// Whether this prompt response belongs to the turn the store is actually
+    /// waiting on. A response for a prompt we already gave up on (the stall
+    /// guard released it and a newer turn is running) must not settle the
+    /// newer turn.
+    fn owns_in_flight_prompt(&self, req: &PromptRequest) -> bool {
+        self.in_flight_prompt.as_deref() == Some(req.bubble_id.as_str())
+    }
+
     /// The prompt response landed: fold the turn usage, then run the shared
     /// settle (the TS `finally`).
     pub fn on_prompt_result(&mut self, now_ms: u64, req: &PromptRequest, result: &Value) {
+        // A response for a prompt we already gave up on: the stall guard
+        // released that turn and a NEWER prompt is the one in flight. Settling
+        // here would clear the newer turn's running state and flush the queue
+        // underneath it — so this late answer is dropped outright.
+        if !self.owns_in_flight_prompt(req) {
+            return;
+        }
+        // Our own turn settled — a force-send's cancelled-turn guard has done
+        // its job (the settle-flush below releases the reordered head).
+        self.disarm_force_send_stall();
         if let Some(usage) = result.get("usage").filter(|u| !u.is_null()) {
             let seconds = ((now_ms.saturating_sub(req.started_at_ms)) as f64 / 1000.0).max(0.1);
             self.apply_turn_usage(&req.session_id, usage, Some(seconds));
@@ -693,6 +751,13 @@ impl SessionCore {
     /// rejected settle does NOT flush: a still-rejecting bridge would
     /// livelock the queue into a reject-resend loop.
     pub fn on_prompt_failed(&mut self, now_ms: u64, req: Option<&PromptRequest>, error: &str) {
+        // Same late-answer rule as on_prompt_result: a failure for a prompt we
+        // already gave up on neither requeues that abandoned draft (the
+        // force-send deliberately skipped it) nor settles the newer turn.
+        if req.is_some_and(|r| !self.owns_in_flight_prompt(r)) {
+            return;
+        }
+        self.disarm_force_send_stall();
         if let Some(req) = req.filter(|_| !is_transport_error(error)) {
             let sid = req.session_id.clone();
             self.messages.retain(|m| m.id != req.bubble_id);
@@ -700,6 +765,7 @@ impl SessionCore {
             queue.insert(0, draft_from_prompt(&req.prompt));
             self.set_queue(&sid, queue);
             self.local_prompt_active = false;
+            self.in_flight_prompt = None;
             self.is_running = false;
             self.cache_active_snapshot();
             return;
@@ -711,7 +777,9 @@ impl SessionCore {
     /// queue (auto-flush: FIFO, each settled turn sends the next).
     fn settle_prompt(&mut self, now_ms: u64) {
         self.local_prompt_active = false;
+        self.in_flight_prompt = None;
         self.is_running = false;
+        self.disarm_force_send_stall();
         self.cache_active_snapshot();
         self.flush_pending(now_ms);
     }
@@ -722,17 +790,20 @@ impl SessionCore {
     pub fn force_send_pending(&mut self, now_ms: u64, index: Option<usize>) -> ForceSendOutcome {
         let sid = match &self.active_session_id {
             Some(s) => s.clone(),
-            None => return ForceSendOutcome::Refused,
+            None => return ForceSendOutcome::Refused(ForceSendRefusal::NoSession),
         };
         let queue = match self.pending_prompts.get(&sid) {
             Some(q) if !q.is_empty() => q.clone(),
-            _ => return ForceSendOutcome::Refused,
+            _ => return ForceSendOutcome::Refused(ForceSendRefusal::EmptyQueue),
         };
         // During replay there is no turn to interrupt; the queue fires on
         // load. Disconnected: run_prompt would silently swallow the draft —
         // the post-reconnect flush owns the queue until the socket is back.
-        if self.loading_session || !self.conn_open {
-            return ForceSendOutcome::Refused;
+        if !self.conn_open {
+            return ForceSendOutcome::Refused(ForceSendRefusal::Disconnected);
+        }
+        if self.loading_session {
+            return ForceSendOutcome::Refused(ForceSendRefusal::Replaying);
         }
         let i = index.unwrap_or(0).min(queue.len() - 1);
         let mut reordered = vec![queue[i].clone()];
@@ -750,7 +821,12 @@ impl SessionCore {
             });
             if self.local_prompt_active {
                 // Own turn: the cancelled prompt's response settles here and
-                // the settle-flush sends the reordered head.
+                // the settle-flush sends the reordered head. Arm the stall
+                // guard: the bridge can answer the cancel without ever
+                // settling our prompt (the turn was already finalising), and
+                // a settle-flush that never runs parks the queue forever
+                // with nothing on screen to say so.
+                self.arm_force_send_stall(now_ms, sid);
                 ForceSendOutcome::ReorderedAndCancelled
             } else {
                 // Foreign/restored turn: its prompt response goes to the
@@ -771,6 +847,67 @@ impl SessionCore {
             self.run_prompt(now_ms, head);
             ForceSendOutcome::Sent
         }
+    }
+
+    /// Arms the "cancelled but never settled" guard for our own turn. The
+    /// settle-flush normally fires within a frame of the cancel; if it does
+    /// not, [`SessionCore::poll_force_send_stall`] releases the queue.
+    fn arm_force_send_stall(&mut self, now_ms: u64, sid: String) {
+        self.force_send_stall = Some((now_ms.saturating_add(FORCE_SEND_STALL_MS), sid, 1));
+    }
+
+    /// Drops the stall guard (any settle path disarms it — the queue is
+    /// moving again on its own).
+    fn disarm_force_send_stall(&mut self) {
+        self.force_send_stall = None;
+    }
+
+    /// The force-send stall guard's tick. A cancelled turn whose prompt
+    /// response never comes back to this connection — the bridge answered the
+    /// cancel while the turn was already finalising, or the response landed on
+    /// a connection that has since been replaced — leaves the running flags
+    /// stuck, and every later force-send takes the `ReorderedAndCancelled`
+    /// branch again and re-cancels a turn that is gone. The button then does
+    /// nothing forever, which is the reported symptom.
+    ///
+    /// The guard gives the settle two full windows (a genuinely live turn
+    /// usually settles well inside the first) and then declares the turn
+    /// settled locally and flushes the queue. Releasing is safe on the bridge
+    /// side: `session/prompt` preempts whatever is still in flight there.
+    ///
+    /// Returns true when the guard fired NOW (the caller re-renders).
+    pub fn poll_force_send_stall(&mut self, now_ms: u64) -> bool {
+        let Some((deadline, sid, rearms)) = self.force_send_stall.clone() else {
+            return false;
+        };
+        if now_ms < deadline {
+            return false;
+        }
+        self.force_send_stall = None;
+        // The session moved on underneath the guard: nothing to release.
+        if self.active_session_id.as_deref() != Some(sid.as_str()) {
+            return false;
+        }
+        // A prompt of ours may still be the one in flight. One re-arm covers a
+        // slow settle; past that the flag is not going to clear (the response
+        // is lost), so releasing is the only way the queue ever moves again.
+        if self.local_prompt_active && rearms > 0 {
+            self.force_send_stall =
+                Some((now_ms.saturating_add(FORCE_SEND_STALL_MS), sid, rearms - 1));
+            return false;
+        }
+        // Abandoning the turn: dropping its identity is what makes the late
+        // response harmless — it no longer matches the in-flight prompt, so
+        // on_prompt_result ignores it instead of settling the turn the
+        // flush below is about to start.
+        self.local_prompt_active = false;
+        self.in_flight_prompt = None;
+        if self.is_running {
+            self.is_running = false;
+            self.cache_active_snapshot();
+        }
+        self.flush_pending(now_ms);
+        true
     }
 
     /// Queue a config pick (appStore `setConfigOption`): the tab toolbar's
@@ -894,6 +1031,12 @@ impl SessionCore {
         self.loading_earlier = false;
         self.loading_session = true;
         self.is_running = false;
+        // The in-flight prompt belonged to the session being left (or to a
+        // turn this load is about to replace): its response must not settle
+        // whatever the attach restores.
+        self.local_prompt_active = false;
+        self.in_flight_prompt = None;
+        self.disarm_force_send_stall();
 
         self.load_seq += 1;
         let limit = if cached.is_some() {
@@ -1070,6 +1213,9 @@ impl SessionCore {
         self.available_commands.clear();
         self.loading_session = false;
         self.is_running = false;
+        self.local_prompt_active = false;
+        self.in_flight_prompt = None;
+        self.disarm_force_send_stall();
     }
 
     // ---- load_earlier ----
@@ -1548,7 +1694,7 @@ mod tests {
         // swallow the draft silently).
         assert_eq!(
             core.force_send_pending(2000, None),
-            ForceSendOutcome::Refused
+            ForceSendOutcome::Refused(ForceSendRefusal::Disconnected)
         );
         assert_eq!(core.pending_prompts["sess_1"].len(), 1);
 
@@ -1658,6 +1804,187 @@ mod tests {
         let req_c = find_prompt(&mut core);
         assert!(serde_json::to_string(&req_c.prompt).unwrap().contains("C"));
         assert!(core.pending_prompts.get("sess_1").is_none());
+    }
+
+    #[test]
+    fn a_cancelled_turn_that_never_settles_releases_the_queue_instead_of_wedging() {
+        let mut core = connected_core();
+
+        // A runs (our own turn), B queues behind it.
+        assert_eq!(core.send_prompt(2000, "A", vec![]), SendOutcome::Ran);
+        let _req_a = find_prompt(&mut core);
+        core.send_prompt(2100, "B", vec![]);
+
+        // Force-send B: our own turn is cancelled and the settle-flush is
+        // supposed to send B. The prompt response never comes back to this
+        // connection (the bridge answered the cancel while the turn was
+        // already finalising), so nothing moves.
+        assert_eq!(
+            core.force_send_pending(2300, None),
+            ForceSendOutcome::ReorderedAndCancelled
+        );
+        assert!(core.is_running && core.local_prompt_active);
+        assert_eq!(queue_texts(&core, "sess_1"), vec!["B"]);
+
+        // Before the deadline the guard holds (a slow-but-alive settle must
+        // still win).
+        assert!(!core.poll_force_send_stall(2300 + FORCE_SEND_STALL_MS - 1));
+        assert_eq!(queue_texts(&core, "sess_1"), vec!["B"]);
+
+        // The response keeps not arriving. Drive the release branch
+        // directly here (every production path that clears the local flag
+        // also disarms the guard — the reachable wedge is the two-window
+        // one the next test pins): the guard releases the queue so B
+        // actually goes out.
+        core.local_prompt_active = false;
+        assert!(core.poll_force_send_stall(2300 + FORCE_SEND_STALL_MS));
+        let req_b = find_prompt(&mut core);
+        assert!(serde_json::to_string(&req_b.prompt).unwrap().contains("B"));
+        assert!(core.is_running && core.local_prompt_active);
+        assert!(core.pending_prompts.get("sess_1").is_none());
+
+        // The guard is one-shot: a later tick does not re-settle this turn.
+        assert!(!core.poll_force_send_stall(2300 + FORCE_SEND_STALL_MS * 2));
+    }
+
+    #[test]
+    fn a_live_local_turn_gets_one_rearm_then_releases() {
+        let mut core = connected_core();
+
+        assert_eq!(core.send_prompt(2000, "A", vec![]), SendOutcome::Ran);
+        let _req_a = find_prompt(&mut core);
+        core.send_prompt(2100, "B", vec![]);
+        assert_eq!(
+            core.force_send_pending(2300, None),
+            ForceSendOutcome::ReorderedAndCancelled
+        );
+        let first = 2300 + FORCE_SEND_STALL_MS;
+
+        // Our prompt is still flagged in flight at the first deadline: the
+        // guard extends the window once instead of releasing a live turn.
+        assert!(core.local_prompt_active);
+        assert!(!core.poll_force_send_stall(first));
+        assert!(core.is_running && core.local_prompt_active);
+        assert_eq!(queue_texts(&core, "sess_1"), vec!["B"]);
+
+        // Still flagged at the SECOND deadline: the response is lost, not
+        // slow. Releasing is the only way the queue ever moves again — and
+        // it is safe, because session/prompt preempts whatever the bridge is
+        // still running.
+        assert!(core.poll_force_send_stall(first + FORCE_SEND_STALL_MS));
+        let req_b = find_prompt(&mut core);
+        assert!(serde_json::to_string(&req_b.prompt).unwrap().contains("B"));
+        assert!(core.pending_prompts.get("sess_1").is_none());
+    }
+
+    #[test]
+    fn a_refused_force_send_says_why() {
+        let mut core = connected_core();
+
+        // Empty queue.
+        assert_eq!(
+            core.force_send_pending(2000, None),
+            ForceSendOutcome::Refused(ForceSendRefusal::EmptyQueue)
+        );
+
+        // Replaying: no turn to interrupt, the load's settle flushes.
+        core.is_running = true;
+        core.send_prompt(2100, "x", vec![]);
+        core.is_running = false;
+        core.loading_session = true;
+        assert_eq!(
+            core.force_send_pending(2200, None),
+            ForceSendOutcome::Refused(ForceSendRefusal::Replaying)
+        );
+
+        // Disconnected: the reconnect flush owns the queue.
+        core.loading_session = false;
+        core.conn_open = false;
+        assert_eq!(
+            core.force_send_pending(2300, None),
+            ForceSendOutcome::Refused(ForceSendRefusal::Disconnected)
+        );
+
+        // No session at all.
+        core.active_session_id = None;
+        assert_eq!(
+            core.force_send_pending(2400, None),
+            ForceSendOutcome::Refused(ForceSendRefusal::NoSession)
+        );
+    }
+
+    #[test]
+    fn a_late_response_from_an_abandoned_turn_cannot_settle_the_new_one() {
+        let mut core = connected_core();
+
+        // A runs (ours), B queues. Force-send B: A is cancelled, and the
+        // store waits on A's prompt response to release B.
+        assert_eq!(core.send_prompt(2000, "A", vec![]), SendOutcome::Ran);
+        let req_a = find_prompt(&mut core);
+        core.send_prompt(2100, "B", vec![]);
+        assert_eq!(
+            core.force_send_pending(2300, None),
+            ForceSendOutcome::ReorderedAndCancelled
+        );
+
+        // A's response never arrives, so the stall guard releases the turn and
+        // B goes out — B is now the in-flight prompt.
+        core.local_prompt_active = false;
+        assert!(core.poll_force_send_stall(2300 + FORCE_SEND_STALL_MS));
+        let req_b = find_prompt(&mut core);
+        assert!(serde_json::to_string(&req_b.prompt).unwrap().contains("B"));
+        assert!(core.is_running && core.local_prompt_active);
+
+        // NOW A's abandoned response finally lands. It must not settle B:
+        // B is still running, still local, still the in-flight prompt.
+        core.on_prompt_result(2500, &req_a, &json!({}));
+        assert!(
+            core.is_running,
+            "a late response must not settle the newer turn"
+        );
+        assert!(core.local_prompt_active);
+        assert_eq!(
+            core.in_flight_prompt.as_deref(),
+            Some(req_b.bubble_id.as_str()),
+            "the newer turn still owns the in-flight slot"
+        );
+
+        // The real settle (B's own response) still works.
+        core.on_prompt_result(2600, &req_b, &json!({}));
+        assert!(!core.is_running && !core.local_prompt_active);
+        assert!(core.in_flight_prompt.is_none());
+    }
+
+    #[test]
+    fn a_late_failure_from_an_abandoned_turn_does_not_requeue_or_settle() {
+        let mut core = connected_core();
+
+        assert_eq!(core.send_prompt(2000, "A", vec![]), SendOutcome::Ran);
+        let req_a = find_prompt(&mut core);
+        core.send_prompt(2100, "B", vec![]);
+        assert_eq!(
+            core.force_send_pending(2300, None),
+            ForceSendOutcome::ReorderedAndCancelled
+        );
+        core.local_prompt_active = false;
+        assert!(core.poll_force_send_stall(2300 + FORCE_SEND_STALL_MS));
+        let req_b = find_prompt(&mut core);
+        assert!(core.is_running && core.local_prompt_active);
+
+        // A's abandoned prompt now fails with a SERVER rejection (the shape
+        // that normally pushes the draft back to the queue head). It belongs
+        // to a turn the force-send deliberately skipped, so it must neither
+        // requeue A nor settle B.
+        core.on_prompt_failed(2500, Some(&req_a), "already running");
+        assert!(core.is_running && core.local_prompt_active);
+        assert!(
+            core.pending_prompts.get("sess_1").is_none(),
+            "the abandoned draft must not come back"
+        );
+        assert_eq!(
+            core.in_flight_prompt.as_deref(),
+            Some(req_b.bubble_id.as_str())
+        );
     }
 
     #[test]

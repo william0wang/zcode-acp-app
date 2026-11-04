@@ -8498,8 +8498,12 @@ mod ui_tests {
         let (handle, wb, _rt) = cx.update(|cx| open(cx, connected_snapshot(), 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
             wb.update(cx, |wb, cx| {
-                let dock =
-                    crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx).expect("spawn");
+                // An IN-MEMORY terminal, not a spawned shell: this test only
+                // pins key ROUTING, and a real PTY drags a reader thread plus
+                // the dock's detached kill-on-drop thread into the gpui test
+                // scheduler (which then reports "activity on another thread"
+                // and fails the run at random).
+                let dock = crate::terminal_panel::spawn_memory_dock(cx);
                 wb.tab_terminals.insert(7, vec![dock]);
                 wb.tab_terminal_open.insert(7);
                 cx.notify();

@@ -38,8 +38,9 @@ pub(crate) struct TerminalDock {
     /// ladder yields to the shell while this is the focused element.
     pub(crate) focus: FocusHandle,
     /// The dock's own handle on the PTY master (the resize callback holds
-    /// the other Arc clone) — kept so the struct reads as the owner.
-    _pty: Arc<Mutex<Box<dyn MasterPty + Send>>>,
+    /// the other Arc clone) — kept so the struct reads as the owner. `None`
+    /// for the in-memory test dock, which has no PTY.
+    _pty: Option<Arc<Mutex<Box<dyn MasterPty + Send>>>>,
     /// Taken by `Drop` — see there for why the kill runs detached.
     child: Mutex<Option<Box<dyn Child + Send + Sync>>>,
 }
@@ -136,9 +137,44 @@ pub(crate) fn spawn_dock(
     Ok(TerminalDock {
         view,
         focus,
-        _pty: pty,
+        _pty: Some(pty),
         child: Mutex::new(Some(child)),
     })
+}
+
+/// A pane backed by in-memory streams instead of a real shell (tests only).
+/// Key-routing tests want the view's focus handle and keystroke handling,
+/// not a process: a spawned PTY drags a reader thread plus the dock's
+/// detached kill-on-drop thread into the gpui test scheduler, which then
+/// fails the run at random with "activity on another thread".
+#[cfg(test)]
+pub(crate) fn spawn_memory_dock(cx: &mut Context<Workbench>) -> TerminalDock {
+    let theme = cx.theme().clone();
+    let config = TerminalConfig {
+        cols: 80,
+        rows: 24,
+        font_family: theme.mono_font_family.to_string(),
+        font_size: ui_text(13.),
+        scrollback: 10_000,
+        line_height_multiplier: 1.0,
+        padding: gpui::Edges::all(px(6.)),
+        colors: terminal_palette(),
+    };
+    let view = cx.new(|cx| {
+        TerminalView::new(
+            Box::new(std::io::sink()) as Box<dyn std::io::Write + Send>,
+            Box::new(std::io::empty()) as Box<dyn std::io::Read + Send>,
+            config,
+            cx,
+        )
+    });
+    let focus = view.read(cx).focus_handle().clone();
+    TerminalDock {
+        view,
+        focus,
+        _pty: None,
+        child: Mutex::new(None),
+    }
 }
 
 /// The ANSI palette: a fixed dark scheme (upstream demo values). Terminal

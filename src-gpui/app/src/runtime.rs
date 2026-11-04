@@ -69,7 +69,8 @@ use protocol::hub::{
 };
 use protocol::hub_client::{HubApiError, HubClient};
 use protocol::session::{
-    LoadEarlierRequest, LoadIntent, PromptRequest, SessionCore, WireRequest,
+    ForceSendOutcome, ForceSendRefusal, LoadEarlierRequest, LoadIntent, PromptRequest, SessionCore,
+    WireRequest,
 };
 use protocol::settings::BackendRestartResult;
 use protocol::settings_client::{HubApiError as SettingsApiError, HubHttpClient};
@@ -5754,6 +5755,9 @@ impl Driver {
             tab.core.flush_update_batch(now);
             tab.core.flush_late_page(now);
             tab.core.poll_earlier_window(now);
+            // A force-send's cancelled turn that never settled: release the
+            // queue here rather than leaving the button permanently inert.
+            tab.core.poll_force_send_stall(now);
         }
         // Toast auto-clear (the notify timer's body).
         self.toast.expire(now);
@@ -7075,14 +7079,28 @@ impl Driver {
                 }
             }
             UiCommand::ForceSendPending => {
-                if let Some(t) = self.active_tab_mut() {
-                    t.core.force_send_pending(now, None);
+                // No active tab is a refusal too: the key was pressed on
+                // nothing, and staying quiet is the dead-key symptom.
+                let outcome = match self.active_tab_mut() {
+                    Some(t) => t.core.force_send_pending(now, None),
+                    None => ForceSendOutcome::Refused(ForceSendRefusal::NoSession),
+                };
+                // The refusal is not silent: an empty composer + Enter on a
+                // parked queue that paints nothing reads as a dead key.
+                if let ForceSendOutcome::Refused(reason) = outcome {
+                    let text = force_send_refusal_text(reason);
+                    self.toast.notify(now, &text);
                 }
             }
             UiCommand::ForceSendPendingAt { index } => {
-                if let Some(t) = self.active_tab_mut() {
-                    let outcome = t.core.force_send_pending(now, Some(index));
-                    traceln!("[driver] force-send pending[{index}] -> {outcome:?}");
+                let outcome = match self.active_tab_mut() {
+                    Some(t) => t.core.force_send_pending(now, Some(index)),
+                    None => ForceSendOutcome::Refused(ForceSendRefusal::NoSession),
+                };
+                traceln!("[driver] force-send pending[{index}] -> {outcome:?}");
+                if let ForceSendOutcome::Refused(reason) = outcome {
+                    let text = force_send_refusal_text(reason);
+                    self.toast.notify(now, &text);
                 }
             }
             UiCommand::DiscardPending { index } => {
@@ -9105,6 +9123,17 @@ fn pending_count(tab: &Tab) -> usize {
         .get(tab.core.active_session_id.as_deref().unwrap_or(""))
         .map(Vec::len)
         .unwrap_or(0)
+}
+
+/// The toast a refused force-send raises. Every branch names what the user
+/// can do about it — a silent refusal is what reads as "the button is dead".
+fn force_send_refusal_text(reason: ForceSendRefusal) -> String {
+    match reason {
+        ForceSendRefusal::NoSession => t!("notice.noSession").into_owned(),
+        ForceSendRefusal::EmptyQueue => t!("notice.queueEmpty").into_owned(),
+        ForceSendRefusal::Replaying => t!("notice.sendWhileLoading").into_owned(),
+        ForceSendRefusal::Disconnected => t!("notice.sendWhileDisconnected").into_owned(),
+    }
 }
 
 /// Message-content signature (the M1 helper, per tab now).

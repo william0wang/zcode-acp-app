@@ -525,7 +525,10 @@
     "configResetSpendFailed": "重置卡未被使用",
     "configResetStale": "这次重置已过期——卡片列表已刷新，请重试",
     "configRestarted": "后端已重启",
-    "configRestartFailed": "旧后端没有退出——改动已保存但尚未生效，请重试"
+    "configRestartFailed": "旧后端没有退出——改动已保存但尚未生效，请重试",
+    "queueEmpty": "队列已空——这条消息已经发出去了",
+    "sendWhileLoading": "会话仍在加载中——加载完成后会自动发送排队的消息",
+    "sendWhileDisconnected": "当前未连接——重新连接后会自动发送排队的消息"
   },
   "projectDialog": {
     "title": "新建会话",
