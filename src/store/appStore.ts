@@ -438,6 +438,11 @@ export interface AppState extends ConfigSlice {
   // sleep leaves zombie sockets that never fire onclose) and reconnects if
   // not. Registered at module level via visibilitychange.
   wakeProbe: () => void;
+  // Battery gate for the discovery poll (2026-11): hidden pages stop polling
+  // entirely (Android freezes the JS within minutes anyway, but the web SPA
+  // tab keeps running); the visible half re-probes the pipe, refreshes the
+  // list once at the ladder's bottom rung, and re-arms. visibilitychange only.
+  applyVisibility: () => void;
   // Returns to the session list. The instance connection stays open so
   // bridge broadcasts keep the list's activity badges live (running state
   // is broadcast-only — the hub's REST discovery carries no such field);
@@ -583,7 +588,19 @@ let prefillSeq = 0;
 // Events from superseded connections must be ignored (their async onclose
 // can fire after a new connection to the SAME instance was started).
 let connSeq = 0;
-let pollTimer: ReturnType<typeof setInterval> | null = null;
+let pollTimer: ReturnType<typeof setTimeout> | null = null;
+// Discovery cadence: a progressive backoff ladder while the list keeps
+// arriving UNCHANGED (a steady 4s poll costs a radio wake-up every tick on
+// a phone — battery spec 2026-11), reset to the bottom by any visible change,
+// any manual probe, and every foreground return.
+const POLL_LADDER_MS = [4000, 8000, 15000, 30000];
+let pollStep = 0;
+// Generation guard for the one-shot poll chain: stopPolling/visibility
+// changes bump it, and a chain that wakes after a bump (or after the
+// profile vanished) stands down instead of re-arming — otherwise an
+// await-spanning refresh would resurrect a poll the disconnect already
+// stopped.
+let pollGen = 0;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
 // When the in-flight openConnection() attempt started (0 = none). wakeProbe
@@ -702,6 +719,40 @@ function mergeCreatedSession(
     sessions: [...inst.sessions, session],
   };
   return next;
+}
+
+// The ladder's change-detector for discovery answers: the hub's heartbeat
+// view moves only when a bridge mutates, so most polls re-deliver the
+// byte-identical list. Compares the fields the list renders (identity,
+// workspace, origin, and per-session id/title/status/updatedAt) — unknown
+// additive wire fields are deliberately NOT compared: the contract is
+// additive-only, and a field this app does not read cannot change what the
+// screen shows, so it must not reset the backoff.
+function sameDiscoveryList(a: HubInstance[], b: HubInstance[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  return a.every((inst, i) => {
+    const other = b[i];
+    if (
+      inst.id !== other.id ||
+      inst.workspace !== other.workspace ||
+      inst.origin !== other.origin ||
+      inst.startedAt !== other.startedAt
+    )
+      return false;
+    const sa = inst.sessions ?? [];
+    const sb = other.sessions ?? [];
+    if (sa.length !== sb.length) return false;
+    return sa.every((s, j) => {
+      const t = sb[j];
+      return (
+        s.sessionId === t.sessionId &&
+        s.title === t.title &&
+        s.status === t.status &&
+        s.updatedAt === t.updatedAt
+      );
+    });
+  });
 }
 
 // The profile matching the book's active entry (first entry as fallback).
@@ -875,16 +926,41 @@ export const useAppStore = create<AppState>((set, get) => {
   }
 
   function startPolling(): void {
-    if (pollTimer) return;
-    void get().refreshInstances();
-    pollTimer = setInterval(() => void get().refreshInstances(), 4000);
+    pollStep = 0; // reset ladder on fresh attach
+    pollGen++; // retire any chain left by a previous session
+    void get().refreshInstances(); // the list must paint now, not on the first tick
+    schedulePoll();
   }
 
   function stopPolling(): void {
+    pollGen++; // stands down any chain awaiting its fetch right now
     if (pollTimer) {
-      clearInterval(pollTimer);
+      clearTimeout(pollTimer);
       pollTimer = null;
     }
+  }
+
+  // Discovery polls ride a one-shot timer re-armed after every answer: an
+  // interval cannot express the ladder, and the next delay is only known
+  // once the previous answer has been compared (refreshInstances sets the
+  // step; awaiting it first keeps the arm honest). No-ops while the page is
+  // hidden (applyVisibility owns that half; an idle-but-visible desktop
+  // still learns of remote changes within the ladder's ceiling).
+  function schedulePoll(): void {
+    if (pollTimer) clearTimeout(pollTimer);
+    pollTimer = null;
+    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    if (!get().profile) return; // torn down (disconnect / switch) mid-flight
+    const delay = POLL_LADDER_MS[Math.min(pollStep, POLL_LADDER_MS.length - 1)];
+    const gen = pollGen;
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      void (async () => {
+        await get().refreshInstances();
+        if (gen !== pollGen) return; // torn down/backgrounded mid-await
+        schedulePoll();
+      })();
+    }, delay);
   }
 
   // Shared connection teardown for the hub-level transitions (disconnect /
@@ -1937,7 +2013,33 @@ export const useAppStore = create<AppState>((set, get) => {
         const instances = await client.instances(opts?.probe === true);
         if (get().profile !== profile) return; // hub changed mid-flight
         discoveryFailures = 0;
-        set({ instances: filterClosedSessions(instances), instancesError: null, hubOffline: false });
+        const next = filterClosedSessions(instances);
+        // Probe answers are a resync and always publish; background polls
+        // skip the set when the list is unchanged (same content ⇒ same
+        // render — re-setting an identical array re-renders every list
+        // subscriber for nothing), and the ladder climbs one rung. A
+        // lingering error flag or hubOffline verdict always publishes:
+        // skipping would strand the banner after a recovery.
+        if (
+          opts?.probe !== true &&
+          !get().instancesError &&
+          !get().hubOffline &&
+          sameDiscoveryList(get().instances, next)
+        ) {
+          if (pollStep < POLL_LADDER_MS.length - 1) pollStep++;
+        } else {
+          pollStep = 0;
+          set({ instances: next, instancesError: null, hubOffline: false });
+          if (opts?.probe === true) {
+            // A probe is the promise that the ladder resets: re-arm the
+            // chain at the bottom rung now, not whenever the previous
+            // timer happens to have been scheduled. Bumping the generation
+            // stands down the retired chain's continuation so it cannot
+            // double-arm after this await.
+            pollGen++;
+            schedulePoll();
+          }
+        }
       } catch (e) {
         if (get().profile !== profile) return;
         if (e instanceof HubApiError && e.network) {
@@ -1949,11 +2051,16 @@ export const useAppStore = create<AppState>((set, get) => {
           if (discoveryFailures >= DISCOVERY_FAIL_THRESHOLD) {
             set({ instances: [], instancesError: null, hubOffline: true });
           }
+          // Stay at the ladder's bottom while the hub is not answering:
+          // hubOffline detection is paced by this poll, and a 30s ceiling
+          // would slow the banner three-fold.
+          pollStep = 0;
           return;
         }
         const msg =
           e instanceof HubApiError ? e.message : `discovery failed: ${(e as Error).message}`;
         set({ instancesError: msg, hubOffline: false });
+        pollStep = 0;
       }
     },
 
@@ -2135,6 +2242,22 @@ export const useAppStore = create<AppState>((set, get) => {
 
     wakeProbe: () => {
       void wakeProbe();
+    },
+
+    applyVisibility: () => {
+      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+        // Backgrounded: stop the discovery poll (the ladder's radio cost
+        // only accrues while foregrounded; Android's own JS freeze makes
+        // this belt-and-braces there, a real saving in a background SPA tab).
+        stopPolling();
+        return;
+      }
+      // Foreground return: validate the (possibly zombie) socket, then pull
+      // the list once at the ladder's bottom rung and re-arm. startPolling
+      // is exactly that: pollGen++ retires the stopped chain, pollStep=0,
+      // one immediate refresh, then schedulePoll.
+      void wakeProbe();
+      if (get().profile) startPolling();
     },
 
     closeRemoteSession: async (instanceId, sessionId) => {
@@ -3170,7 +3293,7 @@ export const useAppStore = create<AppState>((set, get) => {
 // because nothing else re-examines the loop while the screen stays on.
 if (typeof document !== "undefined") {
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") useAppStore.getState().wakeProbe();
+    useAppStore.getState().applyVisibility();
   });
   setInterval(() => {
     if (document.visibilityState === "visible")

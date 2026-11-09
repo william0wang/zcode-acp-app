@@ -14,6 +14,11 @@
   --color-ink: #ececf1; /* primary text */
   --color-dim: #a6a6b0; /* secondary text */
   --color-faint: #6f6f7a; /* muted text */
+  /* Battery spec 2026-11: quantize the pulse. The smooth default is a
+     compositor redraw at panel refresh for the whole lifetime of a running
+     badge; steps() holds each value steady between jumps, so the blink
+     still reads as "live" while pixels change only ~2x/second. */
+  --animate-pulse: pulse 2s steps(4, end) infinite;
 }
 
 html,

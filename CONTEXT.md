@@ -127,6 +127,16 @@ bridge-wide broadcasts; not persisted and unknown for other sessions until the
 first broadcast after a reconnect.
 _Avoid_: session status, online status
 
+**Discovery Polling**:
+The app's foreground-only re-read of the hub's instance list — how sessions
+started or retired elsewhere reach the list while this client holds no
+connection to their instance. Its cadence is battery-driven: it backs off
+while the list keeps arriving unchanged and resets on any change, manual
+refresh, or foreground return. Distinct from the Replay every session
+connection performs, and from the hub's bridge heartbeat which feeds the
+list being read.
+_Avoid_: heartbeat, sync, background refresh
+
 **Session Root**:
 The directory a session was created or loaded with; the anchor every
 session-file path resolves against. Absolute paths must land inside it;
