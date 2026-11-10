@@ -168,6 +168,13 @@ const WORKFLOW_SESSION_RUNS_POLL_MS: u64 = 5_000;
 /// AppUpdatePage's 2s `pollAppUpdate`): the download runs in the hub, and
 /// the only channel back is the same GET that reports the check.
 const APP_UPDATE_POLL_MS: u64 = 2_000;
+/// The status bar's quota dock line background refresh (bridge parity: the
+/// Martty TUI's dock refresher runs the same 60s cadence, bridge
+/// `quota/live.ts` QUOTA_REFRESH_INTERVAL_MS). The desktop otherwise re-reads
+/// the line only at turn end, so an idle session's quota sat frozen
+/// (user, 2026-11-06); the hub caches /api/quota/dock for 15s, so one cheap
+/// GET per minute is the freshness floor.
+const QUOTA_DOCK_POLL_MS: u64 = 60_000;
 /// How long the hub-upgrade verdict note stays (TS SidePanel's 5s
 /// `setTimeout(() => setUpgradeNote(null))`).
 const HUB_UPGRADE_NOTE_MS: u64 = 5_000;
@@ -2619,6 +2626,10 @@ struct Driver {
     /// switch so a dock read minted for the OLD hub drops on arrival instead
     /// of painting the wrong account's line over the new hub's.
     quota_dock_gen: u64,
+    /// Next tick that may kick the idle dock poll (`QUOTA_DOCK_POLL_MS`
+    /// cadence). Advance-then-spawn: the cadence moves even while a phase
+    /// blocks the read, so a reconnect doesn't hot-loop the hub.
+    next_quota_dock_poll_at: u64,
     /// The hub's own version (`/api/system-stats` `hub.version`) — the status
     /// bar's global chip. Refetched on every (re)connect: a hub self-upgrade
     /// restarts the hub (phase dips to Reconnecting and climbs back), so the
@@ -2722,6 +2733,7 @@ impl Driver {
             quota_dock: None,
             quota_dock_loading: false,
             quota_dock_gen: 0,
+            next_quota_dock_poll_at: 0,
             hub_version: None,
             usage: UsagePanel::new(),
             sections: Default::default(),
@@ -5764,6 +5776,17 @@ impl Driver {
         // The hub-upgrade note's 5s timer (TS SidePanel's effect).
         if self.hub_upgrade_note.is_some() && now >= self.hub_upgrade_note_until {
             self.hub_upgrade_note = None;
+        }
+        // The status bar's quota dock line keeps itself fresh while the app
+        // sits idle: turn-end refreshes only cover usage movement, so without
+        // this poll an idle session's quota never moved (Martty's TUI dock
+        // gets the same 60s refresher from the bridge). `spawn_quota_dock`
+        // no-ops outside the hub-reachable phases and dedupes an in-flight
+        // read; the cadence advances regardless so a reconnect can't
+        // hot-loop the hub.
+        if now >= self.next_quota_dock_poll_at {
+            self.next_quota_dock_poll_at = now + QUOTA_DOCK_POLL_MS;
+            self.spawn_quota_dock();
         }
         // The System Status page's 5s poll (TS `setInterval(loadSystemStats,
         // POLL_MS)`) — live only while the page is open.
@@ -10610,6 +10633,31 @@ mod tests {
             d.quota_dock_loading,
             "a quota refresh must also kick the dock line read"
         );
+    }
+
+    /// The idle-session dock poll (QUOTA_DOCK_POLL_MS): a tick past the
+    /// cadence kicks the read once and advances the timer — the line used to
+    /// move only at turn ends, so an idle session's quota sat frozen
+    /// (user, 2026-11-06). Outside the hub-reachable phases the spawn no-ops
+    /// but the cadence still advances (no hot-loop on reconnect).
+    #[tokio::test]
+    async fn the_dock_line_polls_itself_while_idle() {
+        let mut d = driver();
+        d.tick(super::QUOTA_DOCK_POLL_MS);
+        assert!(
+            !d.quota_dock_loading,
+            "no hub yet — the poll must wait like every other dock read"
+        );
+        d.phase = super::Phase::Connected;
+        d.tick(super::QUOTA_DOCK_POLL_MS * 2);
+        assert!(
+            d.quota_dock_loading,
+            "an idle tick past the cadence must re-read the dock line"
+        );
+        // Back-to-back ticks inside the cadence window must not re-fire.
+        d.quota_dock_loading = false;
+        d.tick(super::QUOTA_DOCK_POLL_MS * 2 + 1);
+        assert!(!d.quota_dock_loading, "the cadence gates repeated polls");
     }
 
     /// The status bar's version chip is the HUB's number, not the active

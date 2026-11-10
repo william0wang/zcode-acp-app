@@ -742,20 +742,54 @@ pub(crate) fn finished_fresh(sess: &SessionRow, now: u64) -> bool {
         .is_some_and(|at| now < at.saturating_add(60_000))
 }
 
+/// A config-option value as a MATCH key: the provider spelling normalized
+/// (`account:<family>-<plan>` → `builtin:<family>-<plan>`, the same fold
+/// [`protocol::config_decode::match_provider_id`] applies to the desktop's
+/// own pickers), the model part untouched. The bridge builds the option
+/// values from config.json (`builtin:…`) while the runtime may push a
+/// mid-turn currentValue in the registry's `account:…` spelling — legal
+/// wire data, just a different dialect of the same provider. Display-side
+/// matching normalizes so the chip label and the menu checkmark survive
+/// the push; the wire value itself stays as sent.
+fn config_value_match_key(value: &str) -> String {
+    match value.rfind('\\') {
+        // Backslash spelling: providerId\modelId — model ids never carry `\`.
+        Some(sep) => format!(
+            "{}\\{}",
+            protocol::config_decode::match_provider_id(Some(&value[..sep])),
+            &value[sep + 1..],
+        ),
+        // Legacy bare modelId (and the custom:/… spelling) compares as-is.
+        None => value.to_string(),
+    }
+}
+
 /// One config option's picker data, shared by the composer's chip and the
-/// session panel's row: the current value's display name (the raw value
-/// when the choices do not list it, `—` when unset) and the menu choices as
-/// `(value, name, active)`.
+/// session panel's row: the current value's display name (exact choice name,
+/// else the provider-normalized choice name, else the bare model id — the
+/// raw `providerId\modelId` pair is never a name; TS SessionPanel's
+/// `bareModelIdFromConfigValue` fallback), `—` when unset; plus the menu
+/// choices as `(value, name, active)` under the same matching.
 fn config_option_view(opt: &protocol::acp::ConfigOption) -> (String, Vec<(String, String, bool)>) {
+    let current_key = opt.current_value.as_deref().map(config_value_match_key);
     let current = opt
         .current_value
         .as_deref()
         .map(|v| {
             opt.options
                 .as_ref()
-                .and_then(|choices| choices.iter().find(|c| c.value == v))
+                .and_then(|choices| {
+                    choices
+                        .iter()
+                        .find(|c| c.value == v)
+                        .or_else(|| {
+                            choices
+                                .iter()
+                                .find(|c| current_key.as_deref() == Some(config_value_match_key(&c.value).as_str()))
+                        })
+                })
                 .map(|c| c.name.clone())
-                .unwrap_or_else(|| v.to_string())
+                .unwrap_or_else(|| protocol::bare_model_id_from_config_value(v))
         })
         .unwrap_or_else(|| "—".to_string());
     let choices = opt
@@ -763,11 +797,9 @@ fn config_option_view(opt: &protocol::acp::ConfigOption) -> (String, Vec<(String
         .iter()
         .flatten()
         .map(|c| {
-            (
-                c.value.clone(),
-                c.name.clone(),
-                Some(c.value.as_str()) == opt.current_value.as_deref(),
-            )
+            let active = Some(c.value.as_str()) == opt.current_value.as_deref()
+                || current_key.as_deref() == Some(config_value_match_key(&c.value).as_str());
+            (c.value.clone(), c.name.clone(), active)
         })
         .collect();
     (current, choices)
@@ -6567,6 +6599,51 @@ fn render_tool_run(
             body = body.child(render_tool_card(row_id, start_index + i, view, wb, theme));
         }
         card = card.child(body);
+        // Bottom seam (the TS footer button): a long run's body pushes the
+        // header's toggle far offscreen, so the foot of the card folds it
+        // shut without the scroll back up.
+        let row_id_footer = row_id.to_string();
+        card = card.child(
+            div()
+                .id(SharedString::from(format!(
+                    "tool-run-collapse-{}-{}",
+                    row_id, start_index
+                )))
+                .test_support()
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap_1()
+                .px_2()
+                .py_1()
+                .border_t_1()
+                .border_color(theme.border)
+                .cursor_pointer()
+                .hover(|h| h.bg(theme.title_bar))
+                .on_click({
+                    let wb = wb.clone();
+                    move |_, _window, cx| {
+                        if let Some(wb) = wb.upgrade() {
+                            wb.update(cx, |wb, cx| {
+                                wb.set_tool_run_open(&row_id_footer, start_index, false, cx)
+                            });
+                        }
+                    }
+                })
+                .child(
+                    Icon::new(IconName::ChevronDown)
+                        .small()
+                        .flex_none()
+                        .rotate(radians(std::f32::consts::PI))
+                        .text_color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .text_size(ui_text(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(t!("chat.toolRunCollapse").into_owned()),
+                ),
+        );
     }
     // Right-click on the run's chrome (summary row, the gaps between member
     // cards — the members themselves carry their own menus): copy every
@@ -7914,6 +7991,43 @@ mod display_unit_tests {
         let capped = super::tool_display_name(&long);
         assert!(capped.chars().count() <= 241);
         assert!(capped.ends_with('…'));
+    }
+
+    #[test]
+    fn config_option_view_matches_the_normalized_spelling_and_falls_back_to_bare_ids() {
+        let choice = |value: &str, name: &str| protocol::acp::ConfigOptionChoice {
+            value: value.into(),
+            name: name.into(),
+        };
+        let builtin_value = "builtin:bigmodel-coding-plan\\GLM-5.3-Flash";
+        let mut opt = protocol::acp::ConfigOption {
+            id: "model".into(),
+            name: Some("Model".into()),
+            category: None,
+            current_value: Some(builtin_value.into()),
+            options: Some(vec![choice(builtin_value, "GLM-5.3-Flash")]),
+        };
+        // A current value the choices list → the choice's name, checked.
+        let (current, choices) = super::config_option_view(&opt);
+        assert_eq!(current, "GLM-5.3-Flash");
+        assert!(choices[0].2, "exact match is active");
+        // The runtime's `account:` spelling of the SAME model (the mid-turn
+        // state.updated dialect) normalizes onto the `builtin:` choice: the
+        // label is the choice's name and the checkmark survives (user,
+        // 2026-11-06) — display-side only, the wire value stays as sent.
+        opt.current_value = Some("account:bigmodel-individual-coding-plan\\GLM-5.3-Flash".into());
+        let (current, choices) = super::config_option_view(&opt);
+        assert_eq!(current, "GLM-5.3-Flash");
+        assert!(choices[0].2, "the provider-normalized match is active");
+        // A genuinely unknown value reads as the bare model id — the raw
+        // `providerId\modelId` pair is never a name.
+        opt.current_value = Some("builtin:bigmodel-coding-plan\\GLM-9.9".into());
+        assert_eq!(super::config_option_view(&opt).0, "GLM-9.9");
+        // No choices at all → the same bare-id fallback; unset → the dash.
+        opt.options = None;
+        assert_eq!(super::config_option_view(&opt).0, "GLM-9.9");
+        opt.current_value = None;
+        assert_eq!(super::config_option_view(&opt).0, "—");
     }
 
     #[test]

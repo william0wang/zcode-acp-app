@@ -33,6 +33,7 @@ import {
   Brain,
   Check,
   ChevronDown,
+  ChevronUp,
   Copy,
   FilePen,
   FileText,
@@ -382,6 +383,17 @@ function ToolRunCard({
         <div className="flex flex-col gap-1 border-t border-hairline px-2 py-1.5">
           {children}
         </div>
+      )}
+      {/* A long run's body pushes the header's toggle far offscreen — the
+          bottom seam folds it shut without the scroll back up. */}
+      {open && (
+        <button
+          onClick={() => setOpen(false)}
+          className="flex w-full items-center justify-center gap-1 border-t border-hairline px-3 py-1.5 text-xs text-faint active:bg-white/[0.06]"
+        >
+          <ChevronUp className="size-3.5 shrink-0" />
+          {t("chat.toolRunCollapse")}
+        </button>
       )}
     </div>
   );
