@@ -1,6 +1,6 @@
 [package]
 name = "app"
-version = "0.35.6"
+version = "0.36.0"
 description = "ZCode ACP for Android and the web: attach to a zcode-acp Hub over WebSocket"
 authors = ["William Wang"]
 license = "MIT"
