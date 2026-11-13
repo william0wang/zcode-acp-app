@@ -56,6 +56,9 @@ pub struct BootstrapEnv {
     pub hub_host: Option<String>,
     /// `PATH`, for the last-resort install scan.
     pub path: Option<String>,
+    /// `$SHELL` — the login shell probed for the PATH a GUI app cannot
+    /// inherit (see [`login_shell_path`]).
+    pub shell: Option<String>,
     /// `NPM_CONFIG_PREFIX` — an npm global prefix to probe ahead of the
     /// well-known ones.
     pub npm_config_prefix: Option<String>,
@@ -71,7 +74,9 @@ impl BootstrapEnv {
         let var = |key: &str| std::env::var(key).ok();
         let home_key = if cfg!(unix) { "HOME" } else { "USERPROFILE" };
         Self {
-            home: std::env::var_os(home_key).map(PathBuf::from).unwrap_or_default(),
+            home: std::env::var_os(home_key)
+                .map(PathBuf::from)
+                .unwrap_or_default(),
             xdg_config_home: var("XDG_CONFIG_HOME"),
             xdg_data_home: var("XDG_DATA_HOME"),
             remote_enabled: var("ZCODE_ACP_REMOTE"),
@@ -79,6 +84,7 @@ impl BootstrapEnv {
             hub_port: var("ZCODE_ACP_HUB_PORT"),
             hub_host: var("ZCODE_ACP_HUB_HOST"),
             path: var("PATH"),
+            shell: var("SHELL"),
             npm_config_prefix: var("NPM_CONFIG_PREFIX"),
             install_dirs: None,
         }
@@ -300,10 +306,23 @@ pub struct ServerInstall {
     pub bin: PathBuf,
 }
 
-/// Default probe order: mise shims → bun global bin → npm prefixes → `$PATH`.
+/// How long the login-shell PATH probe may take. A shell start is
+/// milliseconds; the budget only matters for an rc that hangs, which then
+/// degrades to the static probe list.
+pub const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default probe order: mise shims → bun global bin → npm prefixes →
+/// user-local bin → `$PATH`.
 /// Explicit paths instead of a bare PATH lookup because a GUI app inherits
 /// launchd's bare environment — the same reason the server probes well-known
 /// bun locations itself (runtime.ts `bunCandidates`).
+///
+/// `$PATH` here is the INHERITED one: a launchd-launched app gets
+/// `/usr/bin:/bin:/usr/sbin:/sbin`, so a hand-installed dispatcher under
+/// `~/.local/bin` (a source checkout linked there, the documented dev
+/// setup) is invisible to it — hence the explicit user-local dirs, and
+/// [`install_dirs_with_login_shell`] for everything only the user's rc
+/// files know about.
 pub fn default_install_dirs(env: &BootstrapEnv) -> Vec<PathBuf> {
     let data_base = env
         .xdg_data_home
@@ -325,11 +344,14 @@ pub fn default_install_dirs(env: &BootstrapEnv) -> Vec<PathBuf> {
         dirs.push(PathBuf::from(prefix).join("bin"));
     }
     if cfg!(unix) {
-        // System node, Homebrew (arm64 + Linuxbrew), the npm-global convention.
+        // System node, Homebrew (arm64 + Linuxbrew), the npm-global convention,
+        // and the XDG/user-local bin dir source checkouts are usually linked
+        // into (pipx/cargo/mise-farm all use it too).
         dirs.push(PathBuf::from("/usr/local/bin"));
         dirs.push(PathBuf::from("/opt/homebrew/bin"));
         dirs.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
         dirs.push(env.home.join(".npm-global").join("bin"));
+        dirs.push(env.home.join(".local").join("bin"));
     } else {
         dirs.push(env.home.join("AppData").join("Roaming").join("npm"));
     }
@@ -339,16 +361,163 @@ pub fn default_install_dirs(env: &BootstrapEnv) -> Vec<PathBuf> {
     dirs
 }
 
+/// The login shell's `PATH`, or `None` when the probe cannot produce one.
+///
+/// A GUI app launched from Finder/Dock inherits launchd's bare environment,
+/// so the PATH a user actually works with — mise/nvm/asdf shims, Homebrew,
+/// `~/.local/bin` — exists only inside their rc files. Probing a NON-login,
+/// NON-interactive shell never reads them; `-l` reads the profile
+/// (`~/.zprofile`) but not `~/.zshrc`, which is where most version managers
+/// install themselves, so the interactive rc is sourced explicitly — the
+/// same split the server uses (`remote/login-shell-env.ts`). `-i` is
+/// avoided on purpose: this runs inside a GUI process with no terminal.
+///
+/// Blocking (one shell start, bounded by `timeout`); call from the driver's
+/// background runtime, never the UI thread. Failure is silent — the
+/// inherited environment remains the fallback.
+pub fn login_shell_path(env: &BootstrapEnv, timeout: Duration) -> Option<String> {
+    let shell = env
+        .shell
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("/bin/zsh");
+    let name = Path::new(shell)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let rc_files = match name {
+        "zsh" => r#""$HOME/.zshrc""#,
+        "bash" => r#""$HOME/.bash_profile" "$HOME/.bashrc""#,
+        _ => "",
+    };
+    let script = if rc_files.is_empty() {
+        "printf '%s' \"$PATH\"".to_owned()
+    } else {
+        format!("for f in {rc_files}; do [ -r \"$f\" ] && . \"$f\"; done; printf '%s' \"$PATH\"")
+    };
+    let mut cmd = Command::new(shell);
+    cmd.arg("-l")
+        .arg("-c")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let child = cmd.spawn().ok()?;
+    let output = wait_with_timeout(child, timeout)?;
+    let path = String::from_utf8_lossy(&output).trim().to_owned();
+    (!path.is_empty()).then_some(path)
+}
+
+/// Run a probe child to completion, bounded by `timeout`, and return its
+/// stdout — a wedged rc file must never hang the bootstrap.
+///
+/// The read happens on a detached thread because a blocking `read` cannot be
+/// interrupted: if the rc leaked the pipe into a background grandchild, EOF
+/// never arrives and joining that thread would wait forever. The deadline is
+/// therefore enforced on the RECEIVE side, and a probe that misses it is
+/// treated as failed — the caller falls back to the static probe list.
+fn wait_with_timeout(mut child: Child, timeout: Duration) -> Option<Vec<u8>> {
+    use std::io::Read as _;
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // EOF on both is the success shape: the shell exited AND closed the
+        // pipe, so the buffer is complete.
+        if let Ok(buf) = rx.try_recv() {
+            let _ = child.wait();
+            return Some(buf);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The probe dirs plus every directory only the user's login shell knows.
+///
+/// Ordering: the login shell's own resolution order first (that is what a
+/// command typed in a terminal would get), then the static list. This is
+/// what makes a dev-setup dispatcher found AND runnable — its shebang
+/// interpreter (`node`, resolved through PATH) lives on that same shell
+/// PATH, not on launchd's.
+pub fn install_dirs_with_login_shell(env: &BootstrapEnv, timeout: Duration) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = login_shell_path(env, timeout)
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    dirs.extend(default_install_dirs(env));
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| seen.insert(d.clone()));
+    dirs
+}
+
+/// Find the dispatcher bin inside an explicit dir list; first hit wins.
+pub fn find_server_install_in(dirs: &[PathBuf]) -> Option<ServerInstall> {
+    dirs.iter()
+        .map(|dir| dir.join(HUB_BIN_NAME))
+        .find(|bin| bin.is_file())
+        .map(|bin| ServerInstall { bin })
+}
+
 /// Find the installed server's dispatcher bin; first candidate hit wins.
 pub fn find_server_install(env: &BootstrapEnv) -> Option<ServerInstall> {
     let dirs = match &env.install_dirs {
         Some(pinned) => pinned.clone(),
         None => default_install_dirs(env),
     };
-    dirs.into_iter()
-        .map(|dir| dir.join(HUB_BIN_NAME))
-        .find(|bin| bin.is_file())
-        .map(|bin| ServerInstall { bin })
+    find_server_install_in(&dirs)
+}
+
+/// `PATH` for the hub child: the probe dirs, then the inherited PATH.
+///
+/// Union (not replacement) for the same reason the server unions the login
+/// shell's value (`remote/login-shell-env.ts` `unionPath`): the probe dirs
+/// make the dispatcher's own interpreter resolve, while the inherited entries
+/// stay — a daemon that loses `/usr/bin` cannot run its own toolchain, and
+/// every process the hub later spawns inherits this value.
+pub fn hub_child_path(dirs: &[PathBuf], inherited: Option<&str>) -> Option<String> {
+    let mut all: Vec<PathBuf> = dirs.iter().filter(|d| d.is_dir()).cloned().collect();
+    if let Some(inherited) = inherited {
+        all.extend(std::env::split_paths(inherited));
+    }
+    let mut seen = std::collections::HashSet::new();
+    all.retain(|d| seen.insert(d.clone()));
+    if all.is_empty() {
+        return None;
+    }
+    std::env::join_paths(&all)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// [`hub_child_path`] for the real spawn: the inherited half is the live
+/// process PATH, not just the snapshot field (`BootstrapEnv::path` may be
+/// unset on a caller that only filled the hub-relevant vars, and dropping
+/// `/bin` from the daemon's PATH breaks every `sh` helper it runs).
+pub fn hub_child_path_from_process(dirs: &[PathBuf], env: &BootstrapEnv) -> Option<String> {
+    let live = env
+        .path
+        .clone()
+        .or_else(|| std::env::var("PATH").ok())
+        .or_else(|| {
+            // Neither field nor live var: the platform default search path is
+            // what the OS would have used, so a spawn still gets `/bin`.
+            Some(if cfg!(windows) {
+                r"C:\Windows\System32".to_owned()
+            } else {
+                "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_owned()
+            })
+        });
+    hub_child_path(dirs, live.as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -375,18 +544,28 @@ pub fn hub_spawn_env(config: &LocalHubConfig) -> Vec<(String, String)> {
 /// move keeps terminal-wide signals from reaching it) — closing the app must
 /// never stop the hub (CONTEXT.md "Hub Bootstrap").
 ///
+/// `path` replaces the child's `PATH` with the probe dirs ([`hub_child_path`]):
+/// under launchd a wrapper dispatcher cannot resolve its own interpreter, and
+/// every process the hub later spawns (serve bridges, terminals, backends)
+/// inherits that same PATH — the server's `spawnHub` completes the
+/// environment for exactly this reason (`remote/endpoint.ts`).
+///
 /// Whether OUR spawn won the port is NOT decided here — the daemon exits 0
 /// on EADDRINUSE by design (bin/hub.ts:108-111) and the caller adjudicates
 /// by connectivity ([`ensure_hub`]).
 pub fn spawn_hub_daemon(
     install: &ServerInstall,
     config: &LocalHubConfig,
+    path: Option<&str>,
 ) -> io::Result<Child> {
     let mut cmd = Command::new(&install.bin);
     cmd.arg(HUB_SUBCOMMAND)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
     for (key, value) in hub_spawn_env(config) {
         cmd.env(key, value);
     }
@@ -502,9 +681,11 @@ pub enum EnsureHubOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BootstrapError {
-    #[error("no token in the config file or ZCODE_ACP_REMOTE_TOKEN — generate one first (guided setup)")]
+    #[error(
+        "no token in the config file or ZCODE_ACP_REMOTE_TOKEN — generate one first (guided setup)"
+    )]
     MissingToken,
-    #[error("zcode-acp-server is not installed (probed mise/bun/npm locations and PATH for the `{HUB_BIN_NAME}` bin)")]
+    #[error("zcode-acp-server is not installed (probed the login shell's PATH plus mise/bun/npm/user-local locations for the `{HUB_BIN_NAME}` bin)")]
     NotInstalled,
     #[error("spawning the hub daemon failed: {0}")]
     Spawn(#[source] io::Error),
@@ -516,6 +697,37 @@ pub enum BootstrapError {
         port: u16,
         deadline: Duration,
     },
+}
+
+/// Locate the dispatcher and the probe dirs it will run under.
+///
+/// Two stages, cheap first: the static list (mise/bun/npm/user-local/`$PATH`)
+/// covers every package-manager install, and only when it comes up empty is a
+/// login shell probed — that probe starts a process and is the one thing the
+/// bootstrap cannot cache across calls (the rc file is live config).
+///
+/// A caller-pinned `install_dirs` short-circuits both stages: a pinned list
+/// is authoritative, so tests never touch the host's real installs or shell.
+async fn resolve_server_install(env: &BootstrapEnv) -> (Option<ServerInstall>, Vec<PathBuf>) {
+    if let Some(pinned) = &env.install_dirs {
+        return (find_server_install_in(pinned), pinned.clone());
+    }
+    let dirs = default_install_dirs(env);
+    if let Some(install) = find_server_install_in(&dirs) {
+        return (Some(install), dirs);
+    }
+    // A GUI app's inherited PATH cannot see anything the user's rc files add,
+    // which is where a dev checkout's dispatcher (and the interpreter it
+    // execs) actually lives. The probe starts a shell, so it goes to the
+    // blocking pool — this driver's runtime thread must not stall on an rc.
+    let probe_env = env.clone();
+    let shell_dirs = tokio::task::spawn_blocking(move || {
+        install_dirs_with_login_shell(&probe_env, LOGIN_SHELL_PROBE_TIMEOUT)
+    })
+    .await
+    .unwrap_or_default();
+    let install = find_server_install_in(&shell_dirs);
+    (install, shell_dirs)
 }
 
 /// Single TCP connectability probe. TCP-level by design: adjudication only
@@ -566,8 +778,11 @@ pub async fn ensure_hub(
     // The hub never runs unauthenticated (bin/hub.ts) — spawning without a
     // token would just produce a refusing daemon.
     config.token.clone().ok_or(BootstrapError::MissingToken)?;
-    let install = find_server_install(env).ok_or(BootstrapError::NotInstalled)?;
-    let mut child = spawn_hub_daemon(&install, &config).map_err(BootstrapError::Spawn)?;
+    let (install, dirs) = resolve_server_install(env).await;
+    let install = install.ok_or(BootstrapError::NotInstalled)?;
+    let child_path = hub_child_path_from_process(&dirs, env);
+    let mut child = spawn_hub_daemon(&install, &config, child_path.as_deref())
+        .map_err(BootstrapError::Spawn)?;
 
     let deadline = tokio::time::Instant::now() + opts.connect_deadline;
     loop {
@@ -577,7 +792,9 @@ pub async fn ensure_hub(
                 reap_detached(child);
                 return Ok((EnsureHubOutcome::SpawnWon, config));
             }
-            HubRaceState::WonByExisting => return Ok((EnsureHubOutcome::SpawnLostToExisting, config)),
+            HubRaceState::WonByExisting => {
+                return Ok((EnsureHubOutcome::SpawnLostToExisting, config))
+            }
             HubRaceState::Refused { exit_code } => {
                 return Err(BootstrapError::DaemonRefused(exit_code))
             }
@@ -656,7 +873,9 @@ pub enum TokenPlanError {
         #[source]
         source: io::Error,
     },
-    #[error("config file {path} is not valid JSON — fix or remove it manually before writing a token")]
+    #[error(
+        "config file {path} is not valid JSON — fix or remove it manually before writing a token"
+    )]
     Malformed { path: PathBuf },
     #[error("config file {path} is not a JSON object")]
     NotAnObject { path: PathBuf },
@@ -692,10 +911,7 @@ pub fn plan_token_write(config_path: &Path, token: &str) -> Result<TokenWritePla
     if token.is_empty() {
         return Err(TokenPlanError::EmptyToken);
     }
-    let dir_exists = config_path
-        .parent()
-        .map(|p| p.is_dir())
-        .unwrap_or(false);
+    let dir_exists = config_path.parent().map(|p| p.is_dir()).unwrap_or(false);
     let (file_exists, root) = match std::fs::read_to_string(config_path) {
         Ok(text) => (
             true,
@@ -773,10 +989,8 @@ mod tests {
         fn new(tag: &str) -> Self {
             static COUNTER: AtomicU32 = AtomicU32::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "zcode-bootstrap-{}-{n}-{tag}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("zcode-bootstrap-{}-{n}-{tag}", std::process::id()));
             std::fs::create_dir_all(&path).unwrap();
             TempDir(path)
         }
@@ -858,24 +1072,17 @@ mod tests {
         )
         .unwrap();
         assert_eq!(section, RemoteSection::default());
-        let section = parse_remote_section(
-            r#"{"remote": {"hubPort": 0, "extra": true}}"#,
-        )
-        .unwrap();
+        let section = parse_remote_section(r#"{"remote": {"hubPort": 0, "extra": true}}"#).unwrap();
         assert_eq!(section.hub_port, None);
-        let section = parse_remote_section(
-            r#"{"remote": {"hubPort": 70000}}"#,
-        )
-        .unwrap();
+        let section = parse_remote_section(r#"{"remote": {"hubPort": 70000}}"#).unwrap();
         assert_eq!(section.hub_port, None);
-        let section = parse_remote_section(
-            r#"{"remote": {"hubPort": "8377"}}"#,
-        )
-        .unwrap();
+        let section = parse_remote_section(r#"{"remote": {"hubPort": "8377"}}"#).unwrap();
         assert_eq!(section.hub_port, None);
         // Boundary ports are valid.
         assert_eq!(
-            parse_remote_section(r#"{"remote": {"hubPort": 1}}"#).unwrap().hub_port,
+            parse_remote_section(r#"{"remote": {"hubPort": 1}}"#)
+                .unwrap()
+                .hub_port,
             Some(1)
         );
         assert_eq!(
@@ -978,7 +1185,7 @@ mod tests {
         assert_eq!(merged.token.as_deref(), Some("filetok"));
         assert_eq!(merged.hub_port, 9200); // file port wins over env
         assert_eq!(merged.hub_host, DEFAULT_HUB_HOST); // default fills
-        // An invalid file port reads as absent → env applies.
+                                                       // An invalid file port reads as absent → env applies.
         write_config(home.path(), r#"{"remote": {"hubPort": 99999}}"#);
         assert_eq!(resolve_local_hub(&env).hub_port, 8403);
     }
@@ -1020,7 +1227,10 @@ mod tests {
         assert_eq!(status.config.token.as_deref(), Some("tok"));
         assert_eq!(status.config.hub_port, 9300);
         // Disabled file → guided flow offered, config still readable.
-        write_config(home.path(), r#"{"remote": {"enabled": false, "token": "tok"}}"#);
+        write_config(
+            home.path(),
+            r#"{"remote": {"enabled": false, "token": "tok"}}"#,
+        );
         let status = assess_local_hub(&test_env(home.path()));
         assert!(!status.enabled);
         assert_eq!(status.config.token.as_deref(), Some("tok"));
@@ -1049,12 +1259,109 @@ mod tests {
         assert_eq!(dirs[2], PathBuf::from("/npm/prefix/bin"));
         assert!(dirs.contains(&PathBuf::from("/usr/local/bin")));
         assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        // The hand-installed / XDG user-local bin: a dev checkout links its
+        // dispatcher here, and it is NOT on a launchd PATH.
+        assert!(dirs.contains(&PathBuf::from("/home/user/.local/bin")));
         // No PATH → no extra entries; with PATH → appended in order.
         assert!(!dirs.iter().any(|d| d.ends_with("extra-bin")));
         env.path = Some("/a/extra-bin:/b".to_owned());
         let dirs = default_install_dirs(&env);
         assert!(dirs.contains(&PathBuf::from("/a/extra-bin")));
         assert!(dirs.contains(&PathBuf::from("/b")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_shell_path_sources_interactive_rc() {
+        let home = TempDir::new("shellpath");
+        // The shell's own PATH is replaced by the rc file, proving the probe
+        // sources it — the launchd-inherited PATH never contains this dir.
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "PATH=/probe-only-bin:/usr/bin:/bin\nexport PATH\n",
+        )
+        .unwrap();
+        // `-l` reads ~/.zprofile, NOT ~/.zshrc; -i is avoided. So point HOME at
+        // the scratch dir via the shell's own expansion.
+        let mut env = test_env(home.path());
+        env.shell = Some("/bin/sh".to_owned()); // no rc list → bare dump
+        let path = login_shell_path(&env, Duration::from_secs(5));
+        // /bin/sh -l -c 'printf %s "$PATH"' still prints SOMETHING (its
+        // inherited PATH) — the contract is "a usable PATH or None".
+        assert!(path.is_some());
+
+        // zsh specifically: HOME must name the scratch dir for ~/.zshrc.
+        if Path::new("/bin/zsh").exists() {
+            let script = format!(
+                "HOME={} /bin/zsh -l -c 'for f in \"$HOME/.zshrc\"; do [ -r \"$f\" ] && . \"$f\"; done; printf \"%s\" \"$PATH\"'",
+                home.path().display()
+            );
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .unwrap();
+            let got = String::from_utf8_lossy(&out.stdout);
+            assert!(got.contains("/probe-only-bin"), "rc not sourced: {got}");
+        }
+    }
+
+    /// A shell that keeps the stdout pipe open through a background child
+    /// never reaches EOF — the deadline must still settle the probe as failed
+    /// instead of waiting forever (the rc-hangs regression).
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_timeout_gives_up_on_a_leaked_pipe() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 30 & printf started")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let out = wait_with_timeout(child, Duration::from_millis(300));
+        assert!(out.is_none(), "leaked pipe must read as a failed probe");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "deadline not enforced: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_dirs_put_login_shell_path_first() {
+        let home = TempDir::new("dirsorder");
+        std::fs::write(
+            home.path().join(".zshrc"),
+            "PATH=/probe-first:/usr/bin:/bin\n",
+        )
+        .unwrap();
+        let mut env = test_env(home.path());
+        // A shell that ignores the rc keeps the test hermetic; the union and
+        // dedupe behaviour is what this asserts.
+        env.shell = Some("/bin/sh".to_owned());
+        let dirs = install_dirs_with_login_shell(&env, Duration::from_secs(5));
+        assert!(dirs.contains(&home.path().join(".local").join("bin")));
+        // Dedupe: no directory appears twice.
+        let mut unique = dirs.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), dirs.len(), "duplicate probe dirs: {dirs:?}");
+    }
+
+    #[test]
+    fn hub_child_path_unions_probe_dirs_with_inherited() {
+        let home = TempDir::new("childpath");
+        let real = home.path().join("real-bin");
+        std::fs::create_dir_all(&real).unwrap();
+        let missing = home.path().join("missing-bin");
+        let path = hub_child_path(&[real.clone(), missing], Some("/usr/bin:/bin")).unwrap();
+        assert_eq!(path, format!("{}:/usr/bin:/bin", real.to_string_lossy()));
+        // Empty probe dirs still carry the inherited PATH; both empty → None.
+        assert_eq!(hub_child_path(&[], Some("/bin")).as_deref(), Some("/bin"));
+        assert_eq!(hub_child_path(&[], None), None);
     }
 
     #[test]
@@ -1205,7 +1512,10 @@ mod tests {
         assert_eq!(config.hub_port, port);
         // Give a would-be spawn a beat to (wrongly) fire, then prove none did.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(!marker.exists(), "already-listening must not spawn a daemon");
+        assert!(
+            !marker.exists(),
+            "already-listening must not spawn a daemon"
+        );
     }
 
     /// Bind a listener on `port` after `delay` — the spawn path needs the
@@ -1274,7 +1584,10 @@ mod tests {
         env.remote_token = Some("tok".to_owned());
         env.hub_port = Some(port.to_string());
         let err = ensure_hub(&env, &ensure_opts()).await.unwrap_err();
-        assert!(matches!(err, BootstrapError::DaemonRefused(Some(7))), "{err:?}");
+        assert!(
+            matches!(err, BootstrapError::DaemonRefused(Some(7))),
+            "{err:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1320,6 +1633,59 @@ mod tests {
         assert!(matches!(err, BootstrapError::NotInstalled), "{err:?}");
     }
 
+    /// The reported desktop failure: a dev-setup dispatcher lives in
+    /// `~/.local/bin` and is a shell wrapper around a PATH-resolved
+    /// interpreter. Under launchd's bare PATH neither the bin nor `node`
+    /// exists, so the spawn must carry the probe dirs' PATH — otherwise it
+    /// "succeeds" and the daemon dies on exec (silent `NotInstalled`-like
+    /// failure reported as a refused/timed-out daemon).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_hub_spawns_dev_setup_dispatcher_from_user_local_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = ENSURE_SERIAL.lock().await;
+        let home = TempDir::new("userlocal");
+        // A directory the DEFAULT probe list never contains, so the hit below
+        // proves the pinned list is used verbatim — not the default list plus
+        // the host's login-shell PATH (the bug this test pins down).
+        let user_bin = home.path().join("custom-tools");
+        std::fs::create_dir_all(&user_bin).unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        bind_after(Duration::from_millis(400), port).await;
+        // A wrapper that needs a PATH-resolved interpreter, like the real
+        // `zcode-acp` dev shim (`exec node .../dist/cli.js "$@"`): `sleep`
+        // resolves through PATH and exists on the probe list's /bin only if
+        // the spawn carried the completed PATH.
+        let bin = user_bin.join(HUB_BIN_NAME);
+        let marker = home.path().join("spawned-with-path");
+        std::fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\ncommand -v sleep >/dev/null || exit 9\necho \"$PATH\" > {}\nexec sleep 5\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut env = test_env(home.path());
+        env.remote_token = Some("tok".to_owned());
+        env.hub_port = Some(port.to_string());
+        // Pin the probe list to the user-local bin so the test never depends
+        // on (or launches) the host's login shell.
+        env.install_dirs = Some(vec![user_bin.clone()]);
+        let (outcome, _) = ensure_hub(&env, &ensure_opts()).await.unwrap();
+        assert_eq!(outcome, EnsureHubOutcome::SpawnWon);
+        // The daemon saw a PATH that contains its own dir — under launchd's
+        // bare PATH the wrapper could not have resolved `sleep`.
+        let seen = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            seen.split(':').any(|p| Path::new(p) == user_bin),
+            "spawned PATH lost the dispatcher dir: {seen}"
+        );
+    }
+
     // ---- token generation ----
 
     #[test]
@@ -1327,7 +1693,9 @@ mod tests {
         let a = generate_token().unwrap();
         let b = generate_token().unwrap();
         assert_eq!(a.len(), 64);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(a
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
         assert_ne!(a, b);
     }
 
