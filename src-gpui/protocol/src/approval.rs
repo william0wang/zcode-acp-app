@@ -213,8 +213,32 @@ pub fn find_tool_call_part<'a>(
     None
 }
 
+/// The question text for an AskUserQuestion permission popup whose
+/// tool_call part never arrived (ADR 0003 degradation): the bridge's
+/// request_permission fallback carries the zcode `questions` array in
+/// rawInput, and the popup's toolCallId suffix `_N` (single-select) /
+/// `_N_M` (multi-select option) names the question being asked — the FIRST
+/// numeric segment is the question index. None when not question-shaped.
+fn ask_question_from_wire(tool_call_id: Option<&str>, raw_input: Option<&Value>) -> Option<String> {
+    let texts: Vec<&str> = raw_input?
+        .get("questions")?
+        .as_array()?
+        .iter()
+        .filter_map(|q| q.get("question").and_then(Value::as_str))
+        .filter(|s| !s.is_empty())
+        .collect();
+    if texts.is_empty() {
+        return None;
+    }
+    let idx = tool_call_id
+        .and_then(|id| id.split('_').filter_map(|seg| seg.parse::<usize>().ok()).next())
+        .map(|i| i.min(texts.len() - 1))
+        .unwrap_or(0);
+    texts.get(idx).map(|s| s.to_string())
+}
+
 /// Builds the card context from a `session/request_permission` params object
-/// (appStore.ts `buildApprovalContext`). Wire-provided popup fields (bridge
+/// (appStore.ts `resolveApprovalContext`). Wire-provided popup fields (bridge
 /// 0.33+ `toolCall.title` / `toolCall.content`) are preferred over the matched
 /// tool_call part and the INPUT_KEYS heuristic; `plan` rides on
 /// `toolCall.rawInput.plan`.
@@ -254,6 +278,16 @@ pub fn build_approval_context(params: &Value, messages: &[ChatMessage]) -> Optio
         Value::String(s) => s.clone(),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
     });
+    // ADR 0003 degradation made whole: when the tool_call part is missing
+    // (the ask was re-delivered after a reconnect, or belongs to a session
+    // whose messages are not loaded), an AskUserQuestion popup still carries
+    // everything on the wire — rebuild the question card from it instead of
+    // degrading to the raw-JSON pane with a nameless "input" expander.
+    let wire_ask = if part.is_none() {
+        ask_question_from_wire(tool_call_id.as_deref(), raw_input)
+    } else {
+        None
+    };
     if tool_call_id.is_none()
         && raw_input_text.is_none()
         && wire_title.is_none()
@@ -261,16 +295,21 @@ pub fn build_approval_context(params: &Value, messages: &[ChatMessage]) -> Optio
     {
         return None;
     }
+    let detail = content_text
+        .or_else(|| part.map(|p| p.detail.clone()))
+        .or_else(|| {
+            wire_ask
+                .as_ref()
+                .and_then(|_| wire_title.clone().or_else(|| wire_ask.clone()))
+        });
     Some(ApprovalContext {
         tool_call_id,
-        tool_name: part.and_then(|p| {
-            p.raw_name
-                .clone()
-                .or_else(|| Some(p.tool_name.clone()))
-        }),
+        tool_name: part
+            .and_then(|p| p.raw_name.clone().or_else(|| Some(p.tool_name.clone())))
+            .or_else(|| wire_ask.as_ref().map(|_| "AskUserQuestion".to_string())),
         kind: part.and_then(|p| p.kind.clone()),
         title: wire_title.or_else(|| part.map(|p| p.tool_name.clone())),
-        detail: content_text.or_else(|| part.map(|p| p.detail.clone())),
+        detail,
         plan,
         raw_input_text,
     })
@@ -888,6 +927,48 @@ mod tests {
         assert_eq!(build_approval_context(&params, &[]), None);
         // No toolCall object at all.
         assert_eq!(build_approval_context(&json!({ "sessionId": "s1" }), &[]), None);
+    }
+
+    #[test]
+    fn wire_only_ask_user_question_rebuilds_the_card_when_the_part_is_missing() {
+        let params = json!({
+            "toolCall": {
+                "toolCallId": "tc_9_1",
+                "rawInput": { "questions": [
+                    { "question": "Which library?", "options": [{ "label": "A" }] },
+                    { "question": "Which version?", "options": [{ "label": "1" }] }
+                ] },
+                "title": "Which version?"
+            }
+        });
+        let ctx = build_approval_context(&params, &[]).expect("context");
+        assert_eq!(ctx.tool_name.as_deref(), Some("AskUserQuestion"));
+        assert_eq!(ctx.detail.as_deref(), Some("Which version?"));
+    }
+
+    #[test]
+    fn wire_only_ask_without_title_picks_the_question_by_suffix() {
+        // Multi-select popups carry `_N_M`; the FIRST numeric segment is the
+        // question index.
+        let params = json!({
+            "toolCall": {
+                "toolCallId": "ask_1_0",
+                "rawInput": { "questions": [ { "question": "Q0" }, { "question": "Q1" } ] }
+            }
+        });
+        let ctx = build_approval_context(&params, &[]).expect("context");
+        assert_eq!(ctx.tool_name.as_deref(), Some("AskUserQuestion"));
+        assert_eq!(ctx.detail.as_deref(), Some("Q1"));
+    }
+
+    #[test]
+    fn non_question_raw_input_stays_a_plain_tool_card() {
+        let params = json!({
+            "toolCall": { "toolCallId": "call_1", "rawInput": { "command": "npm test" } }
+        });
+        let ctx = build_approval_context(&params, &[]).expect("context");
+        assert_eq!(ctx.tool_name, None);
+        assert_eq!(ctx.detail, None);
     }
 
     #[test]

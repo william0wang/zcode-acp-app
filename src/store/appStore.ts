@@ -222,6 +222,90 @@ export interface PendingPermission {
   context?: ApprovalContext;
 }
 
+// The question text for an AskUserQuestion permission popup whose tool_call
+// part never arrived: the bridge's request_permission fallback carries the
+// zcode `questions` array in rawInput, and the popup's toolCallId suffix
+// `_N` (single-select) / `_N_M` (multi-select option) names the question
+// being asked. Undefined when the input is not question-shaped.
+function askQuestionFromWire(toolCallId: unknown, rawInput: unknown): string | undefined {
+  if (!rawInput || typeof rawInput !== "object") return undefined;
+  const questions = (rawInput as { questions?: unknown }).questions;
+  if (!Array.isArray(questions)) return undefined;
+  const texts = questions
+    .map((q) => (q as { question?: unknown } | null)?.question)
+    .filter((q): q is string => typeof q === "string" && q.length > 0);
+  if (texts.length === 0) return undefined;
+  const m = typeof toolCallId === "string" ? toolCallId.match(/_(\d+)/) : null;
+  const idx = m ? Math.min(Number(m[1]), texts.length - 1) : 0;
+  return texts[idx];
+}
+
+// Pure approval-card context resolution (ADR 0003), exported for tests.
+// The request params alone carry almost nothing readable; the interesting
+// text rides either on the matched tool_call part or — for the bridge's
+// AskUserQuestion fallback — on the wire itself (`title` = the prompt text,
+// `rawInput.questions` = the question set).
+export function resolveApprovalContext(
+  params: Record<string, unknown>,
+  messages: ChatMessage[],
+): ApprovalContext | undefined {
+  const tc = (params.toolCall ?? null) as {
+    toolCallId?: unknown;
+    title?: unknown;
+    content?: unknown;
+    rawInput?: unknown;
+  } | null;
+  if (!tc || typeof tc !== "object") return undefined;
+  const toolCallId =
+    typeof tc.toolCallId === "string" && tc.toolCallId ? tc.toolCallId : undefined;
+  const part = toolCallId ? findToolCallPart(messages, toolCallId) : null;
+  const rawInput = tc.rawInput;
+  const plan =
+    rawInput &&
+    typeof rawInput === "object" &&
+    typeof (rawInput as { plan?: unknown }).plan === "string"
+      ? (rawInput as { plan: string }).plan
+      : undefined;
+  // Wire-provided popup fields (bridge 0.33+): title and content text
+  // blocks carry the readable form of the input — prefer them over the
+  // matched tool_call part and the INPUT_KEYS heuristic.
+  const title = typeof tc.title === "string" && tc.title ? tc.title : undefined;
+  let contentText: string | undefined;
+  if (Array.isArray(tc.content)) {
+    const texts = tc.content
+      .map((b) => (b as { content?: { text?: unknown } } | null)?.content?.text ?? null)
+      .filter((t): t is string => typeof t === "string" && t.length > 0);
+    if (texts.length > 0) contentText = texts.join("\n\n");
+  }
+  let rawInputText: string | undefined;
+  if (rawInput != null) {
+    try {
+      rawInputText = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput, null, 2);
+    } catch {
+      rawInputText = String(rawInput);
+    }
+  }
+  // ADR 0003 degradation made whole: when the tool_call part is missing
+  // (the ask was re-delivered after a reconnect, or belongs to a session
+  // whose messages are not loaded), an AskUserQuestion popup still carries
+  // everything on the wire — rebuild the question card from it instead of
+  // degrading to the raw-JSON pane with a nameless "input" expander.
+  const wireAsk = part ? undefined : askQuestionFromWire(tc.toolCallId, rawInput);
+  if (!toolCallId && rawInputText == null && title == null && contentText == null)
+    return undefined;
+  return {
+    toolCallId,
+    // Part fields first (richer); title = the wire title stored in toolName.
+    toolName: part?.rawName ?? part?.toolName ?? (wireAsk ? "AskUserQuestion" : undefined),
+    kind: part?.kind,
+    title: title ?? part?.toolName,
+    detail:
+      contentText ?? part?.detail ?? (wireAsk ? (title ?? wireAsk) : undefined),
+    plan,
+    rawInputText,
+  };
+}
+
 // One AskUserQuestion field parsed out of an elicitation/create form
 // (bridge builds the schema: `q_<i>` enum/array + `q_<i>_other` free text;
 // the plan-approval form is a single `approval` enum field).
@@ -1186,54 +1270,7 @@ export const useAppStore = create<AppState>((set, get) => {
   }
 
   function buildApprovalContext(params: Record<string, unknown>): ApprovalContext | undefined {
-    const tc = (params.toolCall ?? null) as {
-      toolCallId?: unknown;
-      title?: unknown;
-      content?: unknown;
-      rawInput?: unknown;
-    } | null;
-    if (!tc || typeof tc !== "object") return undefined;
-    const toolCallId =
-      typeof tc.toolCallId === "string" && tc.toolCallId ? tc.toolCallId : undefined;
-    const part = toolCallId ? findToolCallPart(get().messages, toolCallId) : null;
-    const rawInput = tc.rawInput;
-    const plan =
-      rawInput &&
-      typeof rawInput === "object" &&
-      typeof (rawInput as { plan?: unknown }).plan === "string"
-        ? (rawInput as { plan: string }).plan
-        : undefined;
-    // Wire-provided popup fields (bridge 0.33+): title and content text
-    // blocks carry the readable form of the input — prefer them over the
-    // matched tool_call part and the INPUT_KEYS heuristic.
-    const title = typeof tc.title === "string" && tc.title ? tc.title : undefined;
-    let contentText: string | undefined;
-    if (Array.isArray(tc.content)) {
-      const texts = tc.content
-        .map((b) => (b as { content?: { text?: unknown } } | null)?.content?.text ?? null)
-        .filter((t): t is string => typeof t === "string" && t.length > 0);
-      if (texts.length > 0) contentText = texts.join("\n\n");
-    }
-    let rawInputText: string | undefined;
-    if (rawInput != null) {
-      try {
-        rawInputText = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput, null, 2);
-      } catch {
-        rawInputText = String(rawInput);
-      }
-    }
-    if (!toolCallId && rawInputText == null && title == null && contentText == null)
-      return undefined;
-    return {
-      toolCallId,
-      // Part fields first (richer); title = the wire title stored in toolName.
-      toolName: part?.rawName ?? part?.toolName,
-      kind: part?.kind,
-      title: title ?? part?.toolName,
-      detail: contentText ?? part?.detail,
-      plan,
-      rawInputText,
-    };
+    return resolveApprovalContext(params, get().messages);
   }
 
   // Parses an elicitation/create form into renderable fields: the bridge's
