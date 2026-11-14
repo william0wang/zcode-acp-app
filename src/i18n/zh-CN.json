@@ -501,6 +501,22 @@
     "spawnFailed": "终端启动失败",
     "testPlaceholder": "终端（测试构建，未启动 shell）"
   },
+  "remoteTerminal": {
+    "openAction": "终端",
+    "empty": "还没有命令，在下方输入一行",
+    "inputPlaceholder": "命令 · 在桌面端执行",
+    "inputWaiting": "等待终端就绪…",
+    "interrupt": "打断（Ctrl-C）",
+    "send": "执行",
+    "openedAt": "已打开 · {{cwd}}",
+    "closedPane": "已在桌面端关闭",
+    "exitLine": "exit {{code}} · {{s}}",
+    "disabled": "Hub 未开启远程终端（remote.exec.enabled）",
+    "noCarrier": "桌面端未连接",
+    "closed": "已断开",
+    "opening": "正在打开终端…",
+    "gone": "已在桌面端关闭"
+  },
   "permission": {
     "title": "权限请求",
     "planTitle": "可以开始编码了吗？",

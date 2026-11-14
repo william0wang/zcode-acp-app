@@ -37,6 +37,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::remote_terminal;
+use crate::terminal_panel;
+
 // The gpui engine surfaces only through the kit here (the app never adds a
 // direct gpui dependency); Image/ImageFormat ride the kit's re-export.
 use gpui_kit::{Image, ImageFormat};
@@ -77,7 +80,7 @@ use protocol::settings_client::{HubApiError as SettingsApiError, HubHttpClient};
 use rust_i18n::t;
 use protocol::system_stats::SystemStatsResponse;
 use protocol::toast::{Toast, ToastState};
-use protocol::ws::{TungsteniteWsFactory, WsFactory};
+use protocol::ws::{TungsteniteWsFactory, WsFactory, WsEvent, WsStream};
 use protocol::workflow::{
     AmendRunSettingsBody, AmendRunSettingsResponse, ConversationRunSummary, ConversationRunsResponse,
     DismissRunResponse, DismissRunsResponse, RunArtifactsResponse, WorkflowArtifact,
@@ -694,6 +697,24 @@ pub enum UiCommand {
     /// Read the gate verdict off the active tab's bridge (the switch row's
     /// lazy seed — TS `loadWorkflowGate` on config-screen mount).
     ProbeWorkflowGate,
+    // ---- Remote Terminal (ADR-0011) ----
+    /// The workbench's answer to `RuntimeEvent::TerminalSpawnPane` (and to a
+    /// REMOTE pane restart): the pane's tap on Ok, or why none was created.
+    TerminalPaneResult {
+        session_id: String,
+        result: Result<terminal_panel::RemotePaneTap, TerminalPaneError>,
+    },
+    /// A bound remote pane is gone (× button, shell exit, its tab closed).
+    TerminalPaneGone { session_id: String },
+}
+
+/// Why a remote pane could not be created (ADR-0011).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalPaneError {
+    /// The tab's pane row is at `MAX_TERMINAL_PANES`.
+    Cap,
+    /// The PTY spawn itself failed.
+    Failed(String),
 }
 
 /// What the driver surfaces to the window. One shape: a full snapshot —
@@ -713,6 +734,13 @@ pub enum RuntimeEvent {
     /// prefill the text and re-stage the images. One-shot — never part of
     /// the snapshot, so it cannot re-fire on a fingerprint change.
     ComposerPrefill(protocol::chat::PromptDraft),
+    /// Remote Terminal (ADR-0011): spawn-or-replace the remote pane for the
+    /// session's tab (cwd given — the tab may be brand new) and answer via
+    /// `UiCommand::TerminalPaneResult`.
+    TerminalSpawnPane { session_id: String, tab: u64, cwd: String },
+    /// Remote Terminal: close the remote pane bound to the tab (the phone
+    /// asked; the pane-gone report rides the close path).
+    TerminalClosePane { tab: u64 },
 }
 
 /// A built-in agent's model override (server `AgentModelSelection`): the
@@ -1558,6 +1586,15 @@ enum LoopEvent {
     /// by us, or it came back on its own), `Err` carries why the re-spawn
     /// could not bring it back.
     HubRespawn(Result<protocol::bootstrap::EnsureHubOutcome, String>),
+    // ---- Remote Terminal (ADR-0011, hub relay, no tab) ----
+    /// The control connection's handshake completed (ADR-0011): `stream` is
+    /// the writer side; a pump task feeds [`LoopEvent::TerminalWs`] until
+    /// the socket dies.
+    TerminalControlUp { stream: Arc<dyn WsStream> },
+    /// One event off the control socket: `Text` is a relayed phone frame or
+    /// a hub-generated `subs` count; `Closed` is the link dying (connect
+    /// failures land here too — the pump reports them the same way).
+    TerminalWs(WsEvent),
     HistoryProjects {
         seq: u64,
         result: Result<Vec<HubProject>, HubApiError>,
@@ -2625,6 +2662,20 @@ struct Driver {
     /// ([`HUB_RESPAWN_MIN_INTERVAL_MS`] spacing).
     hub_respawn_next_at: u64,
 
+    /// Remote Terminal carrier state (ADR-0011): the registry (terminal
+    /// records, event logs, turn machines), the pane taps keyed by session,
+    /// the outbound control link, and the hub-reported remote subscriber
+    /// count (the turn-done push gate — zero subscribers means nobody is
+    /// watching). The link is never exec-gated: the hub is the gate.
+    terminals: remote_terminal::TerminalRegistry,
+    terminal_handles: HashMap<String, terminal_panel::RemotePaneTap>,
+    terminal_wire: Option<Arc<dyn WsStream>>,
+    /// A control connect is in flight (dedupes the tick's retry).
+    terminal_connecting: bool,
+    terminal_attempts: u32,
+    terminal_retry_at: Option<u64>,
+    terminal_subs: u32,
+
     tabs: Vec<Tab>,
     active_tab: Option<u64>,
     /// Tabs whose connection WE closed (tab close / Retry) — their Closed
@@ -2749,6 +2800,13 @@ impl Driver {
             hub_down_streak: 0,
             hub_respawn_busy: false,
             hub_respawn_next_at: 0,
+            terminals: remote_terminal::TerminalRegistry::new(),
+            terminal_handles: HashMap::new(),
+            terminal_wire: None,
+            terminal_connecting: false,
+            terminal_attempts: 0,
+            terminal_retry_at: None,
+            terminal_subs: 0,
             tabs: Vec::new(),
             active_tab: None,
             closing: HashSet::new(),
@@ -5364,6 +5422,258 @@ impl Driver {
         }
     }
 
+    // ---- Remote Terminal (ADR-0011) ----
+
+    /// Dial the control connection: one outbound WS next to the tab links,
+    /// retried on the reconnect curve. Nothing here knows the exec switch —
+    /// the hub gates clients itself; the control link also carries Desktop
+    /// Presence, which is never switch-gated.
+    fn spawn_terminal_control(&mut self, now: u64) {
+        if self.terminal_wire.is_some()
+            || self.terminal_connecting
+            || !matches!(self.phase, Phase::Discovering | Phase::Connected | Phase::Reconnecting)
+        {
+            return;
+        }
+        if self.terminal_retry_at.is_some_and(|at| now < at) {
+            return;
+        }
+        let Ok(url) = remote_terminal::control_ws_url(&self.hub_url) else {
+            return; // a bad hub URL kills the tab links too; nothing to do
+        };
+        let token = self.token.clone();
+        let factory = self.factory.clone();
+        let tx = self.loop_tx.clone();
+        self.terminal_connecting = true;
+        tokio::spawn(async move {
+            match factory
+                .connect_with_headers(&url, &token, &[remote_terminal::DESKTOP_CLIENT_HEADER])
+                .await
+            {
+                Ok((stream, mut events)) => {
+                    let _ = tx.send(LoopEvent::TerminalControlUp { stream });
+                    while let Some(ev) = events.recv().await {
+                        if tx.send(LoopEvent::TerminalWs(ev)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => traceln!("[terminal] control connect failed: {e}"),
+            }
+            // Feed ended or the handshake failed — one dead-link signal.
+            let _ = tx.send(LoopEvent::TerminalWs(WsEvent::Closed));
+        });
+    }
+
+    /// The control link is gone (hub restart, tunnel blip, failed dial):
+    /// drop the writer, KEEP the pane taps (panes die with the app, not the
+    /// link — a reconnect re-binds them), mark every terminal gone, and arm
+    /// the backoff.
+    fn terminal_link_dead(&mut self, now: u64) {
+        self.terminal_wire = None;
+        self.terminal_connecting = false;
+        self.terminal_attempts += 1;
+        self.terminal_retry_at = Some(now + reconnect_delay_ms(self.terminal_attempts));
+        self.terminal_subs = 0;
+        self.terminals.detach_all();
+    }
+
+    /// Frames out the control socket, best-effort (a dead link re-dials via
+    /// its own Closed signal).
+    fn terminal_send(&self, frames: Vec<String>) {
+        if let Some(wire) = self.terminal_wire.as_ref() {
+            for frame in frames {
+                wire.send(&frame);
+            }
+        }
+    }
+
+    fn terminal_error(&self, code: &str, message: &str) {
+        self.terminal_send(vec![remote_terminal::error_frame(code, message)]);
+    }
+
+    /// One inbound control-socket frame: a relayed phone frame or a
+    /// hub-generated `subs` count. Unknown kinds are ignored (the
+    /// forward-compat rule).
+    fn handle_terminal_ws(&mut self, text: &str, now: u64) {
+        let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+            return;
+        };
+        let session_id = frame.get("sessionId").and_then(|v| v.as_str()).map(str::to_string);
+        match frame.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "subs" => {
+                self.terminal_subs =
+                    frame.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            }
+            "open" => match session_id {
+                Some(session_id) => self.terminal_open(&session_id),
+                None => self.terminal_error("bad_request", "open: missing sessionId"),
+            },
+            "replay" => match session_id {
+                Some(session_id) => {
+                    let after = frame.get("afterSeq").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let frames = self.terminals.replay(&session_id, after);
+                    self.terminal_send(frames);
+                }
+                None => self.terminal_error("bad_request", "replay: missing sessionId"),
+            },
+            "turn" => match (
+                session_id,
+                frame.get("command").and_then(|v| v.as_str()).map(str::to_string),
+            ) {
+                (Some(session_id), Some(command)) => {
+                    self.terminal_turn(&session_id, &command, now)
+                }
+                _ => self.terminal_error("bad_request", "turn: needs sessionId and command"),
+            },
+            "interrupt" => {
+                if let Some(session_id) = session_id {
+                    if let Some(tap) = self.terminal_handles.get(&session_id) {
+                        // Same byte a local Ctrl-C writes. An interactive
+                        // zsh ABANDONS the rest of the interrupted line —
+                        // marker included — so a running turn also gets a
+                        // standalone marker line: it executes at the fresh
+                        // prompt with the shell's real post-interrupt
+                        // status (`$?`, typically 130). On bash the original
+                        // line's printf may fire too; the tee stops at the
+                        // FIRST marker, so the second one is inert.
+                        tap.write_raw(&[0x03]);
+                        if self.terminals.turn_running(&session_id) {
+                            tap.write_line(remote_terminal::MARKER_PRINTF);
+                        }
+                    }
+                }
+            }
+            "close" => {
+                if let Some(session_id) = session_id {
+                    let frames = self.terminals.close(&session_id);
+                    self.terminal_send(frames);
+                    if let Some(tab) = self.tab_for_session(&session_id) {
+                        let _ = self.ev_tx.send(RuntimeEvent::TerminalClosePane { tab });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Phone `open {sessionId}`: resolve the surface (an existing tab, else
+    /// discovery's session opens one), then the registry decides between
+    /// re-binding a live pane and asking the workbench for a spawn.
+    fn terminal_open(&mut self, session_id: &str) {
+        let Some((tab, cwd)) = self.terminal_surface(session_id) else {
+            self.terminal_error("unknown_session", "no tab or advertised session with that id");
+            return;
+        };
+        let pane_alive = self.terminal_handles.contains_key(session_id);
+        let (outcome, frames) = self.terminals.open(session_id, &cwd, pane_alive);
+        self.terminal_send(frames);
+        if matches!(outcome, remote_terminal::OpenOutcome::SpawnNeeded) {
+            let _ = self.ev_tx.send(RuntimeEvent::TerminalSpawnPane {
+                session_id: session_id.to_string(),
+                tab,
+                cwd,
+            });
+        }
+    }
+
+    /// The tab (id, cwd) a session's terminal pane belongs under — opening a
+    /// tab via the existing discovery path when none holds the session.
+    fn terminal_surface(&mut self, session_id: &str) -> Option<(u64, String)> {
+        if let Some(tab) = self.tabs.iter().find(|t| self.tab_holds(t, session_id)) {
+            return Some((tab.id, tab.cwd.clone()));
+        }
+        // No tab: the session must be one discovery advertises — open one
+        // and take the new tab's cwd.
+        let instance = self
+            .instances
+            .iter()
+            .find(|i| i.sessions.iter().any(|s| s.session_id == session_id))
+            .map(|i| i.id.clone())?;
+        self.open_session_by_id(session_id.to_string(), instance);
+        let tab = self.tabs.iter().find(|t| self.tab_holds(t, session_id))?;
+        Some((tab.id, tab.cwd.clone()))
+    }
+
+    fn tab_holds(&self, tab: &Tab, session_id: &str) -> bool {
+        tab.core.active_session_id.as_deref() == Some(session_id)
+            || tab.target.as_deref() == Some(session_id)
+    }
+
+    fn tab_for_session(&self, session_id: &str) -> Option<u64> {
+        self.tabs.iter().find(|t| self.tab_holds(t, session_id)).map(|t| t.id)
+    }
+
+    fn terminal_turn(&mut self, session_id: &str, command: &str, now: u64) {
+        match self.terminals.turn_start(session_id, command, now) {
+            Ok(frames) => {
+                self.terminal_send(frames);
+                if let Some(tap) = self.terminal_handles.get(session_id) {
+                    // Arm BEFORE the write: the echo of the injected line is
+                    // part of the turn's capture.
+                    tap.arm();
+                    tap.write_line(&remote_terminal::injection_line(command));
+                }
+            }
+            Err(error_frame) => self.terminal_send(vec![error_frame]),
+        }
+    }
+
+    /// Poll running turns for the OSC 641 marker: settle the ones whose
+    /// shell answered — tail + exit events out, plus the hub-consumed pair
+    /// (one audit line per turn; one WeCom push when nobody watches).
+    fn terminal_settle_tick(&mut self, now: u64) {
+        let running: Vec<String> = self
+            .terminal_handles
+            .keys()
+            .filter(|s| self.terminals.turn_running(s))
+            .cloned()
+            .collect();
+        for session_id in running {
+            let (exit, raw) = match self.terminal_handles.get(&session_id) {
+                Some(tap) => match tap.exit_code() {
+                    Some(exit) => (exit, tap.take_output()),
+                    None => continue,
+                },
+                None => continue,
+            };
+            let Some((settled, frames)) = self
+                .terminals
+                .settle(&session_id, exit as i64, remote_terminal::turn_tail(&raw), now)
+            else {
+                continue;
+            };
+            self.terminal_send(frames);
+            let command: String = settled.command.chars().take(120).collect();
+            let line = format!(
+                "session={} cmd={} exit={} dur={}ms",
+                session_id, command, settled.exit_code, settled.duration_ms
+            );
+            let mut hub_frames = vec![
+                serde_json::json!({
+                    "v": 1, "type": "audit", "line": line,
+                })
+                .to_string(),
+            ];
+            if self.terminal_subs == 0 {
+                hub_frames.push(
+                    serde_json::json!({
+                        "v": 1, "type": "push",
+                        "title": "Remote terminal",
+                        "body": format!(
+                            "{} → exit {} ({:.1}s)",
+                            command,
+                            settled.exit_code,
+                            settled.duration_ms as f64 / 1000.0
+                        ),
+                    })
+                    .to_string(),
+                );
+            }
+            self.terminal_send(hub_frames);
+        }
+    }
+
     // ---- usage statistics (config page "usage" / "usagePlatform") ----
 
     /// The loads a freshly-mounted Usage page runs: the capability probe
@@ -5875,6 +6185,12 @@ impl Driver {
             // queue here rather than leaving the button permanently inert.
             tab.core.poll_force_send_stall(now);
         }
+        // Remote Terminal (ADR-0011): dial the control link when dark, and
+        // settle running turns whose OSC 641 marker fired.
+        if self.terminal_wire.is_none() {
+            self.spawn_terminal_control(now);
+        }
+        self.terminal_settle_tick(now);
         // Toast auto-clear (the notify timer's body).
         self.toast.expire(now);
         // The hub-upgrade note's 5s timer (TS SidePanel's effect).
@@ -6461,6 +6777,19 @@ impl Driver {
             // ---- hub REST ----
             LoopEvent::Discovery(result) => self.on_discovery(result, now),
             LoopEvent::HubRespawn(result) => self.on_hub_respawn(result),
+            LoopEvent::TerminalControlUp { stream } => {
+                self.terminal_wire = Some(stream);
+                self.terminal_connecting = false;
+                self.terminal_attempts = 0;
+                self.terminal_retry_at = None;
+            }
+            LoopEvent::TerminalWs(WsEvent::Open) => {} // Up already told us
+            LoopEvent::TerminalWs(WsEvent::Text(text)) => self.handle_terminal_ws(&text, now),
+            LoopEvent::TerminalWs(WsEvent::Closed) => {
+                if self.terminal_wire.is_some() || self.terminal_connecting {
+                    self.terminal_link_dead(now);
+                }
+            }
             LoopEvent::HistoryProjects { seq, result } => {
                 if seq != self.history.seq {
                     return; // superseded by an open/back toggle
@@ -8283,6 +8612,30 @@ impl Driver {
                     });
                 }
             }
+            UiCommand::TerminalPaneResult { session_id, result } => match result {
+                Ok(tap) => {
+                    let frames = self.terminals.pane_bound(&session_id);
+                    self.terminal_handles.insert(session_id, tap);
+                    self.terminal_send(frames);
+                }
+                Err(TerminalPaneError::Cap) => {
+                    let frames = self.terminals.pane_refused(
+                        &session_id,
+                        "pane_full",
+                        "terminal pane cap reached",
+                    );
+                    self.terminal_send(frames);
+                }
+                Err(TerminalPaneError::Failed(e)) => {
+                    let frames = self.terminals.pane_refused(&session_id, "internal", &e);
+                    self.terminal_send(frames);
+                }
+            },
+            UiCommand::TerminalPaneGone { session_id } => {
+                self.terminal_handles.remove(&session_id);
+                let frames = self.terminals.pane_gone(&session_id);
+                self.terminal_send(frames);
+            }
             UiCommand::ProbeWorkflowGate => {
                 if self.workflows.gate.is_none() {
                     self.spawn_workflow_gate_probe();
@@ -9590,6 +9943,19 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         // Close tombstones name the OLD hub's instance ids; the new hub's
         // rows owe them nothing.
         d.closed_sessions.clear();
+        // The Remote Terminal pair names the OLD hub (ADR-0011): reset the
+        // registry and drop the taps' driver-side state — the panes die with
+        // their tabs (close_all_tabs above), and closing the wire drops the
+        // hub's client sockets promptly.
+        d.terminals.reset();
+        d.terminal_handles.clear();
+        if let Some(wire) = d.terminal_wire.take() {
+            wire.close();
+        }
+        d.terminal_connecting = false;
+        d.terminal_attempts = 0;
+        d.terminal_retry_at = None;
+        d.terminal_subs = 0;
         // The remote-open watch's memory names the OLD hub's sessions too:
         // without this reset, the new hub's first snapshot would treat every
         // row the old hub never carried as a mid-run arrival and pop tabs
@@ -11024,5 +11390,461 @@ mod tests {
             1,
             "a run that left the session must leave the map"
         );
+    }
+}
+
+#[cfg(test)]
+mod remote_terminal_driver_tests {
+    use super::{Driver, LoopEvent, Phase, RuntimeEvent, TerminalPaneError, UiCommand};
+    use crate::terminal_panel::RemotePaneTap;
+    use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
+    use protocol::ws::{WsEvent, WsStream};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
+
+    /// A recording stand-in for the control socket: captures every frame
+    /// the driver sends.
+    struct RecordWire {
+        sent: Mutex<Vec<serde_json::Value>>,
+    }
+    impl WsStream for RecordWire {
+        fn send(&self, text: &str) {
+            self.sent
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(text).unwrap_or(serde_json::Value::Null));
+        }
+        fn close(&self) {}
+    }
+
+    fn session(session_id: &str) -> HubSessionInfo {
+        HubSessionInfo {
+            session_id: session_id.to_string(),
+            title: None,
+            updated_at: None,
+            status: None,
+        }
+    }
+
+    fn instance(id: &str, workspace: &str, sessions: Vec<HubSessionInfo>) -> HubInstance {
+        HubInstance {
+            id: id.to_string(),
+            port: Some(4900),
+            pid: Some(42),
+            started_at: Some(1),
+            workspace: Some(workspace.to_string()),
+            origin: InstanceOrigin::Serve,
+            sessions,
+            extra: Default::default(),
+        }
+    }
+
+    /// A Connected driver with the control wire up and one advertised
+    /// session (`s1` on instance `i1`, workspace `/w`).
+    fn harness() -> (Driver, Arc<RecordWire>, UnboundedReceiver<RuntimeEvent>) {
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, ev_rx) = unbounded_channel();
+        let mut d = Driver::new(
+            cmd_rx,
+            ev_tx,
+            Arc::new(protocol::ws::TungsteniteWsFactory),
+            Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        d.phase = Phase::Connected;
+        d.hub_url = "http://127.0.0.1:9".to_string();
+        d.instances.push(instance("i1", "/w", vec![session("s1")]));
+        let wire = Arc::new(RecordWire {
+            sent: Mutex::new(Vec::new()),
+        });
+        d.handle_loop_event(
+            LoopEvent::TerminalControlUp {
+                stream: wire.clone() as Arc<dyn WsStream>,
+            },
+            0,
+        );
+        (d, wire, ev_rx)
+    }
+
+    fn phone_frame(d: &mut Driver, body: serde_json::Value) {
+        d.handle_loop_event(LoopEvent::TerminalWs(WsEvent::Text(body.to_string())), 0);
+    }
+
+    /// The full happy path: open → spawn ask → bind → turn → marker →
+    /// settle with audit + push (zero subscribers).
+    #[tokio::test]
+    async fn terminal_open_turn_settle_round_trip() {
+        let (mut d, wire, mut ev_rx) = harness();
+
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let RuntimeEvent::TerminalSpawnPane {
+            session_id,
+            tab,
+            cwd,
+        } = ev_rx.try_recv().expect("a spawn ask")
+        else {
+            panic!("expected TerminalSpawnPane");
+        };
+        assert_eq!((session_id.as_str(), cwd.as_str()), ("s1", "/w"));
+        assert!(d.tabs.iter().any(|t| t.id == tab && t.cwd == "/w"));
+        // The open answer: state(opening) + events([]) — before the bind.
+        {
+            let sent = wire.sent.lock().unwrap();
+            assert_eq!(sent[0]["type"], "state");
+            assert_eq!(sent[0]["terminal"]["state"], "opening");
+            assert_eq!(sent[1]["type"], "events");
+        }
+
+        // The workbench's answer carries the pane tap: ready + open event.
+        let (tap, sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap.clone()),
+            },
+            0,
+        );
+        {
+            let sent = wire.sent.lock().unwrap();
+            assert_eq!(sent[2]["type"], "events");
+            assert_eq!(sent[2]["events"][0]["kind"], "open");
+            assert_eq!(sent[3]["terminal"]["state"], "ready");
+        }
+
+        // The turn: input event + running state; the injected line lands in
+        // the pane's PTY.
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"echo hi"}),
+        );
+        {
+            let sent = wire.sent.lock().unwrap();
+            assert_eq!(sent[4]["events"][0]["kind"], "input");
+            assert_eq!(sent[5]["terminal"]["turn"]["state"], "running");
+            let written = sink.lock().unwrap().clone();
+            assert_eq!(
+                String::from_utf8_lossy(&written),
+                "echo hi; printf '\\e]641;%s\\a' \"$?\"\r"
+            );
+        }
+
+        // The shell answers: the pty ECHO of the injected line comes first
+        // (carrying zsh highlight bytes), then the command's own output,
+        // then the OSC 641 marker. The settle tick ships output/exit events
+        // + audit + push (no subscribers) — and the echoed scaffolding must
+        // NOT survive into the output tail.
+        tap.feed_output_for_test(
+            b"\x1b[32mecho hi; printf '\\e]641;%s\\a' \"$?\"\x1b[0m\r\n",
+        );
+        tap.feed_output_for_test(b"hi\r\n");
+        tap.feed_output_for_test(b"\x1b]641;0\x07");
+        d.tick(2_000);
+        {
+            let sent = wire.sent.lock().unwrap();
+            let kinds: Vec<&str> = sent[6]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["kind"].as_str().unwrap())
+                .collect();
+            assert_eq!(kinds, vec!["output", "exit"]);
+            assert_eq!(sent[6]["events"][0]["text"], "hi");
+            assert_eq!(sent[6]["events"][1]["exitCode"], 0);
+            assert_eq!(sent[7]["terminal"]["turn"], serde_json::Value::Null);
+            assert_eq!(sent[8]["type"], "audit");
+            assert!(sent[8]["line"].as_str().unwrap().contains("echo hi"));
+            assert_eq!(sent[9]["type"], "push");
+            assert_eq!(sent[9]["title"], "Remote terminal");
+        }
+
+        // A second turn reuses the SAME pane (no new spawn ask).
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"true"}),
+        );
+        assert!(ev_rx.try_recv().is_err(), "no second spawn ask");
+    }
+
+    /// A busy terminal refuses a second turn until the marker settles it.
+    #[tokio::test]
+    async fn terminal_turn_is_serial() {
+        let (mut d, wire, _ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap),
+            },
+            0,
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"sleep 5"}),
+        );
+        let before = wire.sent.lock().unwrap().len();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"ls"}),
+        );
+        let sent = wire.sent.lock().unwrap();
+        assert_eq!(sent.len(), before + 1);
+        assert_eq!(sent[before]["code"], "busy");
+    }
+
+    /// An unadvertised session is refused without a tab or a spawn ask.
+    #[tokio::test]
+    async fn terminal_open_refuses_unknown_session() {
+        let (mut d, wire, mut ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"nope"}),
+        );
+        let sent = wire.sent.lock().unwrap();
+        assert_eq!(sent[0]["type"], "error");
+        assert_eq!(sent[0]["code"], "unknown_session");
+        drop(sent);
+        assert!(ev_rx.try_recv().is_err());
+    }
+
+    /// The pane cap answers through the registry: error pane_full, state
+    /// gone — and a later open may try again.
+    #[tokio::test]
+    async fn terminal_pane_cap_refusal() {
+        let (mut d, wire, _ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let before = wire.sent.lock().unwrap().len();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Err(TerminalPaneError::Cap),
+            },
+            0,
+        );
+        let sent = wire.sent.lock().unwrap();
+        assert_eq!(sent[before]["code"], "pane_full");
+        assert_eq!(sent[before + 1]["terminal"]["state"], "gone");
+    }
+
+    /// Phone close: close event + gone state, and the workbench is asked to
+    /// close the pane.
+    #[tokio::test]
+    async fn terminal_close_closes_the_pane() {
+        let (mut d, wire, mut ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let tab = match ev_rx.try_recv().unwrap() {
+            RuntimeEvent::TerminalSpawnPane { tab, .. } => tab,
+            _ => panic!("expected TerminalSpawnPane"),
+        };
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap),
+            },
+            0,
+        );
+        let before = wire.sent.lock().unwrap().len();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"close","sessionId":"s1"}),
+        );
+        let sent = wire.sent.lock().unwrap();
+        assert_eq!(sent[before]["events"][0]["kind"], "close");
+        assert_eq!(sent[before + 1]["terminal"]["state"], "gone");
+        drop(sent);
+        match ev_rx.try_recv().unwrap() {
+            RuntimeEvent::TerminalClosePane { tab: t } => assert_eq!(t, tab),
+            _ => panic!("expected TerminalClosePane"),
+        }
+    }
+
+    /// The pane dying mid-turn settles the turn with a note.
+    #[tokio::test]
+    async fn terminal_pane_gone_settles_the_turn() {
+        let (mut d, wire, _ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap.clone()),
+            },
+            0,
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"sleep 9"}),
+        );
+        let before = wire.sent.lock().unwrap().len();
+        d.handle_cmd(
+            UiCommand::TerminalPaneGone {
+                session_id: "s1".to_string(),
+            },
+            0,
+        );
+        let sent = wire.sent.lock().unwrap();
+        let kinds: Vec<&str> = sent[before]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, vec!["note", "close"]);
+        assert_eq!(sent[before + 1]["terminal"]["state"], "gone");
+        assert!(!d.terminals.turn_running("s1"));
+    }
+
+    /// A control-link blip keeps the pane taps: the next open re-binds the
+    /// SAME pane instead of asking for a spawn.
+    #[tokio::test]
+    async fn terminal_control_blip_rebinds_the_live_pane() {
+        let (mut d, wire, mut ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap),
+            },
+            0,
+        );
+        while ev_rx.try_recv().is_ok() {}
+
+        // The link dies and comes back (a fresh wire).
+        d.handle_loop_event(LoopEvent::TerminalWs(WsEvent::Closed), 1_000);
+        assert!(d.terminal_wire.is_none());
+        let wire2 = Arc::new(RecordWire {
+            sent: Mutex::new(Vec::new()),
+        });
+        d.handle_loop_event(
+            LoopEvent::TerminalControlUp {
+                stream: wire2.clone() as Arc<dyn WsStream>,
+            },
+            2_000,
+        );
+
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        assert!(
+            ev_rx.try_recv().is_err(),
+            "no spawn ask — the pane outlived the link"
+        );
+        let sent = wire2.sent.lock().unwrap();
+        assert_eq!(sent[0]["terminal"]["state"], "ready", "re-bound at once");
+        // Full replay: the first open, then the re-bind's open.
+        assert_eq!(sent[1]["events"].as_array().unwrap().len(), 2);
+        assert_eq!(sent[1]["events"][1]["kind"], "open");
+        drop(sent);
+        assert!(
+            wire.sent.lock().unwrap().len() >= 4,
+            "the old wire saw its frames too"
+        );
+    }
+
+    /// A subscriber watching means no push on settle — the audit line still
+    /// lands.
+    #[tokio::test]
+    async fn terminal_settle_pushes_only_when_unwatched() {
+        let (mut d, wire, _ev_rx) = harness();
+        phone_frame(&mut d, serde_json::json!({"v":1,"type":"subs","count":1}));
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap.clone()),
+            },
+            0,
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"date"}),
+        );
+        tap.feed_output_for_test(b"\x1b]641;0\x07");
+        d.tick(10_000);
+        let sent = wire.sent.lock().unwrap();
+        let types: Vec<&str> = sent.iter().map(|f| f["type"].as_str().unwrap()).collect();
+        assert!(types.contains(&"audit"));
+        assert!(!types.contains(&"push"), "a watcher is connected — no push");
+    }
+
+    /// Interrupt writes the Ctrl-C byte to the bound pane; nothing else.
+    #[tokio::test]
+    async fn terminal_interrupt_writes_the_break_byte() {
+        let (mut d, _wire, _ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let (tap, sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap),
+            },
+            0,
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"interrupt","sessionId":"s1"}),
+        );
+        assert_eq!(sink.lock().unwrap().as_slice(), &[0x03]);
+    }
+
+    /// Interrupt during a RUNNING turn also writes a standalone marker
+    /// line: an interactive zsh abandons the rest of the interrupted line
+    /// (marker included), so without the extra line the turn would never
+    /// settle and every later turn would answer `busy`.
+    #[tokio::test]
+    async fn terminal_interrupt_running_turn_adds_a_marker_line() {
+        let (mut d, _wire, _ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let (tap, sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap),
+            },
+            0,
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"sleep 100"}),
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"interrupt","sessionId":"s1"}),
+        );
+        let marker = crate::remote_terminal::MARKER_PRINTF;
+        let expected = format!("sleep 100; {marker}\r\x03{marker}\r");
+        assert_eq!(String::from_utf8_lossy(&sink.lock().unwrap()), expected);
     }
 }

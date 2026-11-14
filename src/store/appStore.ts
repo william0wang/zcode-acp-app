@@ -494,6 +494,14 @@ export interface AppState extends ConfigSlice {
   manageOpen: boolean;
   openServerManager: () => void;
   closeServerManager: () => void;
+  // Remote Terminal overlay (app ADR-0011): the mobile command-line wiring
+  // into the desktop workbench's session terminal, opened from a SessionList
+  // row action. Pure routing state — the screen owns its own WebSocket
+  // (src/lib/remoteTerminal.ts); closing the screen leaves the desktop pane
+  // alive by design.
+  terminalTarget: { sessionId: string; title?: string } | null;
+  openTerminal: (sessionId: string, title?: string) => void;
+  closeTerminal: () => void;
   setLang: (lang: Lang) => void;
   setFontSize: (size: FontSize) => void;
   refreshInstances: (opts?: { probe?: boolean }) => Promise<void>;
@@ -1838,6 +1846,7 @@ export const useAppStore = create<AppState>((set, get) => {
     savedServers: [],
     activeServerId: null,
     manageOpen: false,
+    terminalTarget: null,
     lang: "en",
     fontSize: "small" as FontSize,
     instances: [],
@@ -1942,6 +1951,7 @@ export const useAppStore = create<AppState>((set, get) => {
         instancesError: null,
         hubOffline: false,
         manageOpen: false,
+        terminalTarget: null,
       });
       startPolling();
       void get().refreshUsageStats();
@@ -1958,6 +1968,7 @@ export const useAppStore = create<AppState>((set, get) => {
         instancesError: null,
         hubOffline: false,
         manageOpen: false,
+        terminalTarget: null,
         ...connectionResetPatch(),
       });
     },
@@ -1976,6 +1987,7 @@ export const useAppStore = create<AppState>((set, get) => {
         instancesError: null,
         hubOffline: false,
         manageOpen: false,
+        terminalTarget: null,
         ...connectionResetPatch(),
       });
       startPolling();
@@ -2023,6 +2035,7 @@ export const useAppStore = create<AppState>((set, get) => {
         instancesError: null,
         hubOffline: false,
         manageOpen: false,
+        terminalTarget: null,
         ...connectionResetPatch(),
       });
     },
@@ -2030,6 +2043,11 @@ export const useAppStore = create<AppState>((set, get) => {
     openServerManager: () => set({ manageOpen: true }),
 
     closeServerManager: () => set({ manageOpen: false }),
+
+    openTerminal: (sessionId, title) =>
+      set({ terminalTarget: { sessionId, title } }),
+
+    closeTerminal: () => set({ terminalTarget: null }),
 
     setLang: (lang) => {
       saveLang(lang);

@@ -61,15 +61,231 @@ impl Drop for TerminalDock {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Remote pane tap (ADR-0011): the write/read side-channel the driver's
+// Remote Terminal turns ride. Every dock gets one — local panes simply never
+// arm the tee, and the shared writer costs one uncontended mutex lock.
+// ---------------------------------------------------------------------------
+
+/// Captured turn output: raw PTY bytes from `arm()` until the OSC 641
+/// marker fires. The marker itself never renders in the pane (alacritty
+/// swallows unknown OSC codes), so detection lives HERE, on the byte stream.
+#[derive(Debug, Default)]
+struct TeeBuffer {
+    armed: bool,
+    buf: Vec<u8>,
+    exit: Option<i32>,
+}
+
+/// Keep the tail window bounded: a `yes`-grade turn must not grow memory;
+/// anything older than this window is droppable the moment it arrives (the
+/// pane keeps its own 10k-line scrollback).
+const TEE_CAP: usize = 64 * 1024;
+/// Marker prefix (`ESC ] 641 ;`) + slack for a code split across reads.
+const MARKER_CARRY: usize = 16;
+
+impl TeeBuffer {
+    fn arm(&mut self) {
+        self.buf.clear();
+        self.exit = None;
+        self.armed = true;
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        if !self.armed {
+            return;
+        }
+        let new_len = bytes.len();
+        self.buf.extend_from_slice(bytes);
+        if self.buf.len() > TEE_CAP {
+            let drop = self.buf.len() - TEE_CAP;
+            self.buf.drain(..drop);
+        }
+        self.scan_marker(new_len);
+    }
+
+    /// Find `ESC ] 641 ; <digits> (BEL | ESC \)` in the freshly appended
+    /// window (plus carry-back for a marker split across reads); on a hit,
+    /// record the code, end the capture AT the marker, and stop appending.
+    fn scan_marker(&mut self, new_len: usize) {
+        let from = self.buf.len().saturating_sub(new_len + MARKER_CARRY);
+        let Some((rel, code)) = find_marker(&self.buf[from..]) else {
+            return;
+        };
+        self.exit = Some(code);
+        self.buf.truncate(from + rel);
+        self.armed = false;
+    }
+
+    fn take_output(&mut self) -> Vec<u8> {
+        self.armed = false;
+        self.exit = None;
+        std::mem::take(&mut self.buf)
+    }
+}
+
+/// The first COMPLETE marker in `window`: `(offset, exit_code)`. A marker
+/// whose terminator has not arrived yet (digits running to the window end)
+/// is left for the next chunk.
+fn find_marker(window: &[u8]) -> Option<(usize, i32)> {
+    const PREFIX: &[u8] = b"]641;";
+    const ESC: u8 = 0x1b;
+    for i in 0..window.len().saturating_sub(PREFIX.len() + 1) {
+        if window[i] != ESC || &window[i + 1..i + 1 + PREFIX.len()] != PREFIX {
+            continue;
+        }
+        let mut j = i + 1 + PREFIX.len();
+        let digits_start = j;
+        while j < window.len() && window[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j == digits_start {
+            continue; // prefix but no code — not ours (or not yet)
+        }
+        if j < window.len() && window[j] == 0x07 {
+            return Some((i, parse_code(&window[digits_start..j])));
+        }
+        if j + 1 < window.len() && window[j] == ESC && window[j + 1] == b'\\' {
+            return Some((i, parse_code(&window[digits_start..j])));
+        }
+        // digits at the very end without a terminator: possibly split —
+        // keep scanning (a later complete marker still wins).
+    }
+    None
+}
+
+fn parse_code(digits: &[u8]) -> i32 {
+    let mut code: i32 = 0;
+    for d in digits {
+        code = code.saturating_mul(10).saturating_add((d - b'0') as i32);
+    }
+    code
+}
+
+/// Writer both the view's key handling and the driver's remote turns write
+/// through — one mutex serializes the two onto the same PTY master.
+struct SharedPtyWriter(Arc<Mutex<Box<dyn std::io::Write + Send>>>);
+
+impl std::io::Write for SharedPtyWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+/// Reader the view's feed runs through: passthrough bytes (the emulator
+/// consumes the marker invisibly) + a tee copy for the turn tail.
+struct TeeReader {
+    inner: Box<dyn std::io::Read + Send>,
+    tee: Arc<Mutex<TeeBuffer>>,
+}
+
+impl std::io::Read for TeeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.tee.lock().unwrap().append(&buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+/// The driver's handle onto one pane's PTY (ADR-0011): input lines and
+/// interrupts down, the captured turn tail up. Cheap to clone; the workbench
+/// reports pane death separately (`UiCommand::TerminalPaneGone`).
+#[derive(Clone)]
+pub(crate) struct RemotePaneTap {
+    writer: Arc<Mutex<Box<dyn std::io::Write + Send>>>,
+    tee: Arc<Mutex<TeeBuffer>>,
+}
+
+impl std::fmt::Debug for RemotePaneTap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemotePaneTap")
+            .field("armed", &self.tee.lock().unwrap().armed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RemotePaneTap {
+    /// One input line into the shell, CR-terminated like a typed Enter.
+    pub(crate) fn write_line(&self, line: &str) {
+        self.write_raw(format!("{line}\r").as_bytes());
+    }
+
+    /// Raw bytes (the interrupt is `\u{3}`).
+    pub(crate) fn write_raw(&self, bytes: &[u8]) {
+        use std::io::Write as _;
+        // Best-effort, like the view's own send: a dead PTY surfaces through
+        // the pane-gone path instead.
+        let _ = self.writer.lock().unwrap().write_all(bytes);
+    }
+
+    /// Begin capturing for a new turn (drops any previous capture).
+    pub(crate) fn arm(&self) {
+        self.tee.lock().unwrap().arm();
+    }
+
+    /// The OSC 641 exit code once the marker fired (peeked by the tick).
+    pub(crate) fn exit_code(&self) -> Option<i32> {
+        self.tee.lock().unwrap().exit
+    }
+
+    /// Drain the captured output (resets armed + exit).
+    pub(crate) fn take_output(&self) -> Vec<u8> {
+        self.tee.lock().unwrap().take_output()
+    }
+
+    /// A sink-backed tap with no PTY (tests): registry-flow wiring only.
+    #[cfg(test)]
+    pub(crate) fn in_memory_for_test() -> Self {
+        Self::in_memory().0
+    }
+
+    /// Simulate PTY output arriving through the pane's reader (tests — the
+    /// real feed is the `TeeReader` the view's thread pulls).
+    #[cfg(test)]
+    pub(crate) fn feed_output_for_test(&self, bytes: &[u8]) {
+        self.tee.lock().unwrap().append(bytes);
+    }
+
+    /// An in-memory tap (tests): writes land in a sink you can read back,
+    /// the tee is real. Returns the tap plus the sink.
+    #[cfg(test)]
+    pub(crate) fn in_memory() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        struct SinkWriter(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SinkWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        (
+            Self {
+                writer: Arc::new(Mutex::new(Box::new(SinkWriter(sink.clone())))),
+                tee: Arc::new(Mutex::new(TeeBuffer::default())),
+            },
+            sink,
+        )
+    }
+}
+
 /// Spawn the login shell in a fresh PTY at `workspace` (None = home) and
 /// wire the view's callbacks into the workbench. `wb` is weak: the exit
 /// callback closes the panel from the next frame, past the view's own
-/// render borrow.
+/// render borrow. The returned tap is the pane's remote side-channel
+/// (ADR-0011) — local panes simply never arm it.
 pub(crate) fn spawn_dock(
     workspace: Option<&str>,
     wb: WeakEntity<Workbench>,
     cx: &mut Context<Workbench>,
-) -> Result<TerminalDock, String> {
+) -> Result<(TerminalDock, RemotePaneTap), String> {
     let theme = cx.theme().clone();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let pair = native_pty_system()
@@ -88,7 +304,8 @@ pub(crate) fn spawn_dock(
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
-    let writer = pair.master.take_writer().map_err(|e| e.to_string())?;
+    let writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> =
+        Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
     let reader = pair.master.try_clone_reader().map_err(|e| e.to_string())?;
     let pty = Arc::new(Mutex::new(pair.master));
     drop(pair.slave);
@@ -104,8 +321,17 @@ pub(crate) fn spawn_dock(
         colors: terminal_palette(),
     };
     let pty_for_resize = pty.clone();
+    let tap = RemotePaneTap {
+        writer: writer.clone(),
+        tee: Arc::new(Mutex::new(TeeBuffer::default())),
+    };
     let view = cx.new(|cx| {
-        TerminalView::new(writer, reader, config, cx)
+        TerminalView::new(
+            Box::new(SharedPtyWriter(writer)),
+            Box::new(TeeReader { inner: reader, tee: tap.tee.clone() }),
+            config,
+            cx,
+        )
             .with_resize_callback(move |cols, rows| {
                 let _ = pty_for_resize.lock().unwrap().resize(PtySize {
                     cols: cols as u16,
@@ -134,12 +360,15 @@ pub(crate) fn spawn_dock(
             })
     });
     let focus = view.read(cx).focus_handle().clone();
-    Ok(TerminalDock {
-        view,
-        focus,
-        _pty: Some(pty),
-        child: Mutex::new(Some(child)),
-    })
+    Ok((
+        TerminalDock {
+            view,
+            focus,
+            _pty: Some(pty),
+            child: Mutex::new(Some(child)),
+        },
+        tap,
+    ))
 }
 
 /// A pane backed by in-memory streams instead of a real shell (tests only).
@@ -399,4 +628,109 @@ fn render_pane(
                 ),
         )
         .child(div().flex_1().min_h_0().child(pane.view.clone()))
+}
+
+#[cfg(test)]
+mod remote_tap_tests {
+    // Explicit imports only — the file-root kit glob shadows #[test] with
+    // gpui's macro (see workbench.rs's test modules / pending_store.rs).
+    use super::{RemotePaneTap, TEE_CAP};
+
+    /// Feed bytes through a tap the way the view's reader thread would.
+    fn feed(tap: &RemotePaneTap, bytes: &[u8]) {
+        tap.tee.lock().unwrap().append(bytes);
+    }
+
+    fn marker(code: i32) -> Vec<u8> {
+        format!("\x1b]641;{code}\x07").into_bytes()
+    }
+
+    #[test]
+    fn marker_fires_exit_and_cuts_the_capture() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        feed(&tap, b"$ npm test\n");
+        feed(&tap, b"ok\n");
+        feed(&tap, &marker(0));
+        feed(&tap, b"$ "); // prompt redraw after the marker: ignored
+        assert_eq!(tap.exit_code(), Some(0));
+        assert_eq!(tap.take_output(), b"$ npm test\nok\n".to_vec());
+        // Drained: a second take is empty, the code cleared.
+        assert_eq!(tap.take_output(), Vec::<u8>::new());
+        assert_eq!(tap.exit_code(), None);
+    }
+
+    #[test]
+    fn marker_split_across_reads_is_still_found() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        feed(&tap, b"out\x1b]64");
+        feed(&tap, b"1;13");
+        feed(&tap, "\x07".as_bytes());
+        assert_eq!(tap.exit_code(), Some(13));
+        assert_eq!(tap.take_output(), b"out".to_vec());
+    }
+
+    #[test]
+    fn st_terminated_marker_and_multi_digit_codes() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        feed(&tap, b"x\x1b]641;130\x1b\\y");
+        assert_eq!(tap.exit_code(), Some(130));
+        // The capture ends BEFORE the marker; `y` arrived disarmed.
+        assert_eq!(tap.take_output(), b"x".to_vec());
+    }
+
+    #[test]
+    fn echo_of_the_injection_line_is_not_a_marker() {
+        // The typed line's echo carries the LITERAL text `printf '\e]641;...'`
+        // (backslash-e), never the byte ESC — no false settle.
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        feed(&tap, b"$ echo hi; printf '\\e]641;%s\\a' \"$?\"\r\nhi\r\n");
+        assert_eq!(tap.exit_code(), None);
+    }
+
+    #[test]
+    fn prefix_without_digits_is_ignored() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        feed(&tap, b"\x1b]641;abc\x07");
+        assert_eq!(tap.exit_code(), None);
+    }
+
+    #[test]
+    fn unarmed_tee_captures_nothing() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        feed(&tap, b"noise");
+        assert_eq!(tap.take_output(), Vec::<u8>::new());
+        tap.arm();
+        feed(&tap, &marker(2));
+        assert_eq!(tap.exit_code(), Some(2));
+    }
+
+    #[test]
+    fn long_output_keeps_only_the_tail_window() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        let chunk = vec![b'x'; 8 * 1024];
+        for _ in 0..40 {
+            feed(&tap, &chunk); // 320 KiB total > TEE_CAP
+        }
+        feed(&tap, &marker(0));
+        let out = tap.take_output();
+        // The marker's own bytes were appended then truncated from the tee
+        // copy, so the window holds TEE_CAP minus the marker's 8 bytes.
+        assert_eq!(out.len(), TEE_CAP - 8);
+        assert!(out.iter().all(|b| *b == b'x'));
+    }
+
+    #[test]
+    fn write_line_carries_the_carriage_return() {
+        let (tap, sink) = RemotePaneTap::in_memory();
+        tap.write_line("echo hi");
+        assert_eq!(*sink.lock().unwrap(), b"echo hi\r".to_vec());
+        tap.write_raw(&[0x03]);
+        assert_eq!(sink.lock().unwrap().as_slice(), b"echo hi\r\x03");
+    }
 }

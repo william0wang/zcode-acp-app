@@ -37,17 +37,32 @@ pub trait WsStream: Send + Sync {
     fn close(&self);
 }
 
+/// What a completed factory handshake hands back: the socket handle plus
+/// its event feed (starts at [`WsEvent::Open`]).
+pub type WsConnect = (Arc<dyn WsStream>, mpsc::Receiver<WsEvent>);
+
 /// `new WebSocket` equivalent. Resolves with the stream plus its event feed
 /// once the underlying transport is created — for the real factory that is
 /// the completed handshake, for a test double an immediately-returned pipe
 /// whose `Open` event arrives on the feed. `bearer` is the token for the
 /// Authorization header (see the module doc).
 pub trait WsFactory: Send + Sync {
-    fn connect(
+    fn connect(&self, url: &str, bearer: &str) -> BoxFuture<'static, Result<WsConnect, String>>;
+
+    /// [`Self::connect`] plus extra HTTP headers on the upgrade request.
+    /// ACP sockets need none (the default ignores them); the Remote
+    /// Terminal control connection identifies itself with `x-zcode-client`
+    /// (ADR-0011) — a header browsers cannot set, which is exactly why the
+    /// identity travels here and not in the query string.
+    fn connect_with_headers(
         &self,
         url: &str,
         bearer: &str,
-    ) -> BoxFuture<'static, Result<(Arc<dyn WsStream>, mpsc::Receiver<WsEvent>), String>>;
+        headers: &[(&str, &str)],
+    ) -> BoxFuture<'static, Result<WsConnect, String>> {
+        let _ = headers;
+        self.connect(url, bearer)
+    }
 }
 
 /// Build the ACP socket URL from a hub URL (the TS `wsUrl`, src/lib/acp.ts):
@@ -100,9 +115,22 @@ impl WsFactory for TungsteniteWsFactory {
         &self,
         url: &str,
         bearer: &str,
-    ) -> BoxFuture<'static, Result<(Arc<dyn WsStream>, mpsc::Receiver<WsEvent>), String>> {
+    ) -> BoxFuture<'static, Result<WsConnect, String>> {
+        self.connect_with_headers(url, bearer, &[])
+    }
+
+    fn connect_with_headers(
+        &self,
+        url: &str,
+        bearer: &str,
+        headers: &[(&str, &str)],
+    ) -> BoxFuture<'static, Result<WsConnect, String>> {
         let url = url.to_string();
         let bearer = bearer.to_string();
+        let headers: Vec<(String, String)> = headers
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
         Box::pin(async move {
             use tokio_tungstenite::tungstenite::client::IntoClientRequest;
             let mut request = url
@@ -117,6 +145,15 @@ impl WsFactory for TungsteniteWsFactory {
                 tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
                 value,
             );
+            for (name, val) in headers {
+                let (name, val) = (
+                    tokio_tungstenite::tungstenite::http::HeaderName::from_bytes(name.as_bytes())
+                        .map_err(|e| e.to_string())?,
+                    tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&val)
+                        .map_err(|e| e.to_string())?,
+                );
+                request.headers_mut().insert(name, val);
+            }
             let (socket, _response) =
                 tokio_tungstenite::connect_async(request).await.map_err(|e| e.to_string())?;
 
@@ -322,6 +359,9 @@ pub(crate) mod fake {
         pub auto_answer_initialize: bool,
         /// Last (url, bearer) handed to connect — bearer-auth assertions.
         pub last_connect: Mutex<Option<(String, String)>>,
+        /// Extra headers the last connect_with_headers carried (ADR-0011
+        /// control-connection identity assertions).
+        pub last_headers: Mutex<Vec<(String, String)>>,
         /// When set, every connect fails (bad URL / token / instance id).
         pub fail: AtomicBool,
     }
@@ -333,6 +373,7 @@ pub(crate) mod fake {
                 open_on_connect,
                 auto_answer_initialize,
                 last_connect: Mutex::new(None),
+                last_headers: Mutex::new(Vec::new()),
                 fail: AtomicBool::new(false),
             })
         }
@@ -347,11 +388,24 @@ pub(crate) mod fake {
             &self,
             url: &str,
             bearer: &str,
-        ) -> BoxFuture<'static, Result<(Arc<dyn WsStream>, mpsc::Receiver<WsEvent>), String>> {
+        ) -> BoxFuture<'static, Result<WsConnect, String>> {
+            self.connect_with_headers(url, bearer, &[])
+        }
+
+        fn connect_with_headers(
+            &self,
+            url: &str,
+            bearer: &str,
+            headers: &[(&str, &str)],
+        ) -> BoxFuture<'static, Result<WsConnect, String>> {
             if self.fail.load(Ordering::SeqCst) {
                 return Box::pin(async move { Err("handshake refused".to_string()) });
             }
             *self.last_connect.lock().unwrap() = Some((url.to_string(), bearer.to_string()));
+            *self.last_headers.lock().unwrap() = headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             let (event_tx, event_rx) = mpsc::channel::<WsEvent>(64);
             let ws = Arc::new(FakeWs {
                 sent: Mutex::new(Vec::new()),

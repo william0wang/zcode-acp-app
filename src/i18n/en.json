@@ -503,6 +503,22 @@
     "spawnFailed": "Failed to start the terminal",
     "testPlaceholder": "terminal (test build — no shell)"
   },
+  "remoteTerminal": {
+    "openAction": "Terminal",
+    "empty": "No commands yet — run one below",
+    "inputPlaceholder": "Command · runs on the desktop",
+    "inputWaiting": "Waiting for the terminal…",
+    "interrupt": "Interrupt (Ctrl-C)",
+    "send": "Run",
+    "openedAt": "opened · {{cwd}}",
+    "closedPane": "closed on the desktop",
+    "exitLine": "exit {{code}} · {{s}}",
+    "disabled": "Remote terminal is off on the hub (remote.exec.enabled)",
+    "noCarrier": "Desktop workbench not connected",
+    "closed": "disconnected",
+    "opening": "opening the terminal…",
+    "gone": "closed on the desktop"
+  },
   "permission": {
     "title": "Permission requested",
     "planTitle": "Ready to code?",

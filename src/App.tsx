@@ -9,6 +9,7 @@ import { ConnectScreen } from "./screens/ConnectScreen";
 import { InstancePicker } from "./screens/InstancePicker";
 import { NoticeToast } from "./components/NoticeToast";
 import { Spinner } from "./components/Spinner";
+import { TerminalScreen } from "./components/TerminalScreen";
 
 // ChatScreen carries the chat engine + diff/lightbox/highlight stack (~63%
 // of the bundle); the connect/picker screens only pay for it once a session
@@ -26,6 +27,7 @@ export default function App() {
   const closeServerManager = useAppStore((s) => s.closeServerManager);
   const instanceId = useAppStore((s) => s.instanceId);
   const activeSessionId = useAppStore((s) => s.activeSessionId);
+  const terminalTarget = useAppStore((s) => s.terminalTarget);
 
   useEffect(() => {
     init();
@@ -89,10 +91,12 @@ export default function App() {
         <ChatScreen />
       </Suspense>
     );
-  // Toasts live above every screen (including the z-50 file overlays).
+  // Toasts live above every screen (including the z-50 file overlays); the
+  // Remote Terminal overlay sits above the screens but below the dialogs.
   return (
     <>
       {body}
+      {terminalTarget && <TerminalScreen />}
       <NoticeToast />
     </>
   );

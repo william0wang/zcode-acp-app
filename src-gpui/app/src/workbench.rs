@@ -68,7 +68,8 @@ use crate::models_page::ModelsForm;
 use crate::quota_page::SpendStage;
 use crate::runtime::{
     FsBrowseView, HistoryRow, HistorySelected, NewSessionView, Phase, ProtocolRuntime,
-    RuntimeEvent, SessionRow, TabPhase, TabSummary, TabView, UiCommand, WorkbenchSnapshot,
+    RuntimeEvent, SessionRow, TabPhase, TabSummary, TabView, TerminalPaneError, UiCommand,
+    WorkbenchSnapshot,
 };
 use crate::server_form::ServerForm;
 use crate::system_status::render_system_status_page;
@@ -144,6 +145,17 @@ impl DrawerSurface {
             DrawerSurface::Quota => "quota",
         }
     }
+}
+
+/// One tab's Remote Terminal binding (ADR-0011): which pane in the tab's
+/// dock row pairs with the phone's command-line view, and the session it
+/// answers to. The registry, the event log, and the pane taps live in the
+/// driver; this only routes view-side facts (pane death, restart rebind)
+/// back as UiCommands.
+#[derive(Debug, Clone)]
+struct RemotePaneBinding {
+    pane: gpui::EntityId,
+    session_id: String,
 }
 
 pub struct Workbench {
@@ -228,6 +240,12 @@ pub struct Workbench {
     /// Tabs whose terminal dock is shown (`tab_terminals` keeps the shell
     /// alive while hidden — the flag only paints).
     tab_terminal_open: std::collections::HashSet<u64>,
+    /// Remote Terminal pane bindings (ADR-0011): the one pane per tab that
+    /// pairs with the phone's command-line view. View-local bookkeeping —
+    /// the terminal registry and the pane taps live in the driver; this map
+    /// only answers "which pane is remote" (× button, restart rebind, tab
+    /// death) and routes spawn answers back as UiCommands.
+    remote_panes: std::collections::HashMap<u64, RemotePaneBinding>,
     /// The chat ↔ terminal vertical split's sizes (shared: the panel height
     /// is a layout fact, not per-tab state).
     terminal_sizes: Entity<ResizableState>,
@@ -1230,6 +1248,7 @@ impl Workbench {
             session_panel_open: false,
             files_panel_session: None,
             tab_terminals: std::collections::HashMap::new(),
+            remote_panes: std::collections::HashMap::new(),
             tab_terminal_open: std::collections::HashSet::new(),
             terminal_sizes,
             font_scale: crate::ui_prefs::load_font_size()
@@ -1422,7 +1441,7 @@ impl Workbench {
         let cwd = self.active_workspace();
         let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
         match dock {
-            Ok(dock) => {
+            Ok((dock, _tap)) => {
                 let focus = dock.focus.clone();
                 self.tab_terminals.entry(id).or_default().push(dock);
                 self.tab_terminal_open.insert(id);
@@ -1453,6 +1472,13 @@ impl Workbench {
         let Some((id, ix)) = hit else {
             return;
         };
+        // A dying REMOTE pane unbinds its terminal (ADR-0011): the driver
+        // settles any running turn with a note and tells the phone.
+        let remote_gone = self
+            .remote_panes
+            .get(&id)
+            .filter(|b| b.pane == exited)
+            .map(|b| b.session_id.clone());
         let emptied = self.tab_terminals.get_mut(&id).is_some_and(|panes| {
             if ix < panes.len() {
                 panes.remove(ix);
@@ -1462,6 +1488,10 @@ impl Workbench {
         if emptied {
             self.tab_terminals.remove(&id);
             self.tab_terminal_open.remove(&id);
+        }
+        if let Some(session_id) = remote_gone {
+            self.remote_panes.remove(&id);
+            self.runtime.send(UiCommand::TerminalPaneGone { session_id });
         }
         cx.notify();
     }
@@ -1509,7 +1539,19 @@ impl Workbench {
         let cwd = self.active_workspace();
         let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
         match dock {
-            Ok(dock) => {
+            Ok((dock, tap)) => {
+                // A restarted REMOTE pane re-binds at once (ADR-0011): the
+                // pairing survives the local restart — the old PTY died with
+                // the replaced dock, and the driver's next turn writes the
+                // fresh one through this tap.
+                if let Some(binding) = self.remote_panes.get_mut(&id) {
+                    if binding.pane == pane {
+                        binding.pane = dock.view.entity_id();
+                        let session_id = binding.session_id.clone();
+                        self.runtime
+                            .send(UiCommand::TerminalPaneResult { session_id, result: Ok(tap) });
+                    }
+                }
                 if let Some(panes) = self.tab_terminals.get_mut(&id) {
                     if ix < panes.len() {
                         // Replace in place: the assignment drops the old
@@ -1530,7 +1572,7 @@ impl Workbench {
         let cwd = self.active_workspace();
         let dock = terminal_panel::spawn_dock(cwd.as_deref(), cx.entity().downgrade(), cx);
         match dock {
-            Ok(dock) => {
+            Ok((dock, _tap)) => {
                 self.tab_terminals.entry(id).or_default().push(dock);
             }
             Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
@@ -1853,6 +1895,20 @@ impl Workbench {
                 self.tab_drafts.retain(|id, _| live.contains(id));
                 self.tab_terminals.retain(|id, _| live.contains(id));
                 self.tab_terminal_open.retain(|id| live.contains(id));
+                // Tabs that died take their remote pane bindings with them —
+                // the driver marks those terminals gone (ADR-0011).
+                let dead_remote: Vec<String> = self
+                    .remote_panes
+                    .iter()
+                    .filter(|(id, _)| !live.contains(id))
+                    .map(|(_, b)| b.session_id.clone())
+                    .collect();
+                if !dead_remote.is_empty() {
+                    self.remote_panes.retain(|id, _| live.contains(id));
+                    for session_id in dead_remote {
+                        self.runtime.send(UiCommand::TerminalPaneGone { session_id });
+                    }
+                }
                 // Full config pages replace the drawer's navigation context —
                 // their entries live IN the drawer, so the page taking over
                 // below closes it. The drawer itself is view-local, so
@@ -1985,6 +2041,91 @@ impl Workbench {
                 // (set_value is window-gated), then consumed.
                 self.composer_prefill = Some(draft);
                 cx.notify();
+            }
+            RuntimeEvent::TerminalSpawnPane { session_id, tab, cwd } => {
+                // Remote Terminal (ADR-0011): the phone opened the session's
+                // terminal — spawn (or replace) the tab's remote pane and
+                // answer the driver with its tap.
+                self.ensure_remote_pane(session_id, tab, cwd, cx);
+            }
+            RuntimeEvent::TerminalClosePane { tab } => {
+                // The phone closed the terminal: its pane goes too (same path
+                // as the pane's × button — gone-reporting rides along).
+                if let Some(binding) = self.remote_panes.get(&tab) {
+                    let pane = binding.pane;
+                    self.close_terminal(pane, cx);
+                }
+            }
+        }
+    }
+
+    /// Spawn-or-replace the tab's Remote Terminal pane (ADR-0011). The pane
+    /// is a regular dock pane — visible, locally typable, killable — whose
+    /// tap the driver writes turns through. A stale binding from a previous
+    /// driver lifecycle is replaced, not reused (its tap is driver-side and
+    /// gone with that lifecycle).
+    fn ensure_remote_pane(
+        &mut self,
+        session_id: String,
+        tab: u64,
+        cwd: String,
+        cx: &mut Context<Self>,
+    ) {
+        // Close a stale remote pane first: two panes for one phone pairing
+        // would race over the same terminal record.
+        if let Some(binding) = self.remote_panes.get(&tab) {
+            let stale = binding.pane;
+            self.close_terminal(stale, cx);
+        }
+        if self
+            .tab_terminals
+            .get(&tab)
+            .is_some_and(|panes| panes.len() >= terminal_panel::MAX_TERMINAL_PANES)
+        {
+            self.runtime.send(UiCommand::TerminalPaneResult {
+                session_id,
+                result: Err(TerminalPaneError::Cap),
+            });
+            return;
+        }
+        // Under test the memory-dock rule applies (no PTY threads in the
+        // gpui scheduler); a sink-backed tap carries the registry flow.
+        #[cfg(test)]
+        let spawned: Result<
+            (terminal_panel::TerminalDock, terminal_panel::RemotePaneTap),
+            TerminalPaneError,
+        > = Ok((
+            terminal_panel::spawn_memory_dock(cx),
+            terminal_panel::RemotePaneTap::in_memory_for_test(),
+        ));
+        #[cfg(not(test))]
+        let spawned: Result<
+            (terminal_panel::TerminalDock, terminal_panel::RemotePaneTap),
+            TerminalPaneError,
+        > = terminal_panel::spawn_dock(Some(&cwd), cx.entity().downgrade(), cx)
+            .map_err(TerminalPaneError::Failed);
+        match spawned {
+            Ok((dock, tap)) => {
+                let pane = dock.view.entity_id();
+                self.tab_terminals.entry(tab).or_default().push(dock);
+                // Show the dock: a hidden pane defeats the point (the user
+                // walks up to the Mac and continues typing).
+                self.tab_terminal_open.insert(tab);
+                self.remote_panes.insert(
+                    tab,
+                    RemotePaneBinding { pane, session_id: session_id.clone() },
+                );
+                self.runtime.send(UiCommand::TerminalPaneResult {
+                    session_id,
+                    result: Ok(tap),
+                });
+                cx.notify();
+            }
+            Err(e) => {
+                self.runtime.send(UiCommand::TerminalPaneResult {
+                    session_id,
+                    result: Err(e),
+                });
             }
         }
     }
@@ -8266,6 +8407,62 @@ mod ui_tests {
         .unwrap();
     }
 
+    /// Remote Terminal pane wiring (ADR-0011): the spawn request mounts a
+    /// pane in the named tab's dock and answers the driver with the tap;
+    /// the phone-side close takes the pane with it and reports it gone.
+    #[gpui_kit::test]
+    fn remote_terminal_pane_spawn_and_close(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let snap = connected_snapshot();
+        let (handle, wb, rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(
+                    RuntimeEvent::TerminalSpawnPane {
+                        session_id: "sess_1".to_string(),
+                        tab: 7,
+                        cwd: "/w".to_string(),
+                    },
+                    cx,
+                );
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("terminal-panel").visible(),
+                "the remote pane shows its dock"
+            );
+            assert!(
+                rt.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::TerminalPaneResult { session_id, result: Ok(_) }
+                        if session_id == "sess_1"
+                )),
+                "the spawn answer carries the pane tap"
+            );
+
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::TerminalClosePane { tab: 7 }, cx);
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("terminal-panel").is_none(),
+                "the close takes the pane with it"
+            );
+            assert!(
+                rt.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::TerminalPaneGone { session_id } if session_id == "sess_1"
+                )),
+                "the driver hears the pane is gone"
+            );
+        })
+        .unwrap();
+    }
+
     /// The rail carries the terminal's visible door, and each tab owns its
     /// OWN terminal: opening on one tab never opens another's, a switch
     /// shows the incoming tab's state, and closing a tab drops its terminal
@@ -8508,8 +8705,9 @@ mod ui_tests {
             // Focus 2: a REAL pane's shell view — the deepest focus there
             // is, and the one whose on_key_down writes to the PTY.
             _wb.update(cx, |wb, cx| {
-                let dock = crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx)
-                    .expect("spawn");
+                let (dock, _tap) =
+                    crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx)
+                        .expect("spawn");
                 wb.tab_terminals.insert(7, vec![dock]);
                 wb.tab_terminal_open.insert(7);
                 cx.notify();
@@ -8560,8 +8758,9 @@ mod ui_tests {
             // The test-mode toggle mounts the placeholder only; mount the
             // real dock by hand (the production spawn path).
             wb.update(cx, |wb, cx| {
-                let dock =
-                    crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx).expect("spawn");
+                let (dock, _tap) =
+                    crate::terminal_panel::spawn_dock(None, cx.weak_entity(), cx)
+                        .expect("spawn");
                 wb.tab_terminals.insert(7, vec![dock]);
                 wb.tab_terminal_open.insert(7);
                 cx.notify();

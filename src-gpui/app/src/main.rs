@@ -30,6 +30,7 @@ mod pending_store;
 mod quota_card;
 mod quota_page;
 mod readout_store;
+mod remote_terminal;
 mod runtime;
 mod server_form;
 mod system_status;
