@@ -53,3 +53,35 @@ terminal window next to the app the user was looking at. Two changes:
   `reused` instances.
 
 Without any desktop signal the ADR-0016 window semantics are unchanged.
+
+## Amendment: the app re-spawns a hub that died mid-session
+
+Hub Bootstrap originally ran once per lifecycle: a hub that went dark
+AFTER the app connected (idle-exit once its last client left, a kill, a
+crash) left the app retrying a dead port forever — only a manual restart
+or a settings-driven lifecycle restart re-ran the bootstrap. The desktop
+app is the presenting surface, so while it runs it must bring its own
+backend back (user, 2026-11-13: "another client started the hub; when
+that client exits the hub closes, and the desktop app should bring it
+back up"). Decision:
+
+- **The discovery poll doubles as the hub-liveness probe.** A
+  network-level miss (the hub answered nothing) counts as one dark poll;
+  an answered error — including the hub's own 500s — is a LIVE hub and
+  resets the streak, so the supervisor never arms off the hub's own
+  restart window more than the threshold allows.
+- **Re-run Hub Bootstrap, not the lifecycle.** After
+  `HUB_RESPAWN_AFTER_STREAK` (2) consecutive dark polls the driver
+  re-runs `ensure_hub` on a spawned task — same EADDRINUSE singleton
+  race, same adjudication — without closing tabs or resetting pages: the
+  dial target (host/port/token) is the config the lifecycle already
+  resolved, so the tabs' reconnect ladders and the next discovery poll
+  recover on their own once the port answers.
+- **Guard rails.** Local-hub only (a remote Connection Profile is
+  dialed, never spawned — unchanged); one attempt in flight; attempts
+  spaced by `HUB_RESPAWN_MIN_INTERVAL_MS` (15s) so a hub that dies on
+  arrival cannot loop the spawn; a failed bootstrap surfaces in the
+  sidebar (`hub restart failed: …`) instead of failing silently. The
+  two-poll threshold also rides through the hub's self-upgrade restart
+  (~2s dark), which would otherwise pay a pointless daemon spawn that
+  the singleton race would have to clean up after.

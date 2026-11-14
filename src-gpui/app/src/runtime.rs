@@ -144,6 +144,18 @@ const TAB_REINCUBATE_ATTEMPTS: u32 = 3;
 const TAB_REINCUBATE_COOLDOWN_MS: u64 = 60_000;
 /// Re-probe cadence while the hub is up but no bridge instance exists yet.
 const NO_INSTANCE_RETRY_MS: u64 = 5_000;
+/// Consecutive network-level discovery failures (each spaced
+/// [`RECONNECT_DELAY_MS`]) after which the local hub is presumed GONE —
+/// idle-exited once its last client left, killed, or dead with the machine's
+/// session — and the driver re-runs the Hub Bootstrap to bring it back. Two
+/// honest retries first: the hub's own self-upgrade restart also lands here
+/// (it closes, respawns within ~2s), and re-running the bootstrap on a hub
+/// that is coming right back merely joins the EADDRINUSE singleton race and
+/// loses politely — but skipping the window avoids a pointless daemon spawn.
+const HUB_RESPAWN_AFTER_STREAK: u32 = 2;
+/// Minimum spacing between hub respawn attempts — a hub that dies on arrival
+/// (bad token, refused port) must not loop the spawn every discovery retry.
+const HUB_RESPAWN_MIN_INTERVAL_MS: u64 = 15_000;
 /// System-status poll cadence while the page is open (TS SystemStatusPage
 /// `POLL_MS`): a live dashboard — and the hub caches one collect for 1s, so
 /// clients must not cache.
@@ -1541,6 +1553,11 @@ enum LoopEvent {
     },
     // ---- hub REST (no tab) ----
     Discovery(Result<Vec<HubInstance>, HubApiError>),
+    /// The hub-respawn supervisor's bootstrap settled (see
+    /// [`Driver::on_hub_respawn`]): `Ok` says the hub is listening (spawned
+    /// by us, or it came back on its own), `Err` carries why the re-spawn
+    /// could not bring it back.
+    HubRespawn(Result<protocol::bootstrap::EnsureHubOutcome, String>),
     HistoryProjects {
         seq: u64,
         result: Result<Vec<HubProject>, HubApiError>,
@@ -2592,6 +2609,22 @@ struct Driver {
     /// anything (the 2026-10-22 quiet-cold-start half).
     discovery_baselined: bool,
 
+    /// True while THIS lifecycle's dial target came from the local Hub
+    /// Bootstrap (never a remote Connection Profile): only then may the
+    /// steady-state supervisor re-spawn the hub — a remote hub is dialed,
+    /// never spawned (CONTEXT.md).
+    local_hub: bool,
+    /// Consecutive discovery failures whose error is NETWORK-level (the hub
+    /// answered nothing): the hub-dark signal the respawn supervisor counts.
+    /// Any answered error or successful poll resets it — the hub is alive.
+    hub_down_streak: u32,
+    /// A hub respawn bootstrap is in flight (one at a time; the result
+    /// clears it).
+    hub_respawn_busy: bool,
+    /// Next tick that may START a respawn attempt
+    /// ([`HUB_RESPAWN_MIN_INTERVAL_MS`] spacing).
+    hub_respawn_next_at: u64,
+
     tabs: Vec<Tab>,
     active_tab: Option<u64>,
     /// Tabs whose connection WE closed (tab close / Retry) — their Closed
@@ -2712,6 +2745,10 @@ impl Driver {
             closed_sessions: HashMap::new(),
             seen_at: HashMap::new(),
             discovery_baselined: false,
+            local_hub: false,
+            hub_down_streak: 0,
+            hub_respawn_busy: false,
+            hub_respawn_next_at: 0,
             tabs: Vec::new(),
             active_tab: None,
             closing: HashSet::new(),
@@ -3076,6 +3113,9 @@ impl Driver {
                 self.discovery_note = None;
                 self.next_discovery_at = now + DISCOVERY_REFRESH_MS;
                 self.discovery_probe = false;
+                // The hub answered — the dark-streak the respawn supervisor
+                // counts is over.
+                self.hub_down_streak = 0;
                 if self.phase == Phase::Discovering || self.phase == Phase::Reconnecting {
                     self.phase = Phase::Connected;
                     // Fresh connect cycle — the one moment the hub's version
@@ -3109,6 +3149,70 @@ impl Driver {
                 if self.phase == Phase::Connected {
                     self.phase = Phase::Reconnecting;
                 }
+                // Only a network-level miss (the hub answered NOTHING) is a
+                // hub-dark signal; an answered error means a live hub. The
+                // streak decides whether the supervisor re-spawns the daemon.
+                if e.network {
+                    self.hub_down_streak = self.hub_down_streak.saturating_add(1);
+                    self.maybe_respawn_hub(now);
+                } else {
+                    self.hub_down_streak = 0;
+                }
+            }
+        }
+    }
+
+    /// Pure decision half of the hub respawn supervisor: every condition that
+    /// gates actually re-running the Hub Bootstrap, split out so the gating
+    /// itself is testable without spawning a real daemon task.
+    fn hub_respawn_due(&self, now: u64) -> bool {
+        self.local_hub
+            && self.hub_down_streak >= HUB_RESPAWN_AFTER_STREAK
+            && !self.hub_respawn_busy
+            && now >= self.hub_respawn_next_at
+    }
+
+    /// The hub went dark mid-session (idle-exit once its last client left, a
+    /// kill, a crash): re-run the local Hub Bootstrap so the app — the
+    /// presenting surface, ADR-0010 — brings its own backend back instead of
+    /// retrying a dead port forever. The tabs' reconnect ladders and the next
+    /// discovery poll recover on their own once the port answers again: the
+    /// dial target (host/port/token) is the same config the lifecycle already
+    /// resolved, so nothing else needs re-pointing.
+    fn maybe_respawn_hub(&mut self, now: u64) {
+        if !self.hub_respawn_due(now) {
+            return;
+        }
+        self.hub_respawn_busy = true;
+        self.hub_respawn_next_at = now + HUB_RESPAWN_MIN_INTERVAL_MS;
+        let streak = self.hub_down_streak;
+        traceln!("[driver] hub dark for {streak} polls — re-running the local bootstrap");
+        let env = BootstrapEnv::from_env();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = ensure_hub(&env, &EnsureOptions::default()).await;
+            let _ = tx.send(LoopEvent::HubRespawn(
+                result
+                    .map(|(outcome, _)| outcome)
+                    .map_err(|e| e.to_string()),
+            ));
+        });
+    }
+
+    /// The respawn bootstrap settled. Success (however the singleton race
+    /// went) clears the streak and lets the next discovery poll — already
+    /// re-armed at [`RECONNECT_DELAY_MS`] — paint the recovery; a failure
+    /// surfaces in the sidebar so an un-startable hub is not silent.
+    fn on_hub_respawn(&mut self, result: Result<protocol::bootstrap::EnsureHubOutcome, String>) {
+        self.hub_respawn_busy = false;
+        match result {
+            Ok(outcome) => {
+                traceln!("[driver] hub respawn bootstrap: {outcome:?}");
+                self.hub_down_streak = 0;
+            }
+            Err(e) => {
+                traceln!("[driver] hub respawn failed: {e}");
+                self.discovery_note = Some(format!("hub restart failed: {e}"));
             }
         }
     }
@@ -6356,6 +6460,7 @@ impl Driver {
             }
             // ---- hub REST ----
             LoopEvent::Discovery(result) => self.on_discovery(result, now),
+            LoopEvent::HubRespawn(result) => self.on_hub_respawn(result),
             LoopEvent::HistoryProjects { seq, result } => {
                 if seq != self.history.seq {
                     return; // superseded by an open/back toggle
@@ -9586,7 +9691,14 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         };
         bootstrap_attempts = 0;
         // The local path resolves the dial target here; a remote profile
-        // already set both before the branch.
+        // already set both before the branch. The flag arms the steady-state
+        // respawn supervisor (a local hub is OURS to re-spawn; a remote one
+        // is only ever dialed), and the supervisor's state resets with the
+        // lifecycle — a fresh bootstrap just proved the hub reachable.
+        d.local_hub = config.is_some();
+        d.hub_down_streak = 0;
+        d.hub_respawn_busy = false;
+        d.hub_respawn_next_at = 0;
         if let Some(config) = config {
             d.hub_url = format!(
                 "http://{}:{}",
@@ -9925,6 +10037,115 @@ mod tests {
         assert!(
             d.tabs.is_empty(),
             "a recently-seen re-admitted row does not pop a tab"
+        );
+    }
+
+    /// The hub respawn supervisor's gate (the 2026-11-13 amendment): a LOCAL
+    /// hub that went dark mid-session is re-spawned, but only after
+    /// [`HUB_RESPAWN_AFTER_STREAK`] consecutive dark polls, one attempt at a
+    /// time, spaced by [`HUB_RESPAWN_MIN_INTERVAL_MS`] — and never for a
+    /// remote Connection Profile (dial-only, CONTEXT.md).
+    #[test]
+    fn hub_respawn_gates_on_local_streak_spacing_and_liveness() {
+        let mut d = driver();
+        // The armed, everything-satisfied shape.
+        d.local_hub = true;
+        d.hub_down_streak = super::HUB_RESPAWN_AFTER_STREAK;
+        d.hub_respawn_next_at = 0;
+        assert!(d.hub_respawn_due(1_000), "local + dark + idle = due");
+
+        d.local_hub = false;
+        assert!(
+            !d.hub_respawn_due(1_000),
+            "a remote profile is never spawned"
+        );
+        d.local_hub = true;
+
+        d.hub_down_streak = super::HUB_RESPAWN_AFTER_STREAK - 1;
+        assert!(
+            !d.hub_respawn_due(1_000),
+            "a self-upgrade restart window must not pay a spawn"
+        );
+        d.hub_down_streak = super::HUB_RESPAWN_AFTER_STREAK;
+
+        d.hub_respawn_busy = true;
+        assert!(!d.hub_respawn_due(1_000), "one attempt at a time");
+        d.hub_respawn_busy = false;
+
+        d.hub_respawn_next_at = 30_000;
+        assert!(!d.hub_respawn_due(29_999), "the spacing window holds");
+        assert!(d.hub_respawn_due(30_000), "the spacing window opens");
+    }
+
+    /// Only a NETWORK-level discovery miss counts as hub-dark — an answered
+    /// error is a LIVE hub (the streak must not arm the supervisor off the
+    /// hub's own 500s), and a successful poll clears the streak. The respawn
+    /// interval is pinned open so the accounting runs without spawning a
+    /// real bootstrap task.
+    #[test]
+    fn dark_polls_accumulate_only_on_network_misses() {
+        let mut d = driver();
+        d.local_hub = true;
+        d.hub_respawn_next_at = u64::MAX; // supervisor trigger disarmed
+        let dark = |msg: &str| HubApiError {
+            message: msg.to_string(),
+            status: None,
+            network: true,
+            instance_dead: false,
+        };
+
+        d.on_discovery(Err(dark("refused")), 1_000);
+        assert_eq!(d.hub_down_streak, 1);
+        d.on_discovery(Err(dark("refused")), 2_000);
+        assert_eq!(d.hub_down_streak, 2, "two dark polls arm the supervisor");
+
+        // An ANSWERED error is a live hub — the streak resets.
+        d.on_discovery(
+            Err(HubApiError {
+                message: "500".to_string(),
+                status: Some(500),
+                network: false,
+                instance_dead: false,
+            }),
+            3_000,
+        );
+        assert_eq!(d.hub_down_streak, 0, "an answered error means a live hub");
+
+        // A successful poll resets too.
+        d.on_discovery(Err(dark("refused")), 4_000);
+        d.on_discovery(Err(dark("refused")), 5_000);
+        assert_eq!(d.hub_down_streak, 2);
+        d.on_discovery(Ok(Vec::new()), 6_000);
+        assert_eq!(d.hub_down_streak, 0, "a successful poll clears the streak");
+    }
+
+    /// The respawn bootstrap's landing: success clears the attempt and the
+    /// streak (the next discovery poll paints the recovery); a failure
+    /// surfaces in the sidebar — an un-startable hub must not fail silently.
+    #[test]
+    fn hub_respawn_results_clear_state_and_surface_failures() {
+        use protocol::bootstrap::EnsureHubOutcome;
+        let mut d = driver();
+        d.hub_respawn_busy = true;
+        d.hub_down_streak = 3;
+
+        d.on_hub_respawn(Ok(EnsureHubOutcome::SpawnLostToExisting));
+        assert!(!d.hub_respawn_busy);
+        assert_eq!(d.hub_down_streak, 0);
+        assert!(
+            d.discovery_note.is_none(),
+            "a successful respawn is not a user-facing problem"
+        );
+
+        d.hub_respawn_busy = true;
+        d.on_hub_respawn(Err("zcode-acp-server is not installed".to_string()));
+        assert!(!d.hub_respawn_busy, "the attempt slot frees either way");
+        assert!(
+            d.discovery_note
+                .as_deref()
+                .is_some_and(|n| n.contains("hub restart failed")),
+            "a failed respawn explains itself in the sidebar: {:?}",
+            d.discovery_note
         );
     }
 
