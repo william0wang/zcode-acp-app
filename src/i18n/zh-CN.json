@@ -83,6 +83,7 @@
   "panel": {
     "title": "设置",
     "session": "会话",
+    "tools": "工具",
     "language": "语言",
     "fontSize": "字体大小",
     "fontSizeSmall": "小",

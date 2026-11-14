@@ -84,6 +84,7 @@
   "panel": {
     "title": "Settings",
     "session": "Session",
+    "tools": "Tools",
     "language": "Language",
     "fontSize": "Font size",
     "fontSizeSmall": "Small",

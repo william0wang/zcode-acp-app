@@ -1,18 +1,39 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ChevronRight, Workflow } from "lucide-react";
+import {
+  ChevronRight,
+  FolderOpen,
+  SquareTerminal,
+  Workflow,
+} from "lucide-react";
+import { useTerminalLive } from "../lib/terminalSession";
 import { useAppStore } from "../store/appStore";
 import { ConfigSheet } from "./ConfigSheet";
 import { PanelShell } from "./SidePanel";
 import { QuotaSection, SectionLabel } from "./QuotaSection";
 import { bareModelIdFromConfigValue } from "../lib/modelValue";
 
-// Session-scoped right panel shown in chat: config options (model / mode /
-// thought) plus the shared account quota card. Global settings live in
-// SettingsPanel.
-export function SessionPanel({ onClose }: { onClose: () => void }) {
+// Session-scoped right panel shown in chat: the session's tools (terminal,
+// files), config options (model / mode / thought) plus the shared account
+// quota card. Global settings live in SettingsPanel.
+export function SessionPanel({
+  onClose,
+  onOpenFiles,
+}: {
+  onClose: () => void;
+  onOpenFiles: () => void;
+}) {
   const { t } = useTranslation();
   const activeSessionId = useAppStore((s) => s.activeSessionId);
+  const sessionTitle = useAppStore(
+    (s) =>
+      s.instances
+        .find((i) => i.id === s.instanceId)
+        ?.sessions?.find((x) => x.sessionId === s.activeSessionId)?.title,
+  );
+  const fsCapable = useAppStore((s) => s.fsCapable);
+  const openTerminal = useAppStore((s) => s.openTerminal);
+  const terminalLive = useTerminalLive();
   const configOptions = useAppStore((s) => s.configOptions);
   const usageStats = useAppStore((s) => s.usageStats);
   const quotaUnavailable = useAppStore((s) => s.quotaUnavailable);
@@ -32,6 +53,57 @@ export function SessionPanel({ onClose }: { onClose: () => void }) {
 
   return (
     <PanelShell title={t("panel.session")} onClose={onClose}>
+      {/* The header keeps a single button, so the session's tools enter from
+          here. Both open full-screen overlays above the chat, hence the panel
+          closes first. */}
+      {(activeSessionId != null || fsCapable) && (
+        <>
+          <SectionLabel title={t("panel.tools")} />
+          {/* Remote Terminal (ADR-0011) is session-bound: this always
+              re-enters THIS session's one terminal. The dot mirrors the
+              header badge — amber pulse while a turn runs, blue while the
+              socket is up. */}
+          {activeSessionId != null && (
+            <button
+              onClick={() => {
+                onClose();
+                openTerminal(activeSessionId, sessionTitle);
+              }}
+              className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left active:bg-white/[0.05]"
+            >
+              <span className="flex items-center gap-2 text-sm text-dim">
+                <SquareTerminal className="size-3.5 shrink-0 text-faint" />
+                {t("remoteTerminal.openAction")}
+              </span>
+              <span className="flex shrink-0 items-center gap-2">
+                {terminalLive?.sessionId === activeSessionId &&
+                  (terminalLive.terminal?.turn?.state === "running" ? (
+                    <span className="size-1.5 animate-pulse rounded-full bg-amber-400" />
+                  ) : terminalLive.conn === "open" ? (
+                    <span className="size-1.5 rounded-full bg-blue-400/70" />
+                  ) : null)}
+                <ChevronRight className="size-4 shrink-0 text-faint" />
+              </span>
+            </button>
+          )}
+          {fsCapable && (
+            <button
+              onClick={() => {
+                onClose();
+                onOpenFiles();
+              }}
+              className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left active:bg-white/[0.05]"
+            >
+              <span className="flex items-center gap-2 text-sm text-dim">
+                <FolderOpen className="size-3.5 shrink-0 text-faint" />
+                {t("files.title")}
+              </span>
+              <ChevronRight className="size-4 shrink-0 text-faint" />
+            </button>
+          )}
+        </>
+      )}
+
       {/* Session-scoped config — meaningless until a session is attached. */}
       {activeSessionId != null && configOptions.length > 0 && (
         <>
