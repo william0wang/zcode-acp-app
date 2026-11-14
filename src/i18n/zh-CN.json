@@ -516,7 +516,9 @@
     "noCarrier": "桌面端未连接",
     "closed": "已断开",
     "opening": "正在打开终端…",
-    "gone": "已在桌面端关闭"
+    "gone": "已在桌面端关闭",
+    "reopen": "重新打开终端",
+    "closeAction": "关闭终端"
   },
   "permission": {
     "title": "权限请求",

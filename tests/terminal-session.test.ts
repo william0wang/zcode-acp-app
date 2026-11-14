@@ -7,6 +7,8 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   closeTerminal,
   ensureTerminal,
+  reopenTerminal,
+  shutdownTerminal,
   subscribeTerminal,
   terminalLive,
   terminalLog,
@@ -151,4 +153,53 @@ test("subscribers hear state changes and the unsubscribe silences them", () => {
   const count = seen.length;
   closeTerminal();
   expect(seen.length).toBe(count);
+});
+
+test("shutdown closes the pane on the wire and drops the holder", () => {
+  ensureTerminal("http://hub", "t", "s1");
+  const ws = openUp();
+  shutdownTerminal();
+  expect(ws.sent.map((f) => f.type)).toEqual(["open", "close"]);
+  expect(terminalLive()).toBeNull();
+  expect(terminalLog().size).toBe(0);
+});
+
+test("reopen asks the workbench for a fresh pane", () => {
+  ensureTerminal("http://hub", "t", "s1");
+  const ws = openUp();
+  reopenTerminal();
+  expect(ws.sent.filter((f) => f.type === "open")).toHaveLength(2);
+});
+
+test("no_carrier is fatal: the holder closes instead of laddering", () => {
+  ensureTerminal("http://hub", "t", "s1");
+  const ws = openUp();
+  ws.server({ v: 1, type: "error", code: "no_carrier", message: "desktop workbench disconnected" });
+  const live = terminalLive()!;
+  expect(live.conn).toBe("closed");
+  expect(live.error?.code).toBe("no_carrier");
+  // The hub closes the socket after the error frame — no reconnect ladder.
+  ws.onclose?.();
+  expect(terminalLive()?.conn).toBe("closed");
+});
+
+test("after a fatal close, reopen redials and re-ensure does not no-op", () => {
+  ensureTerminal("http://hub", "t", "s1");
+  const first = openUp();
+  first.server({ v: 1, type: "error", code: "no_carrier", message: "gone" });
+  expect(terminalLive()?.conn).toBe("closed");
+
+  // Reopen from the closed holder: a fresh socket, attach open on connect.
+  reopenTerminal();
+  expect(FakeWebSocket.current).not.toBe(first);
+  expect(terminalLive()?.conn).toBe("connecting");
+  expect(terminalLive()?.error).toBeNull();
+  const second = openUp();
+  expect(second.sent).toEqual([{ v: 1, type: "open", sessionId: "s1" }]);
+
+  // And the same-session ensure on a closed holder redials too (re-entering
+  // the screen must never stare at a dead terminal).
+  second.server({ v: 1, type: "error", code: "no_carrier", message: "gone" });
+  ensureTerminal("http://hub", "t", "s1");
+  expect(FakeWebSocket.current).not.toBe(second);
 });

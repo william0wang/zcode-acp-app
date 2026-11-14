@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ArrowUp, ChevronLeft, Square } from "lucide-react";
+import { ArrowUp, ChevronLeft, Square, X } from "lucide-react";
 import {
   loadHistory,
   pushHistory,
@@ -10,6 +10,8 @@ import {
 } from "../lib/remoteTerminal";
 import {
   ensureTerminal,
+  reopenTerminal,
+  shutdownTerminal,
   terminalConn,
   terminalLog,
   useTerminalLive,
@@ -208,6 +210,16 @@ export function TerminalScreen() {
           )}
         </div>
         <ConnChip conn={conn} terminal={terminal} />
+        <button
+          onClick={() => {
+            shutdownTerminal();
+            closeTerminalScreen();
+          }}
+          aria-label={t("remoteTerminal.closeAction")}
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+        >
+          <X className="size-5" />
+        </button>
       </header>
 
       <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
@@ -235,7 +247,20 @@ export function TerminalScreen() {
       </div>
 
       <div className="shrink-0 border-t border-hairline px-3 pb-[max(var(--safe-bottom),0.5rem)] pt-2">
-        {running ? (
+        {terminal?.state === "gone" || conn === "closed" ? (
+          // Dead end states: the pane is gone (shell exited / closed) or the
+          // connection fatally closed (carrier gone…). The only way forward
+          // is reopening — a fresh pane, or a full redial when closed. While
+          // the ladder is already reconnecting (hub restart), the wire open
+          // would be dropped — let the ladder land it instead.
+          <button
+            onClick={() => reopenTerminal()}
+            disabled={conn === "reconnecting"}
+            className="w-full rounded-xl bg-blue-500 px-4 py-3 text-sm font-medium text-white active:bg-blue-600 disabled:opacity-50"
+          >
+            {t("remoteTerminal.reopen")}
+          </button>
+        ) : running ? (
           <div className="flex items-center gap-2">
             <div className="flex min-w-0 flex-1 items-center gap-2 rounded-xl bg-raised px-3 py-2.5 ring-1 ring-inset ring-hairline">
               <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-blue-400" />

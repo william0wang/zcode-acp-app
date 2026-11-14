@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronRight, Plus } from "lucide-react";
+import { matchProviderId } from "../../lib/modelValue";
 import { useAppStore } from "../../store/appStore";
 import {
   ConfigBlock,
@@ -130,23 +131,11 @@ export function isAccountProvider(providerId: string): boolean {
 }
 
 /**
- * The provider id as a MATCH key: coding-plan ids normalize to the legacy
- * `builtin:` spelling. The models payload normalizes server-side
- * (configProviderIdFor) while agent files written by the desktop keep the
- * registry's `account:` spelling — both name the same provider, and comparing
- * raw strings never matches them (observed: every agent's model showed as an
- * unmappable id and the picker could not prefill).
+ * The provider id as a MATCH key — lives in lib/modelValue.ts now (the
+ * session panel's option matching needs the same fold); re-exported here for
+ * the config pages' imports. See there for the dialect rationale.
  */
-export function matchProviderId(providerId: string | undefined): string {
-  // Undefined (a rule without a provider id) collapses to "" so two undefined
-  // ids compare equal rather than to everything.
-  if (!providerId?.startsWith("account:")) return providerId ?? "";
-  const m =
-    /^account:([a-z0-9]+)-(?:(?:individual|team|start)-)?coding-plan$/.exec(
-      providerId,
-    );
-  return m ? `builtin:${m[1]}-coding-plan` : providerId;
-}
+export { matchProviderId };
 
 /**
  * Every selectable model as a picker option: the value the runtime spells

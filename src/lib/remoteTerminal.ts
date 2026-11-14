@@ -42,10 +42,14 @@ export interface TerminalHandlers {
   onError: (code: string, message: string) => void;
 }
 
-// Codes that make retrying pointless until the user re-enters: the exec
-// switch is off, or the workbench doesn't know the session. no_carrier and
-// transport drops DO retry — the workbench may come back any moment.
-const FATAL_CODES = new Set(["disabled", "unknown_session"]);
+// Codes that make retrying pointless until the user acts: the exec switch is
+// off, the workbench doesn't know the session, or — no_carrier — the hub has
+// verified the desktop control link is GONE (it errors every client and
+// refuses new dials). Laddering that would spin "reconnecting" against a dead
+// carrier forever; the terminal settles closed (error banner + reopen/close
+// actions) and re-opens when the desktop is back. Plain transport drops DO
+// retry — the carrier may be fine under a network blip.
+const FATAL_CODES = new Set(["disabled", "unknown_session", "no_carrier"]);
 
 // Same ladder as appStore.scheduleReconnect: 1s doubling, 30s cap.
 const RECONNECT_MAX_MS = 30_000;
@@ -101,6 +105,22 @@ export class TerminalConnection {
   /** Ctrl-C for the running turn (same byte a local Ctrl-C writes). */
   interrupt(): void {
     this.send({ v: 1, type: "interrupt", sessionId: this.sessionId });
+  }
+
+  /** Close the pane itself (wire `close`): the workbench kills the pane and
+   *  reports `gone`; a later `open` spawns a fresh one. */
+  requestClose(): void {
+    this.send({ v: 1, type: "close", sessionId: this.sessionId });
+  }
+
+  /** Ask for a fresh pane after `gone` (same frame as the attach open). */
+  reopen(): void {
+    this.send({ v: 1, type: "open", sessionId: this.sessionId });
+  }
+
+  /** Dial again after a fatal close (transport + attach open in one). */
+  redial(): void {
+    this.connect();
   }
 
   close(): void {

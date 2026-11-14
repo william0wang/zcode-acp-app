@@ -86,6 +86,12 @@ export function ensureTerminal(
       state = { ...state, title: nextTitle };
       emit();
     }
+    // A fatally-closed holder (carrier gone, exec off, unknown session) must
+    // not no-op: re-entry redials instead of staring at a dead terminal.
+    if (state.conn !== "closed") return;
+    state = { ...state, conn: "connecting", error: null };
+    emit();
+    conn.redial();
     return;
   }
   closeTerminal();
@@ -101,7 +107,9 @@ export function ensureTerminal(
   conn = new TerminalConnection(hubUrl, token, sessionId, {
     onState: (c) => {
       if (!state) return;
-      state = { ...state, conn: c };
+      // Reconnected ⇒ whatever error the drop carried (hub restarting,
+      // carrier gone…) no longer describes the world.
+      state = c === "open" ? { ...state, conn: c, error: null } : { ...state, conn: c };
       emit();
     },
     onTerminal: (terminal) => {
@@ -136,4 +144,30 @@ export function closeTerminal(): void {
     state = null;
     emit();
   }
+}
+
+/**
+ * Close the terminal EVERYWHERE: the workbench pane (wire `close`) and the
+ * phone-side holder. Re-entry afterwards spawns a fresh pane.
+ */
+export function shutdownTerminal(): void {
+  conn?.requestClose();
+  closeTerminal();
+}
+
+/**
+ * Re-open this session's terminal: after `gone` (shell exited, pane closed)
+ * that is a wire `open` — the workbench spawns a fresh pane, the transcript
+ * continues; after a fatal close (carrier gone…) it is a full redial, the
+ * onopen attach re-`open`s by itself.
+ */
+export function reopenTerminal(): void {
+  if (!conn || !state) return;
+  if (state.conn === "closed") {
+    state = { ...state, conn: "connecting", error: null };
+    emit();
+    conn.redial();
+    return;
+  }
+  conn.reopen();
 }

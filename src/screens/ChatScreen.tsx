@@ -256,7 +256,8 @@ export function ChatScreen() {
             terminalLive?.sessionId === activeSessionId &&
             (terminalLive.terminal?.turn?.state === "running" ? (
               <span className="absolute right-1.5 top-1.5 size-1.5 animate-pulse rounded-full bg-amber-400" />
-            ) : terminalLive.conn === "open" ? (
+            ) : terminalLive.conn === "open" &&
+                terminalLive.terminal?.state !== "gone" ? (
               <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-blue-400/70" />
             ) : null)}
         </button>

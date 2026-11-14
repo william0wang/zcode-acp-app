@@ -7,11 +7,11 @@ import {
   Workflow,
 } from "lucide-react";
 import { useTerminalLive } from "../lib/terminalSession";
+import { bareModelIdFromConfigValue, currentChoice } from "../lib/modelValue";
 import { useAppStore } from "../store/appStore";
 import { ConfigSheet } from "./ConfigSheet";
 import { PanelShell } from "./SidePanel";
 import { QuotaSection, SectionLabel } from "./QuotaSection";
-import { bareModelIdFromConfigValue } from "../lib/modelValue";
 
 // Session-scoped right panel shown in chat: the session's tools (terminal,
 // files), config options (model / mode / thought) plus the shared account
@@ -79,7 +79,8 @@ export function SessionPanel({
                 {terminalLive?.sessionId === activeSessionId &&
                   (terminalLive.terminal?.turn?.state === "running" ? (
                     <span className="size-1.5 animate-pulse rounded-full bg-amber-400" />
-                  ) : terminalLive.conn === "open" ? (
+                  ) : terminalLive.conn === "open" &&
+                      terminalLive.terminal?.state !== "gone" ? (
                     <span className="size-1.5 rounded-full bg-blue-400/70" />
                   ) : null)}
                 <ChevronRight className="size-4 shrink-0 text-faint" />
@@ -109,9 +110,10 @@ export function SessionPanel({
         <>
           <SectionLabel title={t("config.title")} />
           {configOptions.map((opt) => {
-            const current = opt.options?.find(
-              (v) => v.value === opt.currentValue,
-            );
+            // Exact, else provider-normalized (the runtime's mid-turn pushes
+            // spell the provider `account:` while the option list says
+            // `builtin:`) — the choice's name must survive the dialect swap.
+            const current = currentChoice(opt);
             return (
               <button
                 key={opt.id}

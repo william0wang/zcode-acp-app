@@ -1,6 +1,7 @@
 import { useTranslation } from "react-i18next";
 import { Check } from "lucide-react";
 import { useBackHandler } from "../lib/backNav";
+import { configValueMatchKey } from "../lib/modelValue";
 import { useAppStore } from "../store/appStore";
 
 // Bottom sheet listing one config option's values (model / mode / thought).
@@ -28,6 +29,12 @@ export function ConfigSheet({
   const label = t(`config.${option.id}`, {
     defaultValue: option.name ?? option.id,
   });
+  // Same matching as the panel row (SessionPanel): a mid-turn push may spell
+  // the current value's provider differently than the choice list — the
+  // checkmark rides the normalized comparison, not the raw string.
+  const activeKey = option.currentValue
+    ? configValueMatchKey(option.currentValue)
+    : null;
 
   return (
     <div
@@ -40,7 +47,7 @@ export function ConfigSheet({
       >
         <div className="px-3 pb-2 text-sm font-medium text-ink">{label}</div>
         {(option.options ?? []).map((v) => {
-          const active = v.value === option.currentValue;
+          const active = activeKey != null && configValueMatchKey(v.value) === activeKey;
           return (
             <button
               key={v.value}

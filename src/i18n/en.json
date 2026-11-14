@@ -518,7 +518,9 @@
     "noCarrier": "Desktop workbench not connected",
     "closed": "disconnected",
     "opening": "opening the terminal…",
-    "gone": "closed on the desktop"
+    "gone": "closed on the desktop",
+    "reopen": "Reopen terminal",
+    "closeAction": "Close terminal"
   },
   "permission": {
     "title": "Permission requested",
