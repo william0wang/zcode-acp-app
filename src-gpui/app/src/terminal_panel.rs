@@ -75,6 +75,10 @@ struct TeeBuffer {
     armed: bool,
     buf: Vec<u8>,
     exit: Option<i32>,
+    /// The pane's reader hit EOF/error — the shell behind the tap is dead.
+    /// The view's exit callback only runs on render, so a HIDDEN dock never
+    /// reports the death; the driver's settle tick polls this instead.
+    closed: bool,
 }
 
 /// Keep the tail window bounded: a `yes`-grade turn must not grow memory;
@@ -184,9 +188,21 @@ struct TeeReader {
 
 impl std::io::Read for TeeReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.inner.read(buf)?;
+        let n = match self.inner.read(buf) {
+            Ok(n) => n,
+            Err(e) => {
+                // EOF's sibling on some platforms (EIO once the slave side
+                // is fully gone): a dead pane either way.
+                self.tee.lock().unwrap().closed = true;
+                return Err(e);
+            }
+        };
+        let mut tee = self.tee.lock().unwrap();
         if n > 0 {
-            self.tee.lock().unwrap().append(&buf[..n]);
+            tee.append(&buf[..n]);
+        } else {
+            // EOF: the shell exited (or every slave fd closed).
+            tee.closed = true;
         }
         Ok(n)
     }
@@ -238,6 +254,11 @@ impl RemotePaneTap {
         self.tee.lock().unwrap().take_output()
     }
 
+    /// The pane's reader hit EOF/error — the shell behind the tap is dead.
+    pub(crate) fn is_closed(&self) -> bool {
+        self.tee.lock().unwrap().closed
+    }
+
     /// A sink-backed tap with no PTY (tests): registry-flow wiring only.
     #[cfg(test)]
     pub(crate) fn in_memory_for_test() -> Self {
@@ -249,6 +270,12 @@ impl RemotePaneTap {
     #[cfg(test)]
     pub(crate) fn feed_output_for_test(&self, bytes: &[u8]) {
         self.tee.lock().unwrap().append(bytes);
+    }
+
+    /// Simulate the pane's reader hitting EOF (tests — a dead shell).
+    #[cfg(test)]
+    pub(crate) fn feed_eof_for_test(&self) {
+        self.tee.lock().unwrap().closed = true;
     }
 
     /// An in-memory tap (tests): writes land in a sink you can read back,
@@ -634,7 +661,8 @@ fn render_pane(
 mod remote_tap_tests {
     // Explicit imports only — the file-root kit glob shadows #[test] with
     // gpui's macro (see workbench.rs's test modules / pending_store.rs).
-    use super::{RemotePaneTap, TEE_CAP};
+    use super::{RemotePaneTap, TeeReader, TEE_CAP};
+    use std::io::Read;
 
     /// Feed bytes through a tap the way the view's reader thread would.
     fn feed(tap: &RemotePaneTap, bytes: &[u8]) {
@@ -732,5 +760,37 @@ mod remote_tap_tests {
         assert_eq!(*sink.lock().unwrap(), b"echo hi\r".to_vec());
         tap.write_raw(&[0x03]);
         assert_eq!(sink.lock().unwrap().as_slice(), b"echo hi\r\x03");
+    }
+
+    /// The reader marks the tap closed on EOF and on read error — the settle
+    /// tick's only signal that a hidden dock's shell died.
+    #[test]
+    fn tee_reader_marks_the_tap_closed_on_eof_and_error() {
+        // EOF: a reader whose stream ends (shell exited).
+        let (tap, _) = RemotePaneTap::in_memory();
+        tap.arm();
+        let mut eof = TeeReader {
+            inner: Box::new(std::io::Cursor::new(b"last words".to_vec())),
+            tee: tap.tee.clone(),
+        };
+        let mut buf = Vec::new();
+        eof.read_to_end(&mut buf).unwrap();
+        assert_eq!(tap.take_output(), b"last words".to_vec());
+        assert!(tap.is_closed());
+
+        // Error: EIO once the slave side is fully gone (Linux PTY).
+        let (tap, _) = RemotePaneTap::in_memory();
+        struct Broken;
+        impl std::io::Read for Broken {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::Other))
+            }
+        }
+        let mut err = TeeReader {
+            inner: Box::new(Broken),
+            tee: tap.tee.clone(),
+        };
+        assert!(err.read(&mut buf).is_err());
+        assert!(tap.is_closed());
     }
 }

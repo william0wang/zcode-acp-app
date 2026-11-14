@@ -600,6 +600,16 @@ impl TerminalRegistry {
         let Some(t) = self.terminals.get_mut(session_id) else {
             return Vec::new();
         };
+        // Idempotent: the death is reported once. The settle tick and the
+        // view's exit callback can both race here (and the phone `close`
+        // races the pane it closes); a re-open after `gone` is driven by
+        // `open`, which resets the state before this can re-fire. BUT a
+        // record parked `gone` by `detach_all` with its running turn KEPT
+        // (for the post-reconnect replay) still owes that turn a settle —
+        // if the pane died while disconnected, this is the only report.
+        if t.state == TermState::Gone && t.turn.is_none() {
+            return Vec::new();
+        }
         let mut appended = Vec::new();
         if t.turn.take().is_some() {
             if let Some(note) = running_note {
@@ -866,6 +876,34 @@ mod tests {
         let frames = r.pane_gone("s1");
         assert!(frames[0].contains("\"kind\":\"note\""));
         assert!(!r.turn_running("s1"));
+    }
+
+    #[test]
+    fn pane_gone_is_reported_once() {
+        let mut r = ready_terminal();
+        r.turn_start("s1", "x", 0).unwrap();
+        assert!(!r.pane_gone("s1").is_empty());
+        // The settle tick and the view's exit callback can both report the
+        // death; the second report must not re-narrate it.
+        assert!(r.pane_gone("s1").is_empty());
+        assert!(r.close("s1").is_empty());
+    }
+
+    #[test]
+    fn pane_gone_settles_a_detached_records_kept_turn() {
+        // detach_all parks records gone but KEEPS a running turn for the
+        // post-reconnect replay. If the pane died while disconnected, the
+        // settle tick's pane_gone must still settle it — the idempotence
+        // guard must not swallow a kept turn's only report.
+        let mut r = ready_terminal();
+        r.turn_start("s1", "exit", 0).unwrap();
+        r.detach_all();
+        let frames = r.pane_gone("s1");
+        assert!(frames[0].contains("\"kind\":\"note\""));
+        assert!(frames[0].contains("\"kind\":\"close\""));
+        assert!(!r.turn_running("s1"));
+        // And now that the turn is settled, a second report is a no-op.
+        assert!(r.pane_gone("s1").is_empty());
     }
 
     #[test]

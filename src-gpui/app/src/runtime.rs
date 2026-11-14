@@ -5672,6 +5672,27 @@ impl Driver {
             }
             self.terminal_send(hub_frames);
         }
+
+        // A dead pane reports through its tap, not the view: the view's exit
+        // callback only fires on render, and a HIDDEN dock never renders — a
+        // shell exiting there (`exit`, kill) would hang a running turn
+        // forever. EOF on the tap's reader means a dead shell, so sweep the
+        // taps every tick: settle like a pane death, then ask the workbench
+        // to close the pane view itself.
+        let dead: Vec<String> = self
+            .terminal_handles
+            .iter()
+            .filter(|(_, tap)| tap.is_closed())
+            .map(|(s, _)| s.clone())
+            .collect();
+        for session_id in dead {
+            self.terminal_handles.remove(&session_id);
+            let frames = self.terminals.pane_gone(&session_id);
+            self.terminal_send(frames);
+            if let Some(tab) = self.tab_for_session(&session_id) {
+                let _ = self.ev_tx.send(RuntimeEvent::TerminalClosePane { tab });
+            }
+        }
     }
 
     // ---- usage statistics (config page "usage" / "usagePlatform") ----
@@ -11670,6 +11691,58 @@ mod remote_terminal_driver_tests {
             RuntimeEvent::TerminalClosePane { tab: t } => assert_eq!(t, tab),
             _ => panic!("expected TerminalClosePane"),
         }
+    }
+
+    /// A pane whose reader hit EOF while its turn runs — the hidden-dock
+    /// `exit` case: the settle tick (not the never-firing exit callback)
+    /// settles the turn and asks for the pane's close.
+    #[tokio::test]
+    async fn terminal_dead_tap_settles_the_turn_and_closes_the_pane() {
+        let (mut d, wire, mut ev_rx) = harness();
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"open","sessionId":"s1"}),
+        );
+        let tab = match ev_rx.try_recv().unwrap() {
+            RuntimeEvent::TerminalSpawnPane { tab, .. } => tab,
+            _ => panic!("expected TerminalSpawnPane"),
+        };
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneResult {
+                session_id: "s1".to_string(),
+                result: Ok(tap.clone()),
+            },
+            0,
+        );
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"turn","sessionId":"s1","command":"exit"}),
+        );
+        // The shell dies before its OSC 641 marker: reader EOF only.
+        tap.feed_eof_for_test();
+        let before = wire.sent.lock().unwrap().len();
+        d.tick(1_000);
+        {
+            let sent = wire.sent.lock().unwrap();
+            let kinds: Vec<&str> = sent[before]["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["kind"].as_str().unwrap())
+                .collect();
+            assert_eq!(kinds, vec!["note", "close"]);
+            assert_eq!(sent[before + 1]["terminal"]["state"], "gone");
+        }
+        assert!(!d.terminals.turn_running("s1"));
+        match ev_rx.try_recv().unwrap() {
+            RuntimeEvent::TerminalClosePane { tab: t } => assert_eq!(t, tab),
+            _ => panic!("expected TerminalClosePane"),
+        }
+        // Idempotent: the next tick stays quiet.
+        let quiet = wire.sent.lock().unwrap().len();
+        d.tick(2_000);
+        assert_eq!(wire.sent.lock().unwrap().len(), quiet);
     }
 
     /// The pane dying mid-turn settles the turn with a note.
