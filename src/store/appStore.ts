@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { AcpConnection } from "../lib/acp";
 import { HubApiError, HubClient } from "../lib/hub";
+import { closeTerminal as dropTerminalLink } from "../lib/terminalSession";
 import { rememberLaunch } from "../lib/workflow-launches";
 import {
   defaultServerName,
@@ -1943,6 +1944,7 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       saveServerBook({ servers, activeId });
       discoveryFailures = 0;
+      dropTerminalLink();
       set({
         savedServers: servers,
         activeServerId: activeId,
@@ -1959,6 +1961,7 @@ export const useAppStore = create<AppState>((set, get) => {
 
     disconnectHub: () => {
       teardownConnection();
+      dropTerminalLink();
       saveServerBook({ servers: get().savedServers, activeId: null });
       savePending({});
       set({
@@ -1977,6 +1980,7 @@ export const useAppStore = create<AppState>((set, get) => {
       const target = get().savedServers.find((x) => x.id === id);
       if (!target) return;
       teardownConnection();
+      dropTerminalLink();
       saveServerBook({ servers: get().savedServers, activeId: id });
       savePending({});
       discoveryFailures = 0;
@@ -2027,6 +2031,7 @@ export const useAppStore = create<AppState>((set, get) => {
       teardownConnection();
       saveServerBook({ servers, activeId: null });
       savePending({});
+      dropTerminalLink();
       set({
         savedServers: servers,
         activeServerId: null,

@@ -1,16 +1,19 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ArrowUp, ChevronLeft, Square } from "lucide-react";
 import {
-  TerminalConnection,
   loadHistory,
-  mergeEvents,
   pushHistory,
-  registryRestarted,
   type TerminalConnState,
   type TerminalEvent,
   type TerminalInfo,
 } from "../lib/remoteTerminal";
+import {
+  ensureTerminal,
+  terminalConn,
+  terminalLog,
+  useTerminalLive,
+} from "../lib/terminalSession";
 import { useBackHandler } from "../lib/backNav";
 import { useAppStore } from "../store/appStore";
 
@@ -18,8 +21,9 @@ import { useAppStore } from "../store/appStore";
 // the desktop workbench's session terminal. The transcript is the workbench's
 // seq-numbered event log folded by seq (reconnect replays deduplicate); the
 // composer submits one-line turns; a running turn swaps it to an interrupt.
-// Leaving the screen drops only the socket — the desktop pane stays alive
-// for walk-back continuity.
+// The terminal itself lives in lib/terminalSession — leaving this screen
+// keeps the socket and the warm transcript (the pane stays alive on the
+// desktop either way), so re-entry is instant and never spawns a new pane.
 
 function fmtDuration(ms: number | undefined): string {
   if (typeof ms !== "number" || ms < 0) return "";
@@ -102,59 +106,33 @@ export function TerminalScreen() {
   const { t } = useTranslation();
   const target = useAppStore((s) => s.terminalTarget);
   const profile = useAppStore((s) => s.profile);
-  const closeTerminal = useAppStore((s) => s.closeTerminal);
+  const closeTerminalScreen = useAppStore((s) => s.closeTerminal);
 
-  const [conn, setConn] = useState<TerminalConnState>("connecting");
-  const [terminal, setTerminal] = useState<TerminalInfo | null>(null);
-  const [transcript, setTranscript] = useState<TerminalEvent[]>([]);
-  const [error, setError] = useState<{ code: string; message: string } | null>(null);
+  const live = useTerminalLive();
   const [input, setInput] = useState("");
 
-  // The fold map is the source of truth; the transcript snapshot is derived
-  // (sorted by seq) so renders stay ordered across chunked replay bursts.
-  const logRef = useRef(new Map<number, TerminalEvent>());
+  // Input history is local to the composer; everything terminal-shaped is
+  // owned by the session holder and survives this screen.
   const historyRef = useRef<string[]>([]);
   const histIdxRef = useRef<number | null>(null);
   const draftRef = useRef("");
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const connRef = useRef<TerminalConnection | null>(null);
 
   useEffect(() => {
     if (!profile || !target) return;
-    logRef.current = new Map();
     historyRef.current = loadHistory();
     histIdxRef.current = null;
-    setTerminal(null);
-    setTranscript([]);
-    setError(null);
-    const c = new TerminalConnection(profile.hubUrl, profile.token, target.sessionId, {
-      onState: setConn,
-      onTerminal: (terminal) => {
-        // The state frame precedes the open replay: a registry restart
-        // (workbench relaunch) resets the seq space — drop the old epoch
-        // before folding instead of interleaving two of them.
-        if (registryRestarted(logRef.current, terminal.lastSeq)) {
-          logRef.current.clear();
-          setTranscript([]);
-        }
-        setTerminal(terminal);
-      },
-      onEvents: (events) => {
-        mergeEvents(logRef.current, events);
-        setTranscript([...logRef.current.values()].sort((a, b) => a.seq - b.seq));
-      },
-      onError: (code, message) => setError({ code, message }),
-    });
-    connRef.current = c;
-    c.connect();
-    return () => {
-      connRef.current = null;
-      c.close();
-    };
-    // One connection per overlay mount: the effect re-runs only if the
-    // profile itself changes underneath (server switch closes the overlay).
+    ensureTerminal(profile.hubUrl, profile.token, target.sessionId, target.title);
+    // No cleanup: the connection outlives the screen by design. It is closed
+    // by opening another session's terminal or a hub/server reset.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [profile?.hubUrl, profile?.token, target?.sessionId]);
+
+  const transcript = useMemo(() => {
+    void live?.version; // re-derive on transcript churn
+    return [...terminalLog().values()].sort((a, b) => a.seq - b.seq);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live?.version, live?.sessionId]);
 
   // Follow the tail unless the user scrolled up to read.
   useEffect(() => {
@@ -165,23 +143,24 @@ export function TerminalScreen() {
   }, [transcript]);
 
   useBackHandler(() => {
-    closeTerminal();
+    closeTerminalScreen();
     return true;
   });
 
+  const conn = live?.conn ?? "connecting";
+  const terminal = live?.terminal ?? null;
   const running = terminal?.turn?.state === "running";
   const canSend = conn === "open" && terminal?.state === "ready" && !running;
 
   const submit = () => {
     const command = input.trim();
     if (!command || !canSend) return;
-    connRef.current?.sendCommand(command);
+    terminalConn()?.sendCommand(command);
     pushHistory(command);
     historyRef.current = loadHistory();
     histIdxRef.current = null;
     draftRef.current = "";
     setInput("");
-    setError(null);
   };
 
   // Up/down recall (shell convention): up walks back through history from
@@ -208,13 +187,13 @@ export function TerminalScreen() {
   };
 
   if (!target) return null;
-  const cwd = terminal?.cwd;
+  const error = live?.error ?? null;
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-canvas text-ink">
       <header className="flex shrink-0 items-center gap-1 border-b border-hairline px-1.5 pb-2 pt-[max(var(--safe-top),0.5rem)]">
         <button
-          onClick={closeTerminal}
+          onClick={closeTerminalScreen}
           aria-label={t("common.back")}
           className="flex size-9 shrink-0 items-center justify-center rounded-lg text-dim active:bg-white/[0.06]"
         >
@@ -222,9 +201,11 @@ export function TerminalScreen() {
         </button>
         <div className="min-w-0 flex-1">
           <h1 className="truncate text-sm font-semibold">
-            {target.title || t("chat.untitled")}
+            {live?.title || target.title || t("chat.untitled")}
           </h1>
-          {cwd && <p className="truncate font-mono text-[10px] text-faint">{cwd}</p>}
+          {terminal?.cwd && (
+            <p className="truncate font-mono text-[10px] text-faint">{terminal.cwd}</p>
+          )}
         </div>
         <ConnChip conn={conn} terminal={terminal} />
       </header>
@@ -263,7 +244,7 @@ export function TerminalScreen() {
               </span>
             </div>
             <button
-              onClick={() => connRef.current?.interrupt()}
+              onClick={() => terminalConn()?.interrupt()}
               aria-label={t("remoteTerminal.interrupt")}
               className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-red-500/15 text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/25"
             >

@@ -8,6 +8,7 @@ import {
   FolderOpen,
   Menu,
   SlidersHorizontal,
+  SquareTerminal,
 } from "lucide-react";
 import { ChatView } from "../chat/ChatView";
 import { Drawer } from "../components/Drawer";
@@ -21,6 +22,7 @@ import { ElicitationDialog } from "../components/ElicitationDialog";
 import { Spinner } from "../components/Spinner";
 import { ConfigScreenHost } from "./ConfigScreenHost";
 import { useBackHandler } from "../lib/backNav";
+import { useTerminalLive } from "../lib/terminalSession";
 import { useAppStore, type PlanEntry } from "../store/appStore";
 
 function baseName(path: string | undefined): string {
@@ -104,6 +106,12 @@ export function ChatScreen() {
   const notify = useAppStore((s) => s.notify);
   const configOpen = useAppStore((s) => s.configOpen);
   const closeSession = useAppStore((s) => s.closeSession);
+  const openTerminal = useAppStore((s) => s.openTerminal);
+  // Remote Terminal (ADR-0011) is session-bound: the header button always
+  // re-enters THIS session's one terminal (idempotent open, warm transcript).
+  // The dot carries the background state — amber pulse while a turn runs,
+  // blue while the socket is up.
+  const terminalLive = useTerminalLive();
 
   // Route-level back: leave the session for the picker. Overlays mounted on
   // top (drawer, panels, file browser, config screens) register later and so
@@ -242,6 +250,21 @@ export function ChatScreen() {
           className={`mr-1.5 size-2 shrink-0 rounded-full ${statusDot}`}
           aria-label={connState}
         />
+        {activeSessionId && (
+          <button
+            onClick={() => openTerminal(activeSessionId, session?.title)}
+            aria-label={t("remoteTerminal.openAction")}
+            className="relative mr-1 flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          >
+            <SquareTerminal className="size-5" />
+            {terminalLive?.sessionId === activeSessionId &&
+              (terminalLive.terminal?.turn?.state === "running" ? (
+                <span className="absolute right-1.5 top-1.5 size-1.5 animate-pulse rounded-full bg-amber-400" />
+              ) : terminalLive.conn === "open" ? (
+                <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-blue-400/70" />
+              ) : null)}
+          </button>
+        )}
         {fsCapable && (
           <button
             onClick={() => setFilesOpen(true)}
