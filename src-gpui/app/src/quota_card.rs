@@ -7,9 +7,7 @@
 //! - one row implementation shared with the plan page
 //!   (`quota_page::quota_bar_row`), so the surfaces cannot drift apart;
 //! - the sections the hub reports, in the CLI card's order: GLM Coding Plan,
-//!   Opencode Go, Ollama Cloud, plus the CLIProxy pool the server added
-//!   after the TS card was written (bridge 0.66; the protocol decodes it,
-//!   so hiding it would repeat the very gap this card closes);
+//!   Opencode Go, Ollama Cloud;
 //! - status prose for the non-success kinds, verbatim from the CLI card.
 //!
 //! Hidden entirely until the first read answers (TS `if (!quotaUnavailable
@@ -155,27 +153,6 @@ fn render_sections(theme: &Theme, usage: &AccountUsageStats) -> Vec<AnyElement> 
             ollama = ollama.child(status_line(theme, oc_status(&oc.kind)));
         }
         out.push(ollama.into_any_element());
-    }
-
-    // The CLIProxy pool (bridge 0.66): the combined per-window rows — the
-    // per-account breakdown stays with the CLI, like GLM's per-model detail.
-    if let Some(cp) = usage.cliproxy.as_ref().filter(|c| c.kind != "not_configured") {
-        out.push(section_label(theme, "CLIProxy Gemini".to_string(), true));
-        let mut cliproxy = div().id("quota-card-cliproxy").test_support().flex().flex_col();
-        if cp.kind == "success" {
-            for w in cp.combined.iter().flatten() {
-                cliproxy = cliproxy.child(quota_bar_row(
-                    theme,
-                    &w.window,
-                    w.used_percent,
-                    w.resets_at,
-                    None,
-                ));
-            }
-        } else {
-            cliproxy = cliproxy.child(status_line(theme, go_status(&cp.kind)));
-        }
-        out.push(cliproxy.into_any_element());
     }
 
     out

@@ -217,46 +217,23 @@ export function QuotaSection() {
               </>
             )}
 
-            {usageStats.ollama && usageStats.ollama.kind !== "not_configured" && (
-              <>
-                <SectionLabel title="Ollama Cloud" divided />
-                {usageStats.ollama.kind === "success" ? (
-                  usageStats.ollama.windows?.map((w) => (
-                    <QuotaRow
-                      key={w.key}
-                      label={w.label}
-                      percent={w.usagePercent}
-                      resetMs={w.resetsAt}
-                    />
-                  ))
-                ) : (
-                  <p className="px-4 py-1 text-xs text-faint">
-                    {OC_STATUS[usageStats.ollama.kind] ?? OC_STATUS.unavailable}
-                  </p>
-                )}
-              </>
-            )}
-
-            {/* CLIProxy pool (bridge 0.66): the combined per-window rows — the
-                per-account breakdown stays with the CLI, like GLM's per-model
-                detail. Parity with the desktop card's section. */}
-            {usageStats.cliproxy &&
-              usageStats.cliproxy.kind !== "not_configured" && (
+            {usageStats.ollama &&
+              usageStats.ollama.kind !== "not_configured" && (
                 <>
-                  <SectionLabel title="CLIProxy Gemini" divided />
-                  {usageStats.cliproxy.kind === "success" ? (
-                    usageStats.cliproxy.combined?.map((w) => (
+                  <SectionLabel title="Ollama Cloud" divided />
+                  {usageStats.ollama.kind === "success" ? (
+                    usageStats.ollama.windows?.map((w) => (
                       <QuotaRow
-                        key={w.window}
-                        label={w.window}
-                        percent={w.usedPercent}
+                        key={w.key}
+                        label={w.label}
+                        percent={w.usagePercent}
                         resetMs={w.resetsAt}
                       />
                     ))
                   ) : (
                     <p className="px-4 py-1 text-xs text-faint">
-                      {GO_STATUS[usageStats.cliproxy.kind] ??
-                        GO_STATUS.unavailable}
+                      {OC_STATUS[usageStats.ollama.kind] ??
+                        OC_STATUS.unavailable}
                     </p>
                   )}
                 </>

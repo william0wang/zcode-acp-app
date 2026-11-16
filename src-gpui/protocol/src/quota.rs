@@ -4,7 +4,7 @@
 //!
 //! Server reference: `src/handlers/account.ts` (`UsageStatsResult`) plus
 //! `src/quota/types.ts` (`QuotaItem`), `src/quota/opencode-go`,
-//! `src/quota/ollama-cloud`, `src/quota/cliproxy` for the section shapes.
+//! `src/quota/ollama-cloud` for the section shapes.
 //! GLM items pass through verbatim (counts, reset timestamps, per-model
 //! details); Go windows carry the countdown resolved to absolute epoch ms.
 
@@ -148,59 +148,12 @@ pub struct OllamaUsageStats {
     pub usage: Option<OcUsageDetail>,
 }
 
-/// One CLIProxy window: a model family's usage fraction as percent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CpWindowEntry {
-    /// "5h" | "week" — kept permissive (String) like the other vocab fields.
-    pub window: String,
-    pub used_percent: f64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resets_at: Option<u64>,
-}
-
-/// One CLIProxy Gemini model family and its per-window usage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CpModelEntry {
-    pub name: String,
-    pub windows: Vec<CpWindowEntry>,
-}
-
-/// One CLIProxy Gemini account and its per-family usage.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CpAccountEntry {
-    pub label: String,
-    pub models: Vec<CpModelEntry>,
-}
-
-/// CLIProxy section — `accounts` (per-subscription detail) and `combined`
-/// (pool-wide per-window rows) present only on success.
-///
-/// Divergence note (server wins): the ENTIRE section is absent from the TS
-/// type — the server added it with the CLIProxyAPI quota card (bridge 0.66,
-/// handlers/account.ts `CpUsageStats`). Optional here so older-hub payloads
-/// (the hub-first lookup tolerates them) still decode.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CpUsageStats {
-    pub kind: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accounts: Option<Vec<CpAccountEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub combined: Option<Vec<CpWindowEntry>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub other_accounts: Option<u64>,
-}
-
 /// `/api/quota` and `account/usage_stats` result (server `UsageStatsResult`,
-/// handlers/account.ts:123).
+/// handlers/account.ts).
 ///
-/// Divergence note (server wins): the server now ALWAYS sends `ollama` and
-/// `cliproxy`; the TS type carries `ollama?` (bridge <0.41 tolerance) and no
-/// `cliproxy` at all. Both stay optional for cross-version payload tolerance,
-/// exactly like the TS `ollama?`.
+/// Divergence note (server wins): the server now ALWAYS sends `ollama`; the
+/// TS type carries `ollama?` (bridge <0.41 tolerance). Stays optional for
+/// cross-version payload tolerance, exactly like the TS `ollama?`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountUsageStats {
@@ -208,6 +161,4 @@ pub struct AccountUsageStats {
     pub opencode: GoUsageStats,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ollama: Option<OllamaUsageStats>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cliproxy: Option<CpUsageStats>,
 }

@@ -5,11 +5,11 @@
 // This is a regression lock, not general coverage: `parseUsageStats` rebuilds
 // the payload field by field instead of passing it through, so a section the
 // parser does not know about is discarded before any screen can render it.
-// That is exactly how the CLIProxy section shipped twice — the types and the
-// card were added, the parser was not, and the rows were dropped in silence.
-// The assertion is therefore on the STORE STATE after a real refresh, never on
-// a locally re-implemented decode: a copy would pass while the app drops the
-// data.
+// That is exactly how a section shipped twice historically (the CLIProxy pool,
+// later removed) — the types and the card were added, the parser was not, and
+// the rows were dropped in silence. The assertion is therefore on the STORE
+// STATE after a real refresh, never on a locally re-implemented decode: a copy
+// would pass while the app drops the data.
 import { beforeAll, beforeEach, expect, test, vi } from "vitest";
 
 interface FakeResponse {
@@ -58,9 +58,8 @@ const ok = (body: unknown): FakeResponse => ({
 });
 
 /**
- * The shape a bridge 0.66+ hub answers for /api/quota: the three long-standing
- * sections plus the CLIProxy pool. `combined` is the pool-wide row set the
- * card paints; `accounts` is the per-subscription detail it ignores.
+ * The shape a current bridge hub answers for /api/quota: the GLM, Opencode Go,
+ * and Ollama Cloud sections.
  */
 function hubQuotaPayload() {
   return {
@@ -69,47 +68,47 @@ function hubQuotaPayload() {
       level: "pro",
       items: [
         { key: "five_hour", label: "5h limit", usedPercent: 12 },
-        { key: "mcp", label: "MCP tools", usedPercent: 5, usedCount: 5, totalCount: 100 },
+        {
+          key: "mcp",
+          label: "MCP tools",
+          usedPercent: 5,
+          usedCount: 5,
+          totalCount: 100,
+        },
       ],
     },
     opencode: {
       kind: "success",
       windows: [
-        { key: "rolling", label: "5h", usagePercent: 8, resetsAt: 1_792_000_000_000 },
+        {
+          key: "rolling",
+          label: "5h",
+          usagePercent: 8,
+          resetsAt: 1_792_000_000_000,
+        },
       ],
     },
     ollama: {
       kind: "success",
       windows: [
-        { key: "weekly", label: "Week", usagePercent: 3, resetsAt: 1_792_100_000_000 },
-      ],
-    },
-    cliproxy: {
-      kind: "success",
-      accounts: [
         {
-          label: "antutu1ww",
-          models: [
-            {
-              name: "Gemini Models",
-              windows: [
-                { window: "5h", usedPercent: 0, resetsAt: 1_792_499_907_000 },
-                { window: "week", usedPercent: 4.222184, resetsAt: 1_792_905_568_000 },
-              ],
-            },
-          ],
+          key: "weekly",
+          label: "Week",
+          usagePercent: 3,
+          resetsAt: 1_792_100_000_000,
+        },
+        {
+          key: "monthly",
+          label: "Month",
+          usagePercent: 6,
+          resetsAt: 1_792_200_000_000,
         },
       ],
-      combined: [
-        { window: "week", usedPercent: 2.8815745, resetsAt: 1_792_718_293_000 },
-        { window: "5h", usedPercent: 0, resetsAt: 1_792_499_907_000 },
-      ],
-      otherAccounts: 2,
     },
   };
 }
 
-test("the CLIProxy pool survives the quota decode", async () => {
+test("the ollama section survives the quota decode", async () => {
   routes.push({ match: "/api/quota/dock", res: ok({ formatted: null }) });
   routes.push({ match: "/api/quota", res: ok(hubQuotaPayload()) });
 
@@ -119,24 +118,24 @@ test("the CLIProxy pool survives the quota decode", async () => {
 
   const stats = useAppStore.getState().usageStats;
   expect(stats).not.toBeNull();
-  expect(stats?.cliproxy).toBeDefined();
-  expect(stats?.cliproxy?.kind).toBe("success");
-  expect(stats?.cliproxy?.combined).toHaveLength(2);
-  expect(stats?.cliproxy?.combined?.[0]).toEqual({
-    window: "week",
-    usedPercent: 2.8815745,
-    resetsAt: 1_792_718_293_000,
+  expect(stats?.ollama).toBeDefined();
+  expect(stats?.ollama?.kind).toBe("success");
+  expect(stats?.ollama?.windows).toHaveLength(2);
+  expect(stats?.ollama?.windows?.[0]).toEqual({
+    key: "weekly",
+    label: "Week",
+    usagePercent: 3,
+    resetsAt: 1_792_100_000_000,
   });
-  expect(stats?.cliproxy?.otherAccounts).toBe(2);
 });
 
-test("a configured-but-failing pool keeps its kind instead of vanishing", async () => {
+test("a configured-but-failing ollama section keeps its kind instead of vanishing", async () => {
   // auth_error / unavailable are what the card's status line renders. Losing
   // the section entirely would hide the failure behind an absent heading.
   routes.push({ match: "/api/quota/dock", res: ok({ formatted: null }) });
   routes.push({
     match: "/api/quota",
-    res: ok({ ...hubQuotaPayload(), cliproxy: { kind: "auth_error" } }),
+    res: ok({ ...hubQuotaPayload(), ollama: { kind: "auth_error" } }),
   });
 
   const useAppStore = await store();
@@ -144,13 +143,13 @@ test("a configured-but-failing pool keeps its kind instead of vanishing", async 
   await useAppStore.getState().refreshUsageStats();
 
   const stats = useAppStore.getState().usageStats;
-  expect(stats?.cliproxy?.kind).toBe("auth_error");
-  expect(stats?.cliproxy?.combined).toBeUndefined();
+  expect(stats?.ollama?.kind).toBe("auth_error");
+  expect(stats?.ollama?.windows).toBeUndefined();
 });
 
-test("a pre-0.66 hub without the section still decodes the older three", async () => {
+test("a pre-0.41 hub without the ollama section still decodes the older two", async () => {
   const legacy = hubQuotaPayload() as Record<string, unknown>;
-  delete legacy.cliproxy;
+  delete legacy.ollama;
   routes.push({ match: "/api/quota/dock", res: ok({ formatted: null }) });
   routes.push({ match: "/api/quota", res: ok(legacy) });
 
@@ -160,8 +159,7 @@ test("a pre-0.66 hub without the section still decodes the older three", async (
 
   const stats = useAppStore.getState().usageStats;
   expect(stats).not.toBeNull();
-  expect(stats?.cliproxy).toBeUndefined();
+  expect(stats?.ollama).toBeUndefined();
   expect(stats?.glm.kind).toBe("success");
   expect(stats?.opencode.windows).toHaveLength(1);
-  expect(stats?.ollama?.windows).toHaveLength(1);
 });

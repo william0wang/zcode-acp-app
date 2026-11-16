@@ -25,9 +25,9 @@
 //! - upgrade.json              — hub-server.ts:2180-2187, reason vocabulary
 //!                               from diskCodeIsNewer (:1098-1103).
 //! - fs-listing.json           — remote/file-endpoint.ts:187-192, 245.
-//! - quota.json                — handlers/account.ts:123-128 (sections),
+//! - quota.json                — handlers/account.ts (sections),
 //!                               quota/types.ts:38-55 (QuotaItem),
-//!                               account.ts:57-121 (Oc/Cp entries).
+//!                               account.ts (Oc entries).
 //! - settings-all.json         — remote/settings-endpoint.ts:631-672,
 //!                               usage snapshot from settings/usage-stats.ts:106-125.
 //! - settings-usage.json       — settings/usage-stats.ts:87-125, 161-281.
@@ -62,14 +62,12 @@
 //! 3. `AccountUsageStats.ollama` — TS optional (types.ts:212, bridge <0.41
 //!    tolerance); server ALWAYS sends it (handlers/account.ts:126). Rust
 //!    keeps it optional for cross-version payloads; current hubs satisfy it.
-//! 4. `AccountUsageStats.cliproxy` — TS has NO such section; server added it
-//!    with the CLIProxyAPI quota card (handlers/account.ts:116-127; release
-//!    0.66 "feat: add the CLIProxyAPI quota card"). Rust models
-//!    `CpUsageStats` (+ windows/accounts/combined/otherAccounts) as an
-//!    optional section.
+//! 4. `AccountUsageStats.cliproxy` — REMOVED together with the server's
+//!    CLIProxyAPI quota card; older hubs may still send the section and serde
+//!    ignores the unknown field (no `deny_unknown_fields`).
 //! 5. `OllamaUsageStats.usage` — TS has no spend detail; server attaches
 //!    `OcUsageDetail` when the analytics API reports a spend
-//!    (handlers/account.ts:71-88). Rust adds it.
+//!    (handlers/account.ts). Rust adds it.
 //! 6. `SettingsUsage` — TS names a 3-field summary and a non-nullable
 //!    `modelId` with optional counters (types.ts:467-485); the server sends
 //!    an 11-field summary, every counter required, and a NULLABLE modelId,
@@ -447,7 +445,7 @@ fn workflow_gate_set_round_trip() {
 
 #[test]
 fn quota_round_trip() {
-    // Divergences #2-#5 (leftPercent, cliproxy section, ollama usage detail).
+    // Divergences #2/#3/#5 (leftPercent, optional ollama, usage detail).
     assert_round_trip::<AccountUsageStats>("quota.json");
 }
 

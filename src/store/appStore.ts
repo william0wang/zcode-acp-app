@@ -46,11 +46,9 @@ import {
   type AttachmentDraft,
   type ChatMessage,
   type ChatPart,
-  type CliproxyUsageStats,
   type ConfigOption,
   type ConnectionProfile,
   type ContextUsage,
-  type CpWindowEntry,
   type FsListing,
   type GoUsageStats,
   type GoWindowEntry,
@@ -95,7 +93,8 @@ function cacheHitRate(u: unknown): number | null {
   if (!v || typeof v !== "object") return null;
   if (typeof v.cachedReadTokens !== "number") return null;
   const input = typeof v.inputTokens === "number" ? v.inputTokens : 0;
-  const write = typeof v.cachedWriteTokens === "number" ? v.cachedWriteTokens : 0;
+  const write =
+    typeof v.cachedWriteTokens === "number" ? v.cachedWriteTokens : 0;
   const denom = input + v.cachedReadTokens + write;
   return denom > 0 ? Math.round((v.cachedReadTokens / denom) * 100) : null;
 }
@@ -109,7 +108,6 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
     glm?: unknown;
     opencode?: unknown;
     ollama?: unknown;
-    cliproxy?: unknown;
   };
   if (typeof r.glm !== "object" || r.glm === null) return null;
   if (typeof r.opencode !== "object" || r.opencode === null) return null;
@@ -120,10 +118,6 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
     typeof r.ollama === "object" && r.ollama !== null
       ? (r.ollama as Partial<OllamaUsageStats>)
       : undefined;
-  const cp =
-    typeof r.cliproxy === "object" && r.cliproxy !== null
-      ? (r.cliproxy as Partial<CliproxyUsageStats>)
-      : undefined;
   const items = Array.isArray(glm.items)
     ? glm.items.filter((it) => it && typeof it.usedPercent === "number")
     : undefined;
@@ -133,18 +127,18 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
 
   return {
     glm: {
-      kind: (["success", "auth_error", "rate_limited", "unavailable"] as const).includes(
-        glm.kind as GlmUsageStats["kind"],
-      )
+      kind: (
+        ["success", "auth_error", "rate_limited", "unavailable"] as const
+      ).includes(glm.kind as GlmUsageStats["kind"])
         ? (glm.kind as GlmUsageStats["kind"])
         : "unavailable",
       ...(typeof glm.level === "string" ? { level: glm.level } : {}),
       ...(items ? { items: items as QuotaItem[] } : {}),
     },
     opencode: {
-      kind: (["success", "not_configured", "auth_error", "unavailable"] as const).includes(
-        go.kind as GoUsageStats["kind"],
-      )
+      kind: (
+        ["success", "not_configured", "auth_error", "unavailable"] as const
+      ).includes(go.kind as GoUsageStats["kind"])
         ? (go.kind as GoUsageStats["kind"])
         : "unavailable",
       ...(windows ? { windows: windows as GoWindowEntry[] } : {}),
@@ -153,9 +147,14 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
     ...(oc
       ? {
           ollama: {
-            kind: (["success", "not_configured", "auth_error", "unavailable"] as const).includes(
-              oc.kind as OllamaUsageStats["kind"],
-            )
+            kind: (
+              [
+                "success",
+                "not_configured",
+                "auth_error",
+                "unavailable",
+              ] as const
+            ).includes(oc.kind as OllamaUsageStats["kind"])
               ? (oc.kind as OllamaUsageStats["kind"])
               : "unavailable",
             ...(Array.isArray(oc.windows)
@@ -164,30 +163,6 @@ function parseUsageStats(result: unknown): AccountUsageStats | null {
                     (w) => w && typeof w.usagePercent === "number",
                   ) as OcWindowEntry[],
                 }
-              : {}),
-          },
-        }
-      : {}),
-    // CLIProxy section is optional — pre-0.66.0 bridges don't send it. The
-    // pool-wide `combined` rows are what the card renders; the per-account
-    // breakdown stays on the CLI like GLM's per-model detail.
-    ...(cp
-      ? {
-          cliproxy: {
-            kind: (["success", "not_configured", "auth_error", "unavailable"] as const).includes(
-              cp.kind as CliproxyUsageStats["kind"],
-            )
-              ? (cp.kind as CliproxyUsageStats["kind"])
-              : "unavailable",
-            ...(Array.isArray(cp.combined)
-              ? {
-                  combined: cp.combined.filter(
-                    (w) => w && typeof w.usedPercent === "number",
-                  ) as CpWindowEntry[],
-                }
-              : {}),
-            ...(typeof cp.otherAccounts === "number"
-              ? { otherAccounts: cp.otherAccounts }
               : {}),
           },
         }
@@ -228,7 +203,10 @@ export interface PendingPermission {
 // zcode `questions` array in rawInput, and the popup's toolCallId suffix
 // `_N` (single-select) / `_N_M` (multi-select option) names the question
 // being asked. Undefined when the input is not question-shaped.
-function askQuestionFromWire(toolCallId: unknown, rawInput: unknown): string | undefined {
+function askQuestionFromWire(
+  toolCallId: unknown,
+  rawInput: unknown,
+): string | undefined {
   if (!rawInput || typeof rawInput !== "object") return undefined;
   const questions = (rawInput as { questions?: unknown }).questions;
   if (!Array.isArray(questions)) return undefined;
@@ -258,7 +236,9 @@ export function resolveApprovalContext(
   } | null;
   if (!tc || typeof tc !== "object") return undefined;
   const toolCallId =
-    typeof tc.toolCallId === "string" && tc.toolCallId ? tc.toolCallId : undefined;
+    typeof tc.toolCallId === "string" && tc.toolCallId
+      ? tc.toolCallId
+      : undefined;
   const part = toolCallId ? findToolCallPart(messages, toolCallId) : null;
   const rawInput = tc.rawInput;
   const plan =
@@ -274,14 +254,20 @@ export function resolveApprovalContext(
   let contentText: string | undefined;
   if (Array.isArray(tc.content)) {
     const texts = tc.content
-      .map((b) => (b as { content?: { text?: unknown } } | null)?.content?.text ?? null)
+      .map(
+        (b) =>
+          (b as { content?: { text?: unknown } } | null)?.content?.text ?? null,
+      )
       .filter((t): t is string => typeof t === "string" && t.length > 0);
     if (texts.length > 0) contentText = texts.join("\n\n");
   }
   let rawInputText: string | undefined;
   if (rawInput != null) {
     try {
-      rawInputText = typeof rawInput === "string" ? rawInput : JSON.stringify(rawInput, null, 2);
+      rawInputText =
+        typeof rawInput === "string"
+          ? rawInput
+          : JSON.stringify(rawInput, null, 2);
     } catch {
       rawInputText = String(rawInput);
     }
@@ -291,13 +277,23 @@ export function resolveApprovalContext(
   // whose messages are not loaded), an AskUserQuestion popup still carries
   // everything on the wire — rebuild the question card from it instead of
   // degrading to the raw-JSON pane with a nameless "input" expander.
-  const wireAsk = part ? undefined : askQuestionFromWire(tc.toolCallId, rawInput);
-  if (!toolCallId && rawInputText == null && title == null && contentText == null)
+  const wireAsk = part
+    ? undefined
+    : askQuestionFromWire(tc.toolCallId, rawInput);
+  if (
+    !toolCallId &&
+    rawInputText == null &&
+    title == null &&
+    contentText == null
+  )
     return undefined;
   return {
     toolCallId,
     // Part fields first (richer); title = the wire title stored in toolName.
-    toolName: part?.rawName ?? part?.toolName ?? (wireAsk ? "AskUserQuestion" : undefined),
+    toolName:
+      part?.rawName ??
+      part?.toolName ??
+      (wireAsk ? "AskUserQuestion" : undefined),
     kind: part?.kind,
     title: title ?? part?.toolName,
     detail:
@@ -469,7 +465,11 @@ export interface AppState extends ConfigSlice {
   // (the workflow "create via conversation" entry, and queued drafts returned
   // for editing via editPending). Nonce-keyed so the same text twice still
   // reads as a new request; consumed exactly once.
-  composerPrefill: { text: string; images?: AttachmentDraft[]; nonce: number } | null;
+  composerPrefill: {
+    text: string;
+    images?: AttachmentDraft[];
+    nonce: number;
+  } | null;
   setComposerPrefill: (text: string) => void;
   clearComposerPrefill: () => void;
 
@@ -477,7 +477,11 @@ export interface AppState extends ConfigSlice {
   // Upserts by normalized hubUrl: an existing entry gets the new token and
   // becomes active; otherwise a new entry is appended (name defaults to the
   // URL host). Connecting NEVER drops the other saved servers.
-  connectToHub: (input: { hubUrl: string; token: string; name?: string }) => void;
+  connectToHub: (input: {
+    hubUrl: string;
+    token: string;
+    name?: string;
+  }) => void;
   // Tears the connection down and clears the active selection; the saved
   // server list itself is kept (the manager screen lists them).
   disconnectHub: () => void;
@@ -525,7 +529,10 @@ export interface AppState extends ConfigSlice {
   // with the listing's instance), then attach and session/load the store id —
   // the normal connect path replays the history. Resolves true only on a
   // successful attach (see createProjectSession).
-  resumeProjectSession: (workspacePath: string, sessionId: string) => Promise<boolean>;
+  resumeProjectSession: (
+    workspacePath: string,
+    sessionId: string,
+  ) => Promise<boolean>;
   openSession: (instanceId: string, sessionId: string) => Promise<void>;
   // Foreground wake hook: proves the WS pipe is actually alive (Android deep
   // sleep leaves zombie sockets that never fire onclose) and reconnects if
@@ -544,7 +551,10 @@ export interface AppState extends ConfigSlice {
   // `intent: "auto"` marks a client-automatic load (the reconnect replay):
   // the bridge then answers `_meta.zcode.sessionClosed` for a remotely closed
   // conversation instead of re-arming it, and the store retires it locally.
-  loadSession: (sessionId: string, opts?: { intent?: SessionIntent }) => Promise<void>;
+  loadSession: (
+    sessionId: string,
+    opts?: { intent?: SessionIntent },
+  ) => Promise<void>;
   // Retires a session from remote discovery via the hub's HTTP close
   // endpoint (ADR-0006). Close, not delete — editor-side-still-open
   // conversations self-heal back on their next use. Refused (409 notice)
@@ -564,7 +574,11 @@ export interface AppState extends ConfigSlice {
   // The one-shot auto-title never revises a title; this is the manual path.
   // Updates the local list optimistically; the bridge broadcasts the change
   // to attached clients and the next discovery poll reconciles.
-  renameSession: (instanceId: string, sessionId: string, title: string) => Promise<void>;
+  renameSession: (
+    instanceId: string,
+    sessionId: string,
+    title: string,
+  ) => Promise<void>;
   // Terminates a remote-incubated bridge via the hub's instance shutdown
   // endpoint — the "close the session window" counterpart for app-created
   // instances. Editor-origin bridges are refused server-side (403).
@@ -598,7 +612,10 @@ export interface AppState extends ConfigSlice {
   answerPermission: (requestId: number, optionId: string) => void;
   // Resolves a pending elicitation form: content answers it (accept), null
   // declines. Same first-response-wins race as permissions.
-  answerElicitation: (requestId: number, content: Record<string, string | string[]> | null) => void;
+  answerElicitation: (
+    requestId: number,
+    content: Record<string, string | string[]> | null,
+  ) => void;
   dismissNotice: () => void;
   // Ephemeral UI feedback (download progress, copy confirmations); renders
   // above every overlay and auto-clears.
@@ -654,7 +671,11 @@ export interface AppState extends ConfigSlice {
   // same identity equation as resume/amend). With `instanceId` it rides the
   // hub route and reaches ANY instance's run; the ACP fallback below only
   // reaches the instance the socket is bound to.
-  stopWorkflowRun: (runId: string, sessionId: string, instanceId?: string) => Promise<boolean>;
+  stopWorkflowRun: (
+    runId: string,
+    sessionId: string,
+    instanceId?: string,
+  ) => Promise<boolean>;
   // Best-effort per-session run summaries for the runs list (the `resumable`
   // verdict lives there). Silent on failure: a session the bridge no longer
   // knows simply contributes no summaries and its rows stay read-only.
@@ -733,8 +754,8 @@ const CLOSE_TOMBSTONE_MS = 60_000;
 // tab locally and do not retry (REMOTE-CLIENTS "Closing a session").
 function sessionClosedAnswer(result: unknown): boolean {
   return (
-    (result as { _meta?: { zcode?: { sessionClosed?: unknown } } } | null)?._meta?.zcode
-      ?.sessionClosed === true
+    (result as { _meta?: { zcode?: { sessionClosed?: unknown } } } | null)
+      ?._meta?.zcode?.sessionClosed === true
   );
 }
 
@@ -761,7 +782,9 @@ function filterClosedSessions(list: HubInstance[]): HubInstance[] {
   if (!any) return list;
   return list.map((i) => ({
     ...i,
-    sessions: (i.sessions ?? []).filter((s) => !isSessionTombstoned(s.sessionId)),
+    sessions: (i.sessions ?? []).filter(
+      (s) => !isSessionTombstoned(s.sessionId),
+    ),
   }));
 }
 
@@ -771,7 +794,9 @@ function filterClosedSessions(list: HubInstance[]): HubInstance[] {
 function isTransientConnError(e: unknown): boolean {
   if (e instanceof HubApiError) return e.network;
   const msg = e instanceof Error ? e.message : String(e);
-  return msg.includes("connection closed") || msg.includes("connection not open");
+  return (
+    msg.includes("connection closed") || msg.includes("connection not open")
+  );
 }
 
 function stopReconnect(): void {
@@ -804,7 +829,8 @@ function mergeCreatedSession(
       },
     ];
   const inst = instances[idx];
-  if (inst.sessions.some((x) => x.sessionId === session.sessionId)) return instances;
+  if (inst.sessions.some((x) => x.sessionId === session.sessionId))
+    return instances;
   const next = [...instances];
   next[idx] = {
     ...inst,
@@ -849,7 +875,10 @@ function sameDiscoveryList(a: HubInstance[], b: HubInstance[]): boolean {
 }
 
 // The profile matching the book's active entry (first entry as fallback).
-function activeProfile(servers: SavedServer[], activeId: string | null): ConnectionProfile | null {
+function activeProfile(
+  servers: SavedServer[],
+  activeId: string | null,
+): ConnectionProfile | null {
   const s = servers.find((x) => x.id === activeId) ?? servers[0];
   return s ? { hubUrl: s.hubUrl, token: s.token } : null;
 }
@@ -875,7 +904,8 @@ function connectionResetPatch(): Partial<AppState> {
     configOptions: [],
     currentModeId: null,
     usage: null,
-    cacheHit: null, turnStats: null,
+    cacheHit: null,
+    turnStats: null,
     availableCommands: [],
     usageStats: null,
     quotaDock: null,
@@ -957,7 +987,11 @@ export const useAppStore = create<AppState>((set, get) => {
   // NEW bridge attaches for attach-only clients) into the title-bar readouts.
   // Turns without cache numbers keep the previous rate; tps needs output
   // tokens plus a wall time (absent on foreign turns from an old bridge).
-  function applyTurnUsage(sessionId: string, usage: unknown, seconds?: number): void {
+  function applyTurnUsage(
+    sessionId: string,
+    usage: unknown,
+    seconds?: number,
+  ): void {
     const hit = cacheHitRate(usage);
     const v = usage as { outputTokens?: unknown } | null;
     const outTok = typeof v?.outputTokens === "number" ? v.outputTokens : 0;
@@ -1042,7 +1076,11 @@ export const useAppStore = create<AppState>((set, get) => {
   function schedulePoll(): void {
     if (pollTimer) clearTimeout(pollTimer);
     pollTimer = null;
-    if (typeof document !== "undefined" && document.visibilityState !== "visible") return;
+    if (
+      typeof document !== "undefined" &&
+      document.visibilityState !== "visible"
+    )
+      return;
     if (!get().profile) return; // torn down (disconnect / switch) mid-flight
     const delay = POLL_LADDER_MS[Math.min(pollStep, POLL_LADDER_MS.length - 1)];
     const gen = pollGen;
@@ -1073,12 +1111,14 @@ export const useAppStore = create<AppState>((set, get) => {
 
   // Replay bursts hundreds of updates in one go; batching them into a single
   // store write keeps render cost O(bursts) instead of O(chunks).
-  let updateQueue: { sessionId: string; u: SessionUpdate; meta?: unknown }[] = [];
+  let updateQueue: { sessionId: string; u: SessionUpdate; meta?: unknown }[] =
+    [];
   let flushTimer: ReturnType<typeof setTimeout> | null = null;
   // While a session/load_earlier request is in flight its updates must be
   // PREPENDED, not appended — buffer them until the request resolves.
   let collectingEarlier = false;
-  let earlierBuffer: { sessionId: string; u: SessionUpdate; meta?: unknown }[] = [];
+  let earlierBuffer: { sessionId: string; u: SessionUpdate; meta?: unknown }[] =
+    [];
   // Page updates (marked earlierPage) arriving OUTSIDE the collection window
   // — the load_earlier response already landed. They are replay content by
   // construction, never live, so they must not fall into applyUpdate (that
@@ -1145,7 +1185,10 @@ export const useAppStore = create<AppState>((set, get) => {
         const seam = segment[segment.length - 1];
         segment = segment.slice(0, -1);
         if (segment.length === 0) return {};
-        rest = [{ ...seam, parts: [...seam.parts, ...rest[0].parts] }, ...rest.slice(1)];
+        rest = [
+          { ...seam, parts: [...seam.parts, ...rest[0].parts] },
+          ...rest.slice(1),
+        ];
       }
       return { messages: [...segment, ...rest] };
     });
@@ -1241,7 +1284,11 @@ export const useAppStore = create<AppState>((set, get) => {
     cacheActiveSnapshot();
   }
 
-  function applyUpdate(sessionId: string, u: SessionUpdate, meta?: unknown): void {
+  function applyUpdate(
+    sessionId: string,
+    u: SessionUpdate,
+    meta?: unknown,
+  ): void {
     updateQueue.push({ sessionId, u, meta });
     if (flushTimer) return;
     flushTimer = setTimeout(() => {
@@ -1256,7 +1303,9 @@ export const useAppStore = create<AppState>((set, get) => {
   // (awaiting confirmation > running > just finished > idle).
   function setActivity(
     sessionId: string,
-    patch: Partial<SessionActivity> | ((prev: SessionActivity) => Partial<SessionActivity>),
+    patch:
+      | Partial<SessionActivity>
+      | ((prev: SessionActivity) => Partial<SessionActivity>),
   ): void {
     set((state) => {
       const prev: SessionActivity = state.sessionStates[sessionId] ?? {
@@ -1278,7 +1327,9 @@ export const useAppStore = create<AppState>((set, get) => {
     });
   }
 
-  function buildApprovalContext(params: Record<string, unknown>): ApprovalContext | undefined {
+  function buildApprovalContext(
+    params: Record<string, unknown>,
+  ): ApprovalContext | undefined {
     return resolveApprovalContext(params, get().messages);
   }
 
@@ -1295,7 +1346,8 @@ export const useAppStore = create<AppState>((set, get) => {
   } | null {
     const sessionId = String(params.sessionId ?? "");
     const message = typeof params.message === "string" ? params.message : "";
-    const schema = params.requestedSchema as { properties?: Record<string, unknown> } | undefined;
+    const schema = params.requestedSchema as
+      { properties?: Record<string, unknown> } | undefined;
     const props = schema?.properties;
     if (!sessionId || typeof props !== "object" || props === null) return null;
     const fields: ElicitField[] = [];
@@ -1325,7 +1377,8 @@ export const useAppStore = create<AppState>((set, get) => {
         }));
       fields.push({
         key,
-        otherKey: typeof props[`${key}_other`] === "object" ? `${key}_other` : null,
+        otherKey:
+          typeof props[`${key}_other`] === "object" ? `${key}_other` : null,
         question: typeof prop.title === "string" ? prop.title : key,
         description:
           typeof prop.description === "string" && prop.description.trim()
@@ -1454,7 +1507,12 @@ export const useAppStore = create<AppState>((set, get) => {
     await s.refreshInstances({ probe: true });
     // Re-read after the await: the hub/instance may have changed meanwhile.
     const cur = get();
-    if (!cur.profile || cur.profile !== s.profile || cur.instanceId !== s.instanceId) return;
+    if (
+      !cur.profile ||
+      cur.profile !== s.profile ||
+      cur.instanceId !== s.instanceId
+    )
+      return;
     // Hub unreachable or discovery failed (phone just woke, network not yet
     // ready): instance liveness is UNKNOWN, not "gone" — retry in place
     // instead of bouncing the user out of the session. Only a successful
@@ -1488,7 +1546,8 @@ export const useAppStore = create<AppState>((set, get) => {
         configOptions: [],
         currentModeId: null,
         usage: null,
-        cacheHit: null, turnStats: null,
+        cacheHit: null,
+        turnStats: null,
         availableCommands: [],
         // usageStats stays (hub-level quota, not instance-scoped) — nothing
         // re-fetches it here, so clearing would blank the card until the
@@ -1596,7 +1655,10 @@ export const useAppStore = create<AppState>((set, get) => {
     }
   }
 
-  async function openConnection(profile: ConnectionProfile, instanceId: string): Promise<void> {
+  async function openConnection(
+    profile: ConnectionProfile,
+    instanceId: string,
+  ): Promise<void> {
     stopReconnect();
     const mySeq = ++connSeq;
     acp?.close();
@@ -1642,7 +1704,8 @@ export const useAppStore = create<AppState>((set, get) => {
         // Marked updates arriving OUTSIDE the window are still replay, never
         // live — they take the late-page buffer (prepended), never the tail.
         const marked =
-          isEarlierPageMeta((update as { _meta?: unknown })._meta) || isEarlierPageMeta(meta);
+          isEarlierPageMeta((update as { _meta?: unknown })._meta) ||
+          isEarlierPageMeta(meta);
         if (
           collectingEarlier &&
           sessionId === get().activeSessionId &&
@@ -1739,7 +1802,10 @@ export const useAppStore = create<AppState>((set, get) => {
           // ask once so a blocked approval never waits in silence (the
           // backgrounded/locked-phone case is the bridge's push, not ours).
           if (get().activeSessionId !== sessionId) {
-            const raw = req.params as { toolCall?: { title?: unknown }; toolName?: unknown };
+            const raw = req.params as {
+              toolCall?: { title?: unknown };
+              toolName?: unknown;
+            };
             const title =
               (typeof raw.toolCall?.title === "string" && raw.toolCall.title) ||
               (typeof raw.toolName === "string" && raw.toolName) ||
@@ -1797,7 +1863,8 @@ export const useAppStore = create<AppState>((set, get) => {
           }
           return { permissions, elicitations };
         });
-        for (const sid of cleared) setActivity(sid, { awaitingPermission: false });
+        for (const sid of cleared)
+          setActivity(sid, { awaitingPermission: false });
         pendingResponds.delete(id);
         pendingElicitResponds.delete(id);
       },
@@ -1871,7 +1938,8 @@ export const useAppStore = create<AppState>((set, get) => {
     configOptions: [],
     currentModeId: null,
     usage: null,
-    cacheHit: null, turnStats: null,
+    cacheHit: null,
+    turnStats: null,
     availableCommands: [],
     usageStats: null,
     quotaDock: null,
@@ -2118,7 +2186,9 @@ export const useAppStore = create<AppState>((set, get) => {
           return;
         }
         const msg =
-          e instanceof HubApiError ? e.message : `discovery failed: ${(e as Error).message}`;
+          e instanceof HubApiError
+            ? e.message
+            : `discovery failed: ${(e as Error).message}`;
         set({ instancesError: msg, hubOffline: false });
         pollStep = 0;
       }
@@ -2174,7 +2244,8 @@ export const useAppStore = create<AppState>((set, get) => {
         configOptions: [],
         currentModeId: null,
         usage: null,
-        cacheHit: null, turnStats: null,
+        cacheHit: null,
+        turnStats: null,
         availableCommands: [],
         fsCapable: false,
         pageMarkerCapable: false,
@@ -2187,12 +2258,17 @@ export const useAppStore = create<AppState>((set, get) => {
       // Attach to the requested session, else the most recently updated one.
       // noAttach (remote session-create): the caller opens a FRESH session
       // itself — never auto-attach a recycled instance's history.
-      if (!opts?.noAttach && get().connState === "open" && !get().activeSessionId) {
+      if (
+        !opts?.noAttach &&
+        get().connState === "open" &&
+        !get().activeSessionId
+      ) {
         const inst = get().instances.find((i) => i.id === instanceId);
         let target = attachSessionId ?? null;
         if (!target && inst?.sessions?.length) {
-          target = [...inst.sessions].sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]
-            .sessionId;
+          target = [...inst.sessions].sort(
+            (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0),
+          )[0].sessionId;
         }
         if (target) {
           // A caller-named session is the caller's gesture (user — the
@@ -2200,7 +2276,8 @@ export const useAppStore = create<AppState>((set, get) => {
           // OUR pick from a possibly stale list, so it is auto: the bridge
           // answers sessionClosed for a conversation closed elsewhere
           // instead of letting the pick resurrect it.
-          const intent: SessionIntent = opts?.intent ?? (attachSessionId ? "user" : "auto");
+          const intent: SessionIntent =
+            opts?.intent ?? (attachSessionId ? "user" : "auto");
           await get().loadSession(target, { intent });
         }
       }
@@ -2305,7 +2382,10 @@ export const useAppStore = create<AppState>((set, get) => {
     },
 
     applyVisibility: () => {
-      if (typeof document !== "undefined" && document.visibilityState !== "visible") {
+      if (
+        typeof document !== "undefined" &&
+        document.visibilityState !== "visible"
+      ) {
         // Backgrounded: stop the discovery poll (the ladder's radio cost
         // only accrues while foregrounded; Android's own JS freeze makes
         // this belt-and-braces there, a real saving in a background SPA tab).
@@ -2384,7 +2464,8 @@ export const useAppStore = create<AppState>((set, get) => {
         configOptions: [],
         currentModeId: null,
         usage: null,
-        cacheHit: null, turnStats: null,
+        cacheHit: null,
+        turnStats: null,
         availableCommands: [],
         // usageStats stays (hub-level quota, not instance-scoped).
         sessionStates: {},
@@ -2497,7 +2578,8 @@ export const useAppStore = create<AppState>((set, get) => {
           configOptions: [],
           currentModeId: null,
           usage: null,
-          cacheHit: null, turnStats: null,
+          cacheHit: null,
+          turnStats: null,
           availableCommands: [],
           loadingSession: false,
           isRunning: false,
@@ -2575,7 +2657,9 @@ export const useAppStore = create<AppState>((set, get) => {
             // (the user default stays implicit — the old wire shape): the
             // bridge then refuses to re-arm a remotely closed conversation
             // and flags the answer instead (sessionClosedAnswer).
-            _meta: { zcode: { limit, ...(intent === "auto" ? { intent } : {}) } },
+            _meta: {
+              zcode: { limit, ...(intent === "auto" ? { intent } : {}) },
+            },
           });
 
         if (cached) {
@@ -2610,7 +2694,9 @@ export const useAppStore = create<AppState>((set, get) => {
               modes?: { currentModeId?: string };
               configOptions?: ConfigOption[];
             } | null;
-            const configOptions = Array.isArray(res?.configOptions) ? res!.configOptions! : [];
+            const configOptions = Array.isArray(res?.configOptions)
+              ? res!.configOptions!
+              : [];
             const currentModeId = res?.modes?.currentModeId ?? null;
             // Unchanged: keep the painted messages/cursor/hasMore — they
             // stay valid for load_earlier. The metadata-only cursor anchors
@@ -2678,8 +2764,11 @@ export const useAppStore = create<AppState>((set, get) => {
         set({
           replayCursor: meta?.cursor ?? null,
           hasMore: meta?.hasMore ?? false,
-          totalMessages: typeof meta?.totalMessages === "number" ? meta.totalMessages : null,
-          configOptions: Array.isArray(res?.configOptions) ? res!.configOptions! : [],
+          totalMessages:
+            typeof meta?.totalMessages === "number" ? meta.totalMessages : null,
+          configOptions: Array.isArray(res?.configOptions)
+            ? res!.configOptions!
+            : [],
           currentModeId: res?.modes?.currentModeId ?? null,
           loadingSession: false,
           // A turn that survived the reconnect is still running on the bridge
@@ -2710,7 +2799,9 @@ export const useAppStore = create<AppState>((set, get) => {
             ? null
             : { notice: `session/load failed: ${(e as Error).message}` }),
           loadingSession: false,
-          ...(s.activeSessionId === sessionId && replaying ? { messages: [] } : {}),
+          ...(s.activeSessionId === sessionId && replaying
+            ? { messages: [] }
+            : {}),
         }));
       }
     },
@@ -2764,11 +2855,18 @@ export const useAppStore = create<AppState>((set, get) => {
             // plan/config/usage in old pages are stale: take messages only
           }
           let rest = state.messages;
-          if (segment.length && rest.length && segment[segment.length - 1].id === rest[0].id) {
+          if (
+            segment.length &&
+            rest.length &&
+            segment[segment.length - 1].id === rest[0].id
+          ) {
             // Seam dedupe: the same message split across pages.
             const seam = segment[segment.length - 1];
             segment = segment.slice(0, -1);
-            rest = [{ ...seam, parts: [...seam.parts, ...rest[0].parts] }, ...rest.slice(1)];
+            rest = [
+              { ...seam, parts: [...seam.parts, ...rest[0].parts] },
+              ...rest.slice(1),
+            ];
           }
           const meta = readReplayMeta(result);
           return {
@@ -2805,7 +2903,8 @@ export const useAppStore = create<AppState>((set, get) => {
           configId,
           value,
         });
-        const opts = (result as { configOptions?: ConfigOption[] } | null)?.configOptions;
+        const opts = (result as { configOptions?: ConfigOption[] } | null)
+          ?.configOptions;
         if (Array.isArray(opts)) set({ configOptions: opts });
         // The bridge also broadcasts config_option_update / current_mode_update
         // to every client (editor included) — the store picks those up too.
@@ -2835,7 +2934,8 @@ export const useAppStore = create<AppState>((set, get) => {
           usageStatsAt: Date.now(),
         });
       } catch {
-        if (get().profile === profile) set({ usageStats: null, quotaUnavailable: true });
+        if (get().profile === profile)
+          set({ usageStats: null, quotaUnavailable: true });
       }
     },
 
@@ -2868,7 +2968,11 @@ export const useAppStore = create<AppState>((set, get) => {
           const cur = get();
           if (revived && cur.instanceId && cur.activeSessionId) {
             try {
-              return await client.fsList(cur.instanceId, cur.activeSessionId, path);
+              return await client.fsList(
+                cur.instanceId,
+                cur.activeSessionId,
+                path,
+              );
             } catch {
               return null;
             }
@@ -2883,7 +2987,13 @@ export const useAppStore = create<AppState>((set, get) => {
       const s = get();
       if (!client || !s.instanceId || !s.activeSessionId) return null;
       try {
-        return await client.fsFileText(s.instanceId, s.activeSessionId, path, line, limit);
+        return await client.fsFileText(
+          s.instanceId,
+          s.activeSessionId,
+          path,
+          line,
+          limit,
+        );
       } catch (e) {
         if (e instanceof HubApiError && e.instanceDead) {
           const revived = await reviveDeadInstance();
@@ -2927,7 +3037,10 @@ export const useAppStore = create<AppState>((set, get) => {
       }
       const draft: PromptDraft = { text, images: images ?? [] };
       if (!acp || s.connState !== "open" || s.isRunning || s.loadingSession) {
-        setQueue(s.activeSessionId, [...(s.pendingPrompts[s.activeSessionId] ?? []), draft]);
+        setQueue(s.activeSessionId, [
+          ...(s.pendingPrompts[s.activeSessionId] ?? []),
+          draft,
+        ]);
         return;
       }
       await get().runPrompt(draft);
@@ -2935,7 +3048,13 @@ export const useAppStore = create<AppState>((set, get) => {
 
     runPrompt: async (draft) => {
       const s = get();
-      if (!acp || s.connState !== "open" || !s.activeSessionId || s.loadingSession) return;
+      if (
+        !acp ||
+        s.connState !== "open" ||
+        !s.activeSessionId ||
+        s.loadingSession
+      )
+        return;
       // Live turns never echo the user's message back (only replay does), so
       // insert it optimistically; replay replaces the whole history anyway.
       // Always a NEW message: two prompts sent back-to-back are two turns
@@ -3001,7 +3120,10 @@ export const useAppStore = create<AppState>((set, get) => {
           set((state) => ({
             messages: state.messages.filter((m) => m.id !== msg.id),
           }));
-          setQueue(sessionId, [draft, ...(get().pendingPrompts[sessionId] ?? [])]);
+          setQueue(sessionId, [
+            draft,
+            ...(get().pendingPrompts[sessionId] ?? []),
+          ]);
           set({ notice: `prompt failed: ${(e as Error).message}` });
         }
       } finally {
@@ -3034,10 +3156,7 @@ export const useAppStore = create<AppState>((set, get) => {
       // let the settle-flush pick it up. Foreign/restored turn: cancel AND
       // flush now — its settle goes to the connection that prompted it.
       const i = Math.min(Math.max(index ?? 0, 0), queue.length - 1);
-      const reordered = [
-        queue[i],
-        ...queue.filter((_, j) => j !== i),
-      ];
+      const reordered = [queue[i], ...queue.filter((_, j) => j !== i)];
       if (s.isRunning) {
         setQueue(sid, reordered);
         get().cancelTurn();
@@ -3082,7 +3201,11 @@ export const useAppStore = create<AppState>((set, get) => {
       );
       prefillSeq += 1;
       set({
-        composerPrefill: { text: draft.text, images: draft.images, nonce: prefillSeq },
+        composerPrefill: {
+          text: draft.text,
+          images: draft.images,
+          nonce: prefillSeq,
+        },
       });
     },
 
@@ -3108,7 +3231,8 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         return { permissions };
       });
-      for (const sid of cleared) setActivity(sid, { awaitingPermission: false });
+      for (const sid of cleared)
+        setActivity(sid, { awaitingPermission: false });
       respond({ outcome: { outcome: "selected", optionId } });
     },
 
@@ -3127,7 +3251,8 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         return { elicitations };
       });
-      for (const sid of cleared) setActivity(sid, { awaitingPermission: false });
+      for (const sid of cleared)
+        setActivity(sid, { awaitingPermission: false });
       // Wire shape (elicitation/create): accept carries the form content,
       // anything else declines. Absent fields = skipped questions.
       respond(content ? { action: "accept", content } : { action: "decline" });
@@ -3236,7 +3361,13 @@ export const useAppStore = create<AppState>((set, get) => {
     amendWorkflowRun: async (input) => {
       return get().workflowAction(
         "amend run settings",
-        (client, iid) => client.amendRunSettings(iid, input.runId, input.sessionId, input.body),
+        (client, iid) =>
+          client.amendRunSettings(
+            iid,
+            input.runId,
+            input.sessionId,
+            input.body,
+          ),
         false,
         undefined,
         input.instanceId,
@@ -3272,7 +3403,9 @@ export const useAppStore = create<AppState>((set, get) => {
         }
         return true;
       } catch (e) {
-        get().notify(`stop run failed: ${e instanceof Error ? e.message : String(e)}`);
+        get().notify(
+          `stop run failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
         return false;
       }
     },
@@ -3335,7 +3468,13 @@ export const useAppStore = create<AppState>((set, get) => {
               : String(e);
         const hadData = get().workflowHub !== null;
         set({
-          ...(hadData ? {} : { workflowHub: [], workflowActiveRuns: [], workflowRecentRuns: [] }),
+          ...(hadData
+            ? {}
+            : {
+                workflowHub: [],
+                workflowActiveRuns: [],
+                workflowRecentRuns: [],
+              }),
           workflowHubError: hadData ? get().workflowHubError : message,
           workflowHubLoading: false,
         });

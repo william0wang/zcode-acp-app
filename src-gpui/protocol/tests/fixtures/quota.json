@@ -49,27 +49,5 @@
       "outputTokens": 58020,
       "window": "30d"
     }
-  },
-  "cliproxy": {
-    "kind": "success",
-    "accounts": [
-      {
-        "label": "gemini-01",
-        "models": [
-          {
-            "name": "gemini-3-pro",
-            "windows": [
-              { "window": "5h", "usedPercent": 51.2, "resetsAt": 1760530800000 },
-              { "window": "week", "usedPercent": 9.8 }
-            ]
-          }
-        ]
-      }
-    ],
-    "combined": [
-      { "window": "5h", "usedPercent": 51.2, "resetsAt": 1760530800000 },
-      { "window": "week", "usedPercent": 9.8 }
-    ],
-    "otherAccounts": 2
   }
 }
