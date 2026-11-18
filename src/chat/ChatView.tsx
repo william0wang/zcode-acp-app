@@ -546,7 +546,7 @@ const UserMessage = memo(function UserMessage({
     );
   }
   return (
-    <MessagePrimitive.Root className="flex min-w-0 flex-col items-end">
+    <MessagePrimitive.Root className="flex min-w-0 animate-msg-in flex-col items-end">
       <div
         onContextMenu={copyFrom}
         className="max-w-[85%] min-w-0 break-words whitespace-pre-wrap rounded-[22px] rounded-br-md bg-raised px-4 py-2.5 text-sm text-ink select-none"
@@ -621,7 +621,7 @@ const AssistantMessage = memo(function AssistantMessage() {
     s.message.parts.some((p) => p.type === "text" && p.text.trim() !== ""),
   );
   return (
-    <MessagePrimitive.Root className="min-w-0">
+    <MessagePrimitive.Root className="min-w-0 animate-msg-in">
       <div className="w-full text-base leading-relaxed text-ink">
         <MessagePrimitive.GroupedParts
           groupBy={groupPartByType({
