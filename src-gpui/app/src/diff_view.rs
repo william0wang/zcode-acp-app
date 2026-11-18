@@ -28,6 +28,11 @@ pub enum DiffLineKind {
 pub struct DiffLine {
     pub kind: DiffLineKind,
     pub text: String,
+    /// 1-based source line numbers (req 2.1): the old side's row for
+    /// Context/Del, the new side's for Context/Add — None where the row
+    /// has no presence on that side.
+    pub old_no: Option<u32>,
+    pub new_no: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +46,8 @@ fn line(kind: DiffLineKind, text: &str) -> DiffLine {
     DiffLine {
         kind,
         text: text.to_string(),
+        old_no: None,
+        new_no: None,
     }
 }
 
@@ -49,6 +56,37 @@ fn truncate_chars(s: &str, max: usize) -> String {
         return s.to_string();
     }
     s.chars().take(max).collect()
+}
+
+/// 1-based source numbering accumulator (req 2.1): old advances on
+/// Context/Del, new on Context/Add.
+#[derive(Default)]
+struct Numbering {
+    old_no: u32,
+    new_no: u32,
+}
+
+impl Numbering {
+    fn stamp(&mut self, kind: DiffLineKind, text: &str) -> DiffLine {
+        let mut row = line(kind, text);
+        match kind {
+            DiffLineKind::Context => {
+                self.old_no += 1;
+                self.new_no += 1;
+                row.old_no = Some(self.old_no);
+                row.new_no = Some(self.new_no);
+            }
+            DiffLineKind::Del => {
+                self.old_no += 1;
+                row.old_no = Some(self.old_no);
+            }
+            DiffLineKind::Add => {
+                self.new_no += 1;
+                row.new_no = Some(self.new_no);
+            }
+        }
+        row
+    }
 }
 
 /// Whole-file old/new texts → unified rows. Common prefix/suffix are
@@ -64,6 +102,7 @@ pub fn unified(old: &str, new: &str) -> (Vec<DiffLine>, bool) {
     let b: Vec<&str> = new.lines().collect();
 
     let mut lines = Vec::new();
+    let mut num = Numbering::default();
     let mut start = 0;
     while start < a.len() && start < b.len() && a[start] == b[start] {
         start += 1;
@@ -74,7 +113,7 @@ pub fn unified(old: &str, new: &str) -> (Vec<DiffLine>, bool) {
         end_b -= 1;
     }
     for l in &a[..start] {
-        lines.push(line(DiffLineKind::Context, l));
+        lines.push(num.stamp(DiffLineKind::Context, l));
     }
 
     let mid_a = &a[start..end_a];
@@ -82,10 +121,10 @@ pub fn unified(old: &str, new: &str) -> (Vec<DiffLine>, bool) {
     let (n, m) = (mid_a.len(), mid_b.len());
     if (n + 1) * (m + 1) > MAX_DP_CELLS {
         for l in mid_a {
-            lines.push(line(DiffLineKind::Del, l));
+            lines.push(num.stamp(DiffLineKind::Del, l));
         }
         for l in mid_b {
-            lines.push(line(DiffLineKind::Add, l));
+            lines.push(num.stamp(DiffLineKind::Add, l));
         }
     } else {
         // dp[i][j] = LCS length of mid_a[i..] × mid_b[j..], row-major with
@@ -103,31 +142,68 @@ pub fn unified(old: &str, new: &str) -> (Vec<DiffLine>, bool) {
         let (mut i, mut j) = (0, 0);
         while i < n && j < m {
             if mid_a[i] == mid_b[j] {
-                lines.push(line(DiffLineKind::Context, mid_a[i]));
+                lines.push(num.stamp(DiffLineKind::Context, mid_a[i]));
                 i += 1;
                 j += 1;
             } else if dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1] {
-                lines.push(line(DiffLineKind::Del, mid_a[i]));
+                lines.push(num.stamp(DiffLineKind::Del, mid_a[i]));
                 i += 1;
             } else {
-                lines.push(line(DiffLineKind::Add, mid_b[j]));
+                lines.push(num.stamp(DiffLineKind::Add, mid_b[j]));
                 j += 1;
             }
         }
         while i < n {
-            lines.push(line(DiffLineKind::Del, mid_a[i]));
+            lines.push(num.stamp(DiffLineKind::Del, mid_a[i]));
             i += 1;
         }
         while j < m {
-            lines.push(line(DiffLineKind::Add, mid_b[j]));
+            lines.push(num.stamp(DiffLineKind::Add, mid_b[j]));
             j += 1;
         }
     }
 
     for l in &a[end_a..] {
-        lines.push(line(DiffLineKind::Context, l));
+        lines.push(num.stamp(DiffLineKind::Context, l));
     }
     (lines, old_capped || new_capped)
+}
+
+/// Side-by-side pairing (req 2.1's split toggle): each Del/Add RUN until
+/// the next Context pairs old-left / new-right, the shorter side padded
+/// with None; Context rows fill both sides. Pure — the renderer just walks
+/// the pairs.
+pub fn split_pairs(lines: &[DiffLine]) -> Vec<(Option<DiffLine>, Option<DiffLine>)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        if lines[i].kind == DiffLineKind::Context {
+            out.push((Some(lines[i].clone()), Some(lines[i].clone())));
+            i += 1;
+            continue;
+        }
+        let run = &lines[i..];
+        let end = run
+            .iter()
+            .position(|l| l.kind == DiffLineKind::Context)
+            .unwrap_or(run.len());
+        let dels: Vec<&DiffLine> = run[..end]
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Del)
+            .collect();
+        let adds: Vec<&DiffLine> = run[..end]
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Add)
+            .collect();
+        for k in 0..dels.len().max(adds.len()) {
+            out.push((
+                dels.get(k).map(|l| (*l).clone()),
+                adds.get(k).map(|l| (*l).clone()),
+            ));
+        }
+        i += end;
+    }
+    out
 }
 
 /// Diff blocks → rendered blocks (TS ToolCard's `diffs.map(DiffBlock)`).
@@ -249,5 +325,46 @@ mod tests {
         assert_eq!(kinds(&blocks[0].lines), vec![DiffLineKind::Add]);
         assert!(blocks[1].truncated);
         assert_eq!(blocks[1].lines[0].text.len(), MAX_DIFF_CHARS);
+    }
+
+    // Req 2.1: 1-based source numbering rides every row.
+    #[test]
+    fn rows_carry_source_line_numbers() {
+        let (rows, _) = unified("a\nb\nc", "a\nx\ny\nc");
+        // Context(a:1/1), Del(b:2/-), Add(x:-/2), Add(y:-/3), Context(c:3/4).
+        assert_eq!(rows[0].old_no, Some(1));
+        assert_eq!(rows[0].new_no, Some(1));
+        assert_eq!(rows[1].old_no, Some(2));
+        assert_eq!(rows[1].new_no, None);
+        assert_eq!(rows[2].old_no, None);
+        assert_eq!(rows[2].new_no, Some(2));
+        assert_eq!(rows[3].new_no, Some(3));
+        assert_eq!(rows[4].old_no, Some(3));
+        assert_eq!(rows[4].new_no, Some(4));
+    }
+
+    // Req 2.1: the split pairing runs dels left / adds right, padded.
+    #[test]
+    fn split_pairs_align_runs_side_by_side() {
+        let (rows, _) = unified("a\nb\nc\nd", "a\nx\ny\nd");
+        let pairs = split_pairs(&rows);
+        // Context(a,a), (Del b, Add x), (Del c, Add y), Context(d,d) — the
+        // DP may interleave Del/Add rows, but the pairing groups the RUN by
+        // kind, so both dels meet both adds.
+        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs[0].0.as_ref().unwrap().text, "a");
+        assert_eq!(pairs[0].1.as_ref().unwrap().text, "a");
+        assert_eq!(pairs[1].0.as_ref().unwrap().text, "b");
+        assert_eq!(pairs[1].1.as_ref().unwrap().text, "x");
+        assert_eq!(pairs[2].0.as_ref().unwrap().text, "c");
+        assert_eq!(pairs[2].1.as_ref().unwrap().text, "y");
+        assert_eq!(pairs[3].0.as_ref().unwrap().text, "d");
+        // A longer add run pads the old side with None.
+        let (rows, _) = unified("a", "a\np\nq\nr");
+        let pairs = split_pairs(&rows);
+        // Context(a,a), (None,p), (None,q), (None,r).
+        assert_eq!(pairs.len(), 4);
+        assert!(pairs[1].0.is_none());
+        assert_eq!(pairs[3].1.as_ref().unwrap().text, "r");
     }
 }

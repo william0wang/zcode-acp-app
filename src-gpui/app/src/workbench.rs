@@ -60,7 +60,7 @@ use protocol::session::RewindKind;
 use rust_i18n::t;
 
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
-use crate::diff_view::{blocks_of, DiffBlock, DiffLineKind};
+use crate::diff_view::{blocks_of, DiffBlock, DiffLine, DiffLineKind};
 use crate::file_browser::{
     absolute_dir, is_loopback_hub, render_file_viewer, render_files_header, render_files_panel,
     FilesPanelCtx,
@@ -243,6 +243,9 @@ pub struct Workbench {
     /// The last terminal-bell notice (req 2.9) — throttle only; the notice
     /// itself clears with the composer's other notices.
     bell_last_at: Option<u64>,
+    /// Diff blocks switched to split view (req 2.1), keyed by
+    /// (row id, part index, block index).
+    diff_split: std::collections::HashSet<(String, usize, usize)>,
     quit_stopping: bool,
     quit_confirmed: bool,
     /// The left dock (view-local layout, never wire state): the sessions
@@ -737,16 +740,31 @@ fn tool_short_name(label: &str) -> String {
 }
 
 /// One ACP diff block's unified view — the TS `DiffBlock`
-/// (ChatView.tsx:166): path header, the capped-sides notice, then the
-/// +/- rows. Word-level diff and line numbers stay TS-side polish
-/// (jsdiff/ReactDiffViewer); line coloring is the functional core. Colors
-/// are the quiet-dark palette's emerald/red families (the theme's accent
-/// pair for running/failed states).
+/// One diff line-number gutter cell (req 2.1): right-aligned mono, muted,
+/// fixed width so the text column stays aligned across the block.
+fn diff_no_cell(no: Option<u32>, theme: &component::Theme) -> Div {
+    div()
+        .flex_none()
+        .w(px(28.))
+        .text_right()
+        .text_size(ui_text(10.))
+        .text_color(theme.muted_foreground.opacity(0.7))
+        .child(no.map(|n| n.to_string()).unwrap_or_default())
+}
+
+/// (ChatView.tsx:166): path header, the capped-sides notice, then the +/-
+/// rows with 1-based source line numbers (req 2.1) and a unified↔split
+/// toggle. Line coloring is the functional core; colors are the
+/// quiet-dark palette's emerald/red families (the theme's accent pair for
+/// running/failed states). Syntax highlight stays out — the kit's
+/// tree-sitter pipeline lives inside TextView, not hand-laid rows.
 fn render_diff_block(
     block: &DiffBlock,
     row_id: &str,
     part_index: usize,
     block_index: usize,
+    split: bool,
+    wb: &WeakEntity<Workbench>,
     theme: &component::Theme,
 ) -> gpui::Div {
     let mut card = div()
@@ -757,20 +775,46 @@ fn render_diff_block(
         .border_1()
         .border_color(theme.border)
         .overflow_hidden();
-    if !block.path.is_empty() {
+    // Header: the path with the split toggle at its right end.
+    {
+        let key = (row_id.to_string(), part_index, block_index);
+        let wb_toggle = wb.clone();
         card = card.child(
             div()
                 .id(SharedString::from(format!(
                     "tool-diff-path-{row_id}-{part_index}-{block_index}"
                 )))
-                .truncate()
+                .flex()
+                .items_center()
+                .gap_1()
                 .px_2()
                 .py(px(3.))
                 .bg(theme.title_bar)
                 .border_b_1()
                 .border_color(theme.border)
                 .text_color(theme.muted_foreground)
-                .child(block.path.clone())
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(block.path.clone()),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "tool-diff-split-{row_id}-{part_index}-{block_index}"
+                    )))
+                    .ghost()
+                    .xsmall()
+                    .icon(KitIconName::SquareSplitHorizontal)
+                    .tooltip(t!("chat.splitView"))
+                    .when(split, |b| b.selected(true))
+                    .on_click(move |_, _, cx| {
+                        if let Some(wb) = wb_toggle.upgrade() {
+                            wb.update(cx, |wb, cx| wb.toggle_diff_split(key.clone(), cx));
+                        }
+                    }),
+                )
                 .test_support(),
         );
     }
@@ -790,20 +834,66 @@ fn render_diff_block(
     }
     let diff = diff_colors();
     let mut lines = div();
-    for l in &block.lines {
+    let unified_row = |l: &DiffLine| -> Div {
         let (glyph, text_color, bg): (&str, Hsla, Option<Hsla>) = match l.kind {
             DiffLineKind::Add => ("+", diff.add_text, Some(diff.add_bg)),
             DiffLineKind::Del => ("-", diff.del_text, Some(diff.del_bg)),
             DiffLineKind::Context => (" ", theme.muted_foreground, None),
         };
-        let mut row = div().min_w_0().flex().px_2().gap_1().text_color(text_color);
+        let mut row = div().min_w_0().flex().gap_1().text_color(text_color);
         if let Some(bg) = bg {
             row = row.bg(bg);
         }
-        lines = lines.child(
-            row.child(div().flex_none().child(glyph))
-                .child(div().min_w_0().child(l.text.clone())),
-        );
+        row.child(diff_no_cell(l.old_no, theme))
+            .child(diff_no_cell(l.new_no, theme))
+            .child(div().flex_none().child(glyph))
+            .child(div().min_w_0().child(l.text.clone()))
+    };
+    if split {
+        // Side-by-side (req 2.1): old left, new right, per hunk pair.
+        for (old, new) in crate::diff_view::split_pairs(&block.lines) {
+            let cell = |l: Option<DiffLine>| {
+                let mut cell = div().flex_1().min_w_0().flex().gap_1();
+                match l {
+                    Some(l) => {
+                        let (glyph, text_color, bg): (&str, Hsla, Option<Hsla>) = match l.kind {
+                            DiffLineKind::Add => ("+", diff.add_text, Some(diff.add_bg)),
+                            DiffLineKind::Del => ("-", diff.del_text, Some(diff.del_bg)),
+                            DiffLineKind::Context => (" ", theme.muted_foreground, None),
+                        };
+                        let mut row = div().min_w_0().flex().gap_1().text_color(text_color);
+                        if let Some(bg) = bg {
+                            row = row.bg(bg);
+                        }
+                        cell = cell.child(row.child(diff_no_cell(l.old_no, theme)).child(
+                            div().flex_none().child(glyph).child(l.text.clone()),
+                        ));
+                    }
+                    // Keep the empty side's height so the pairing reads.
+                    None => cell = cell.child(div().min_w_0().child("\u{a0}")),
+                }
+                cell
+            };
+            lines = lines
+                .child(
+                    div()
+                        .flex()
+                        .min_w_0()
+                        .child(cell(old))
+                        .child(
+                            div()
+                                .flex_none()
+                                .w(px(1.))
+                                .bg(theme.border)
+                                .child("\u{a0}"),
+                        )
+                        .child(cell(new)),
+                );
+        }
+    } else {
+        for l in &block.lines {
+            lines = lines.child(unified_row(l));
+        }
     }
     card.child(lines)
 }
@@ -1521,6 +1611,7 @@ impl Workbench {
             copied_code: None,
             about_open: false,
             bell_last_at: None,
+            diff_split: std::collections::HashSet::new(),
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
             tool_run_open: std::collections::HashMap::new(),
@@ -2982,6 +3073,18 @@ impl Workbench {
             }
         })
         .detach();
+    }
+
+    /// Toggle one diff block's unified↔split view (req 2.1).
+    fn toggle_diff_split(
+        &mut self,
+        key: (String, usize, usize),
+        cx: &mut Context<Self>,
+    ) {
+        if !self.diff_split.remove(&key) {
+            self.diff_split.insert(key);
+        }
+        cx.notify();
     }
 
     /// A terminal pane rang its bell (req 2.9): no sound — the OS owns that
@@ -5608,6 +5711,7 @@ impl Workbench {
         let chat_font = self.font_scale.chat_px();
         let thought_full = self.thought_full.clone();
         let tool_run_open = self.tool_run_open.clone();
+        let diff_split = self.diff_split.clone();
         // Message-action context (requirements 0.1): latest-role targets and
         // the rewind gates. The loop leaves the LAST user/assistant row in
         // each slot — the wire's latest-only contract.
@@ -5660,6 +5764,7 @@ impl Workbench {
                                 chat_font,
                                 &thought_full,
                                 &tool_run_open,
+                                &diff_split,
                                 cx,
                             )
                         }
@@ -6574,6 +6679,7 @@ fn render_row(
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
     tool_run_open: &std::collections::HashMap<(String, usize), bool>,
+    diff_split: &std::collections::HashSet<(String, usize, usize)>,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -6591,6 +6697,7 @@ fn render_row(
             chat_font,
             thought_full,
             tool_run_open,
+            diff_split,
             cx,
             theme,
         )
@@ -6873,6 +6980,7 @@ fn render_assistant_row(
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
     tool_run_open: &std::collections::HashMap<(String, usize), bool>,
+    diff_split: &std::collections::HashSet<(String, usize, usize)>,
     cx: &App,
     theme: &component::Theme,
 ) -> AnyElement {
@@ -6905,9 +7013,9 @@ fn render_assistant_row(
                     .get(&(row.id.clone(), start))
                     .copied()
                     .unwrap_or(false);
-                render_tool_run(&row.id, start, run, open, wb, theme)
+                render_tool_run(&row.id, start, run, open, wb, diff_split, theme)
             } else {
-                render_tool_card(&row.id, start, &run[0], wb, theme)
+                render_tool_card(&row.id, start, &run[0], wb, diff_split, theme)
             });
             continue;
         }
@@ -7174,6 +7282,7 @@ fn render_tool_card(
     part_index: usize,
     view: &PartView,
     wb: &WeakEntity<Workbench>,
+    diff_split: &std::collections::HashSet<(String, usize, usize)>,
     theme: &component::Theme,
 ) -> AnyElement {
     let PartView::ToolCall {
@@ -7344,7 +7453,11 @@ fn render_tool_card(
             );
         }
         for (bi, block) in diffs.iter().enumerate() {
-            body = body.child(render_diff_block(block, row_id, part_index, bi, theme));
+            let split =
+                diff_split.contains(&(row_id.to_string(), part_index, bi));
+            body = body.child(render_diff_block(
+                block, row_id, part_index, bi, split, wb, theme,
+            ));
         }
         // A live call with no output yet: the input is all there is to show —
         // a sub-agent dispatch streams nothing until it finishes, so without
@@ -7435,6 +7548,7 @@ fn render_tool_run(
     run: &[PartView],
     open: bool,
     wb: &WeakEntity<Workbench>,
+    diff_split: &std::collections::HashSet<(String, usize, usize)>,
     theme: &component::Theme,
 ) -> AnyElement {
     let (names, running, failed) = tool_run_summary(run);
@@ -7544,7 +7658,7 @@ fn render_tool_run(
             .border_t_1()
             .border_color(theme.border);
         for (i, view) in run.iter().enumerate() {
-            body = body.child(render_tool_card(row_id, start_index + i, view, wb, theme));
+            body = body.child(render_tool_card(row_id, start_index + i, view, wb, diff_split, theme));
         }
         card = card.child(body);
         // Bottom seam (the TS footer button): a long run's body pushes the
