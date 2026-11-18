@@ -41,6 +41,124 @@ fn no_fractional_style_helpers() {
     );
 }
 
+/// The spacing ladder (requirements 2.3): every spacing call (`p*`/`m*`/
+/// `gap*`) with a raw `px(N)` value must name a ladder member — the TS
+/// Tailwind scale restated (ui_tokens::SPACING_LADDER_PX). Element SIZES
+/// (`size(px(..))`, bar heights, dots) and canvas geometry are out of
+/// scope: only the layout-helper prefixes below are scanned.
+#[test]
+fn spacing_values_on_the_ladder() {
+    // Alignment-derived indents that AREN'T ladder members but encode a
+    // sum of ladder members (documented; keep this list at zero unless a
+    // layout truly aligns to a computed spine):
+    // - 38: workflows node spine = op tile 28 + gap 10
+    // - 46: chart category labels = y-axis col 40 + gap 6
+    const ALLOWED: [f32; 2] = [38., 46.];
+    const LADDER: [f32; 14] = [1., 2., 3., 4., 6., 8., 10., 12., 14., 16., 20., 24., 32., 48.];
+    const SPACING_PREFIXES: [&str; 17] = [
+        "p", "px", "py", "pt", "pb", "pl", "pr", "m", "mx", "my", "mt", "mb", "ml", "mr",
+        "gap", "gap_x", "gap_y",
+    ];
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let text = fs::read_to_string(&path).expect("read source file");
+                for (i, raw) in text.lines().enumerate() {
+                    let line = raw.split("//").next().unwrap_or("");
+                    if let Some(v) = spacing_literal(line, &SPACING_PREFIXES) {
+                        if !LADDER.contains(&v) && !ALLOWED.contains(&v) {
+                            offenders.push(format!("{}:{}: {}", path.display(), i + 1, raw.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "spacing literals off the design ladder (ui_tokens::SPACING_LADDER_PX, \
+         the TS Tailwind scale). Snap to a ladder member; sizes that derive \
+         from OTHER ladder members go through the ALLOWED list with the \
+         arithmetic documented:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The first `.prefix(px(N.))` spacing call on the line, as `Some(N)`.
+fn spacing_literal(line: &str, prefixes: &[&str]) -> Option<f32> {
+    let mut rest = line;
+    while let Some(dot) = rest.find('.') {
+        rest = &rest[dot + 1..];
+        let ident: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        let after = &rest[ident.len()..];
+        if !prefixes.contains(&ident.as_str()) || !after.starts_with("(px(") {
+            continue;
+        }
+        let tail = &after["(px(".len()..];
+        let num: String = tail.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+        return num.parse::<f32>().ok();
+    }
+    None
+}
+
+/// The text-size roles (requirements 2.5): `ui_text(N)` may only name
+/// ui_tokens::text_role values — caption 10 / body 12 / strong 13 /
+/// title 14. The ladder scales every role; raw off-role sizes fragment
+/// the type scale again.
+#[test]
+fn text_sizes_on_the_role_whitelist() {
+    const ROLES: [f32; 4] = [10., 12., 13., 14.];
+
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders: Vec<String> = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![src];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                let text = fs::read_to_string(&path).expect("read source file");
+                for (i, raw) in text.lines().enumerate() {
+                    let line = raw.split("//").next().unwrap_or("");
+                    if let Some(v) = ui_text_literal(line) {
+                        if !ROLES.contains(&v) {
+                            offenders.push(format!("{}:{}: {}", path.display(), i + 1, raw.trim()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "ui_text() off the role whitelist (caption 10 / body 12 / strong 13 / \
+         title 14 — ui_tokens::text_role). Map the odd size to its role:\n{}",
+        offenders.join("\n")
+    );
+}
+
+/// The `ui_text(N.)` literal on the line, as `Some(N)`.
+fn ui_text_literal(line: &str) -> Option<f32> {
+    let idx = line.find("ui_text(")?;
+    let tail = &line[idx + "ui_text(".len()..];
+    let num: String = tail
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    num.parse::<f32>().ok()
+}
+
 /// Any `.<prefix>_<int>_<frac>(` style-helper call — the fork maps the
 /// fractional suffix to `relative(..)`, which is only ever wanted for
 /// widths/heights by explicit design (none exist today; add a per-prefix

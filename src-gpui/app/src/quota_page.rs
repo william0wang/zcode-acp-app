@@ -556,7 +556,7 @@ fn use_card_button(
         .when(busy, |this| this.opacity(0.4))
         .when(!busy, |this| {
             this.cursor_pointer()
-                .hover(|h| h.bg(white().opacity(0.12)))
+                .hover(|h| h.bg(crate::ui_tokens::active_bg()))
                 .on_click(move |_, _, cx| {
                     wb.update(cx, |wb, cx| wb.quota_ask_spend(reset_type, cx));
                 })
@@ -605,7 +605,7 @@ fn warn_box(theme: &Theme, wb: &gpui::Entity<Workbench>, reset_type: ResetCardTy
                         .text_size(ui_text(13.))
                         .text_color(faint(theme))
                         .cursor_pointer()
-                        .hover(|h| h.bg(white().opacity(0.06)))
+                        .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                         .on_click(move |_, _, cx| {
                             cancel_wb.update(cx, |wb, cx| wb.quota_cancel_spend(cx));
                         })
@@ -683,7 +683,7 @@ fn spend_confirm_box(
                         .text_size(ui_text(13.))
                         .text_color(faint(theme))
                         .cursor_pointer()
-                        .hover(|h| h.bg(white().opacity(0.06)))
+                        .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                         .on_click(move |_, _, cx| {
                             cancel_wb.update(cx, |wb, cx| wb.quota_cancel_spend(cx));
                         })
@@ -707,7 +707,7 @@ fn spend_confirm_box(
                         .when(busy, |this| this.opacity(0.6))
                         .when(!busy, |this| {
                             this.cursor_pointer()
-                                .hover(|h| h.bg(white().opacity(0.15)))
+                                .hover(|h| h.bg(crate::ui_tokens::active_bg()))
                                 .on_click(move |_, _, cx| {
                                     spend_wb.update(cx, |wb, cx| {
                                         wb.quota_commit_spend(reset_type, cx)
@@ -754,7 +754,7 @@ fn provider_picker(
                 .when(!selected, |this| {
                     this.text_color(faint(theme))
                         .cursor_pointer()
-                        .hover(|h| h.bg(white().opacity(0.06)))
+                        .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                         .when(!busy, |this| {
                             this.on_click(move |_, _, _| {
                                 runtime.send(UiCommand::QuotaPickProvider {

@@ -41,6 +41,30 @@ pub(crate) fn wash(color: Hsla) -> Hsla {
     color.opacity(0.12)
 }
 
+// -- interactive overlays ----------------------------------------------------
+//
+// The ghost-button idiom both ends share (TS --color-hover/active/selected):
+// white overlays on any surface, NOT a second surface color. The former
+// per-file idioms (`theme.secondary.opacity(0.5/0.6)`, `white().opacity(
+// 0.05/0.06/0.12)`) unify onto these three — one hover looks like every
+// other hover, on canvas, surface or raised alike.
+
+/// Hover wash: 6% white (TS bg-hover).
+pub(crate) fn hover_bg() -> Hsla {
+    let c: Hsla = rgb(0xffffff).into();
+    c.opacity(0.06)
+}
+/// Pressed wash: 11% white (TS bg-active).
+pub(crate) fn active_bg() -> Hsla {
+    let c: Hsla = rgb(0xffffff).into();
+    c.opacity(0.11)
+}
+/// Selected row fill: a steady 8% white (TS bg-selected).
+pub(crate) fn selected_bg() -> Hsla {
+    let c: Hsla = rgb(0xffffff).into();
+    c.opacity(0.08)
+}
+
 /// Diff line colors (workbench diff cards): text + row background. The
 /// former literals at workbench.rs:680-681, named once.
 pub(crate) struct DiffColors {
@@ -118,11 +142,17 @@ pub(crate) fn update_stage_text(stage: &str) -> Hsla {
 
 // -- spacing ladder ---------------------------------------------------------
 
-/// The 4px ladder (requirements 2.3): the ONLY spacing values new layout
-/// code may use. `layout_lint.rs` scans raw `px(N)` spacing calls against
-/// this set (1px stays legal for hairline offsets, 3px for the tab strip's
-/// baseline nudges; the odd members the lint allows are listed there).
-pub(crate) const SPACING_LADDER_PX: [f32; 10] = [2., 4., 6., 8., 12., 16., 20., 24., 32., 48.];
+/// The spacing ladder (requirements 2.3): the ONLY spacing values new
+/// layout code may use — the TS/Tailwind scale restated. `layout_lint.rs`
+/// fails on spacing calls (`p*`/`m*`/`gap*`) outside it. 1px stays legal
+/// for hairline offsets; element SIZES (`size(px(N))`, bars, dots) and
+/// canvas geometry are not spacing and are out of the lint's scope. Two
+/// alignment-derived indents (`pl(38)` op-tile spine = tile 28 + gap 10,
+/// `pl(46)` chart labels = y-axis col 40 + gap 6) carry a documented
+/// allow-list in the lint.
+pub(crate) const SPACING_LADDER_PX: [f32; 14] = [
+    1., 2., 3., 4., 6., 8., 10., 12., 14., 16., 20., 24., 32., 48.,
+];
 
 // -- text roles -------------------------------------------------------------
 
@@ -157,19 +187,35 @@ mod tests {
 
     #[test]
     fn agent_swatches_cover_the_form_names() {
-        for name in [
-            "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan",
-        ] {
+        // "cyan" IS the fallback arm (the server's own form lists it last);
+        // the other seven must each name a distinct color.
+        for name in ["red", "blue", "green", "yellow", "purple", "orange", "pink"] {
             assert_ne!(agent_swatch(name), agent_swatch("__never__"));
         }
+        assert_eq!(agent_swatch("cyan"), agent_swatch("__never__"));
     }
 
     #[test]
-    fn spacing_ladder_is_4px_aligned() {
+    fn spacing_ladder_matches_the_ts_scale() {
         for v in SPACING_LADDER_PX {
-            assert_eq!(v % 2., 0., "ladder value {v} off the 2px grid");
+            assert!(v >= 1., "ladder value {v} below hairline");
         }
         assert!(SPACING_LADDER_PX.contains(&8.));
         assert!(SPACING_LADDER_PX.contains(&16.));
+        assert!(!SPACING_LADDER_PX.contains(&5.), "5px is off-ladder: use 4");
+    }
+
+    #[test]
+    fn text_roles_are_the_whitelist() {
+        // The lint fails on any ui_text() outside these four roles.
+        assert_eq!(
+            [
+                text_role::CAPTION,
+                text_role::BODY,
+                text_role::BODY_STRONG,
+                text_role::TITLE
+            ],
+            [10., 12., 13., 14.]
+        );
     }
 }

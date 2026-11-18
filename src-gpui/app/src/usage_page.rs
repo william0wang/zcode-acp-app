@@ -415,7 +415,7 @@ where
         })
         .when(!active, |this| {
             this.text_color(theme.muted_foreground.opacity(0.8))
-                .hover(|h| h.bg(white_alpha(0.05)))
+                .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
         })
         .child(label.to_string())
         .on_click(move |_, _, _| fire())

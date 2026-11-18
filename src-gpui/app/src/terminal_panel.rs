@@ -623,7 +623,7 @@ fn render_pane(
                         .min_w_0()
                         .flex_1()
                         .truncate()
-                        .text_size(ui_text(11.))
+                        .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
                         .child(format!("{} {}", t!("terminal.title"), ix + 1)),
                 )

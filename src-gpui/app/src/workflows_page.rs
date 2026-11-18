@@ -125,7 +125,7 @@ fn status_badge(status: Option<&str>, key: &str, theme: &component::Theme) -> An
         .flex_none()
         .flex()
         .items_center()
-        .gap(px(5.))
+        .gap(px(4.))
         .px(px(6.))
         .py(px(1.))
         .rounded_md()
@@ -753,7 +753,7 @@ fn render_group_card(
             .px_4()
             .py_3()
             .cursor_pointer()
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .on_click({
                 let runtime = wb.runtime.clone();
                 move |_, _, _| {
@@ -1646,7 +1646,7 @@ fn render_run_tabs(run: &WorkflowRunView, wb: &Workbench, theme: &component::The
                 .flex_1()
                 .items_center()
                 .justify_center()
-                .py(px(5.))
+                .py(px(4.))
                 .rounded_md()
                 .text_size(ui_text(12.))
                 .cursor_pointer()
@@ -1931,7 +1931,7 @@ fn render_phase_card(
         .py_2()
         .min_w_0()
         .cursor_pointer()
-        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+        .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
         .border_b_1()
         .border_color(if open {
             theme.border
@@ -2055,7 +2055,7 @@ fn render_step_row(wb: &Workbench, n: &NodeAgg, cx: &Context<Workbench>) -> AnyE
                 .gap_2()
                 .min_w_0()
                 .cursor_pointer()
-                .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+                .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                 .on_click(move |_, _, cx| {
                     let key = toggle_key.clone();
                     wb_toggle.update(cx, |wb, cx| {
@@ -2192,7 +2192,7 @@ fn render_event_row(
         .border_b_1()
         .border_color(theme.border)
         .cursor_pointer()
-        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+        .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
         .on_click({
             let key = raw_key.clone();
             move |_, _, cx| {
@@ -2329,7 +2329,7 @@ fn render_run_artifacts_tab(
                         .px_4()
                         .py_3()
                         .cursor_pointer()
-                        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+                        .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                         .on_click(move |_, _, _| {
                             runtime.send(UiCommand::WorkflowRunOpenArtifact { artifact_id: artifact_id.clone() });
                         })
@@ -2482,7 +2482,7 @@ fn render_workspace_row(
         .px_4()
         .py(px(10.))
         .cursor_pointer()
-        .hover(|this| this.bg(theme.secondary.opacity(0.5)))
+        .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
         .on_click(move |_, _, _| {
             // TS `loadNode` returns early without a site/ordinal address.
             if let (Some(site), Some(ord)) = (site_id.clone(), ordinal) {
@@ -3035,7 +3035,7 @@ fn render_metrics_tiles(
                                     .min_w_0()
                                     .pt(px(2.))
                                     .font_family(theme.mono_font_family.clone())
-                                    .text_size(ui_text(15.))
+                                    .text_size(ui_text(14.))
                                     .text_color(theme.foreground)
                                     .truncate()
                                     .child(format!(
@@ -3315,7 +3315,7 @@ fn render_chart_view(
                     .items_end()
                     .h(px(180.))
                     .w(px(40.))
-                    .text_size(ui_text(9.))
+                    .text_size(ui_text(10.))
                     .text_color(theme.muted_foreground)
                     .child(chart_fmt(grid[2]))
                     .child(chart_fmt(grid[1]))
@@ -3331,7 +3331,7 @@ fn render_chart_view(
                 .justify_between()
                 .pl(px(46.))
                 .pt(px(2.))
-                .text_size(ui_text(9.))
+                .text_size(ui_text(10.))
                 .text_color(theme.muted_foreground)
                 .children(
                     model
@@ -4533,7 +4533,7 @@ impl Workbench {
                     })
                     .when(!gate_busy, |this| {
                         this.cursor_pointer()
-                            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                     })
                     .when(!gate_busy, move |this| {
                         this.on_click(move |_, _, cx| {

@@ -838,7 +838,7 @@ fn render_mcp_row(
         .px_4()
         .py_3()
         .cursor_pointer()
-        .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+        .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
         .on_click(move |_, window, cx| {
             wb.update(cx, |this, cx| this.open_mcp_form(Some(target.clone()), window, cx));
         })
@@ -1052,7 +1052,7 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                 .px_4()
                 .py_3()
                 .cursor_pointer()
-                .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                 .on_click(move |_, _, cx| {
                     wb_handle.update(cx, |this, cx| {
                         this.hooks_open_event =
@@ -1327,7 +1327,7 @@ fn render_agent_row(
         let target = agent.clone();
         row = row
             .cursor_pointer()
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .on_click(move |_, window, cx| {
                 wb.update(cx, |this, cx| {
                     this.open_agent_form(Some(target.clone()), window, cx)
@@ -1366,7 +1366,7 @@ fn render_agent_row(
                                 .py(px(1.))
                                 .rounded_md()
                                 .bg(theme.secondary)
-                                .text_size(ui_text(9.))
+                                .text_size(ui_text(10.))
                                 .text_color(theme.muted_foreground)
                                 .child(t!("zconfig.agentBuiltIn").into_owned()),
                         )

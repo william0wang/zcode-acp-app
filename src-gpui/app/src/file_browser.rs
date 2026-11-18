@@ -736,7 +736,7 @@ fn render_entry_row(
         .px_2()
         .py_1()
         .rounded_md()
-        .hover(|h| h.bg(theme.secondary.opacity(0.6)))
+        .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
         .cursor_pointer()
         .child(icon)
         .child(

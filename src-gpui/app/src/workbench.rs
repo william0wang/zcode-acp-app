@@ -2635,7 +2635,7 @@ impl Workbench {
                             .test_support()
                             .min_w_0()
                             .truncate()
-                            .text_size(ui_text(11.))
+                            .text_size(ui_text(10.))
                             .text_color(theme.foreground)
                             .child(hub.unwrap_or_else(|| label.to_string())),
                     )
@@ -2645,7 +2645,7 @@ impl Workbench {
                                 .id("status-activity")
                                 .test_support()
                                 .flex_none()
-                                .text_size(ui_text(11.))
+                                .text_size(ui_text(10.))
                                 .text_color(theme.accent)
                                 .child(text),
                         )
@@ -2657,7 +2657,7 @@ impl Workbench {
                                 .test_support()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(ui_text(11.))
+                                .text_size(ui_text(10.))
                                 .text_color(theme.muted_foreground)
                                 .child(note),
                         )
@@ -2670,7 +2670,7 @@ impl Workbench {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(ui_text(11.))
+                    .text_size(ui_text(10.))
                     .text_color(theme.danger)
                     .child(message.clone()),
             );
@@ -2707,7 +2707,7 @@ impl Workbench {
                     .test_support()
                     .min_w_0()
                     .truncate()
-                    .text_size(ui_text(11.))
+                    .text_size(ui_text(10.))
                     .font_family(theme.mono_font_family.clone())
                     .text_color(theme.muted_foreground)
                     .child(dock),
@@ -2970,7 +2970,7 @@ impl Workbench {
             .bg(theme.title_bar)
             .child(
                 div()
-                    .text_size(ui_text(15.))
+                    .text_size(ui_text(14.))
                     .text_color(theme.foreground)
                     .child("Enable remote access"),
             )
@@ -3071,7 +3071,7 @@ impl Workbench {
             .rounded_md()
             .cursor_pointer()
             .when(active, |this| this.bg(theme.secondary))
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .child(Icon::new(icon).size_4().text_color(color))
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
             .test_support()
@@ -3105,7 +3105,7 @@ impl Workbench {
             .rounded_md()
             .cursor_pointer()
             .when(active, |this| this.bg(theme.secondary))
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .child(Icon::new(KitIconName::Terminal).size_4().text_color(color))
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
             .test_support()
@@ -3143,7 +3143,7 @@ impl Workbench {
             .rounded_md()
             .cursor_pointer()
             .when(active, |this| this.bg(theme.secondary))
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .child(Icon::new(icon).size_4().text_color(color))
             .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
             .test_support()
@@ -3653,7 +3653,7 @@ impl Workbench {
                     .px_2()
                     .py_2()
                     .rounded_md()
-                    .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                    .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                     .cursor_pointer()
                     .child(
                         Icon::new(icon)
@@ -3703,7 +3703,7 @@ impl Workbench {
                 .px_2()
                 .py_2()
                 .rounded_md()
-                .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                 .cursor_pointer()
                 .child(
                     Icon::new(KitIconName::Workflow)
@@ -4103,7 +4103,7 @@ impl Workbench {
             .py_1()
             .rounded_md()
             .when(active, |this| this.bg(theme.secondary))
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .cursor_pointer()
             .child(dot)
             .child(
@@ -4341,7 +4341,7 @@ impl Workbench {
                                 .px_2()
                                 .py_1()
                                 .rounded_md()
-                                .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+                                .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
                                 .cursor_pointer()
                                 .child(
                                     div()
@@ -4506,7 +4506,7 @@ impl Workbench {
             .px_2()
             .py_1()
             .rounded_md()
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .cursor_pointer()
             .child(
                 div()
@@ -4734,7 +4734,7 @@ impl Workbench {
                 .px_3()
                 .py(px(6.))
                 .cursor_pointer()
-                .hover(|h| h.bg(theme.secondary))
+                .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                 .on_click(move |_, _, cx| {
                     wb.update(cx, |wb, cx| {
                         wb.plan_open = !wb.plan_open;
@@ -4852,15 +4852,17 @@ impl Workbench {
             .pt_1()
             .pb_1()
             .rounded_t_md()
+            // Proportional UI font (requirements 2.5): the mono family read
+            // as terminal chrome, not a document tab. Mono slots (paths, the
+            // quota dock line) keep their own family.
             .text_size(ui_text(13.))
-            .font_family(theme.mono_font_family.clone())
             .cursor_pointer()
             .when(active, |this| {
                 this.bg(theme.secondary).text_color(theme.foreground)
             })
             .when(!active, |this| {
                 this.text_color(theme.muted_foreground)
-                    .hover(|h| h.bg(theme.secondary.opacity(0.5)))
+                    .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
             })
             .on_click(move |_, _, _| runtime.send(UiCommand::SelectTab { id: tab_id }));
 
@@ -5188,7 +5190,7 @@ impl Workbench {
                 row = row.child(
                     div()
                         .flex_none()
-                        .text_size(ui_text(9.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .child(t!("chat.pending").into_owned()),
                 );
@@ -5287,7 +5289,7 @@ impl Workbench {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .text_size(ui_text(9.))
+                        .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
                         .child("svg")
                         .into_any_element(),
@@ -5884,7 +5886,7 @@ fn render_slash_menu(
             .py_1()
             .min_w_0()
             .when(selected, |this| this.bg(theme.secondary))
-            .hover(|this| this.bg(theme.secondary))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .on_click({
                 let wb = wb.clone();
                 move |_, _, cx| {
@@ -6093,10 +6095,12 @@ fn render_user_row(
                 SharedString::from(format!("msg-image-{}-{part_index}", row.id)),
             )),
             // TextView resolves its body size off the wrapper's text_size —
-            // the ladder rides that inheritance.
+            // the ladder rides that inheritance. The line height matches the
+            // plain branch (requirements 2.6 — one reading rhythm).
             PartView::Markdown { state, .. } => bubble.child(
                 div()
                     .text_size(px(chat_font.0))
+                    .line_height(relative(1.45))
                     .p_2()
                     .rounded_md()
                     .bg(theme.background)
@@ -6243,7 +6247,7 @@ fn render_assistant_row(
                         .px_3()
                         .py(px(6.))
                         .cursor_pointer()
-                        .hover(|h| h.bg(theme.title_bar))
+                        .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                         .on_click({
                             let wb = wb.clone();
                             move |_, _window, cx| {
@@ -6341,9 +6345,15 @@ fn render_assistant_row(
             }
             // TextView resolves its body size off the wrapper's text_size —
             // the ladder rides that inheritance (no wrapper = the window's
-            // 16px default, which is the Medium step).
+            // 16px default, which is the Medium step). The line height
+            // matches the plain branch (requirements 2.6).
             PartView::Markdown { state, .. } => {
-                column.child(div().text_size(px(chat_font.1)).child(TextView::new(state)))
+                column.child(
+                    div()
+                        .text_size(px(chat_font.1))
+                        .line_height(relative(1.55))
+                        .child(TextView::new(state)),
+                )
             }
             PartView::Plain { text } => column.child(
                 div()
@@ -6467,7 +6477,7 @@ fn render_tool_card(
             .py_1()
             .cursor_pointer()
             .overflow_hidden()
-            .hover(|h| h.bg(theme.title_bar))
+            .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
             .on_click({
                 let wb = wb.clone();
                 move |_, _window, cx| {
@@ -6668,7 +6678,7 @@ fn render_tool_run(
             .py_1()
             .cursor_pointer()
             .overflow_hidden()
-            .hover(|h| h.bg(theme.title_bar))
+            .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
             .on_click({
                 let wb = wb.clone();
                 move |_, _window, cx| {
@@ -6762,7 +6772,7 @@ fn render_tool_run(
                 .border_t_1()
                 .border_color(theme.border)
                 .cursor_pointer()
-                .hover(|h| h.bg(theme.title_bar))
+                .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                 .on_click({
                     let wb = wb.clone();
                     move |_, _window, cx| {
@@ -7768,7 +7778,7 @@ impl Workbench {
                             .py(px(6.))
                             .rounded_md()
                             .cursor_pointer()
-                            .hover(|h| h.bg(theme.secondary))
+                            .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                             .on_click({
                                 let runtime = runtime.clone();
                                 let ws = workspace_path.clone();
@@ -7946,7 +7956,7 @@ impl Workbench {
                     .py_1()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|h| h.bg(theme.secondary))
+                    .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                     .on_click(move |_, _, _| {
                         runtime.send(UiCommand::NewSessionBrowse {
                             path: Some(parent.clone()),
@@ -7992,7 +8002,7 @@ impl Workbench {
                     .py_1()
                     .rounded_md()
                     .cursor_pointer()
-                    .hover(|h| h.bg(theme.secondary))
+                    .hover(|h| h.bg(crate::ui_tokens::hover_bg()))
                     .on_click({
                         let runtime = runtime.clone();
                         let path = path.clone();

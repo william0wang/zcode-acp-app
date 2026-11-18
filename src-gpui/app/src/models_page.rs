@@ -480,7 +480,7 @@ impl Workbench {
                 div()
                     .px_4()
                     .pb_1()
-                    .text_size(ui_text(11.))
+                    .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
                     .child(t!("zconfig.providersTitle").into_owned()),
             );
@@ -650,7 +650,7 @@ impl Workbench {
             .px_4()
             .py_3()
             .cursor_pointer()
-            .hover(|this| this.bg(theme.secondary.opacity(0.6)))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .on_click(move |_, window, cx| {
                 wb.update(cx, |this, cx| {
                     this.open_models_form(Some(target.clone()), window, cx)
@@ -1125,11 +1125,11 @@ fn model_test_badge(
     };
     div()
         .flex_none()
-        .px(px(5.))
+        .px(px(4.))
         .py(px(1.))
         .rounded_md()
         .bg(theme.secondary)
-        .text_size(ui_text(9.))
+        .text_size(ui_text(10.))
         .text_color(color)
         .child(text)
         .into_any_element()
@@ -1241,11 +1241,11 @@ fn render_provider_row(
                             this.child(
                                 div()
                                     .flex_none()
-                                    .px(px(5.))
+                                    .px(px(4.))
                                     .py(px(1.))
                                     .rounded_md()
                                     .bg(theme.secondary)
-                                    .text_size(ui_text(9.))
+                                    .text_size(ui_text(10.))
                                     .text_color(theme.muted_foreground)
                                     .child(t!("zconfig.providerPlan").into_owned()),
                             )
