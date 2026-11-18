@@ -55,6 +55,7 @@ use protocol::chat::{AttachmentDraft, ChatMessage, ChatPart, ChatRole};
 use protocol::image::{
     decode_attachment_bytes, prepare_image, sniff_mime, PrepareError, MAX_IMAGES,
 };
+use protocol::session::RewindKind;
 use rust_i18n::t;
 
 use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
@@ -188,6 +189,10 @@ pub struct Workbench {
     /// append to the composer text — parked for the render pass because
     /// `set_value` needs a window (the composer_prefill route).
     composer_append: Option<String>,
+    /// The inline edit-and-resend state (requirements 0.1, rewind spec):
+    /// the row being edited, its rewind mid, and the textarea. None = no
+    /// edit in flight. Resend dispatches `session/edit_user_message`.
+    edit_row: Option<(String, String, Entity<TextareaState>)>,
     /// The incoming tab's draft on a switch, adopted during render (the
     /// composer_prefill route: set_value needs a window).
     composer_restore: Option<(String, Vec<StagedImage>)>,
@@ -527,6 +532,23 @@ struct RowModel {
     role: ChatRole,
     collapsed: bool,
     parts: Vec<PartView>,
+    /// Replay-only rewind handle (bridge spec §4.3); None on live echoes and
+    /// local optimistic bubbles — presence is the addressable gate.
+    mid: Option<String>,
+}
+
+/// Per-render message-action context (requirements 0.1): the rewind gates
+/// (connection capability + the tail's addressable mids) and which row is
+/// mid-edit. Latest-only is the wire contract — the UI never offers an
+/// action the bridge would refuse.
+#[derive(Clone, Default)]
+struct RowActions {
+    rewind_capable: bool,
+    last_user_id: Option<String>,
+    last_user_mid: Option<String>,
+    last_assistant_id: Option<String>,
+    last_assistant_mid: Option<String>,
+    editing: Option<String>,
 }
 
 fn stream_motion() -> TextViewMotion {
@@ -960,6 +982,119 @@ fn chat_row_menu(
     }
 }
 
+/// The quote affordance (requirements 0.1 — pure client): re-enter the row's
+/// text into the composer as an editable draft. An occupied composer keeps
+/// its text (the quote appends on its own paragraph).
+fn quote_button(row: &RowModel, text: String, wb: &WeakEntity<Workbench>) -> Button {
+    Button::new(SharedString::from(format!("quote-{}", row.id)))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Quote)
+        .tooltip(t!("chat.quote"))
+        .on_click({
+            let wb = wb.clone();
+            move |_, window, cx| {
+                if let Some(wb) = wb.upgrade() {
+                    let composer = wb.read(cx).composer.clone();
+                    let cur = composer.read(cx).value().to_string();
+                    let next = if cur.trim().is_empty() {
+                        text.clone()
+                    } else {
+                        format!("{}\n\n{}", cur, text)
+                    };
+                    composer.update(cx, |state, cx| state.set_value(&next, window, cx));
+                }
+            }
+        })
+}
+
+/// The edit-and-resend affordance (requirements 0.1, rewind spec §4.1):
+/// opens the inline editor on the latest addressable user message.
+fn edit_button(row: &RowModel, mid: &str, text: String, wb: &WeakEntity<Workbench>) -> Button {
+    let row_id = row.id.clone();
+    let mid = mid.to_string();
+    Button::new(SharedString::from(format!("edit-{}", row.id)))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Pencil)
+        .tooltip(t!("chat.editMessage"))
+        .on_click({
+            let wb = wb.clone();
+            move |_, window, cx| {
+                if let Some(wb) = wb.upgrade() {
+                    wb.update(cx, |wb, cx| {
+                        let area = cx.new(|cx| TextareaState::new(window, cx));
+                        area.update(cx, |state, cx| state.set_value(&text, window, cx));
+                        wb.edit_row = Some((row_id.clone(), mid.clone(), area));
+                        cx.notify();
+                    });
+                }
+            }
+        })
+}
+
+/// The regenerate affordance (requirements 0.1, rewind spec §4.2): retry the
+/// latest turn. `message_id` is the tail assistant row's mid when it has
+/// one, else None (the bridge's default-latest).
+fn regenerate_button(row: &RowModel, message_id: Option<String>, wb: &WeakEntity<Workbench>) -> Button {
+    Button::new(SharedString::from(format!("regen-{}", row.id)))
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::RotateCcw)
+        .tooltip(t!("chat.regenerate"))
+        .on_click({
+            let wb = wb.clone();
+            move |_, _, cx| {
+                if let Some(wb) = wb.upgrade() {
+                    let runtime = wb.read(cx).runtime.clone();
+                    runtime.send(UiCommand::RetryTurn {
+                        message_id: message_id.clone(),
+                    });
+                }
+            }
+        })
+}
+
+/// The ADR-0012 rewind boundary chip: a centered system pill marking where
+/// the discarded tail was cut — without it the missing history reads like a
+/// glitch rather than an intentional rewind. Same shape as the
+/// task-notification chip.
+fn render_rewind_chip(kind: RewindKind, theme: &component::Theme) -> AnyElement {
+    div()
+        .id("rewind-boundary-chip")
+        .test_support()
+        .flex()
+        .min_w_0()
+        .justify_center()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .min_w_0()
+                .max_w(relative(0.8))
+                .px_2()
+                .py_1()
+                .rounded_full()
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.title_bar)
+                .text_size(ui_text(12.))
+                .text_color(theme.muted_foreground)
+                .child(
+                    Icon::new(KitIconName::Undo)
+                        .small()
+                        .flex_none()
+                        .text_color(theme.muted_foreground),
+                )
+                .child(match kind {
+                    RewindKind::Edit => t!("chat.rewoundResent").into_owned(),
+                    RewindKind::Retry => t!("chat.regenerated").into_owned(),
+                }),
+        )
+        .into_any_element()
+}
+
 /// Drag-and-drop payload of one tab (strip reorder): the dragged tab's id.
 /// A newtype — not a bare `u64` — so the drop targets can name exactly this
 /// drag (`on_drop::<TabDragId>`), never some other u64 payload.
@@ -1234,6 +1369,7 @@ impl Workbench {
             clear_composer: false,
             composer_prefill: None,
             composer_append: None,
+            edit_row: None,
             composer_restore: None,
             tab_drafts: std::collections::HashMap::new(),
             staged: Vec::new(),
@@ -2158,6 +2294,7 @@ impl Workbench {
             // The plan strip folds back on a session switch (the TS screen
             // remounts, so its uncontrolled `<details>` resets).
             self.plan_open = false;
+            self.edit_row = None;
             self.scroller.update(cx, |state, cx| state.reset(0, cx));
         }
 
@@ -2240,6 +2377,13 @@ impl Workbench {
         }
         if let Some(tab) = self.tab.as_mut() {
             tab.messages = messages;
+        }
+        // An edit in flight whose row vanished (the rewind already rewrote
+        // the tail, or the reload dropped it) is stale — drop it.
+        if let Some((id, _, _)) = self.edit_row.as_ref() {
+            if !self.rows.iter().any(|r| &r.id == id) {
+                self.edit_row = None;
+            }
         }
         cx.notify();
     }
@@ -5122,28 +5266,108 @@ impl Workbench {
         let chat_font = self.font_scale.chat_px();
         let thought_full = self.thought_full.clone();
         let tool_run_open = self.tool_run_open.clone();
+        // Message-action context (requirements 0.1): latest-role targets and
+        // the rewind gates. The loop leaves the LAST user/assistant row in
+        // each slot — the wire's latest-only contract.
+        let mut actions = RowActions {
+            rewind_capable: self.tab.as_ref().is_some_and(|t| t.rewind_capable),
+            editing: self.edit_row.as_ref().map(|(id, _, _)| id.clone()),
+            ..RowActions::default()
+        };
+        for row in &self.rows {
+            match row.role {
+                ChatRole::User => {
+                    actions.last_user_id = Some(row.id.clone());
+                    actions.last_user_mid = row.mid.clone();
+                }
+                ChatRole::Assistant => {
+                    actions.last_assistant_id = Some(row.id.clone());
+                    actions.last_assistant_mid = row.mid.clone();
+                }
+            }
+        }
+        let edit_row = self.edit_row.clone();
+        // ADR-0012 boundary chip: anchors at the reload's message count; a
+        // stale index past the row count (history shrank underneath) is
+        // clamped to ride after the last row instead of vanishing.
+        let rewind_mark = self.tab.as_ref().and_then(|t| t.rewind_mark);
+        let rewind_at = rewind_mark.map(|(_, at)| at.min(rows.len()));
         column
             .child(
                 MessageScroller::new("chat", scroller, move |index, _window, cx| {
                     let is_last_row = index + 1 == rows.len();
-                    if let Some(row) = rows.get(index) {
-                        render_row(
-                            row,
-                            is_last_row,
-                            running,
-                            copied.as_deref(),
-                            &weak_rows,
-                            chat_font,
-                            &thought_full,
-                            &tool_run_open,
-                            cx,
-                        )
+                    let chip_kind = rewind_mark
+                        .filter(|(_, at)| {
+                            (*at).min(rows.len()) == index || (*at > index && is_last_row)
+                        })
+                        .map(|(kind, _)| kind);
+                    let element = if let Some(row) = rows.get(index) {
+                        // The inline edit-and-resend editor replaces the row.
+                        if actions.editing.as_deref() == Some(row.id.as_str()) {
+                            render_edit_row(row, &edit_row, &runtime, &weak_rows, cx)
+                        } else {
+                            render_row(
+                                row,
+                                is_last_row,
+                                running,
+                                copied.as_deref(),
+                                &actions,
+                                &weak_rows,
+                                chat_font,
+                                &thought_full,
+                                &tool_run_open,
+                                cx,
+                            )
+                        }
                     } else if let Some(card) = card.as_ref() {
                         // The trailing approval card row (inline in the stream —
-                        // requirements §2).
+                        // requirements §2). A boundary index AT the row count
+                        // (nothing streamed yet) rides above the card.
+                        if rewind_at == Some(index) {
+                            let theme = cx.theme();
+                            return div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .min_w_0()
+                                .child(render_rewind_chip(
+                                    rewind_mark.map(|(kind, _)| kind).unwrap_or(RewindKind::Edit),
+                                    &theme,
+                                ))
+                                .child(render_approval_card(card, &runtime, &weak, cx))
+                                .into_any_element();
+                        }
                         render_approval_card(card, &runtime, &weak, cx)
                     } else {
                         div().into_any_element()
+                    };
+                    match chip_kind {
+                        // Above the boundary row…
+                        Some(kind) if rewind_at == Some(index) => {
+                            let theme = cx.theme();
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .min_w_0()
+                                .child(render_rewind_chip(kind, &theme))
+                                .child(element)
+                                .into_any_element()
+                        }
+                        // …or below the last row when the boundary sits past
+                        // the list end (nothing streamed yet).
+                        Some(kind) => {
+                            let theme = cx.theme();
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_2()
+                                .min_w_0()
+                                .child(element)
+                                .child(render_rewind_chip(kind, &theme))
+                                .into_any_element()
+                        }
+                        None => element,
                     }
                 })
                 .with_bottom_fade(fade)
@@ -5590,6 +5814,7 @@ fn new_row(msg: &ChatMessage, cx: &mut Context<Workbench>) -> RowModel {
         role: msg.role,
         collapsed: msg.collapsed.unwrap_or(false),
         parts,
+        mid: msg.mid.clone(),
     }
 }
 
@@ -5973,6 +6198,7 @@ fn render_row(
     is_last_row: bool,
     running: bool,
     copied: Option<&str>,
+    actions: &RowActions,
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
@@ -5981,12 +6207,15 @@ fn render_row(
 ) -> AnyElement {
     let theme = cx.theme();
     match row.role {
-        ChatRole::User => render_user_row(row, copied, wb, chat_font, theme).into_any_element(),
+        ChatRole::User => {
+            render_user_row(row, copied, actions, wb, chat_font, theme).into_any_element()
+        }
         ChatRole::Assistant => render_assistant_row(
             row,
             is_last_row,
             running,
             copied,
+            actions,
             wb,
             chat_font,
             thought_full,
@@ -5998,9 +6227,100 @@ fn render_row(
     }
 }
 
+/// The inline edit-and-resend editor (requirements 0.1): replaces the user
+/// row while open — the message text in a textarea with Resend / Cancel.
+/// Resend dispatches `session/edit_user_message`; the reload + boundary chip
+/// follow the ack (SessionCore owns that flow).
+fn render_edit_row(
+    row: &RowModel,
+    edit_row: &Option<(String, String, Entity<TextareaState>)>,
+    runtime: &ProtocolRuntime,
+    wb: &WeakEntity<Workbench>,
+    cx: &App,
+) -> AnyElement {
+    let Some((_, mid, area)) = edit_row else {
+        return div().into_any_element();
+    };
+    let theme = cx.theme();
+    let runtime = runtime.clone();
+    let wb_resend = wb.clone();
+    let area_resend = area.clone();
+    let mid_resend = mid.clone();
+    div()
+        .id(SharedString::from(format!("edit-row-{}", row.id)))
+        .test_support()
+        .flex()
+        .justify_end()
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_end()
+                .flex_none()
+                .max_w(relative(0.85))
+                .px_3()
+                .py_2()
+                .rounded_lg()
+                .bg(theme.accent.opacity(0.18))
+                .border_1()
+                .border_color(theme.accent.opacity(0.45))
+                .child(
+                    div().w_full().child(Textarea::new(area).small()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pt_1()
+                        .child(
+                            Button::new("edit-resend")
+                                .primary()
+                                .small()
+                                .label(t!("chat.resend").into_owned())
+                                .on_click(move |_, _, cx| {
+                                    let text = area_resend.read(cx).value().to_string();
+                                    if !text.trim().is_empty() {
+                                        runtime.send(UiCommand::EditUserMessage {
+                                            message_id: mid_resend.clone(),
+                                            new_text: text,
+                                        });
+                                    }
+                                    if let Some(wb) = wb_resend.upgrade() {
+                                        wb.update(cx, |wb, cx| {
+                                            wb.edit_row = None;
+                                            cx.notify();
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("edit-cancel")
+                                .secondary()
+                                .small()
+                                .label(t!("common.cancel").into_owned())
+                                .on_click({
+                                    let wb = wb.clone();
+                                    move |_, _, cx| {
+                                        if let Some(wb) = wb.upgrade() {
+                                            wb.update(cx, |wb, cx| {
+                                                wb.edit_row = None;
+                                                cx.notify();
+                                            });
+                                        }
+                                    }
+                                }),
+                        ),
+                ),
+        )
+        .into_any_element()
+}
+
 fn render_user_row(
     row: &RowModel,
     copied: Option<&str>,
+    actions: &RowActions,
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     theme: &component::Theme,
@@ -6145,6 +6465,18 @@ fn render_user_row(
             copied == Some(row.id.as_str()),
             wb,
         ));
+        // Quote is the always-available fallback action (0.1); edit-resend
+        // exists only on the latest addressable user message (the wire's
+        // latest-only gate, mirrored from the TS editMid gate).
+        side = side.child(quote_button(row, text.clone(), wb));
+        if actions.rewind_capable
+            && actions.last_user_id.as_deref() == Some(row.id.as_str())
+            && !row.collapsed
+        {
+            if let Some(mid) = row.mid.as_deref() {
+                side = side.child(edit_button(row, mid, text.clone(), wb));
+            }
+        }
     }
     div()
         .id(SharedString::from(format!("user-row-{}", row.id)))
@@ -6167,6 +6499,7 @@ fn render_assistant_row(
     is_last_row: bool,
     running: bool,
     copied: Option<&str>,
+    actions: &RowActions,
     wb: &WeakEntity<Workbench>,
     chat_font: (f32, f32),
     thought_full: &std::collections::HashSet<(String, usize)>,
@@ -6408,6 +6741,15 @@ fn render_assistant_row(
                 copied == Some(row.id.as_str()),
                 wb,
             ))
+            // Quote works everywhere; regenerate rides the latest assistant
+            // row only. A tail row without a mid (local card message) sends
+            // None — the bridge's default-latest resolves the target.
+            .child(quote_button(row, text.clone(), wb))
+            .when(
+                actions.rewind_capable
+                    && actions.last_assistant_id.as_deref() == Some(row.id.as_str()),
+                |this| this.child(regenerate_button(row, row.mid.clone(), wb)),
+            )
         })
         .context_menu(chat_row_menu(text))
         .into_any_element()
@@ -8059,6 +8401,7 @@ mod display_unit_tests {
             parts: vec![PartView::Plain {
                 text: text.to_string(),
             }],
+            mid: None,
         }
     }
 
@@ -9533,6 +9876,7 @@ mod ui_tests {
                     }],
                     created_at: 1,
                     collapsed: None,
+                    mid: None,
                 },
                 protocol::chat::ChatMessage {
                     id: "m_agent".to_string(),
@@ -9542,6 +9886,7 @@ mod ui_tests {
                     }],
                     created_at: 2,
                     collapsed: None,
+                    mid: None,
                 },
             ],
             pending: Vec::new(),
@@ -9555,6 +9900,8 @@ mod ui_tests {
             turn_stats: None,
             plan_entries: None,
             fs_capable: false,
+            rewind_capable: false,
+            rewind_mark: None,
             available_commands: Vec::new(),
         };
         active.session_id = Some("sess_1".to_string());

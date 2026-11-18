@@ -872,6 +872,7 @@ mod tests {
             })],
             created_at: 1,
             collapsed: None,
+            mid: None,
         }
     }
 

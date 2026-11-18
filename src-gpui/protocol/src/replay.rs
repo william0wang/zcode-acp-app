@@ -249,6 +249,7 @@ impl MessageFactory {
             parts: Vec::new(),
             created_at: now_ms,
             collapsed: None,
+            mid: None,
         }
     }
 }
@@ -345,6 +346,7 @@ pub fn append_chunk_message(
             parts: vec![part],
             created_at: now_ms,
             collapsed: None,
+            mid: None,
         });
         return;
     }
@@ -361,6 +363,23 @@ pub fn is_collapsed_meta(meta: Option<&Value>) -> bool {
     meta.and_then(|m| m.get("zcode"))
         .map(|z| z.get("collapsed") == Some(&Value::Bool(true)))
         .unwrap_or(false)
+}
+
+/// `_meta.zcode.mid` on a replayed chunk (rewind spec §4.3): the backend's
+/// stable handle for the row the chunk belongs to. Either placement is read
+/// — the notification-level meta envelope first, then the update-level
+/// `_meta` — mirroring the TS `zcodeMid`. Meaningful only when the chunk's
+/// own `messageId` also groups it (the pair names the same row).
+pub fn zcode_mid(u: &SessionUpdate, meta: Option<&Value>) -> Option<String> {
+    fn read(v: &Value) -> Option<String> {
+        v.get("zcode")
+            .and_then(|z| z.get("mid"))
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    }
+    meta.and_then(read)
+        .or_else(|| u.rest.get("_meta").and_then(read))
 }
 
 /// `_meta.zcode.earlierPage` on session/load_earlier paged updates — the
@@ -460,6 +479,19 @@ pub fn apply_one(
             return ApplyPatch::Nothing;
         }
         append_chunk_message(msgs, u, role, &text, TextPartKind::Text, ids, now_ms);
+        // Rewind addressing: stamp the handle onto the grouped message, only
+        // when the chunk pairs its own messageId with the meta mid (the pair
+        // names the same row). Live echoes carry no meta mid, so they stay
+        // address-free.
+        let wire_mid = rest
+            .get("messageId")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty());
+        if let (Some(wire), Some(mid)) = (wire_mid, zcode_mid(u, meta)) {
+            if let Some(m) = msgs.iter_mut().find(|m| m.id == wire && m.mid.is_none()) {
+                m.mid = Some(mid);
+            }
+        }
         if role == ChatRole::User && is_collapsed_meta(meta) {
             let mid = rest.get("messageId").and_then(Value::as_str).unwrap_or("");
             if let Some(m) = msgs
@@ -538,6 +570,7 @@ pub fn apply_one(
                     parts: vec![ChatPart::ToolCall(part)],
                     created_at: now_ms,
                     collapsed: None,
+                    mid: zcode_mid(u, meta),
                 });
             }
             return ApplyPatch::Messages;
@@ -744,6 +777,61 @@ mod tests {
         SessionUpdate::with_rest(kind, rest)
     }
 
+    // Port anchor: tests/rewind-mid.test.ts — replayed addressable chunks
+    // carry `_meta.zcode.mid` (either placement); live echoes and local
+    // optimistic bubbles never do.
+    #[test]
+    fn rewind_mid_stamping() {
+        let note_meta = json!({ "zcode": { "mid": "m-1" } });
+        let mut msgs = Vec::new();
+        let mut ids = factory();
+        // Notification-level placement.
+        apply_one(
+            &mut msgs,
+            &chunk("user_message_chunk", Some("u-1"), "hi"),
+            Some(&note_meta),
+            &mut ids,
+            1,
+        );
+        assert_eq!(msgs[0].mid.as_deref(), Some("m-1"));
+        // Update-level placement, and a second chunk stamps nothing new
+        // (the handle is already on the grouped message).
+        let mut update = chunk("agent_message_chunk", Some("a-1"), "yo");
+        update
+            .rest
+            .insert("_meta".to_owned(), json!({ "zcode": { "mid": "m-2" } }));
+        apply_one(&mut msgs, &update, None, &mut ids, 2);
+        assert_eq!(msgs[1].mid.as_deref(), Some("m-2"));
+        apply_one(
+            &mut msgs,
+            &chunk("agent_message_chunk", Some("a-1"), " again"),
+            Some(&json!({ "zcode": { "mid": "m-2" } })),
+            &mut ids,
+            3,
+        );
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].mid.as_deref(), Some("m-2"));
+        // Live echo (no meta mid anywhere) stays address-free.
+        apply_one(
+            &mut msgs,
+            &chunk("agent_message_chunk", Some("a-2"), "live"),
+            None,
+            &mut ids,
+            4,
+        );
+        assert_eq!(msgs[2].mid, None);
+        // A mid without the chunk's own messageId groups nowhere — nothing
+        // is stamped (never invent an address).
+        apply_one(
+            &mut msgs,
+            &chunk("agent_message_chunk", None, "loose"),
+            Some(&json!({ "zcode": { "mid": "m-3" } })),
+            &mut ids,
+            5,
+        );
+        assert!(msgs.iter().all(|m| m.mid != Some("m-3".to_string())));
+    }
+
     #[test]
     fn bridge_page_marker_floor() {
         // Port anchor: the 0.44.1 floor from tests/earlier-*.test.ts drivers.
@@ -786,6 +874,7 @@ mod tests {
             parts: vec![ChatPart::Thought { text: "t".into() }],
             created_at: 0,
             collapsed: None,
+            mid: None,
         };
         assert_eq!(
             snapshot_tail_id(&[thought]).as_deref(),

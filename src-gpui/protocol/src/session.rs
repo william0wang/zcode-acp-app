@@ -65,6 +65,28 @@ pub enum WireRequest {
         config_id: String,
         value: String,
     },
+    /// `session/edit_user_message` (rewind spec §4.1): edit-and-resend the
+    /// latest user message. The ack is the cue to `session/load` the
+    /// rewritten tail; the replacement turn streams through the regular
+    /// update/turnState pipeline.
+    EditMessage {
+        session_id: String,
+        message_id: String,
+        new_text: String,
+    },
+    /// `session/retry_turn` (rewind spec §4.2); `message_id` omitted means
+    /// the bridge resolves the latest retryable turn itself.
+    RetryTurn {
+        session_id: String,
+        message_id: Option<String>,
+    },
+}
+
+/// Which rewind action produced the current boundary chip (ADR-0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RewindKind {
+    Edit,
+    Retry,
 }
 
 /// Why a `session/load` is issued — rides as `_meta.zcode.intent`
@@ -237,6 +259,11 @@ pub struct SessionCore {
     /// Bridge marks load_earlier page updates `_meta.zcode.earlierPage`
     /// (zcode-acp-server 0.44.1+); gates the marker-based page routing.
     pub page_marker_capable: bool,
+    /// ADR-0012 boundary chip: `(kind, index into messages)` where a rewind
+    /// cut the discarded tail — rendered above that message so the
+    /// discontinuity reads as intentional. Cleared on session switch and
+    /// load_earlier (its prepend shifts indices); not persisted.
+    pub rewind_mark: Option<(RewindKind, usize)>,
 
     // ---- module-level singletons from the TS closure ----
     /// True while a session/prompt WE sent is in flight. Turn-end
@@ -280,6 +307,10 @@ pub struct SessionCore {
     /// settled the NEW turn — clearing its running state and re-flushing the
     /// queue underneath it.
     in_flight_prompt: Option<String>,
+    /// Armed by the rewind result handler while its post-ack `session/load`
+    /// is in flight; stamped into `rewind_mark` (at the message count the
+    /// reload produced) when that load lands, dropped if it fails.
+    pending_rewind_mark: Option<RewindKind>,
 }
 
 impl SessionCore {
@@ -980,6 +1011,79 @@ impl SessionCore {
         Some(draft)
     }
 
+    // ---- rewind (bridge spec: edit & resend / regenerate) ----
+
+    /// Edit-and-resend the latest user message (`session/edit_user_message`).
+    /// The bridge raises busy at handler entry, but that broadcast races the
+    /// ack — the optimistic `is_running` closes the composer gap in between
+    /// (the TS store does the same). A failure unlocks in
+    /// [`Self::on_rewind_failed`]; a success keeps the lock: the busy window
+    /// spans the whole replacement turn and the reload's `turnActive`
+    /// re-asserts it.
+    pub fn edit_user_message(&mut self, message_id: &str, new_text: &str) -> bool {
+        let sid = match &self.active_session_id {
+            Some(s) => s.clone(),
+            None => return false,
+        };
+        if !self.conn_open {
+            return false;
+        }
+        self.is_running = true;
+        self.outbox.push(WireRequest::EditMessage {
+            session_id: sid,
+            message_id: message_id.to_owned(),
+            new_text: new_text.to_owned(),
+        });
+        true
+    }
+
+    /// Regenerate (`session/retry_turn`): `message_id` names the assistant
+    /// row via its mid; None = the bridge's default-latest.
+    pub fn retry_turn(&mut self, message_id: Option<&str>) -> bool {
+        let sid = match &self.active_session_id {
+            Some(s) => s.clone(),
+            None => return false,
+        };
+        if !self.conn_open {
+            return false;
+        }
+        self.is_running = true;
+        self.outbox.push(WireRequest::RetryTurn {
+            session_id: sid,
+            message_id: message_id.map(str::to_owned),
+        });
+        true
+    }
+
+    /// The rewind ack landed (admission): reload the rewritten tail (the
+    /// discarded branch is gone from the store) and arm the boundary chip.
+    /// The replacement turn streams on its own — the reload's `turnActive`
+    /// keeps the composer locked, never the ack.
+    pub fn on_rewind_result(&mut self, kind: RewindKind) {
+        let sid = match &self.active_session_id {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        self.load_session(&sid);
+        self.pending_rewind_mark = Some(kind);
+    }
+
+    /// The rewind request failed: undo the optimistic lock (the TS notice
+    /// path is not ported; the runtime logs the message).
+    pub fn on_rewind_failed(&mut self, _message: &str) {
+        self.is_running = false;
+        self.pending_rewind_mark = None;
+    }
+
+    /// The post-rewind reload settled: the chip anchors at the message count
+    /// the reload produced — everything above is kept history, everything
+    /// below is the rewound-and-resent content streaming in after.
+    fn apply_pending_rewind_mark(&mut self) {
+        if let Some(kind) = self.pending_rewind_mark.take() {
+            self.rewind_mark = Some((kind, self.messages.len()));
+        }
+    }
+
     // ---- load flows ----
 
     /// `session/load`: replay is the catch-up mechanism after any
@@ -1031,6 +1135,9 @@ impl SessionCore {
         self.loading_earlier = false;
         self.loading_session = true;
         self.is_running = false;
+        // A rewind result handler re-arms pending_rewind_mark AFTER its
+        // load_session call, so clearing here is safe for both callers.
+        self.rewind_mark = None;
         // The in-flight prompt belonged to the session being left (or to a
         // turn this load is about to replace): its response must not settle
         // whatever the attach restores.
@@ -1116,6 +1223,9 @@ impl SessionCore {
                 updated.current_mode_id = current_mode_id;
                 self.cache.write(req.session_id.as_str(), updated);
                 self.flush_pending(now_ms);
+                // AFTER the flush: the chip anchors at the final message
+                // count, batched replay chunks included.
+                self.apply_pending_rewind_mark();
                 return;
             }
             // History moved while away: drop the painted snapshot and replay
@@ -1164,6 +1274,9 @@ impl SessionCore {
         // (flush_pending no-ops while a restored turn is running — its
         // turnState end event does the flushing then).
         self.flush_pending(now_ms);
+        // AFTER the flush: the chip anchors at the final message count,
+        // batched replay chunks included.
+        self.apply_pending_rewind_mark();
     }
 
     /// A `session/load` failed. The in-flight batch AND the
@@ -1186,6 +1299,13 @@ impl SessionCore {
         }
         self.drop_queued_updates();
         self.loading_session = false;
+        // A post-rewind reload that fails leaves the optimistic lock on
+        // forever — settle it the way the TS catch does (the turnState
+        // end, if the turn is genuinely running, is a no-op on false).
+        if self.pending_rewind_mark.is_some() {
+            self.pending_rewind_mark = None;
+            self.is_running = false;
+        }
         if req.limit == REPLAY_TAIL_LIMIT
             && self.active_session_id.as_deref() == Some(req.session_id.as_str())
         {
@@ -1213,6 +1333,8 @@ impl SessionCore {
         self.available_commands.clear();
         self.loading_session = false;
         self.is_running = false;
+        self.rewind_mark = None;
+        self.pending_rewind_mark = None;
         self.local_prompt_active = false;
         self.in_flight_prompt = None;
         self.disarm_force_send_stall();
@@ -1326,6 +1448,9 @@ impl SessionCore {
                 self.replay_cursor = meta.cursor;
                 self.has_more = meta.has_more.unwrap_or(false);
                 self.loading_earlier = false;
+                // The prepend shifts message indices — the chip's anchor
+                // dies with it (it was for the immediate reload view).
+                self.rewind_mark = None;
             }
             // else: the store switched away mid-flight — the page's
             // messages/cursor land nowhere (the next load re-bases), exactly
@@ -2886,5 +3011,83 @@ mod tests {
         assert_eq!(ts.output_tokens, 200);
         assert_eq!(ts.seconds, 4.0);
         assert!(!core.is_running);
+    }
+
+    // Port anchor: the TS appStore editUserMessage/retryTurn semantics —
+    // optimistic lock, ack-driven reload, boundary chip, unlock on failure.
+    #[test]
+    fn rewind_mark_lands_at_the_reload_boundary_and_clears() {
+        let mut core = booted_with_tail("0.44.1", "cursor");
+        assert!(!core.messages.is_empty());
+
+        // Edit-resend: optimistic lock + the wire request.
+        assert!(core.edit_user_message("some-mid", "edited"));
+        assert!(core.is_running);
+        assert!(matches!(
+            core.take_wire().as_slice(),
+            [WireRequest::EditMessage {
+                session_id,
+                message_id,
+                new_text,
+            }] if session_id == "sess_1"
+                && message_id == "some-mid"
+                && new_text == "edited"
+        ));
+
+        // Ack = admission: reload the rewritten tail, arm the chip. The
+        // replacement turn keeps the composer locked via the reload's
+        // turnActive (absent here), never via the ack. The boot's snapshot
+        // is cached, so the reload is the usual double hop: a limit-0
+        // reconcile that sees the tail MOVE (the rewind rewrote it), then
+        // the full tail replay.
+        core.on_rewind_result(RewindKind::Edit);
+        let reconcile = expect_load(&mut core);
+        assert_eq!(reconcile.limit, 0);
+        core.on_load_result(2001, &reconcile, &json!({}));
+        let replay = expect_load(&mut core);
+        assert_eq!(replay.limit, REPLAY_TAIL_LIMIT);
+        for (kind, mid, text) in [
+            ("user_message_chunk", "keep_1", "kept q "),
+            ("agent_message_chunk", "keep_1", "kept a "),
+        ] {
+            core.on_update(2000, "sess_1", text_update(kind, Some(mid), text), None);
+        }
+        core.on_load_result(2001, &replay, &json!({}));
+        let (kind, at) = core.rewind_mark.expect("the chip landed");
+        assert_eq!(kind, RewindKind::Edit);
+        assert_eq!(at, core.messages.len(), "the boundary is the reload's end");
+        assert!(!core.is_running, "no turnActive in this replay");
+
+        // load_earlier's prepend shifts indices — the anchor dies with it.
+        core.has_more = true;
+        core.replay_cursor = Some("cur".into());
+        core.load_earlier(3000);
+        assert!(matches!(
+            core.take_wire().as_slice(),
+            [WireRequest::LoadEarlier(_)]
+        ));
+        core.on_load_earlier_result(3001, &json!({}));
+        assert_eq!(core.rewind_mark, None);
+    }
+
+    #[test]
+    fn rewind_failure_unlocks_and_arms_no_reload() {
+        let mut core = booted_with_tail("0.44.1", "cursor");
+        assert!(core.retry_turn(None));
+        assert!(core.is_running);
+        assert!(matches!(
+            core.take_wire().as_slice(),
+            [WireRequest::RetryTurn {
+                session_id,
+                message_id,
+            }] if session_id == "sess_1" && message_id.is_none()
+        ));
+        core.on_rewind_failed("rewind rejected by backend");
+        assert!(!core.is_running, "the optimistic lock is undone");
+        assert!(core.rewind_mark.is_none());
+        assert!(
+            core.take_wire().is_empty(),
+            "a failed rewind triggers no reload"
+        );
     }
 }

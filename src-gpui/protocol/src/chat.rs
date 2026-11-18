@@ -90,6 +90,12 @@ pub struct ChatMessage {
     /// instead of a wall of user text (`_meta.zcode.collapsed`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collapsed: Option<bool>,
+    /// Replay-only rewind handle (`_meta.zcode.mid`, bridge spec §4.3):
+    /// present iff this row is a backend-addressable message. Live echoes
+    /// and local optimistic bubbles never carry one — presence is the UI's
+    /// addressable gate next to the connection-level `rewind_capable`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mid: Option<String>,
 }
 
 /// Last completed turn's speed readout (title bar): output tokens, wall

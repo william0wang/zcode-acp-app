@@ -72,7 +72,8 @@ use protocol::hub::{
 };
 use protocol::hub_client::{HubApiError, HubClient};
 use protocol::session::{
-    ForceSendOutcome, ForceSendRefusal, LoadEarlierRequest, LoadIntent, PromptRequest, SessionCore,
+    ForceSendOutcome, ForceSendRefusal, LoadEarlierRequest, LoadIntent, PromptRequest, RewindKind,
+    SessionCore,
     WireRequest,
 };
 use protocol::settings::BackendRestartResult;
@@ -240,6 +241,16 @@ pub enum UiCommand {
     /// `session/set_config_option` on the active tab's session; the answer's
     /// `configOptions` plus the bridge's broadcasts refresh the chips.
     SetConfigOption { config_id: String, value: String },
+    /// Rewind (bridge spec §4.1): edit-and-resend the latest user message.
+    /// `message_id` is the bubble's `mid`; the UI gates on the rewind
+    /// capability and offers this only on the latest addressable bubble.
+    EditUserMessage {
+        message_id: String,
+        new_text: String,
+    },
+    /// Rewind (bridge spec §4.2): regenerate. `message_id` omitted = the
+    /// bridge resolves the latest retryable turn.
+    RetryTurn { message_id: Option<String> },
     /// Manual retry from the status bar (re-runs the whole bootstrap).
     Retry,
     /// Confirms the guided token setup's previewed write (Phase::TokenGuide):
@@ -988,6 +999,14 @@ pub struct TabView {
     /// The bridge advertised the zcode fs capability (Session Files gating,
     /// TS `fsCapable`): per-session `/fs/list` exists on this bridge.
     pub fs_capable: bool,
+    /// The bridge advertised the rewind extensions (`_meta.zcode.rewind`,
+    /// session/edit_user_message + session/retry_turn): gates the
+    /// edit-resend / regenerate actions; against an older bridge the
+    /// buttons stay hidden (quote-to-composer remains).
+    pub rewind_capable: bool,
+    /// ADR-0012 boundary chip: which rewind cut the tail and at which
+    /// message index (SessionCore `rewind_mark`).
+    pub rewind_mark: Option<(protocol::session::RewindKind, usize)>,
     /// Slash commands from `available_commands_update` — the composer's "/"
     /// completion menu (ChatView.tsx `commands`).
     pub available_commands: Vec<protocol::acp::SlashCommand>,
@@ -1557,6 +1576,14 @@ enum LoopEvent {
         req: PromptRequest,
         result: Result<Value, String>,
     },
+    /// A rewind request (`session/edit_user_message` / `session/retry_turn`)
+    /// settled on a tab. Ok = admission: the core reloads the rewritten tail
+    /// and arms the boundary chip; the replacement turn streams on its own.
+    RewindResult {
+        tab: u64,
+        kind: RewindKind,
+        result: Result<Value, String>,
+    },
     /// `session/set_config_option` settled on a tab.
     SetConfigResult {
         tab: u64,
@@ -2035,6 +2062,9 @@ struct Tab {
     /// The bridge advertised the zcode fs capability on the last
     /// `initialize` (Session Files gating, TS `fsCapable`).
     fs_capable: bool,
+    /// The rewind extensions capability on the last `initialize`
+    /// (`_meta.zcode.rewind`, TS `rewindCapable`).
+    rewind_capable: bool,
 }
 
 /// The sidebar's history browser state (driver-owned — all wire I/O lives
@@ -2911,6 +2941,7 @@ impl Driver {
             reconnect_attempts: 0,
             reincubated_at: None,
             fs_capable: false,
+            rewind_capable: false,
         });
         self.active_tab = Some(id);
         traceln!("[driver] tab {id} opened (instance {})", self.tabs.last().unwrap().instance_id);
@@ -6460,6 +6491,49 @@ impl Driver {
                         let _ = tx.send(LoopEvent::SetConfigResult { tab: tab_id, result: res });
                     });
                 }
+                WireRequest::EditMessage {
+                    session_id,
+                    message_id,
+                    new_text,
+                } => {
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let res = conn
+                            .request(
+                                "session/edit_user_message",
+                                json!({
+                                    "sessionId": session_id,
+                                    "messageId": message_id,
+                                    "newText": new_text,
+                                }),
+                            )
+                            .await
+                            .map_err(|e| e.0);
+                        let _ = tx.send(LoopEvent::RewindResult {
+                            tab: tab_id,
+                            kind: RewindKind::Edit,
+                            result: res,
+                        });
+                    });
+                }
+                WireRequest::RetryTurn {
+                    session_id,
+                    message_id,
+                } => {
+                    let conn = conn.clone();
+                    tokio::spawn(async move {
+                        let mut params = json!({ "sessionId": session_id });
+                        if let Some(id) = message_id {
+                            params["messageId"] = json!(id);
+                        }
+                        let res = conn.request("session/retry_turn", params).await.map_err(|e| e.0);
+                        let _ = tx.send(LoopEvent::RewindResult {
+                            tab: tab_id,
+                            kind: RewindKind::Retry,
+                            result: res,
+                        });
+                    });
+                }
             }
         }
     }
@@ -6704,6 +6778,20 @@ impl Driver {
                             self.record_readouts(&req.session_id);
                         }
                         Err(e) => t.core.on_prompt_failed(now, Some(&req), &e),
+                    }
+                }
+            }
+            LoopEvent::RewindResult { tab, kind, result } => {
+                if let Some(t) = self.tab_mut(tab) {
+                    match result {
+                        // Admission ack: reload + boundary chip; the busy
+                        // window spans the replacement turn (turnState owns
+                        // the composer lock from here).
+                        Ok(_) => t.core.on_rewind_result(kind),
+                        Err(e) => {
+                            traceln!("[driver] tab {tab} rewind failed: {e}");
+                            t.core.on_rewind_failed(&e);
+                        }
                     }
                 }
             }
@@ -7246,6 +7334,7 @@ impl Driver {
                     );
                     t.core.on_initialize(init.agent_version());
                     t.fs_capable = init.fs_capability();
+                    t.rewind_capable = init.rewind_capability();
                     t.core.conn_open = true;
                     t.reconnect_attempts = 0;
                     // A fresh wire knows nothing until events arrive; the
@@ -7554,6 +7643,16 @@ impl Driver {
             UiCommand::SetConfigOption { config_id, value } => {
                 if let Some(t) = self.active_tab_mut() {
                     t.core.set_config_option(&config_id, &value);
+                }
+            }
+            UiCommand::EditUserMessage { message_id, new_text } => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.core.edit_user_message(&message_id, &new_text);
+                }
+            }
+            UiCommand::RetryTurn { message_id } => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.core.retry_turn(message_id.as_deref());
                 }
             }
             UiCommand::ForceSendPending => {
@@ -8777,6 +8876,8 @@ impl Driver {
             turn_stats: tab.core.turn_stats,
             plan_entries: tab.core.plan_entries.clone(),
             fs_capable: tab.fs_capable,
+            rewind_capable: tab.rewind_capable,
+            rewind_mark: tab.core.rewind_mark,
             available_commands: tab.core.available_commands.clone(),
         }
     }
@@ -8836,6 +8937,20 @@ impl Driver {
             // Session Files gating: the files panel's capability note and
             // the dock-seed decision read it off the active tab.
             mix(tab.fs_capable as u64, &mut sig);
+            // Rewind gating + the boundary chip (message-action buttons and
+            // the rewound-and-resent divider repaint with these).
+            mix(tab.rewind_capable as u64, &mut sig);
+            mix(
+                tab.core
+                    .rewind_mark
+                    .map(|(k, at)| {
+                        ((k == protocol::session::RewindKind::Edit) as u64)
+                            .wrapping_mul(1_000_000_007)
+                            .wrapping_add(at as u64)
+                    })
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
             // Slash commands (batch K): the composer's "/" menu contents —
             // an overwrite landing must re-emit even between empty states.
             mix(tab.core.available_commands.len() as u64, &mut sig);

@@ -149,6 +149,16 @@ impl AcpInitializeResult {
             == Some(true)
     }
 
+    /// The zcode rewind capability (`session/edit_user_message` +
+    /// `session/retry_turn`, bridge spec §4.4): absence is the unsupported
+    /// spelling, same as `fs`.
+    pub fn rewind_capability(&self) -> bool {
+        self.raw
+            .pointer("/agentCapabilities/_meta/zcode/rewind")
+            .and_then(Value::as_bool)
+            == Some(true)
+    }
+
     /// The bridge's advertised version (page-marker gating on the TS side).
     pub fn agent_version(&self) -> Option<&str> {
         self.raw.pointer("/agentInfo/version").and_then(Value::as_str)
