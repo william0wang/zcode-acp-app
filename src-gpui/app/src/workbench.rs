@@ -104,7 +104,10 @@ const DRAWER_WIDTH: f32 = 380.;
 // `Workbench::on_quit_action` for the quit guard. `FocusSessionSearch` is ⌘K;
 // `SelectTab1..9` are ⌘1..⌘9 (requirements §4's basic desktop shortcuts).
 // `StopTurn` is Esc — `session/cancel` on the running turn (ChatView's
-// Cancel, at keyboard distance).
+// Cancel, at keyboard distance). `ApprovalConfirm` (Enter) and
+// `ApprovalDigit1..9` answer the pending approval card at keyboard distance
+// (req 0.3) — they fire only while no text input owns the key (input key
+// listeners consume Enter/digits before global bindings dispatch).
 gpui_kit::actions!(
     workbench,
     [
@@ -112,6 +115,16 @@ gpui_kit::actions!(
         FocusSessionSearch,
         StopTurn,
         ToggleTerminal,
+        ApprovalConfirm,
+        ApprovalDigit1,
+        ApprovalDigit2,
+        ApprovalDigit3,
+        ApprovalDigit4,
+        ApprovalDigit5,
+        ApprovalDigit6,
+        ApprovalDigit7,
+        ApprovalDigit8,
+        ApprovalDigit9,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -1983,10 +1996,46 @@ impl Workbench {
             // The drawer is view-local — closing it is purely ours.
         } else if let Some(cmd) = self.open_config_page_close() {
             self.runtime.send(cmd);
+        } else if let Some(cmd) = self
+            .card
+            .as_ref()
+            .and_then(|card| card.read(cx).escape_command())
+        {
+            // A pending approval card owns Esc before the turn cancel (req
+            // 0.3): the reject-kind option, or a declined elicitation.
+            self.runtime.send(cmd);
         } else if self.tab.as_ref().is_some_and(|t| t.running) {
             self.runtime.send(UiCommand::CancelTurn);
         }
         cx.notify();
+    }
+
+    /// The approval card's Enter (req 0.3): the shape's primary answer.
+    pub(crate) fn on_approval_confirm(
+        &mut self,
+        _: &ApprovalConfirm,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(card) = self.card.clone() else {
+            return;
+        };
+        if let Some(cmd) = card.read(cx).confirm_command(cx) {
+            self.runtime.send(cmd);
+            cx.notify();
+        }
+    }
+
+    /// The approval card's digit picks (req 0.3): the nth permission option,
+    /// only with more than one option on the table.
+    fn on_approval_digit(&mut self, n: usize, cx: &mut Context<Self>) {
+        let Some(card) = self.card.clone() else {
+            return;
+        };
+        if let Some(cmd) = card.read(cx).digit_command(n) {
+            self.runtime.send(cmd);
+            cx.notify();
+        }
     }
 
     /// Open the rename sheet for a sidebar row (G1). The prefill lands
@@ -5372,6 +5421,8 @@ impl Workbench {
             }
         }
         let edit_row = self.edit_row.clone();
+        // Other sessions' pending asks ride the card render (req 2.16).
+        let approval_queue = self.tab.as_ref().map(|t| t.approval_queue).unwrap_or(0);
         // ADR-0012 boundary chip: anchors at the reload's message count; a
         // stale index past the row count (history shrank underneath) is
         // clamped to ride after the last row instead of vanishing.
@@ -5419,10 +5470,12 @@ impl Workbench {
                                     rewind_mark.map(|(kind, _)| kind).unwrap_or(RewindKind::Edit),
                                     &theme,
                                 ))
-                                .child(render_approval_card(card, &runtime, &weak, cx))
+                                .child(render_approval_card(
+                                    card, &runtime, &weak, approval_queue, cx,
+                                ))
                                 .into_any_element();
                         }
-                        render_approval_card(card, &runtime, &weak, cx)
+                        render_approval_card(card, &runtime, &weak, approval_queue, cx)
                     } else {
                         div().into_any_element()
                     };
@@ -7517,11 +7570,39 @@ impl Render for Workbench {
             // guard before anything closes; so do ⌘K (session search) and
             // ⌘1..9 (tab selection) — the shortcuts fire from any focus
             // inside the workbench tree.
-            .on_action(cx.listener(Self::on_quit_action))
-            .on_action(cx.listener(Self::on_focus_search))
-            .on_action(cx.listener(Self::on_stop_turn))
-            .on_action(cx.listener(Self::on_toggle_terminal))
-            .on_action(cx.listener(Self::on_select_tab1))
+             .on_action(cx.listener(Self::on_quit_action))
+             .on_action(cx.listener(Self::on_focus_search))
+             .on_action(cx.listener(Self::on_stop_turn))
+             .on_action(cx.listener(Self::on_toggle_terminal))
+             .on_action(cx.listener(Self::on_approval_confirm))
+             .on_action(cx.listener(|this, _: &ApprovalDigit1, _, cx| {
+                 this.on_approval_digit(1, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit2, _, cx| {
+                 this.on_approval_digit(2, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit3, _, cx| {
+                 this.on_approval_digit(3, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit4, _, cx| {
+                 this.on_approval_digit(4, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit5, _, cx| {
+                 this.on_approval_digit(5, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit6, _, cx| {
+                 this.on_approval_digit(6, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit7, _, cx| {
+                 this.on_approval_digit(7, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit8, _, cx| {
+                 this.on_approval_digit(8, cx)
+             }))
+             .on_action(cx.listener(|this, _: &ApprovalDigit9, _, cx| {
+                 this.on_approval_digit(9, cx)
+             }))
+             .on_action(cx.listener(Self::on_select_tab1))
             .on_action(cx.listener(Self::on_select_tab2))
             .on_action(cx.listener(Self::on_select_tab3))
             .on_action(cx.listener(Self::on_select_tab4))
@@ -10070,6 +10151,7 @@ mod ui_tests {
             fs_capable: false,
             rewind_capable: false,
             rewind_mark: None,
+            approval_queue: 0,
             available_commands: Vec::new(),
         };
         active.session_id = Some("sess_1".to_string());

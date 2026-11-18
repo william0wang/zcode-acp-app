@@ -1007,6 +1007,9 @@ pub struct TabView {
     /// ADR-0012 boundary chip: which rewind cut the tail and at which
     /// message index (SessionCore `rewind_mark`).
     pub rewind_mark: Option<(protocol::session::RewindKind, usize)>,
+    /// Pending approval/elicitation asks on OTHER sessions (req 2.16) —
+    /// the footer line behind the active card.
+    pub approval_queue: usize,
     /// Slash commands from `available_commands_update` — the composer's "/"
     /// completion menu (ChatView.tsx `commands`).
     pub available_commands: Vec<protocol::acp::SlashCommand>,
@@ -8878,6 +8881,7 @@ impl Driver {
             fs_capable: tab.fs_capable,
             rewind_capable: tab.rewind_capable,
             rewind_mark: tab.core.rewind_mark,
+            approval_queue: 0,
             available_commands: tab.core.available_commands.clone(),
         }
     }
@@ -8951,6 +8955,8 @@ impl Driver {
                     .unwrap_or(u64::MAX),
                 &mut sig,
             );
+            // The approval queue footer (2.16) rides the same per-tab mix.
+            mix(tab.approvals.pending_total() as u64, &mut sig);
             // Slash commands (batch K): the composer's "/" menu contents —
             // an overwrite landing must re-emit even between empty states.
             mix(tab.core.available_commands.len() as u64, &mut sig);
@@ -9494,10 +9500,19 @@ impl Driver {
                     .unwrap_or(false),
             })
             .collect();
-        let active = self
-            .active_tab
-            .and_then(|id| self.tab(id))
-            .map(Self::tab_view);
+        let active = self.active_tab.and_then(|id| self.tab(id)).map(|tab| {
+            // Other sessions' pending asks (req 2.16): everything across the
+            // tabs minus this tab's own — the footer count behind the card.
+            let queue: usize = self
+                .tabs
+                .iter()
+                .map(|t| t.approvals.pending_total())
+                .sum::<usize>()
+                .saturating_sub(tab.approvals.pending_total());
+            let mut view = Self::tab_view(tab);
+            view.approval_queue = queue;
+            view
+        });
         let history = HistoryPanelView {
             open: self.history.open,
             projects: self.history.projects.as_ref().map(|list| {

@@ -788,6 +788,12 @@ impl ApprovalCore {
         self.permissions.contains_key(session_id) || self.elicitations.contains_key(session_id)
     }
 
+    /// Total pending asks (permissions + elicitations) — the queue counter
+    /// behind the active card's footer (req 2.16).
+    pub fn pending_total(&self) -> usize {
+        self.permissions.len() + self.elicitations.len()
+    }
+
     /// Full reset (driver lifecycle restart / instance switch).
     pub fn clear(&mut self) {
         self.permissions.clear();

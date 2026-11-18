@@ -39,6 +39,7 @@ use protocol::approval::{
 };
 use rust_i18n::t;
 
+use crate::i18n::t_count;
 use crate::runtime::{ProtocolRuntime, UiCommand};
 use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
@@ -83,6 +84,89 @@ impl ApprovalCard {
             self.ask.request_id(),
             matches!(self.ask, PendingAsk::Elicitation(_)),
         )
+    }
+
+    /// The Enter answer (req 0.3 — PermissionDialog's keyboard): the shape's
+    /// primary action. Plan → approve; tool/question permission → the first
+    /// allow_* option (fallback: the first option); elicitation form → submit
+    /// with the current picks (a plan-form approves directly).
+    pub fn confirm_command(&self, cx: &App) -> Option<UiCommand> {
+        match &self.ask {
+            PendingAsk::Permission(p) => {
+                let approve = p.options.iter().find(|o| {
+                    o.option_id == "approve"
+                        || o.kind.as_deref().is_some_and(|k| k.starts_with("allow"))
+                });
+                let pick = approve.or_else(|| p.options.first())?;
+                Some(UiCommand::AnswerPermission {
+                    request_id: p.request_id,
+                    option_id: pick.option_id.clone(),
+                })
+            }
+            PendingAsk::Elicitation(form) => {
+                if let Some(field) = plan_field(form) {
+                    return Some(UiCommand::AnswerElicitation {
+                        request_id: form.request_id,
+                        answers: Some(vec![(
+                            field.key.clone(),
+                            ElicitValue::One("approve".to_string()),
+                        )]),
+                    });
+                }
+                // The submit button's exact answer shape, built from the
+                // live picks.
+                let mut others: HashMap<String, String> = HashMap::new();
+                for (key, input) in &self.others {
+                    others.insert(key.clone(), input.read(cx).value().to_string());
+                }
+                let answers =
+                    build_elicitation_answers(&form.fields, &self.picked, &self.checked, &others);
+                Some(UiCommand::AnswerElicitation {
+                    request_id: form.request_id,
+                    answers: Some(answers),
+                })
+            }
+        }
+    }
+
+    /// The Esc answer (req 0.3): the first reject-kind option — no fallback
+    /// when the server sent none (TS's "else no-op"); an elicitation form
+    /// declines.
+    pub fn escape_command(&self) -> Option<UiCommand> {
+        match &self.ask {
+            PendingAsk::Permission(p) => {
+                let reject = p.options.iter().find(|o| {
+                    o.option_id == "reject"
+                        || o.kind
+                            .as_deref()
+                            .is_some_and(|k| k.starts_with("reject") || k.starts_with("deny"))
+                })?;
+                Some(UiCommand::AnswerPermission {
+                    request_id: p.request_id,
+                    option_id: reject.option_id.clone(),
+                })
+            }
+            PendingAsk::Elicitation(form) => Some(UiCommand::AnswerElicitation {
+                request_id: form.request_id,
+                answers: None,
+            }),
+        }
+    }
+
+    /// Digits 1-9 (req 0.3 — TS binds them only with more than one option):
+    /// the nth permission option.
+    pub fn digit_command(&self, n: usize) -> Option<UiCommand> {
+        let PendingAsk::Permission(p) = &self.ask else {
+            return None;
+        };
+        if p.options.len() < 2 {
+            return None;
+        }
+        let pick = p.options.get(n.saturating_sub(1).min(p.options.len() - 1))?;
+        Some(UiCommand::AnswerPermission {
+            request_id: p.request_id,
+            option_id: pick.option_id.clone(),
+        })
     }
 
     pub fn new(window: &mut Window, ask: PendingAsk, cx: &mut Context<Self>) -> Self {
@@ -162,11 +246,13 @@ fn stream_motion() -> TextViewMotion {
 
 /// Renders the card row (the scroller's last row while the ask is pending).
 /// `workbench` is the weak self-handle for re-render notifications after a
-/// local pick/toggle.
+/// local pick/toggle. `queue` counts OTHER sessions' pending asks (req
+/// 2.16) — the footer line under the hint.
 pub fn render_approval_card(
     card: &Entity<ApprovalCard>,
     runtime: &ProtocolRuntime,
     workbench: &WeakEntity<Workbench>,
+    queue: usize,
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
@@ -571,6 +657,18 @@ pub fn render_approval_card(
             .text_color(theme.muted_foreground)
             .child(t!("permission.hint").into_owned()),
     );
+    // The queue line (req 2.16): other sessions' asks waiting behind this
+    // card — the multi-session blind spot the inline-only shape had.
+    if queue > 0 {
+        column = column.child(
+            div()
+                .id("approval-queue")
+                .test_support()
+                .text_size(ui_text(10.))
+                .text_color(theme.muted_foreground)
+                .child(t_count("permission.queueWaiting", queue as u64)),
+        );
+    }
 
     div()
         .flex()
