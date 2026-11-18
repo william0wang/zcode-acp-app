@@ -25,7 +25,7 @@
 use std::collections::BTreeMap;
 
 use gpui::prelude::FluentBuilder as _;
-use gpui::{AnyElement, Context, Entity, Rgba, Window, div, px, rgb};
+use gpui::{AnyElement, Context, Entity, Rgba, Window, div, px};
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
@@ -58,16 +58,7 @@ pub(crate) const AGENT_COLORS: [&str; 8] = [
 ];
 
 fn swatch_fill(name: &str) -> Rgba {
-    match name {
-        "red" => rgb(0xef4444),
-        "blue" => rgb(0x3b82f6),
-        "green" => rgb(0x22c55e),
-        "yellow" => rgb(0xfacc15),
-        "purple" => rgb(0xa855f7),
-        "orange" => rgb(0xf97316),
-        "pink" => rgb(0xec4899),
-        _ => rgb(0x06b6d4),
-    }
+    crate::ui_tokens::agent_swatch(name).to_rgb().into()
 }
 
 /// The MCP form's transports (TS `TYPES`); an entry carrying a type this
@@ -3267,7 +3258,7 @@ fn render_app_update_body(
             .child(
                 div()
                     .text_size(ui_text(13.))
-                    .text_color(rgb(0x6ee7b7))
+                    .text_color(crate::ui_tokens::update_stage_text("done"))
                     .child(fill(
                         &t!("zconfig.updateDone"),
                         &[("version", latest.as_deref().unwrap_or(""))],
@@ -3292,7 +3283,9 @@ fn render_app_update_body(
             .child(
                 div()
                     .text_size(ui_text(13.))
-                    .text_color(rgb(0xfcd34d))
+                    .text_color(crate::ui_tokens::update_stage_text(
+                        "needs-user-install",
+                    ))
                     .child(t!("zconfig.updateNeedsUser").into_owned()),
             )
             .when_some(
@@ -3331,7 +3324,7 @@ fn render_app_update_body(
             .child(
                 div()
                     .text_size(ui_text(13.))
-                    .text_color(rgb(0xfca5a5))
+                    .text_color(crate::ui_tokens::update_stage_text("failed"))
                     .child(t!("zconfig.updateFailed").into_owned()),
             )
             .when_some(

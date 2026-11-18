@@ -36,6 +36,7 @@ mod server_form;
 mod system_status;
 mod terminal_panel;
 mod ui_prefs;
+mod ui_tokens;
 mod usage_page;
 mod workbench;
 mod workflow_launches;

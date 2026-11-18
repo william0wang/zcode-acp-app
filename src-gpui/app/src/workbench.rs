@@ -76,6 +76,7 @@ use crate::system_status::render_system_status_page;
 use crate::terminal_panel;
 use gpui_terminal::TerminalView;
 use crate::ui_prefs::ui_text;
+use crate::ui_tokens::diff_colors;
 use crate::usage_page::render_usage_page;
 use crate::workflows_page::{WorkflowAmendForm, WorkflowMetaForm, WorkflowStartForm};
 use crate::zconfig_pages::ZConfigForm;
@@ -668,17 +669,18 @@ fn render_diff_block(
                 )))
                 .px_2()
                 .py(px(3.))
-                .bg(rgb(0x2a1d08))
+                .bg(diff_colors().trunc_bg)
                 .text_color(theme.warning_foreground)
                 .child(t!("chat.diffTruncated").to_string())
                 .test_support(),
         );
     }
+    let diff = diff_colors();
     let mut lines = div();
     for l in &block.lines {
         let (glyph, text_color, bg): (&str, Hsla, Option<Hsla>) = match l.kind {
-            DiffLineKind::Add => ("+", rgb(0x6ee7b7).into(), Some(rgb(0x0f2a1e).into())),
-            DiffLineKind::Del => ("-", rgb(0xfca5a5).into(), Some(rgb(0x33141a).into())),
+            DiffLineKind::Add => ("+", diff.add_text, Some(diff.add_bg)),
+            DiffLineKind::Del => ("-", diff.del_text, Some(diff.del_bg)),
             DiffLineKind::Context => (" ", theme.muted_foreground, None),
         };
         let mut row = div().min_w_0().flex().px_2().gap_1().text_color(text_color);

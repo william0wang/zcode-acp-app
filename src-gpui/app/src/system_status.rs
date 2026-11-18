@@ -158,8 +158,7 @@ fn battery_status(status: Option<&str>) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn faint(theme: &Theme) -> gpui::Hsla {
-    // TS text-faint — one step dimmer than text-dim (muted_foreground).
-    theme.muted_foreground.opacity(0.75)
+    crate::ui_tokens::faint(theme)
 }
 
 /// A read-only label/value row, the shape most configuration data takes

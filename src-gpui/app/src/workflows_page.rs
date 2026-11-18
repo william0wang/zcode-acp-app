@@ -25,7 +25,7 @@ use std::time::Duration;
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     canvas, point, pulsating_between, radians, size, Animation, AnyElement, Bounds, Context,
-    Entity, Hsla, PathBuilder, Pixels, Rgba, Window, div, fill as quad_fill, px, rgb,
+    Entity, Hsla, PathBuilder, Pixels, Rgba, Window, div, fill as quad_fill, px,
 };
 use gpui_kit::component;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -105,17 +105,10 @@ pub(crate) fn run_is_active(status: &str) -> bool {
 /// colored dot ALWAYS pairs with the word. Success emerald, failure red,
 /// live sky, pending an empty ring, and the stopped family
 /// (stopped/cancelled/superseded/interrupted) deliberately NEUTRAL — a
-/// stopped run is not an error. Unknown tokens fall back neutral.
+/// stopped run is not an error. Unknown tokens fall back neutral. The
+/// palette itself lives in ui_tokens (`run_status_color`, batch 2).
 fn status_dot(status: &str) -> Rgba {
-    match status {
-        // emerald-500 — the accent itself dropped to 600 (batch T), so the
-        // success dot rides one step above it, visible but not glaring.
-        "completed" | "ok" | "settled" => rgb(0x10b981),
-        "errored" | "failed" => rgb(0xf87171),
-        "running" | "dispatched" | "executing" => rgb(0x38bdf8),
-        "pending" | "queued" | "waiting" => rgb(0x6b7280),
-        _ => rgb(0x9ca3af),
-    }
+    crate::ui_tokens::run_status_color(status).to_rgb().into()
 }
 
 /// The status badge (TS `StatusBadge`): dot + localized word.
@@ -3179,11 +3172,13 @@ fn render_chart_view(
     };
     let grid_color = theme.chart_grid;
     let baseline_color = theme.muted_foreground.opacity(0.35);
+    // The categorical series ride ui_tokens' chart palette (TS --color-chart-1..6);
+    // the status hues stay here — this chart's series ARE statuses.
     let series_colors: [Hsla; 5] = [
-        theme.info,
-        theme.success,
-        theme.danger,
-        theme.warning,
+        crate::ui_tokens::info_text(),
+        crate::ui_tokens::success_text(),
+        crate::ui_tokens::danger_text(),
+        crate::ui_tokens::warning_text(),
         theme.accent,
     ];
     let m = model.clone();

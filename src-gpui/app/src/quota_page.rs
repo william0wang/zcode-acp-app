@@ -117,29 +117,28 @@ fn heat_color(pct: f64) -> Hsla {
     rgb(((r as u32) << 16) | ((g as u32) << 8) | b as u32).into()
 }
 
-/// amber-300 (#FCD34D) — the warning pair's text color.
+/// amber-300 — the warning pair's text color (ui_tokens::warning_text,
+/// batch 2).
 fn amber_text() -> Hsla {
-    rgb(0xFCD34D).into()
+    crate::ui_tokens::warning_text()
 }
 
-/// amber-500 (#F59E0B) at `opacity` — the warning box/button fills.
+/// amber-500 at `opacity` — the warning box/button fills (ui_tokens pair).
 fn amber_fill(opacity: f32) -> Hsla {
     let c: Hsla = rgb(0xF59E0B).into();
     c.opacity(opacity)
 }
 
-/// emerald-700 (#047857) at 85% — the card-row check glyph, following the
-/// accent's step down (batch U; solid bright emeralds glare on the dark
-/// canvas).
+/// emerald-700 at 85% — the card-row check glyph, following the accent's
+/// step down (batch U; solid bright emeralds glare on the dark canvas).
 fn emerald_check() -> Hsla {
     let c: Hsla = rgb(0x047857).into();
     c.opacity(0.85)
 }
 
 /// TS text-faint — one step dimmer than text-dim (muted_foreground).
-pub(crate) fn faint(theme: &Theme) -> gpui::Hsla {
-    theme.muted_foreground.opacity(0.75)
-}
+/// Kept as a local alias: the definition lives in ui_tokens (batch 2).
+pub(crate) use crate::ui_tokens::faint;
 
 /// The `notice.*` i18n keys the store surfaces, resolved through the shared
 /// catalog (`t!` falls back to its input — plain failure text passes
