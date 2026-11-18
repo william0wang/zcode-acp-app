@@ -86,7 +86,13 @@
     "resend": "重发",
     "regenerate": "重新生成",
     "pin": "置顶",
-    "unpin": "取消置顶"
+    "unpin": "取消置顶",
+    "compact": "压缩",
+    "statsTitle": "上下文",
+    "statsCache": "缓存命中",
+    "statsSpeed": "上一回合",
+    "contextHigh": "上下文接近上限——压缩以释放空间",
+    "connectSlow": "连接时间较长——请检查网络或 hub"
   },
   "panel": {
     "title": "设置",

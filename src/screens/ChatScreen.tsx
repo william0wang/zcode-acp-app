@@ -21,6 +21,8 @@ import { Spinner } from "../components/Spinner";
 import { ConfigScreenHost } from "./ConfigScreenHost";
 import { useBackHandler } from "../lib/backNav";
 import { useTerminalLive } from "../lib/terminalSession";
+import { haptic } from "../lib/haptic";
+import { Popover } from "../ui";
 import { useAppStore, type PlanEntry } from "../store/appStore";
 
 function baseName(path: string | undefined): string {
@@ -45,40 +47,184 @@ function fmtContext(used: number, size: number): string {
   return `${Math.min(100, (used / size) * 100).toFixed(1)}%/${fmtTokens(size)}`;
 }
 
+// Plan panel (requirements 1.8): auto-expands while a turn runs (the plan
+// is live progress then), collapses when idle; the first manual toggle wins
+// permanently (the ThoughtCard rule). The summary carries a done/total
+// progress bar.
 function PlanPanel({ entries }: { entries: PlanEntry[] }) {
   const { t } = useTranslation();
+  const isRunning = useAppStore((s) => s.isRunning);
+  const [open, setOpen] = useState(false);
+  const [touched, setTouched] = useState(false);
+  useEffect(() => {
+    if (!touched) setOpen(isRunning);
+  }, [isRunning, touched]);
   const done = entries.filter((e) => e.status === "completed").length;
   return (
-    <details className="border-b border-hairline bg-surface/60 px-4 py-2 text-xs text-dim">
-      <summary className="group flex cursor-pointer select-none items-center gap-1.5 text-dim [&::-webkit-details-marker]:hidden">
-        <ChevronDown className="size-3.5 shrink-0 text-faint transition-transform group-open:rotate-180" />
-        <span>
+    <div className="border-b border-hairline bg-surface/60 px-4 py-2 text-xs text-dim">
+      <button
+        onClick={() => {
+          setTouched(true);
+          setOpen((o) => !o);
+        }}
+        className="flex w-full select-none items-center gap-1.5 text-left text-dim"
+      >
+        <ChevronDown
+          className={`size-3.5 shrink-0 text-faint transition-transform ${open ? "rotate-180" : ""}`}
+        />
+        <span className="shrink-0">
           {t("chat.plan")} · {done}/{entries.length}
         </span>
-      </summary>
-      <ul className="mt-1.5 flex flex-col gap-1 pb-1">
-        {entries.map((e, i) => (
-          <li key={i} className="flex items-start gap-1.5">
-            {e.status === "completed" ? (
-              <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
-            ) : e.status === "active" ? (
-              <ChevronRight className="mt-0.5 size-3.5 shrink-0 text-info" />
-            ) : (
-              <Circle className="mt-0.5 size-3.5 shrink-0 text-faint" />
-            )}
-            <span
-              className={
-                e.status === "completed"
-                  ? "text-faint line-through"
-                  : "text-dim"
-              }
-            >
-              {e.content}
+        <span className="ml-2 h-1 min-w-8 flex-1 overflow-hidden rounded-full bg-hover">
+          <span
+            className="block h-full rounded-full bg-info transition-[width] duration-300"
+            style={{ width: `${(done / Math.max(entries.length, 1)) * 100}%` }}
+          />
+        </span>
+      </button>
+      {open && (
+        <ul className="mt-1.5 flex flex-col gap-1 pb-1">
+          {entries.map((e, i) => (
+            <li key={i} className="flex items-start gap-1.5">
+              {e.status === "completed" ? (
+                <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
+              ) : e.status === "active" ? (
+                <ChevronRight className="mt-0.5 size-3.5 shrink-0 text-info" />
+              ) : (
+                <Circle className="mt-0.5 size-3.5 shrink-0 text-faint" />
+              )}
+              <span
+                className={
+                  e.status === "completed"
+                    ? "text-faint line-through"
+                    : "text-dim"
+                }
+              >
+                {e.content}
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// Context stats (requirements 1.6/1.7): the always-visible segment stays
+// minimal (percent + window); tps, cache and the quota dock fold into this
+// popover, which is where the ≥80% warning and the compact entry live.
+function ContextStats({
+  usage,
+  cacheHit,
+  turnStats,
+  quotaDock,
+}: {
+  usage: { used: number; size: number };
+  cacheHit: number | null;
+  turnStats: { tps: number; outputTokens: number; seconds: number } | null;
+  quotaDock: string | null;
+}) {
+  const { t } = useTranslation();
+  const isRunning = useAppStore((s) => s.isRunning);
+  const sendPrompt = useAppStore((s) => s.sendPrompt);
+  const availableCommands = useAppStore((s) => s.availableCommands);
+  const pct = Math.min(100, (usage.used / usage.size) * 100);
+  const high = pct >= 80;
+  const compactOk =
+    !isRunning &&
+    availableCommands.some((c) => c.name.replace(/^\$/, "") === "compact");
+  const row = "flex items-center justify-between gap-4";
+  return (
+    <Popover
+      trigger={
+        <button
+          className={`shrink-0 whitespace-nowrap ${high ? "font-semibold text-warning" : ""}`}
+          aria-label={t("chat.statsTitle")}
+        >
+          {fmtContext(usage.used, usage.size)}
+        </button>
+      }
+      align="start"
+      className="w-64"
+    >
+      <div className="flex flex-col gap-1.5 px-2 py-1.5 text-xs text-dim">
+        <div className={row}>
+          <span className="text-faint">{t("chat.statsTitle")}</span>
+          <span className={high ? "font-medium text-warning" : ""}>
+            {pct.toFixed(1)}% · {fmtTokens(usage.used)}/{fmtTokens(usage.size)}
+          </span>
+        </div>
+        {cacheHit != null && (
+          <div className={row}>
+            <span className="text-faint">{t("chat.statsCache")}</span>
+            <span className="tabular-nums">{cacheHit}%</span>
+          </div>
+        )}
+        {turnStats && (
+          <div className={row}>
+            <span className="text-faint">{t("chat.statsSpeed")}</span>
+            <span className="tabular-nums">
+              {turnStats.tps} tok/s · {turnStats.seconds}s
             </span>
-          </li>
-        ))}
-      </ul>
-    </details>
+          </div>
+        )}
+        {quotaDock && (
+          <div className={`${row} border-t border-hairline pt-1.5`}>
+            <span className="whitespace-nowrap text-faint">{quotaDock}</span>
+          </div>
+        )}
+        {high && (
+          <div className="border-t border-hairline pt-1.5">
+            <p className="text-warning">{t("chat.contextHigh")}</p>
+            {compactOk && (
+              <button
+                onClick={() => {
+                  haptic();
+                  void sendPrompt("/compact");
+                }}
+                className="mt-1.5 w-full rounded-lg bg-raised px-3 py-2 text-xs font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
+              >
+                {t("chat.compact")}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </Popover>
+  );
+}
+
+// Connect overlay (requirements 1.9): after 10s the spinner grows a hint
+// and a cancel that tears the attempt down (no silent auto-retry).
+function ConnectingOverlay() {
+  const { t } = useTranslation();
+  const abortConnection = useAppStore((s) => s.abortConnection);
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    const id = setTimeout(() => setSlow(true), 10_000);
+    return () => clearTimeout(id);
+  }, []);
+  return (
+    <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-canvas/90">
+      <Spinner className="size-8" />
+      <div className="text-sm text-dim">{t("chat.connecting")}</div>
+      {slow && (
+        <>
+          <div className="max-w-64 text-center text-xs text-faint">
+            {t("chat.connectSlow")}
+          </div>
+          <button
+            onClick={() => {
+              haptic();
+              abortConnection();
+            }}
+            className="rounded-xl bg-raised px-4 py-2.5 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
+          >
+            {t("common.cancel")}
+          </button>
+        </>
+      )}
+    </div>
   );
 }
 
@@ -211,33 +357,22 @@ export function ChatScreen() {
           <div className="truncate text-base font-medium">{title}</div>
           {workspace && (
             <div className="flex items-baseline text-2xs text-faint">
-              {/* Stats live in the title bar, TUI style: context `17.5%/1.0M`,
-                  bare cache percent, `tok/s`, then the quota dock line — the
-                  hub's preformatted string (ADR-0021), byte-identical to the
-                  TUI's bottom dock, refreshed at connect and each turn end.
-                  The dock and tps segments are header-container gated; the
-                  workspace path truncates so the numbers stay visible. */}
+              {/* Stats live in the title bar, TUI style: the context chip is
+                  the always-visible segment (`17.5%/1.0M`); cache, tok/s and
+                  the quota dock line (ADR-0021) fold into its popover, so
+                  nothing is container-gated away anymore (requirements 1.6).
+                  ≥80% turns the chip and the header bar warning (1.7). */}
               <span className="min-w-0 truncate">{workspace}</span>
               {usage != null && usage.size > 0 && (
-                <span className="shrink-0 whitespace-nowrap">
-                  {" · "}
-                  {fmtContext(usage.used, usage.size)}
-                </span>
-              )}
-              {cacheHit != null && (
-                <span className="shrink-0 whitespace-nowrap">
-                  · {cacheHit}%
-                </span>
-              )}
-              {turnStats && (
-                <span className="hidden shrink-0 whitespace-nowrap @min-[520px]:inline">
-                  · {turnStats.tps} tok/s
-                </span>
-              )}
-              {quotaDock && (
-                <span className="ml-auto hidden shrink-0 whitespace-nowrap pl-2 @min-[640px]:inline">
-                  {quotaDock}
-                </span>
+                <>
+                  <span className="shrink-0">{" · "}</span>
+                  <ContextStats
+                    usage={usage}
+                    cacheHit={cacheHit}
+                    turnStats={turnStats}
+                    quotaDock={quotaDock}
+                  />
+                </>
               )}
             </div>
           )}
@@ -264,7 +399,9 @@ export function ChatScreen() {
         {usage && usage.size > 0 && (
           <div className="absolute inset-x-0 bottom-0 h-0.5 bg-hover">
             <div
-              className="h-full bg-info"
+              className={`h-full ${
+                usage.used / usage.size >= 0.8 ? "bg-warning" : "bg-info"
+              }`}
               style={{
                 width: `${Math.min(100, (usage.used / usage.size) * 100)}%`,
               }}
@@ -321,12 +458,7 @@ export function ChatScreen() {
       <PermissionDialog />
       <ElicitationDialog />
 
-      {connState === "connecting" && (
-        <div className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-canvas/90">
-          <Spinner className="size-8" />
-          <div className="text-sm text-dim">{t("chat.connecting")}</div>
-        </div>
-      )}
+      {connState === "connecting" && <ConnectingOverlay />}
     </div>
   );
 }

@@ -87,7 +87,13 @@
     "resend": "Resend",
     "regenerate": "Regenerate",
     "pin": "Pin to top",
-    "unpin": "Unpin"
+    "unpin": "Unpin",
+    "compact": "Compact",
+    "statsTitle": "Context",
+    "statsCache": "Cache hit",
+    "statsSpeed": "Last turn",
+    "contextHigh": "Context nearly full — compact to free space",
+    "connectSlow": "Still connecting — check the network or the hub"
   },
   "panel": {
     "title": "Settings",
