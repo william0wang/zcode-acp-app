@@ -425,6 +425,12 @@ export interface AppState extends ConfigSlice {
   // edit-resend / regenerate actions; against an older bridge the buttons
   // stay hidden (quote-to-composer remains).
   rewindCapable: boolean;
+  // Rewind boundary marker (ADR-0012 amendment): after an edit-resend or
+  // regenerate the reload boundary is where the discarded tail was cut. A
+  // one-shot chip renders there so the discontinuity reads as intentional.
+  // `at` indexes into `messages`; cleared on session switch and load_earlier
+  // (its prepend would shift the index).
+  rewindMark: { kind: "edit" | "retry"; at: number } | null;
   // Bridge marks load_earlier page updates `_meta.zcode.earlierPage`
   // (zcode-acp-server 0.44.1+); gates the marker-based page routing. Against
   // an older bridge the unmarked pages fall back to the pre-marker
@@ -952,6 +958,7 @@ function connectionResetPatch(): Partial<AppState> {
     fsCapable: false,
     pageMarkerCapable: false,
     rewindCapable: false,
+    rewindMark: null,
     loadingSession: false,
     isRunning: false,
     // Configuration state describes ONE machine, so it is re-probed on the
@@ -1585,6 +1592,7 @@ export const useAppStore = create<AppState>((set, get) => {
         fsCapable: false,
         pageMarkerCapable: false,
         rewindCapable: false,
+        rewindMark: null,
         replayCursor: null,
         hasMore: false,
         totalMessages: null,
@@ -2012,6 +2020,7 @@ export const useAppStore = create<AppState>((set, get) => {
     fsCapable: false,
     pageMarkerCapable: false,
     rewindCapable: false,
+    rewindMark: null,
     loadingSession: false,
     pinnedSessions: loadPinnedSessions(),
     unreadBySession: {},
@@ -2322,6 +2331,7 @@ export const useAppStore = create<AppState>((set, get) => {
         fsCapable: false,
         pageMarkerCapable: false,
         rewindCapable: false,
+        rewindMark: null,
         // usageStats stays: quota is hub-level (/api/quota), not tied to the
         // instance connection — switching instances must not blank the card.
         sessionStates: {},
@@ -2531,6 +2541,7 @@ export const useAppStore = create<AppState>((set, get) => {
         fsCapable: false,
         pageMarkerCapable: false,
         rewindCapable: false,
+        rewindMark: null,
         replayCursor: null,
         hasMore: false,
         totalMessages: null,
@@ -2710,6 +2721,10 @@ export const useAppStore = create<AppState>((set, get) => {
           loadingEarlier: false,
           loadingSession: true,
           isRunning: false,
+          // Session switch or same-session reload: a boundary chip set by the
+          // rewind actions is re-stamped AFTER this load resolves, so clearing
+          // here is safe for both callers.
+          rewindMark: null,
         };
       });
       // True once the tail replay request is sent: the wire may have applied
@@ -2952,6 +2967,9 @@ export const useAppStore = create<AppState>((set, get) => {
             replayCursor: meta?.cursor ?? null,
             hasMore: meta?.hasMore ?? false,
             loadingEarlier: false,
+            // The prepend shifts message indices — the chip's anchor dies
+            // with it (the discontinuity was for the immediate reload view).
+            rewindMark: null,
           };
         });
         cacheActiveSnapshot();
@@ -3311,6 +3329,9 @@ export const useAppStore = create<AppState>((set, get) => {
         // History rewrote in place — the ack is the caller's cue to reload
         // (backend spec §6); the replacement turn streams on its own.
         await get().loadSession(sid);
+        // ADR-0012: mark the reload boundary — everything above is kept
+        // history, everything below is the rewound-and-resent content.
+        set({ rewindMark: { kind: "edit", at: get().messages.length } });
       } catch (e) {
         set({ isRunning: false });
         if (!isTransientConnError(e))
@@ -3329,6 +3350,7 @@ export const useAppStore = create<AppState>((set, get) => {
           ...(messageId ? { messageId } : {}),
         });
         await get().loadSession(sid);
+        set({ rewindMark: { kind: "retry", at: get().messages.length } });
       } catch (e) {
         set({ isRunning: false });
         if (!isTransientConnError(e))
@@ -3369,6 +3391,7 @@ export const useAppStore = create<AppState>((set, get) => {
         fsCapable: false,
         pageMarkerCapable: false,
         rewindCapable: false,
+        rewindMark: null,
         sessionStates: {},
         loadingSession: false,
         isRunning: false,

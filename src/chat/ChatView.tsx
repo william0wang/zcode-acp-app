@@ -1535,6 +1535,19 @@ const TEXT_FILE_RE =
   /\.(md|markdown|txt|json|jsonc|ya?ml|toml|ini|xml|html?|css|scss|less|jsx?|tsx?|mjs|cjs|py|rb|rs|go|java|kt|c|h|cpp|hpp|cs|swift|sh|bash|zsh|fish|sql|lua|pl|php|dart|gradle|properties|env|gitignore)$/i;
 const DROP_TEXT_LIMIT = 65536;
 
+// System chip marking a rewind boundary (ADR-0012): the edit-resend/retry cut
+// the tail and the replacement streams in below it — without the marker the
+// missing history reads like a glitch rather than an intentional rewind.
+function RewindChip({ kind }: { kind: "edit" | "retry" }) {
+  const { t } = useTranslation();
+  return (
+    <div className="mx-auto flex w-fit shrink-0 items-center gap-1.5 rounded-full bg-surface px-2.5 py-1 text-2xs text-faint ring-1 ring-hairline">
+      <History className="size-3" />
+      {kind === "edit" ? t("chat.rewoundResent") : t("chat.regenerated")}
+    </div>
+  );
+}
+
 function Thread({
   viewportRef,
   onScroll,
@@ -1561,6 +1574,7 @@ function Thread({
   const loadingSession = useAppStore((s) => s.loadingSession);
   const messages = useAppStore((s) => s.messages);
   const rewindCapable = useAppStore((s) => s.rewindCapable);
+  const rewindMark = useAppStore((s) => s.rewindMark);
   const retryTurn = useAppStore((s) => s.retryTurn);
 
   // Latest-role targets for the rewind actions (latest-only is the wire
@@ -1583,6 +1597,14 @@ function Thread({
   const onRegenerate = useCallback(() => {
     void retryTurn(lastAssistantMid ?? undefined);
   }, [retryTurn, lastAssistantMid]);
+
+  // ADR-0012 boundary chip: rides above the first message of the post-rewind
+  // segment. Until the replacement turn flushes its first chunk the boundary
+  // sits past the list end — then the chip renders after the messages.
+  const boundaryId =
+    rewindMark && rewindMark.at < messages.length
+      ? messages[rewindMark.at]?.id ?? null
+      : null;
 
   // Stick-to-bottom comes from the library hook (ADR 0004); only the
   // load-earlier anchoring stays hand-rolled below. The library's
@@ -1716,35 +1738,48 @@ function Thread({
           </button>
         )}
         <ThreadPrimitive.Messages>
-          {({ message }) =>
-            message.role === "user" ? (
-              <UserMessage
-                key={message.id}
-                collapsed={collapsedIds.has(message.id)}
-                notice={taskNotices.get(message.id)}
-                images={userImages.get(message.id)}
-                editMid={
-                  rewindCapable &&
-                  message.id === lastUserId &&
-                  lastUserMid &&
-                  !collapsedIds.has(message.id) &&
-                  !taskNotices.has(message.id)
-                    ? lastUserMid
-                    : undefined
-                }
-              />
+          {({ message }) => {
+            const chip =
+              rewindMark && boundaryId === message.id ? (
+                <RewindChip kind={rewindMark.kind} />
+              ) : null;
+            return message.role === "user" ? (
+              <>
+                {chip}
+                <UserMessage
+                  key={message.id}
+                  collapsed={collapsedIds.has(message.id)}
+                  notice={taskNotices.get(message.id)}
+                  images={userImages.get(message.id)}
+                  editMid={
+                    rewindCapable &&
+                    message.id === lastUserId &&
+                    lastUserMid &&
+                    !collapsedIds.has(message.id) &&
+                    !taskNotices.has(message.id)
+                      ? lastUserMid
+                      : undefined
+                  }
+                />
+              </>
             ) : (
-              <AssistantMessage
-                key={message.id}
-                onRegenerate={
-                  rewindCapable && message.id === lastAssistantId
-                    ? onRegenerate
-                    : undefined
-                }
-              />
-            )
-          }
+              <>
+                {chip}
+                <AssistantMessage
+                  key={message.id}
+                  onRegenerate={
+                    rewindCapable && message.id === lastAssistantId
+                      ? onRegenerate
+                      : undefined
+                  }
+                />
+              </>
+            );
+          }}
         </ThreadPrimitive.Messages>
+        {rewindMark && boundaryId === null && (
+          <RewindChip kind={rewindMark.kind} />
+        )}
         <PendingPrompts />
         <Composer />
       </ThreadPrimitive.Viewport>

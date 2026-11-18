@@ -85,6 +85,8 @@
     "editMessageTitle": "编辑消息",
     "resend": "重发",
     "regenerate": "重新生成",
+    "rewoundResent": "已回退并重发",
+    "regenerated": "已重新生成",
     "pin": "置顶",
     "unpin": "取消置顶",
     "compact": "压缩",

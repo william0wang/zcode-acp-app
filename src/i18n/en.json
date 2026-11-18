@@ -86,6 +86,8 @@
     "editMessageTitle": "Edit message",
     "resend": "Resend",
     "regenerate": "Regenerate",
+    "rewoundResent": "Rewound and resent",
+    "regenerated": "Regenerated",
     "pin": "Pin to top",
     "unpin": "Unpin",
     "compact": "Compact",
