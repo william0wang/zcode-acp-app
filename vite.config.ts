@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { defineConfig } from "vite";
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
@@ -27,5 +27,10 @@ export default defineConfig({
     host: true, // reachable from adb devices during `tauri android dev`
     port: 5173,
     strictPort: true,
+  },
+  test: {
+    // Defaults minus nothing, plus the agent scratch dir: research clones
+    // under .zcode/ carry their own test suites that vitest would swallow.
+    exclude: ["**/node_modules/**", "**/dist/**", ".zcode/**"],
   },
 });

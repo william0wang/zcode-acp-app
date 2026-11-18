@@ -4,9 +4,12 @@
 /*
  * Layered dark palette ("quiet dark", ChatGPT-like): the app reads as stacked
  * surfaces rather than one flat zinc background. Semantic names keep the
- * component classes free of raw hex values.
+ * component classes free of raw hex values. Dark-only by product decision
+ * (ADR-0013): every token below is a single-theme vocabulary, not a theming
+ * seam.
  */
 @theme {
+  /* Surfaces & text */
   --color-canvas: #0d0d0f; /* app base */
   --color-surface: #161619; /* panels, sheets, cards */
   --color-raised: #1e1e22; /* composer shell, user bubble, inputs */
@@ -14,11 +17,93 @@
   --color-ink: #ececf1; /* primary text */
   --color-dim: #a6a6b0; /* secondary text */
   --color-faint: #6f6f7a; /* muted text */
+
+  /* Interactive overlays: the ghost-button idiom on dark surfaces.
+     Replaces hand-rolled bg-white/[0.06] etc. across the app. */
+  --color-hover: rgb(255 255 255 / 6%);
+  --color-active: rgb(255 255 255 / 11%);
+  --color-selected: rgb(255 255 255 / 8%);
+
+  /* Status: value + wash pair. Wash is the background tint for chips,
+     banners and alerts; value is text/icon/border. */
+  --color-success: #34d399;
+  --color-success-wash: rgb(52 211 153 / 12%);
+  --color-warning: #fbbf24;
+  --color-warning-wash: rgb(251 191 36 / 12%);
+  --color-danger: #f87171;
+  --color-danger-wash: rgb(248 113 113 / 12%);
+  --color-danger-strong: #ef4444; /* solid destructive button fill */
+  --color-info: #38bdf8;
+  --color-info-wash: rgb(56 189 248 / 12%);
+
+  /* Categorical chart palette (workflow artifact charts, usage graphs). */
+  --color-chart-1: #818cf8;
+  --color-chart-2: #34d399;
+  --color-chart-3: #fbbf24;
+  --color-chart-4: #f472b6;
+  --color-chart-5: #38bdf8;
+  --color-chart-6: #a78bfa;
+
+  /* Elevation: floating layers above raised surfaces. */
+  --shadow-pop: 0 4px 12px rgb(0 0 0 / 35%);
+  --shadow-overlay: 0 12px 32px rgb(0 0 0 / 45%);
+
+  /* Type: one step below xs for dense metadata (timestamps, counts);
+     converges the former text-[10px]/text-[11px] hand-rolls. */
+  --text-2xs: 0.6875rem; /* 11px */
+  --text-2xs--line-height: 1rem;
+
+  /* Mono stack for code, commands, paths, stats. Fixes the previously
+     dangling var(--font-mono) reference in ChatView. */
+  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas,
+    "Liberation Mono", monospace;
+
   /* Battery spec 2026-11: quantize the pulse. The smooth default is a
      compositor redraw at panel refresh for the whole lifetime of a running
      badge; steps() holds each value steady between jumps, so the blink
      still reads as "live" while pixels change only ~2x/second. */
   --animate-pulse: pulse 2s steps(4, end) infinite;
+
+  /* Motion vocabulary (mirror on the Rust side in Batch 2). */
+  --animate-fade-in: fade-in 0.18s ease-out both;
+  --animate-msg-in: msg-in 0.22s ease-out both;
+  --animate-slide-up: slide-up 0.24s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  --animate-sheet-in: sheet-in 0.26s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes msg-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@keyframes slide-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+@keyframes sheet-in {
+  from {
+    transform: translateY(100%);
+  }
+}
+
+/* Reduced motion: keep layout animations from flying (the Rust client's
+   reduce_motion() parity). */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 html,
