@@ -2854,21 +2854,31 @@ export const useAppStore = create<AppState>((set, get) => {
           modes?: { currentModeId?: string };
           configOptions?: ConfigOption[];
         } | null;
-        set({
-          replayCursor: meta?.cursor ?? null,
-          hasMore: meta?.hasMore ?? false,
-          totalMessages:
-            typeof meta?.totalMessages === "number" ? meta.totalMessages : null,
-          configOptions: Array.isArray(res?.configOptions)
-            ? res!.configOptions!
-            : [],
-          currentModeId: res?.modes?.currentModeId ?? null,
-          loadingSession: false,
-          // A turn that survived the reconnect is still running on the bridge
-          // (replayMeta.turnActive): restore the running UI instead of the
-          // idle composer, which would let a prompt collide with the turn.
-          isRunning: meta?.turnActive === true,
-        });
+        set((s) =>
+          // The user may have switched sessions mid-replay — this tail
+          // metadata belongs to THIS session's view and must not overwrite
+          // the other session's load-earlier anchor (same guard as above).
+          s.activeSessionId === sessionId
+            ? {
+                replayCursor: meta?.cursor ?? null,
+                hasMore: meta?.hasMore ?? false,
+                totalMessages:
+                  typeof meta?.totalMessages === "number"
+                    ? meta.totalMessages
+                    : null,
+                configOptions: Array.isArray(res?.configOptions)
+                  ? res!.configOptions!
+                  : [],
+                currentModeId: res?.modes?.currentModeId ?? null,
+                loadingSession: false,
+                // A turn that survived the reconnect is still running on the
+                // bridge (replayMeta.turnActive): restore the running UI
+                // instead of the idle composer, which would let a prompt
+                // collide with the turn.
+                isRunning: meta?.turnActive === true,
+              }
+            : {},
+        );
         setActivity(sessionId, { running: meta?.turnActive === true });
         cacheActiveSnapshot();
         // History is live: send whatever queued while the replay streamed
@@ -3326,6 +3336,12 @@ export const useAppStore = create<AppState>((set, get) => {
           messageId,
           newText,
         });
+        // The edit Sheet closes before this runs — the user may have backed
+        // out and opened another session while the request was in flight.
+        // The edit landed server-side regardless; a background reload would
+        // drag activeSessionId back here and poison the other session's
+        // pagination state, so reload + mark only while still on screen.
+        if (get().activeSessionId !== sid) return;
         // History rewrote in place — the ack is the caller's cue to reload
         // (backend spec §6); the replacement turn streams on its own.
         await get().loadSession(sid);
@@ -3333,7 +3349,9 @@ export const useAppStore = create<AppState>((set, get) => {
         // history, everything below is the rewound-and-resent content.
         set({ rewindMark: { kind: "edit", at: get().messages.length } });
       } catch (e) {
-        set({ isRunning: false });
+        // Another session may own the composer lock by now — only undo the
+        // optimistic isRunning for the session it was set for.
+        if (get().activeSessionId === sid) set({ isRunning: false });
         if (!isTransientConnError(e))
           set({ notice: `edit failed: ${(e as Error).message}` });
       }
@@ -3349,10 +3367,13 @@ export const useAppStore = create<AppState>((set, get) => {
           sessionId: sid,
           ...(messageId ? { messageId } : {}),
         });
+        // Same switch-away guard as editUserMessage: no background reload
+        // or boundary mark while another session is on screen.
+        if (get().activeSessionId !== sid) return;
         await get().loadSession(sid);
         set({ rewindMark: { kind: "retry", at: get().messages.length } });
       } catch (e) {
-        set({ isRunning: false });
+        if (get().activeSessionId === sid) set({ isRunning: false });
         if (!isTransientConnError(e))
           set({ notice: `retry failed: ${(e as Error).message}` });
       }
