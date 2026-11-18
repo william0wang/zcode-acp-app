@@ -363,7 +363,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::ArrowLeft)
-                        .tooltip("Back to the workbench")
+                        .tooltip(t!("common.backToWorkbench"))
                         .on_click(move |_, _, _| runtime.send(UiCommand::CloseModels)),
                 )
                 .child(
@@ -379,7 +379,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::RefreshCw)
-                        .tooltip("Reload the models list")
+                        .tooltip(t!("zconfig.modelsReload"))
                         .disabled(page.loading)
                         .on_click(move |_, _, _| runtime.send(UiCommand::RefreshModels))
                 }),
@@ -415,7 +415,7 @@ impl Workbench {
                             .ghost()
                             .xsmall()
                             .label("×")
-                            .tooltip("Dismiss")
+                            .tooltip(t!("common.dismiss"))
                             .on_click(move |_, _, _| {
                                 runtime.send(UiCommand::DismissConfigNotice)
                             }),
@@ -856,7 +856,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::ArrowLeft)
-                        .tooltip("Back to the models list")
+                        .tooltip(t!("zconfig.backToModels"))
                         .on_click(move |_, _, cx| {
                             wb.update(cx, |this, cx| this.close_models_form(cx));
                         }),
@@ -1153,7 +1153,7 @@ fn render_model_test_button(
         .ghost()
         .xsmall()
         .disabled(busy || testing)
-        .tooltip("Send one minimal request to check this model answers")
+        .tooltip(t!("zconfig.probeModel"))
         .on_click(move |_, _, cx| {
             cx.stop_propagation();
             runtime.send(UiCommand::TestModelConnectivity {
@@ -1268,7 +1268,7 @@ fn render_provider_row(
                 .ghost()
                 .xsmall()
                 .icon(IconName::Settings2)
-                .tooltip("Edit this provider's endpoint and key")
+                .tooltip(t!("zconfig.editProvider"))
                 .disabled(busy)
                 .on_click(move |_, window, cx| {
                     let p = owned.clone();

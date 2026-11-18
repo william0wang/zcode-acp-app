@@ -46,10 +46,11 @@ pub(crate) fn fill(text: &str, args: &[(&str, &str)]) -> String {
 
 /// An i18next-style plural lookup (the `count` counterpart of [`fill`]'s
 /// seam): the shared catalogs pluralize with `_one`/`_other` suffixes that
-/// rust-i18n's exact-key resolution never tries, and locales without plural
-/// forms (zh) carry only the bare key. Try the count-appropriate suffix,
-/// then the bare spelling, then the `en` fallback — the `{{count}}`
-/// placeholder still goes through [`fill`] afterwards.
+/// rust-i18n's exact-key resolution never tries. Count keys carry the
+/// suffixed pair in EVERY locale (zh has no plural forms, so its two
+/// variants share one wording). Try the count-appropriate suffix, then the
+/// bare spelling, then the `en` fallback — the `{{count}}` placeholder
+/// still goes through [`fill`] afterwards.
 pub(crate) fn t_count(key: &str, count: u64) -> String {
     t_count_in(&rust_i18n::locale().to_string(), key, count)
 }
@@ -59,8 +60,8 @@ pub(crate) fn t_count(key: &str, count: u64) -> String {
 pub(crate) fn t_count_in(locale: &str, key: &str, count: u64) -> String {
     let suffix = if count == 1 { "_one" } else { "_other" };
     let suffixed = format!("{key}{suffix}");
-    // The catalogs' plural convention: `en` carries the `_one`/`_other`
-    // variants, zh (no plural forms) carries the bare key. The ACTIVE
+    // The catalogs' plural convention: count keys carry `_one`/`_other` in
+    // every locale (zh's two variants share one wording). The ACTIVE
     // locale's own spelling must win — i18next resolves [key_suffix, key]
     // per language before crossing to the fallback language, and asking
     // rust-i18n for the suffixed key in zh would answer with the `en`
@@ -286,10 +287,20 @@ mod tests {
             t_count_in("en", "zconfig.hooksEntryCount", 2),
             "{{count}} entries"
         );
-        // zh has no plural forms — the bare key answers for any count.
+        // zh has no plural forms — the `_one`/`_other` pair shares one
+        // wording, and count == 1 must answer from zh (never leak en's).
+        assert_eq!(
+            t_count_in("zh-CN", "zconfig.hooksEntryCount", 1),
+            "{{count}} 条"
+        );
         assert_eq!(
             t_count_in("zh-CN", "zconfig.hooksEntryCount", 2),
             "{{count}} 条"
+        );
+        // The project rows' count key went fully suffixed in both catalogs.
+        assert_eq!(
+            t_count_in("en", "projectDialog.sessionCount", 2),
+            "{{count}} sessions"
         );
         // The resolved template still interpolates through fill.
         assert_eq!(

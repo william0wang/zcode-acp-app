@@ -16,6 +16,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Sizable as _, WindowExt as _};
 use gpui_kit::*;
 use protocol::hub::SavedServer;
+use rust_i18n::t;
 
 use crate::runtime::{ProtocolRuntime, UiCommand};
 use crate::ui_prefs::ui_text;
@@ -40,9 +41,9 @@ impl ServerForm {
         cx: &mut App,
     ) {
         let title = if prefill.is_some() {
-            "Edit remote server"
+            t!("connect.editServer").into_owned()
         } else {
-            "Add remote server"
+            t!("connect.addServer").into_owned()
         };
         let form = cx.new(|cx| Self::new(prefill, runtime, window, cx));
         // The builder reruns whenever the dialog layer rebuilds; the name
@@ -54,7 +55,7 @@ impl ServerForm {
                 let focus = form.read(cx).name.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             }
-            dialog.title(title).child(form.clone())
+            dialog.title(title.clone()).child(form.clone())
         });
     }
 
@@ -64,7 +65,8 @@ impl ServerForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let name = cx.new(|cx| InputState::new(window, cx).placeholder("Name (e.g. dev box)"));
+        let name =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("connect.namePlaceholder")));
         let hub_url =
             cx.new(|cx| InputState::new(window, cx).placeholder("https://hub.example:8377"));
         let token = cx.new(|cx| InputState::new(window, cx).placeholder("Bearer token"));
@@ -127,7 +129,7 @@ impl ServerForm {
         window.close_dialog(cx);
     }
 
-    fn field(&self, label: &'static str, input: &Entity<InputState>, cx: &App) -> impl IntoElement {
+    fn field(&self, label: &str, input: &Entity<InputState>, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         div()
             .flex()
@@ -137,7 +139,7 @@ impl ServerForm {
                 div()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child(label),
+                    .child(label.to_string()),
             )
             .child(Input::new(input).small())
     }
@@ -152,9 +154,9 @@ impl Render for ServerForm {
             .flex()
             .flex_col()
             .gap_3()
-            .child(self.field("Name", &self.name, cx))
-            .child(self.field("Hub URL", &self.hub_url, cx))
-            .child(self.field("Token", &self.token, cx))
+            .child(self.field(&t!("connect.serverName"), &self.name, cx))
+            .child(self.field(&t!("connect.hubUrl"), &self.hub_url, cx))
+            .child(self.field(&t!("connect.token"), &self.token, cx))
             .child(
                 div()
                     .flex()
@@ -166,7 +168,7 @@ impl Render for ServerForm {
                         Button::new("server-form-cancel")
                             .secondary()
                             .small()
-                            .label("Cancel")
+                            .label(t!("common.cancel").into_owned())
                             .on_click(|_, window, cx| window.close_dialog(cx)),
                     )
                     .child(
@@ -174,9 +176,9 @@ impl Render for ServerForm {
                             .primary()
                             .small()
                             .label(if self.editing.is_some() {
-                                "Save"
+                                t!("connect.saveServer").into_owned()
                             } else {
-                                "Add and connect"
+                                t!("connect.addAndConnect").into_owned()
                             })
                             .disabled(!can_submit)
                             .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),

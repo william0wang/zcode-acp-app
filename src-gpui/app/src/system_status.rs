@@ -645,7 +645,7 @@ fn render_notice_banner(
                 .ghost()
                 .xsmall()
                 .icon(IconName::CircleX)
-                .tooltip("Dismiss")
+                .tooltip(t!("common.dismiss"))
                 .on_click(move |_, _, _| runtime.send(UiCommand::DismissConfigNotice)),
         )
         .into_any_element()

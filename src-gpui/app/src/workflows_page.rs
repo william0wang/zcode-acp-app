@@ -274,7 +274,7 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
                     .ghost()
                     .xsmall()
                     .icon(IconName::ArrowLeft)
-                    .tooltip("Back")
+                    .tooltip(t!("common.back"))
                     .on_click(move |_, _, _| runtime.send(back.clone())),
             )
             .child(
@@ -291,7 +291,7 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
                     .ghost()
                     .xsmall()
                     .icon(IconName::RefreshCw)
-                    .tooltip("Reload")
+                    .tooltip(t!("common.reload"))
                     .disabled(page.loading)
                     .on_click(move |_, _, _| runtime2.send(UiCommand::RefreshWorkflows)),
             ),
@@ -329,7 +329,7 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
                         .ghost()
                         .xsmall()
                         .label("×")
-                        .tooltip("Dismiss")
+                        .tooltip(t!("common.dismiss"))
                         .on_click(move |_, _, _| {
                             runtime3.send(UiCommand::DismissConfigNotice)
                         }),
@@ -3404,7 +3404,7 @@ fn render_chart_view(
                 .pt_1()
                 .text_size(ui_text(10.))
                 .text_color(theme.muted_foreground)
-                .child("log scale"),
+                .child(t!("zconfig.logScale").into_owned()),
         );
     }
     outer.into_any_element()
@@ -4659,7 +4659,7 @@ fn form_header(
                 .ghost()
                 .xsmall()
                 .icon(IconName::ArrowLeft)
-                .tooltip("Back")
+                .tooltip(t!("common.back"))
                 .on_click(move |_, _, cx| {
                     wb.update(cx, |this, cx| this.close_workflow_form(cx));
                 }),

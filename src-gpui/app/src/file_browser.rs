@@ -451,7 +451,7 @@ pub(crate) fn render_files_header(
                     .ghost()
                     .xsmall()
                     .icon(KitIconName::SquareTerminal)
-                    .tooltip("Open a terminal in this directory")
+                    .tooltip(t!("files.openTerminal"))
                     .on_click(move |_, _, cx| {
                         let abs = absolute_dir(&root, &path);
                         let wb = wb_term.clone();
@@ -481,7 +481,7 @@ pub(crate) fn render_files_header(
                     .ghost()
                     .xsmall()
                     .icon(KitIconName::CodeXml)
-                    .tooltip("Open this directory in Zed")
+                    .tooltip(t!("files.openZed"))
                     .on_click(move |_, _, cx| {
                         let abs = absolute_dir(&root, &path);
                         if let Err(e) = open_in_zed(&abs) {
@@ -495,7 +495,7 @@ pub(crate) fn render_files_header(
                 .ghost()
                 .xsmall()
                 .icon(KitIconName::FolderOpen)
-                .tooltip("Show this directory in the platform file manager")
+                .tooltip(t!("files.openLocalDir"))
                 .on_click(move |_, _, cx| {
                     let abs = absolute_dir(&root, &path);
                     if let Err(e) = open_in_file_manager(&abs) {
@@ -515,9 +515,9 @@ pub(crate) fn render_files_header(
                 KitIconName::EyeOff
             })
             .tooltip(if show_hidden {
-                "Hide dotfiles"
+                t!("files.hideDot").into_owned()
             } else {
-                "Show dotfiles"
+                t!("files.showDot").into_owned()
             })
             .on_click(move |_, _, cx| {
                 wb_toggle.update(cx, |wb, cx| wb.toggle_files_hidden(cx));
@@ -528,7 +528,7 @@ pub(crate) fn render_files_header(
             .ghost()
             .xsmall()
             .icon(KitIconName::RefreshCw)
-            .tooltip("Re-read this directory")
+            .tooltip(t!("files.reread"))
             .on_click(move |_, _, _| {
                 refresh_runtime.send(UiCommand::FilesNavigate {
                     path: current_path.clone(),
@@ -629,7 +629,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
             div()
                 .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
-                .child("reading…"),
+                .child(t!("files.reading").into_owned()),
         );
     } else if let Some(err) = &view.error {
         let runtime = runtime.clone();
@@ -649,7 +649,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                     Button::new("files-retry")
                         .secondary()
                         .xsmall()
-                        .label("Retry")
+                        .label(t!("files.retry").into_owned())
                         .on_click(move |_, _, _| {
                             runtime.send(UiCommand::FilesNavigate { path: path.clone() })
                         }),
@@ -671,7 +671,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                     .test_support()
                     .text_size(ui_text(10.))
                     .text_color(theme.warning_foreground)
-                    .child("list truncated — enter a subdirectory to keep walking"),
+                    .child(t!("files.truncated").into_owned()),
             );
         }
         if entries.is_empty() {
@@ -679,7 +679,7 @@ pub(crate) fn render_files_panel(view: &FilesPanelView, ctx: &FilesPanelCtx, cx:
                 div()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child("empty directory"),
+                    .child(t!("files.empty").into_owned()),
             );
         }
     }
@@ -813,7 +813,7 @@ pub(crate) fn render_file_viewer(
                 .ghost()
                 .xsmall()
                 .icon(KitIconName::X)
-                .tooltip("Back to the file list")
+                .tooltip(t!("files.backToList"))
                 .on_click({
                     let runtime = runtime.clone();
                     move |_, _, _| runtime.send(UiCommand::FilesCloseView)
@@ -845,8 +845,8 @@ pub(crate) fn render_file_viewer(
             Button::new("file-viewer-md-toggle")
                 .ghost()
                 .xsmall()
-                .label(if md_source { "Preview" } else { "Source" })
-                .tooltip("Toggle markdown preview / source")
+                .label(if md_source { t!("files.preview").into_owned() } else { t!("files.source").into_owned() })
+                .tooltip(t!("files.togglePreview"))
                 .on_click(move |_, _, cx| {
                     let _ = wb_toggle.update(cx, |wb, cx| {
                         wb.file_md_source = Some((path.clone(), next));
@@ -866,7 +866,7 @@ pub(crate) fn render_file_viewer(
                     .ghost()
                     .xsmall()
                     .icon(KitIconName::CodeXml)
-                    .tooltip("Open this file in Zed")
+                    .tooltip(t!("files.openFileZed"))
                     .on_click(move |_, _, cx| {
                         if let Err(e) = open_in_zed(&abs) {
                             let _ = wb_open.update(cx, |wb, cx| wb.files_notice(&e, cx));
@@ -913,7 +913,7 @@ pub(crate) fn render_file_viewer(
             div()
                 .text_size(ui_text(12.))
                 .text_color(theme.muted_foreground)
-                .child("reading…"),
+                .child(t!("files.reading").into_owned()),
         );
     } else if let Some(err) = &view.error {
         let runtime = runtime.clone();
@@ -933,7 +933,7 @@ pub(crate) fn render_file_viewer(
                     Button::new("file-viewer-retry")
                         .secondary()
                         .xsmall()
-                        .label("Retry")
+                        .label(t!("files.retry").into_owned())
                         .on_click(move |_, _, _| {
                             runtime.send(UiCommand::FilesView { path: path.clone() })
                         }),
@@ -952,7 +952,7 @@ pub(crate) fn render_file_viewer(
                         div()
                             .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
-                            .child("loading preview…"),
+                            .child(t!("files.loadingPreview").into_owned()),
                     );
                 } else if let Some(src) = &view.image {
                     let open_src = src.clone();
@@ -982,7 +982,7 @@ pub(crate) fn render_file_viewer(
                         div()
                             .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
-                            .child("no preview available"),
+                            .child(t!("files.noPreview").into_owned()),
                     );
                 }
             }
@@ -991,7 +991,7 @@ pub(crate) fn render_file_viewer(
                     div()
                         .text_size(ui_text(12.))
                         .text_color(theme.muted_foreground)
-                        .child("binary file — open it with the default application instead"),
+                        .child(t!("files.binary").into_owned()),
                 );
             }
             FileKind::Text => {

@@ -5799,7 +5799,7 @@ impl Driver {
                 hub_frames.push(
                     serde_json::json!({
                         "v": 1, "type": "push",
-                        "title": "Remote terminal",
+                        "title": t!("terminal.pushTitle"),
                         "body": format!(
                             "{} → exit {} ({:.1}s)",
                             command,
@@ -7102,7 +7102,7 @@ impl Driver {
                             }
                         }
                     }
-                    self.toast.notify(now, "Session renamed");
+                    self.toast.notify(now, &rust_i18n::t!("notice.sessionRenamed"));
                 }
                 Err(e) => {
                     self.toast.notify(now, &format!("rename session failed: {e}"));

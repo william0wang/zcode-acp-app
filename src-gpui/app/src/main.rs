@@ -51,6 +51,7 @@ use gpui_kit::{
     QuitMode, SystemMenuType, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use runtime::ProtocolRuntime;
+use rust_i18n::t;
 use workbench::{
     ApprovalConfirm, ApprovalDigit1, ApprovalDigit2, ApprovalDigit3, ApprovalDigit4,
     ApprovalDigit5, ApprovalDigit6, ApprovalDigit7, ApprovalDigit8, ApprovalDigit9, EditCopy,
@@ -233,24 +234,32 @@ fn main() {
             // an Edit menu whose items carry the native selectors — inputs
             // keep their own ⌘C/⌘V handling; the app actions serve the
             // no-input case (window selection copy; clipboard-to-composer
-            // paste).
+            // paste). Labels resolve against the startup locale; the menu
+            // re-localizes on the next launch after a language switch.
             cx.set_menus(vec![
                 Menu::new("ZCode ACP").items(vec![
-                    MenuItem::action("About ZCode ACP", ShowAbout),
+                    MenuItem::action(t!("menu.about").into_owned(), ShowAbout),
                     MenuItem::separator(),
-                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::os_submenu(
+                        t!("menu.services").into_owned(),
+                        SystemMenuType::Services,
+                    ),
                     MenuItem::separator(),
-                    MenuItem::action("Preferences…", ShowPreferences),
+                    MenuItem::action(t!("menu.preferences").into_owned(), ShowPreferences),
                     MenuItem::separator(),
-                    MenuItem::action("Quit ZCode ACP", QuitApp),
+                    MenuItem::action(t!("menu.quit").into_owned(), QuitApp),
                 ]),
-                Menu::new("File").items(vec![MenuItem::action(
-                    "Reopen Closed Tab",
+                Menu::new(t!("menu.file").into_owned()).items(vec![MenuItem::action(
+                    t!("menu.reopenTab").into_owned(),
                     ReopenClosedTab,
                 )]),
-                Menu::new("Edit").items(vec![
-                    MenuItem::os_action("Copy", EditCopy, OsAction::Copy),
-                    MenuItem::os_action("Paste", EditPaste, OsAction::Paste),
+                Menu::new(t!("menu.editMenu").into_owned()).items(vec![
+                    MenuItem::os_action(t!("menu.copy").into_owned(), EditCopy, OsAction::Copy),
+                    MenuItem::os_action(
+                        t!("menu.paste").into_owned(),
+                        EditPaste,
+                        OsAction::Paste,
+                    ),
                 ]),
             ]);
 

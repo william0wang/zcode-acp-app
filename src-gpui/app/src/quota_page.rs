@@ -292,7 +292,7 @@ fn notice_banner(theme: &Theme, notice: &str, runtime: &ProtocolRuntime) -> AnyE
                 .ghost()
                 .xsmall()
                 .icon(IconName::CircleX)
-                .tooltip("Dismiss")
+                .tooltip(t!("common.dismiss"))
                 .on_click(move |_, _, _| runtime.send(UiCommand::DismissConfigNotice)),
         )
         .into_any_element()
@@ -851,7 +851,7 @@ impl Workbench {
                     .ghost()
                     .xsmall()
                     .icon(IconName::ArrowLeft)
-                    .tooltip("Back to the workbench")
+                    .tooltip(t!("common.backToWorkbench"))
                     .on_click(move |_, _, _| back_runtime.send(UiCommand::CloseQuota)),
             )
             .child(
@@ -868,7 +868,7 @@ impl Workbench {
                     .ghost()
                     .xsmall()
                     .icon(IconName::RefreshCw)
-                    .tooltip("Refresh the allowance")
+                    .tooltip(t!("quota.refreshHint"))
                     .on_click(move |_, _, _| refresh_runtime.send(UiCommand::RefreshQuota)),
             );
 

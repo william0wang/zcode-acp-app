@@ -477,13 +477,13 @@ pub fn render_approval_card(
                     .iter()
                     .find(|o| o.value == "approve")
                     .map(|o| o.label.clone())
-                    .unwrap_or_else(|| "Approve".to_string());
+                    .unwrap_or_else(|| t!("permission.approve").into_owned());
                 let reject_label = field
                     .options
                     .iter()
                     .find(|o| o.value == "reject")
                     .map(|o| o.label.clone())
-                    .unwrap_or_else(|| "Reject".to_string());
+                    .unwrap_or_else(|| t!("permission.reject").into_owned());
                 let mk = |value: &'static str| {
                     let runtime = runtime.clone();
                     let key = key.clone();
@@ -679,7 +679,7 @@ pub fn render_approval_card(
                 .flex_none()
                 .text_size(ui_text(12.))
                 .text_color(theme.warning)
-                .child("Ask"),
+                .child(t!("permission.askTag").into_owned()),
         )
         .child(
             div()
@@ -791,7 +791,7 @@ pub fn render_toast_strip(
                 .ghost()
                 .xsmall()
                 .label("×")
-                .tooltip("Dismiss")
+                .tooltip(t!("common.dismiss"))
                 .on_click({
                     let runtime = runtime.clone();
                     move |_, _, _| runtime.send(UiCommand::DismissToast)

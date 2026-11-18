@@ -416,7 +416,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
                     .ghost()
                     .xsmall()
                     .icon(IconName::ArrowLeft)
-                    .tooltip("Back to the workbench")
+                    .tooltip(t!("common.backToWorkbench"))
                     .on_click(move |_, _, _| {
                         runtime.send(UiCommand::CloseConfigPage { page: close_kind })
                     }),
@@ -433,7 +433,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
                     .ghost()
                     .xsmall()
                     .icon(IconName::RefreshCw)
-                    .tooltip("Reload the section")
+                    .tooltip(t!("zconfig.reloadSection"))
                     .disabled(page.loading)
                     .on_click(move |_, _, _| {
                         runtime2.send(UiCommand::RefreshConfigPage { page: refresh_kind })
@@ -469,7 +469,7 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
                         .ghost()
                         .xsmall()
                         .label("×")
-                        .tooltip("Dismiss")
+                        .tooltip(t!("common.dismiss"))
                         .on_click(move |_, _, _| {
                             runtime3.send(UiCommand::DismissConfigNotice)
                         }),
@@ -2323,7 +2323,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::ArrowLeft)
-                        .tooltip("Back to the section list")
+                        .tooltip(t!("zconfig.backToSections"))
                         .on_click(move |_, _, cx| {
                             wb.update(cx, |this, cx| this.close_zconfig_form(cx));
                         }),

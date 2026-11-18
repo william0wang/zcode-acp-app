@@ -1159,7 +1159,7 @@ fn chat_row_menu(
         let has_text = !text.trim().is_empty();
         if let Some(selected) = selection {
             m = m.item(
-                PopupMenuItem::new("Copy selection").on_click(move |_, _, cx| {
+                PopupMenuItem::new(t!("chat.copySelection").into_owned()).on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(selected.clone()));
                 }),
             );
@@ -1521,22 +1521,22 @@ impl Workbench {
         let scroller = cx.new(|cx| MessageScrollerState::new(0, cx));
         // The sessions panel's search field (⌘K focuses it).
         let session_search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Search sessions"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("chat.searchPlaceholder")));
         // Re-render per keystroke: the sidebar's filter reads the value.
         let search_sub = cx.subscribe(&session_search, |_, _, _: &InputEvent, cx| cx.notify());
         let new_session_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("projectDialog.filter")));
         let ns_filter_sub =
             cx.subscribe(&new_session_filter, |_, _, _: &InputEvent, cx| cx.notify());
         // The history panel's project-layer filter (TS ProjectHistoryDialog
         // :413-421) — the same shape as the chooser's.
         let history_filter =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Filter projects"));
+            cx.new(|cx| InputState::new(window, cx).placeholder(t!("historyDialog.filter")));
         let history_filter_sub =
             cx.subscribe(&history_filter, |_, _, _: &InputEvent, cx| cx.notify());
         // The rename sheet's draft (G1) — Enter saves when non-empty (the TS
         // sheet's disabled-Save guard), every keystroke re-renders the button.
-        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("Session title"));
+        let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder(t!("chat.renamePlaceholder")));
         let rename_sub = cx.subscribe(
             &rename_input,
             |this, _, event: &InputEvent, cx| match event {
@@ -3294,7 +3294,7 @@ impl Workbench {
                 Button::new("retry")
                     .secondary()
                     .small()
-                    .label("Retry")
+                    .label(t!("common.retry").into_owned())
                     .on_click(move |_, _, _| runtime.send(UiCommand::Retry)),
             );
         }
@@ -3587,7 +3587,7 @@ impl Workbench {
                 div()
                     .text_size(ui_text(14.))
                     .text_color(theme.foreground)
-                    .child("Enable remote access"),
+                    .child(t!("connect.enableRemote").into_owned()),
             )
             .child(
                 div()
@@ -3634,7 +3634,7 @@ impl Workbench {
                 .child(
                     Button::new("token-write")
                         .primary()
-                        .label("Write and connect")
+                        .label(t!("connect.writeAndConnect").into_owned())
                         .on_click({
                             let runtime = runtime.clone();
                             move |_, _, _| runtime.send(UiCommand::ConfirmTokenWrite)
@@ -3643,7 +3643,7 @@ impl Workbench {
                 .child(
                     Button::new("token-regenerate")
                         .secondary()
-                        .label("Regenerate")
+                        .label(t!("connect.regenerate").into_owned())
                         .on_click({
                             let runtime = runtime.clone();
                             move |_, _, _| runtime.send(UiCommand::Retry)
@@ -3835,7 +3835,7 @@ impl Workbench {
                         div()
                             .text_size(ui_text(13.))
                             .text_color(theme.foreground)
-                            .child("Local hub"),
+                            .child(t!("connect.localHub").into_owned()),
                     )
                     .child(
                         div()
@@ -3843,7 +3843,7 @@ impl Workbench {
                             .truncate()
                             .text_size(ui_text(12.))
                             .text_color(theme.muted_foreground)
-                            .child("Spawned or discovered on this machine"),
+                            .child(t!("connect.localHubHint").into_owned()),
                     ),
             );
         if !local_active {
@@ -3853,7 +3853,7 @@ impl Workbench {
                     .ghost()
                     .xsmall()
                     .icon(KitIconName::Plug)
-                    .tooltip("Switch to the local hub")
+                    .tooltip(t!("connect.switchLocalHub"))
                     .on_click(move |_, _, _| runtime.send(UiCommand::SwitchProfile { id: None })),
             );
         }
@@ -3910,7 +3910,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(KitIconName::Plug)
-                        .tooltip("Switch to this hub")
+                        .tooltip(t!("connect.switchHub"))
                         .on_click(move |_, _, _| {
                             runtime.send(UiCommand::SwitchProfile {
                                 id: Some(id.clone()),
@@ -3929,7 +3929,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(KitIconName::Pencil)
-                        .tooltip("Edit")
+                        .tooltip(t!("common.edit"))
                         .on_click(move |_, window, cx| {
                             ServerForm::open(Some(&server), runtime.clone(), window, cx)
                         }),
@@ -3947,9 +3947,9 @@ impl Workbench {
             let remove =
                 Button::new(SharedString::from(format!("server-remove-{}", server.id))).xsmall();
             let remove = if armed {
-                remove.danger().label("Confirm remove")
+                remove.danger().label(t!("connect.confirmRemove").into_owned())
             } else {
-                remove.ghost().icon(KitIconName::Trash).tooltip("Remove")
+                remove.ghost().icon(KitIconName::Trash).tooltip(t!("common.remove"))
             };
             row = row.child(remove.on_click(move |_, _, cx| {
                 let arm_id = arm_id.clone();
@@ -4414,7 +4414,7 @@ impl Workbench {
                             .ghost()
                             .xsmall()
                             .icon(KitIconName::X)
-                            .tooltip("Close the files panel")
+                            .tooltip(t!("files.close"))
                             .on_click(move |_, _, cx| {
                                 wb_close.update(cx, |this, cx| this.toggle_session_panel(cx));
                             }),
@@ -4516,7 +4516,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::Plus)
-                        .tooltip("New session — pick the project directory it belongs to")
+                        .tooltip(t!("chat.newSessionHint"))
                         .on_click(move |_, _, _| runtime_new.send(UiCommand::NewSessionToggle)),
                 )
                 .child(
@@ -4524,7 +4524,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::RefreshCw)
-                        .tooltip("Refresh the live session list")
+                        .tooltip(t!("picker.refreshHint"))
                         .on_click(move |_, _, _| runtime.send(UiCommand::RefreshSessions)),
                 ),
         );
@@ -4598,7 +4598,7 @@ impl Workbench {
                     .ghost()
                     .xsmall()
                     .label(t!("historyDialog.title").into_owned())
-                    .tooltip("Browse a project's past sessions")
+                    .tooltip(t!("historyDialog.hint"))
                     .on_click(move |_, _, _| runtime_hist.send(UiCommand::HistoryToggle)),
             ),
         );
@@ -4672,7 +4672,7 @@ impl Workbench {
                 .ghost()
                 .xsmall()
                 .icon(IconName::Ellipsis)
-                .tooltip("Session actions")
+                .tooltip(t!("chat.sessionActions"))
                 .dropdown_menu(move |menu, _, _| {
                     let mut m = menu;
                     // The builder runs on every open — fresh captures.
@@ -4706,7 +4706,7 @@ impl Workbench {
                         menu_instance.clone(),
                         menu_session.clone(),
                     );
-                    m = m.item(PopupMenuItem::new("End session").on_click(move |_, _, _| {
+                    m = m.item(PopupMenuItem::new(t!("chat.endSession").into_owned()).on_click(move |_, _, _| {
                         runtime.send(UiCommand::CloseSession {
                             instance_id: inst.clone(),
                             session_id: sid.clone(),
@@ -4810,7 +4810,7 @@ impl Workbench {
                     div()
                         .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
-                        .child("open"),
+                        .child(t!("chat.sessionOpen").into_owned()),
                 )
             })
             .child(actions)
@@ -4849,7 +4849,7 @@ impl Workbench {
                     .ghost()
                     .xsmall()
                     .icon(IconName::ArrowLeft)
-                    .tooltip("All projects")
+                    .tooltip(t!("historyDialog.allProjects"))
                     .on_click(move |_, _, _| runtime_back.send(UiCommand::HistoryBack)),
             );
         }
@@ -4873,7 +4873,7 @@ impl Workbench {
                     .ghost()
                     .xsmall()
                     .icon(KitIconName::X)
-                    .tooltip("Close the dialog")
+                    .tooltip(t!("common.closeDialog"))
                     .on_click(move |_, _, _| runtime.send(UiCommand::HistoryToggle)),
             );
 
@@ -5148,7 +5148,7 @@ impl Workbench {
                 .ghost()
                 .xsmall()
                 .icon(IconName::Ellipsis)
-                .tooltip("Session actions")
+                .tooltip(t!("chat.sessionActions"))
                 .dropdown_menu(move |menu, _, _| {
                     let mut m = menu;
                     let (runtime, sid) = (menu_runtime.clone(), menu_session.clone());
@@ -5264,7 +5264,7 @@ impl Workbench {
                     .pb_1()
                     .text_size(ui_text(13.))
                     .text_color(theme.muted_foreground)
-                    .child("no session open"),
+                    .child(t!("chat.noSessionOpen").into_owned()),
             );
         }
 
@@ -5274,7 +5274,7 @@ impl Workbench {
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
-                .tooltip("New session — pick the project directory it belongs to")
+                .tooltip(t!("chat.newSessionHint"))
                 .on_click(move |_, _, _| runtime.send(UiCommand::NewSessionToggle)),
         );
 
@@ -5573,7 +5573,7 @@ impl Workbench {
                     div()
                         .text_size(ui_text(10.))
                         .text_color(theme.danger)
-                        .child("error"),
+                        .child(t!("chat.tabError").into_owned()),
                 );
             }
             None if tab.running => {
@@ -5656,7 +5656,7 @@ impl Workbench {
                 .ghost()
                 .xsmall()
                 .icon(IconName::CircleX)
-                .tooltip("Close tab — the session keeps running on the hub")
+                .tooltip(t!("chat.closeTabHint"))
                 .on_click(move |_, _, _| runtime2.send(UiCommand::CloseTab { id: close_id })),
         );
 
@@ -5676,7 +5676,7 @@ impl Workbench {
             let mut m = menu;
             let (runtime, id) = (menu_runtime.clone(), menu_id);
             m = m.item(
-                PopupMenuItem::new("Close tab")
+                PopupMenuItem::new(t!("chat.closeTab").into_owned())
                     .on_click(move |_, _, _| runtime.send(UiCommand::CloseTab { id })),
             );
             let (runtime, id) = (menu_runtime.clone(), menu_id);
@@ -5726,7 +5726,7 @@ impl Workbench {
                         .small()
                         .label(label)
                         .disabled(loading)
-                        .tooltip("session/load_earlier — the stored cursor rides back verbatim")
+                        .tooltip(t!("chat.loadEarlierHint"))
                         .on_click(move |_, _, _| runtime.send(UiCommand::LoadEarlier)),
                 ),
             );
@@ -5976,7 +5976,7 @@ impl Workbench {
                             .ghost()
                             .xsmall()
                             .label(t!("chat.sendNow").into_owned())
-                            .tooltip("Interrupt the running turn and send this one first")
+                            .tooltip(t!("chat.sendNowHint"))
                             .on_click(move |_, _, _| {
                                 runtime.send(UiCommand::ForceSendPendingAt { index })
                             }),
@@ -5988,7 +5988,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .label(t!("chat.editPending").into_owned())
-                        .tooltip("Back into the composer for changes")
+                        .tooltip(t!("chat.editPendingHint"))
                         .on_click(move |_, _, _| runtime.send(UiCommand::EditPending { index })),
                 );
                 let runtime = self.runtime.clone();
@@ -5997,7 +5997,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::CircleX)
-                        .tooltip("Discard")
+                        .tooltip(t!("chat.discard"))
                         .on_click(move |_, _, _| runtime.send(UiCommand::DiscardPending { index })),
                 );
                 column = column.child(row);
@@ -6007,7 +6007,7 @@ impl Workbench {
                     div()
                         .text_size(ui_text(10.))
                         .text_color(theme.muted_foreground)
-                        .child("queued — the next one sends when the running turn settles"),
+                        .child(t!("chat.queuedHint").into_owned()),
                 );
             }
         }
@@ -6055,7 +6055,7 @@ impl Workbench {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::CircleX)
-                                .tooltip("Remove attachment")
+                                .tooltip(t!("chat.removeAttachment"))
                                 .on_click(move |_, _, cx| {
                                     wb.update(cx, |this, cx| this.remove_staged(index, cx));
                                 }),
@@ -6101,7 +6101,7 @@ impl Workbench {
                 .ghost()
                 .small()
                 .icon(KitIconName::ImagePlus)
-                .tooltip("Attach images — paste or drop them here too")
+                .tooltip(t!("chat.attachHint"))
                 .on_click({
                     let wb = wb.clone();
                     move |_, _window, cx| {
@@ -6112,7 +6112,7 @@ impl Workbench {
                             files: true,
                             directories: false,
                             multiple: true,
-                            prompt: Some("Choose images".into()),
+                            prompt: Some(t!("chat.chooseImages").into_owned().into()),
                         });
                         cx.spawn(async move |cx| {
                             let Ok(Ok(Some(paths))) = rx.await else {
@@ -6160,7 +6160,7 @@ impl Workbench {
                     .secondary()
                     .small()
                     .icon(IconName::Square)
-                    .tooltip("Cancel the running turn")
+                    .tooltip(t!("chat.cancelTurn"))
                     .on_click(move |_, _, _| runtime.send(UiCommand::CancelTurn)),
             );
         }
@@ -6199,7 +6199,7 @@ impl Workbench {
                 .small()
                 .label(t!("chat.send").into_owned())
                 .disabled(!can_send)
-                .tooltip("Enter — queues while a turn is running")
+                .tooltip(t!("chat.enterQueues"))
                 .on_click(move |_, window, cx| {
                     let text = composer.read(cx).value().to_string();
                     let Some((text, images)) = wb.read(cx).outgoing_prompt(&text) else {
@@ -7290,7 +7290,7 @@ fn render_assistant_row(
                                 Button::new(SharedString::from(format!("thought-more-{}", row.id)))
                                     .ghost()
                                     .xsmall()
-                                    .label(if full { "Collapse" } else { "Show all" })
+                                    .label(if full { t!("chat.collapseOutput").into_owned() } else { t!("chat.expandOutput").into_owned() })
                                     .on_click(move |_, _window, cx| {
                                         if let Some(wb) = wb.upgrade() {
                                             wb.update(cx, |wb, cx| {
@@ -7647,14 +7647,14 @@ fn render_tool_card(
         let mut m = menu;
         let command = menu_command.clone();
         m = m.item(
-            PopupMenuItem::new("Copy command").on_click(move |_, _, cx| {
+            PopupMenuItem::new(t!("chat.copyCommand").into_owned()).on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
             }),
         );
         let empty = menu_output.trim().is_empty();
         let output = menu_output.clone();
         m = m.item(
-            PopupMenuItem::new("Copy output")
+            PopupMenuItem::new(t!("chat.copyOutput").into_owned())
                 .disabled(empty)
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(output.clone()));
@@ -7887,14 +7887,14 @@ fn render_tool_run(
         let mut m = menu;
         let commands = commands.clone();
         m = m.item(
-            PopupMenuItem::new("Copy commands").on_click(move |_, _, cx| {
+            PopupMenuItem::new(t!("chat.copyCommands").into_owned()).on_click(move |_, _, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(commands.clone()));
             }),
         );
         let empty = outputs.trim().is_empty();
         let outputs = outputs.clone();
         m = m.item(
-            PopupMenuItem::new("Copy output")
+            PopupMenuItem::new(t!("chat.copyOutput").into_owned())
                 .disabled(empty)
                 .on_click(move |_, _, cx| {
                     cx.write_to_clipboard(ClipboardItem::new_string(outputs.clone()));
@@ -8380,7 +8380,7 @@ impl Workbench {
                             .ghost()
                             .xsmall()
                             .icon(KitIconName::X)
-                            .tooltip("Close the drawer")
+                            .tooltip(t!("panel.close"))
                             .on_click(move |_, _, cx| {
                                 wb.update(cx, |wb, cx| wb.toggle_drawer(close_surface, cx));
                             }),
@@ -8516,19 +8516,16 @@ impl Workbench {
                 div()
                     .text_size(ui_text(13.))
                     .text_color(theme.foreground)
-                    .child("Quit with your turns still running"),
+                    .child(t!("quit.title").into_owned()),
             )
             .child(
                 div()
                     .min_w_0()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child(format!(
-                        "{n} turn{s} you started from this app {is} still running on the hub — \
-                 they keep running after it closes. Turns started from other clients \
-                 are never touched.",
-                        s = if n == 1 { "" } else { "s" },
-                        is = if n == 1 { "is" } else { "are" },
+                    .child(fill(
+                        &t_count("quit.body", n as u64),
+                        &[("n", &n.to_string())],
                     )),
             );
         if stopping {
@@ -8538,7 +8535,7 @@ impl Workbench {
                     .test_support()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child("Stopping the running turns…"),
+                    .child(t!("quit.stopping").into_owned()),
             );
         } else {
             card = card.child(
@@ -8551,7 +8548,7 @@ impl Workbench {
                         Button::new("quit-stop")
                             .secondary()
                             .small()
-                            .label("Stop Turns & Quit")
+                            .label(t!("quit.stopAndQuit").into_owned())
                             .on_click({
                                 let wb = wb.clone();
                                 move |_, window, cx| {
@@ -8566,7 +8563,7 @@ impl Workbench {
                         Button::new("quit-only")
                             .primary()
                             .small()
-                            .label("Quit Only")
+                            .label(t!("quit.quitOnly").into_owned())
                             .on_click({
                                 let wb = wb.clone();
                                 move |_, window, cx| {
@@ -8663,7 +8660,13 @@ impl Workbench {
                 div()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child(format!("Version {}{}", env!("CARGO_PKG_VERSION"), hub)),
+                    .child(fill(
+                        &t!("about.version"),
+                        &[(
+                            "version",
+                            &format!("{}{}", env!("CARGO_PKG_VERSION"), hub),
+                        )],
+                    )),
             )
             .child(
                 div()
@@ -8746,14 +8749,14 @@ impl Workbench {
                 div()
                     .text_size(ui_text(13.))
                     .text_color(theme.foreground)
-                    .child("Rename session"),
+                    .child(t!("chat.renameSession").into_owned()),
             )
             .child(
                 div()
                     .min_w_0()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child("The title shows here, in the editor, and in the ZCode app."),
+                    .child(t!("chat.renameSessionHint").into_owned()),
             )
             .child(Input::new(&self.rename_input).small())
             .child(
@@ -8766,7 +8769,7 @@ impl Workbench {
                         Button::new("rename-cancel")
                             .secondary()
                             .small()
-                            .label("Cancel")
+                            .label(t!("common.cancel").into_owned())
                             .on_click({
                                 let wb = wb.clone();
                                 move |_, _, cx| {
@@ -8781,7 +8784,7 @@ impl Workbench {
                         Button::new("rename-save")
                             .primary()
                             .small()
-                            .label("Save")
+                            .label(t!("common.save").into_owned())
                             .disabled(!can_save)
                             .on_click({
                                 let wb = wb.clone();
@@ -8851,9 +8854,9 @@ impl Workbench {
                         .text_size(ui_text(14.))
                         .text_color(theme.foreground)
                         .child(if view.browse.is_some() {
-                            "Browse directories".to_string()
+                            t!("projectDialog.browse").into_owned()
                         } else {
-                            "New session".to_string()
+                            t!("projectDialog.title").into_owned()
                         }),
                 )
                 .child(div().flex_1())
@@ -8862,8 +8865,8 @@ impl Workbench {
                         Button::new("ns-browse")
                             .ghost()
                             .xsmall()
-                            .label("Browse")
-                            .tooltip("Walk the machine's directories instead")
+                            .label(t!("projectDialog.browseBtn").into_owned())
+                            .tooltip(t!("projectDialog.browseHint"))
                             .on_click({
                                 let runtime = runtime.clone();
                                 move |_, _, _| {
@@ -8877,8 +8880,8 @@ impl Workbench {
                         Button::new("ns-projects")
                             .ghost()
                             .xsmall()
-                            .label("Projects")
-                            .tooltip("Back to the known-projects list")
+                            .label(t!("projectDialog.projects").into_owned())
+                            .tooltip(t!("projectDialog.backToProjects"))
                             .on_click({
                                 let runtime = runtime.clone();
                                 move |_, _, _| runtime.send(UiCommand::NewSessionCloseBrowse)
@@ -8890,7 +8893,7 @@ impl Workbench {
                         .ghost()
                         .xsmall()
                         .icon(IconName::CircleX)
-                        .tooltip("Close — Esc")
+                        .tooltip(t!("projectDialog.closeEsc"))
                         .on_click({
                             let runtime = runtime.clone();
                             move |_, _, _| runtime.send(UiCommand::NewSessionToggle)
@@ -8929,7 +8932,7 @@ impl Workbench {
                         div()
                             .text_size(ui_text(13.))
                             .text_color(theme.muted_foreground)
-                            .child("loading projects…"),
+                            .child(t!("projectDialog.loading").into_owned()),
                     );
                 }
                 Some(projects) if projects.is_empty() => {
@@ -8937,7 +8940,7 @@ impl Workbench {
                         div()
                             .text_size(ui_text(13.))
                             .text_color(theme.muted_foreground)
-                            .child("No known projects yet — use Browse to pick a directory."),
+                            .child(t!("projectDialog.noProjectsYet").into_owned()),
                     );
                 }
                 Some(projects) => {
@@ -9113,9 +9116,9 @@ impl Workbench {
                     Button::new("ns-start-here")
                         .primary()
                         .small()
-                        .label("Start session here")
+                        .label(t!("projectDialog.startHere").into_owned())
                         .disabled(!browse.creatable || creating.is_some())
-                        .tooltip("Only known projects and remote.projectRoots directories can start a session")
+                        .tooltip(t!("projectDialog.notAllowedShort"))
                         .on_click({
                             let runtime = runtime.clone();
                             let ws = browse.path.clone();
@@ -9131,7 +9134,7 @@ impl Workbench {
                         div()
                             .text_size(ui_text(12.))
                             .text_color(theme.accent)
-                            .child("creating…"),
+                            .child(t!("projectDialog.creating").into_owned()),
                     )
                 })
                 .when(!browse.creatable, |this| {
@@ -9139,7 +9142,7 @@ impl Workbench {
                         div()
                             .text_size(ui_text(10.))
                             .text_color(theme.muted_foreground)
-                            .child("not allowed here — go into a project directory"),
+                            .child(t!("projectDialog.notAllowedRow").into_owned()),
                     )
                 }),
         );
@@ -9187,7 +9190,7 @@ impl Workbench {
                 div()
                     .text_size(ui_text(12.))
                     .text_color(theme.muted_foreground)
-                    .child("No subdirectories."),
+                    .child(t!("projectDialog.emptyDir").into_owned()),
             );
         }
         for name in &browse.entries {
@@ -9236,7 +9239,7 @@ impl Workbench {
                 div()
                     .text_size(ui_text(10.))
                     .text_color(theme.muted_foreground)
-                    .child("list truncated — enter a subdirectory to keep walking"),
+                    .child(t!("projectDialog.listTruncated").into_owned()),
             );
         }
         body

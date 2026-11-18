@@ -183,7 +183,7 @@ pub fn render_usage_page(
                     .ghost()
                     .small()
                     .icon(IconName::ArrowLeft)
-                    .tooltip("Back to the workbench")
+                    .tooltip(t!("common.backToWorkbench"))
                     .on_click(move |_, _, _| rt.send(UiCommand::CloseUsage)),
             )
             .child(
@@ -820,7 +820,7 @@ fn render_local_tab(view: &UsagePageView, runtime: &ProtocolRuntime, theme: &The
 
     let daily = view.local.as_ref().map(|u| u.daily.as_slice()).unwrap_or(&[]);
     if !daily.is_empty() {
-        let mut block = config_block(Some("By day"), true, theme);
+        let mut block = config_block(Some(t!("zconfig.usageByDay").as_ref()), true, theme);
         for day in daily {
             let models = day
                 .models

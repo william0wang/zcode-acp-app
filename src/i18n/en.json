@@ -14,14 +14,24 @@
     "namePlaceholder": "Optional — defaults to the host",
     "deleteServer": "Delete server",
     "deleteConfirm": "Tap again to delete",
-    "saveServer": "Save"
+    "saveServer": "Save",
+    "addAndConnect": "Add and connect",
+    "enableRemote": "Enable remote access",
+    "writeAndConnect": "Write and connect",
+    "regenerate": "Regenerate",
+    "localHub": "Local hub",
+    "localHubHint": "Spawned or discovered on this machine",
+    "switchLocalHub": "Switch to the local hub",
+    "switchHub": "Switch to this hub",
+    "confirmRemove": "Confirm remove"
   },
   "picker": {
     "title": "Sessions",
     "refresh": "Refresh",
     "connecting": "Connecting…",
     "empty": "No sessions yet. Open your editor with the bridge running.",
-    "hubOffline": "Hub offline — it starts together with your editor. Waiting…"
+    "hubOffline": "Hub offline — it starts together with your editor. Waiting…",
+    "refreshHint": "Refresh the live session list"
   },
   "chat": {
     "empty": "No messages yet",
@@ -103,7 +113,26 @@
     "collapseOutput": "Collapse",
     "viewFullFile": "View full file",
     "splitView": "Side by side",
-    "dropUnsupported": "Only images and small text files can be dropped"
+    "dropUnsupported": "Only images and small text files can be dropped",
+    "copySelection": "Copy selection",
+    "sessionOpen": "open",
+    "tabError": "error",
+    "closeTab": "Close tab",
+    "closeTabHint": "Close tab — the session keeps running on the hub",
+    "loadEarlierHint": "session/load_earlier — the stored cursor rides back verbatim",
+    "sendNowHint": "Interrupt the running turn and send this one first",
+    "editPendingHint": "Back into the composer for changes",
+    "queuedHint": "queued — the next one sends when the running turn settles",
+    "removeAttachment": "Remove attachment",
+    "attachHint": "Add images — paste or drop them here too",
+    "chooseImages": "Choose images",
+    "cancelTurn": "Cancel the running turn",
+    "enterQueues": "Enter — queues while a turn is running",
+    "copyCommands": "Copy commands",
+    "sessionActions": "Session actions",
+    "endSession": "End session",
+    "newSessionHint": "New session — pick the project directory it belongs to",
+    "noSessionOpen": "No session open"
   },
   "panel": {
     "title": "Settings",
@@ -120,7 +149,8 @@
     "upgradeLatest": "Hub is up to date ({{version}})",
     "upgradeRestarted": "Hub restarted onto {{version}}",
     "workflows": "Workflows",
-    "workflowManage": "Manage workflows…"
+    "workflowManage": "Manage workflows…",
+    "close": "Close the drawer"
   },
   "zconfig": {
     "title": "ZCode configuration",
@@ -464,7 +494,14 @@
     "providerKeyHint": "The key this provider authenticates with",
     "providerKeyKeepHint": "Stored key unchanged unless you type a new one",
     "providerPlan": "plan",
-    "updateRelaunch": "Relaunch"
+    "updateRelaunch": "Relaunch",
+    "reloadSection": "Reload the section",
+    "backToSections": "Back to the section list",
+    "modelsReload": "Reload the models list",
+    "backToModels": "Back to the models list",
+    "probeModel": "Send one minimal request to check this model answers",
+    "editProvider": "Edit this provider's endpoint and key",
+    "logScale": "log scale"
   },
   "system": {
     "title": "System status",
@@ -517,7 +554,8 @@
     "title": "Plan usage",
     "refresh": "Refresh",
     "updated": "Updated",
-    "unavailable": "Unavailable — tap Refresh to retry"
+    "unavailable": "Unavailable — tap Refresh to retry",
+    "refreshHint": "Refresh the allowance"
   },
   "terminal": {
     "title": "Terminal",
@@ -527,7 +565,8 @@
     "closePane": "Close this pane",
     "hide": "Hide the terminal",
     "spawnFailed": "Failed to start the terminal",
-    "testPlaceholder": "terminal (test build — no shell)"
+    "testPlaceholder": "terminal (test build — no shell)",
+    "pushTitle": "Remote terminal"
   },
   "remoteTerminal": {
     "openAction": "Terminal",
@@ -560,7 +599,8 @@
     "otherValue": "or type a custom value",
     "otherValueMulti": "or a custom value",
     "queueWaiting_one": "{{count}} more approval waiting in other sessions",
-    "queueWaiting_other": "{{count}} more approvals waiting in other sessions"
+    "queueWaiting_other": "{{count}} more approvals waiting in other sessions",
+    "askTag": "Ask"
   },
   "notice": {
     "unsupported": "This interaction must be answered in your editor",
@@ -592,15 +632,24 @@
     "filter": "Filter projects",
     "loading": "Loading projects…",
     "empty": "No matching projects",
-    "sessionCount": "{{count}} sessions",
-    "sessionCount_one": "1 session",
+    "sessionCount_one": "{{count}} session",
+    "sessionCount_other": "{{count}} sessions",
     "tooOld": "Bridge 0.17.0+ required to start sessions",
     "browse": "Browse directories",
     "startHere": "Start session here",
     "notAllowed": "New sessions can't start in this directory — it is neither a known project nor under a remote.projectRoots root on the hub machine",
     "loadingDirs": "Loading directories…",
     "emptyDir": "No subdirectories",
-    "listTruncated": "First 2000 entries shown"
+    "listTruncated": "First 2000 entries shown",
+    "browseBtn": "Browse",
+    "browseHint": "Walk the machine's directories instead",
+    "projects": "Projects",
+    "backToProjects": "Back to the known-projects list",
+    "closeEsc": "Close — Esc",
+    "noProjectsYet": "No known projects yet — use Browse to pick a directory.",
+    "creating": "creating…",
+    "notAllowedShort": "Only known projects and remote.projectRoots directories can start a session",
+    "notAllowedRow": "not allowed here — go into a project directory"
   },
   "historyDialog": {
     "title": "Session history",
@@ -617,20 +666,50 @@
     "retry": "Retry",
     "tooOld": "Bridge 0.19.0+ required for session history",
     "deleteProject": "Delete project",
-    "deleteProjectHint": "Hides this project and ALL its conversations from every list — this app, the desktop app, and the CLI. Nothing is purged; the project reappears when a new session starts in it."
+    "deleteProjectHint": "Hides this project and ALL its conversations from every list — this app, the desktop app, and the CLI. Nothing is purged; the project reappears when a new session starts in it.",
+    "allProjects": "All projects"
   },
   "common": {
     "cancel": "Cancel",
     "close": "Close",
     "back": "Back",
     "save": "Save",
-    "exitHint": "Press back again to exit"
+    "exitHint": "Press back again to exit",
+    "dismiss": "Dismiss",
+    "backToWorkbench": "Back to the workbench",
+    "reload": "Reload",
+    "retry": "Retry",
+    "edit": "Edit",
+    "remove": "Remove",
+    "closeDialog": "Close the dialog"
   },
   "error": {
     "title": "Something broke",
     "copy": "Copy details",
     "copied": "Copied",
     "reload": "Reload"
+  },
+  "quit": {
+    "title": "Quit with your turns still running",
+    "body_one": "1 turn you started from this app is still running on the hub — it keeps running after it closes. Turns started from other clients are never touched.",
+    "body_other": "{{n}} turns you started from this app are still running on the hub — they keep running after it closes. Turns started from other clients are never touched.",
+    "stopping": "Stopping the running turns…",
+    "stopAndQuit": "Stop Turns & Quit",
+    "quitOnly": "Quit Only"
+  },
+  "menu": {
+    "about": "About ZCode ACP",
+    "services": "Services",
+    "preferences": "Preferences…",
+    "quit": "Quit ZCode ACP",
+    "file": "File",
+    "reopenTab": "Reopen Closed Tab",
+    "editMenu": "Edit",
+    "copy": "Copy",
+    "paste": "Paste"
+  },
+  "about": {
+    "version": "Version {{version}}"
   },
   "files": {
     "title": "Files",
@@ -642,7 +721,19 @@
     "empty": "Empty directory",
     "truncated": "Showing the first 2000 entries",
     "loadError": "Failed to load",
-    "retry": "Retry"
+    "retry": "Retry",
+    "hideDot": "Hide dotfiles",
+    "showDot": "Show dotfiles",
+    "reading": "reading…",
+    "openTerminal": "Open a terminal in this directory",
+    "openZed": "Open this directory in Zed",
+    "reread": "Re-read this directory",
+    "backToList": "Back to the file list",
+    "togglePreview": "Toggle markdown preview / source",
+    "openFileZed": "Open this file in Zed",
+    "loadingPreview": "loading preview…",
+    "noPreview": "no preview available",
+    "binary": "binary file — open it with the default application instead"
   },
   "viewer": {
     "download": "Download",

@@ -14,14 +14,24 @@
     "namePlaceholder": "可选,默认取主机名",
     "deleteServer": "删除服务器",
     "deleteConfirm": "再点一次确认删除",
-    "saveServer": "保存"
+    "saveServer": "保存",
+    "addAndConnect": "添加并连接",
+    "enableRemote": "启用远程访问",
+    "writeAndConnect": "写入并连接",
+    "regenerate": "重新生成",
+    "localHub": "本机 hub",
+    "localHubHint": "在本机启动或自动发现",
+    "switchLocalHub": "切换到本机 hub",
+    "switchHub": "切换到此 hub",
+    "confirmRemove": "确认移除"
   },
   "picker": {
     "title": "会话",
     "refresh": "刷新",
     "connecting": "连接中…",
     "empty": "还没有会话。在编辑器中启动 bridge。",
-    "hubOffline": "Hub 未在线——它会随编辑器一起启动，等待中…"
+    "hubOffline": "Hub 未在线——它会随编辑器一起启动，等待中…",
+    "refreshHint": "刷新实时会话列表"
   },
   "chat": {
     "empty": "还没有消息",
@@ -40,7 +50,8 @@
     "untitled": "未命名会话",
     "thinking": "思考中…",
     "thought": "思考过程",
-    "toolRun": "{{count}} 个工具调用",
+    "toolRun_one": "{{count}} 个工具调用",
+    "toolRun_other": "{{count}} 个工具调用",
     "toolRunCollapse": "收起",
     "contextHandoff": "前序会话摘要",
     "taskNotice": "后台任务通知",
@@ -102,7 +113,26 @@
     "collapseOutput": "收起",
     "viewFullFile": "查看完整文件",
     "splitView": "双栏对比",
-    "dropUnsupported": "仅支持拖入图片或小文本文件"
+    "dropUnsupported": "仅支持拖入图片或小文本文件",
+    "copySelection": "复制选区",
+    "sessionOpen": "已打开",
+    "tabError": "错误",
+    "closeTab": "关闭标签页",
+    "closeTabHint": "关闭标签页——会话仍在 hub 上运行",
+    "loadEarlierHint": "session/load_earlier——存储的游标原样带回",
+    "sendNowHint": "打断当前回合，优先发送这条",
+    "editPendingHint": "退回输入框修改",
+    "queuedHint": "已排队——当前回合结束后发送下一条",
+    "removeAttachment": "移除附件",
+    "attachHint": "添加图片——也可粘贴或拖放到此处",
+    "chooseImages": "选择图片",
+    "cancelTurn": "停止当前回合",
+    "enterQueues": "Enter——回合运行中则排队",
+    "copyCommands": "复制全部命令",
+    "sessionActions": "会话操作",
+    "endSession": "结束会话",
+    "newSessionHint": "新建会话——选择它所属的项目目录",
+    "noSessionOpen": "未打开会话"
   },
   "panel": {
     "title": "设置",
@@ -119,7 +149,8 @@
     "upgradeLatest": "Hub 已是最新 ({{version}})",
     "upgradeRestarted": "Hub 已重启到 {{version}}",
     "workflows": "工作流",
-    "workflowManage": "管理工作流…"
+    "workflowManage": "管理工作流…",
+    "close": "关闭抽屉"
   },
   "zconfig": {
     "title": "ZCode 配置",
@@ -224,7 +255,8 @@
     "hooksEmpty": "没有配置 Hooks",
     "hooksAll": "全部 Hooks",
     "hooksAnyMatcher": "任意",
-    "hooksEntryCount": "{{count}} 条",
+    "hooksEntryCount_one": "{{count}} 条",
+    "hooksEntryCount_other": "{{count}} 条",
     "hooksNoEntries": "此事件没有条目",
     "hooksReadOnly": "只能编辑已有条目，不能增删",
     "hookEdit": "编辑 Hook",
@@ -462,7 +494,14 @@
     "providerKeyHint": "该供应商用于鉴权的密钥",
     "providerKeyKeepHint": "不输入新密钥则保持已存密钥不变",
     "providerPlan": "套餐",
-    "updateRelaunch": "重启应用"
+    "updateRelaunch": "重启应用",
+    "reloadSection": "重新加载此分区",
+    "backToSections": "返回分区列表",
+    "modelsReload": "重新加载模型列表",
+    "backToModels": "返回模型列表",
+    "probeModel": "发送一个最小请求验证该模型可用",
+    "editProvider": "编辑此供应商的端点和密钥",
+    "logScale": "对数刻度"
   },
   "system": {
     "title": "系统状态",
@@ -515,7 +554,8 @@
     "title": "配额使用",
     "refresh": "刷新",
     "updated": "更新于",
-    "unavailable": "暂不可用，点刷新重试"
+    "unavailable": "暂不可用，点刷新重试",
+    "refreshHint": "刷新额度"
   },
   "terminal": {
     "title": "终端",
@@ -525,7 +565,8 @@
     "closePane": "关闭此终端",
     "hide": "收起终端",
     "spawnFailed": "终端启动失败",
-    "testPlaceholder": "终端（测试构建，未启动 shell）"
+    "testPlaceholder": "终端（测试构建，未启动 shell）",
+    "pushTitle": "远程终端"
   },
   "remoteTerminal": {
     "openAction": "终端",
@@ -558,7 +599,8 @@
     "otherValue": "或输入自定义值",
     "otherValueMulti": "或自定义值",
     "queueWaiting_one": "其他会话还有 {{count}} 个待审批",
-    "queueWaiting_other": "其他会话还有 {{count}} 个待审批"
+    "queueWaiting_other": "其他会话还有 {{count}} 个待审批",
+    "askTag": "提问"
   },
   "notice": {
     "unsupported": "此交互请在编辑器中应答",
@@ -590,14 +632,24 @@
     "filter": "筛选项目",
     "loading": "正在加载项目…",
     "empty": "没有匹配的项目",
-    "sessionCount": "{{count}} 个会话",
+    "sessionCount_one": "{{count}} 个会话",
+    "sessionCount_other": "{{count}} 个会话",
     "tooOld": "新建会话需要 bridge 0.17.0+",
     "browse": "浏览目录",
     "startHere": "在此启动会话",
     "notAllowed": "无法在此目录启动新会话——它既不是已知项目，也不在桌面机配置的 remote.projectRoots 允许根目录内",
     "loadingDirs": "正在读取目录…",
     "emptyDir": "没有子目录",
-    "listTruncated": "仅显示前 2000 项"
+    "listTruncated": "仅显示前 2000 项",
+    "browseBtn": "浏览",
+    "browseHint": "改为浏览整机目录",
+    "projects": "项目",
+    "backToProjects": "返回已知项目列表",
+    "closeEsc": "关闭——Esc",
+    "noProjectsYet": "还没有已知项目——用「浏览」选择一个目录。",
+    "creating": "创建中…",
+    "notAllowedShort": "只有已知项目和 remote.projectRoots 允许根目录内的目录可以启动会话",
+    "notAllowedRow": "此处不允许——请进入项目目录"
   },
   "historyDialog": {
     "title": "会话历史",
@@ -614,20 +666,50 @@
     "retry": "重试",
     "tooOld": "会话历史需要 bridge 0.19.0+",
     "deleteProject": "删除项目",
-    "deleteProjectHint": "在所有列表中隐藏该项目及其全部会话（本 App、桌面端、CLI）。不会清除内容；该项目出现新会话时会重新显示。"
+    "deleteProjectHint": "在所有列表中隐藏该项目及其全部会话（本 App、桌面端、CLI）。不会清除内容；该项目出现新会话时会重新显示。",
+    "allProjects": "全部项目"
   },
   "common": {
     "cancel": "取消",
     "close": "关闭",
     "back": "返回",
     "save": "保存",
-    "exitHint": "再按一次退出"
+    "exitHint": "再按一次退出",
+    "dismiss": "关闭",
+    "backToWorkbench": "返回工作台",
+    "reload": "重新加载",
+    "retry": "重试",
+    "edit": "编辑",
+    "remove": "移除",
+    "closeDialog": "关闭对话框"
   },
   "error": {
     "title": "出错了",
     "copy": "复制详情",
     "copied": "已复制",
     "reload": "重新加载"
+  },
+  "quit": {
+    "title": "有回合仍在运行，确认退出",
+    "body_one": "你从本应用启动的 1 个回合仍在 hub 上运行——关闭后它将继续运行。其他客户端启动的回合不受影响。",
+    "body_other": "你从本应用启动的 {{n}} 个回合仍在 hub 上运行——关闭后它们将继续运行。其他客户端启动的回合不受影响。",
+    "stopping": "正在停止运行中的回合…",
+    "stopAndQuit": "停止回合并退出",
+    "quitOnly": "仅退出"
+  },
+  "menu": {
+    "about": "关于 ZCode ACP",
+    "services": "服务",
+    "preferences": "偏好设置…",
+    "quit": "退出 ZCode ACP",
+    "file": "文件",
+    "reopenTab": "重新打开关闭的标签页",
+    "editMenu": "编辑",
+    "copy": "拷贝",
+    "paste": "粘贴"
+  },
+  "about": {
+    "version": "版本 {{version}}"
   },
   "files": {
     "title": "文件",
@@ -639,7 +721,19 @@
     "empty": "空目录",
     "truncated": "仅显示前 2000 项",
     "loadError": "加载失败",
-    "retry": "重试"
+    "retry": "重试",
+    "hideDot": "隐藏点文件",
+    "showDot": "显示点文件",
+    "reading": "读取中…",
+    "openTerminal": "在此目录打开终端",
+    "openZed": "在 Zed 中打开此目录",
+    "reread": "重新读取此目录",
+    "backToList": "返回文件列表",
+    "togglePreview": "切换 Markdown 预览/源码",
+    "openFileZed": "在 Zed 中打开此文件",
+    "loadingPreview": "正在加载预览…",
+    "noPreview": "无可用预览",
+    "binary": "二进制文件——请用默认应用打开"
   },
   "viewer": {
     "download": "下载",
