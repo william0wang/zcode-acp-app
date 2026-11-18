@@ -43,6 +43,7 @@ use gpui_kit::component::button::{Button, ButtonGroup, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::message_scroller::{MessageScroller, MessageScrollerState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewMotion, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -358,6 +359,9 @@ pub struct Workbench {
     /// The message row whose copy button just fired (the TS ActionBar's
     /// copied checkmark, E4): cleared by a short timer.
     copied_row: Option<String>,
+    /// The code block whose copy check is showing (req 0.2) — keyed by a
+    /// hash of the block's code, held for the same beat as `copied_row`.
+    copied_code: Option<u64>,
     /// The plan/todo strip's manual fold (E3, ChatScreen PlanPanel's
     /// `<details>`): collapsed by default, reset on a session switch like
     /// the TS remount.
@@ -509,6 +513,9 @@ enum PartView {
         detail_head: String,
         detail: String,
         fold_kind: Option<String>,
+        /// ACP tool kind (execute/edit/read/search/fetch/…) — the per-kind
+        /// icon pick for the summary row (req 2.2).
+        kind: Option<String>,
         /// Pretty-printed `rawInput`, shown as the body while the call is in
         /// flight with no output yet (a sub-agent dispatch carries only its
         /// prompt until completion).
@@ -549,6 +556,63 @@ struct RowActions {
     last_assistant_id: Option<String>,
     last_assistant_mid: Option<String>,
     editing: Option<String>,
+}
+
+/// Stable key for one code block's copy-check state (req 0.2): a hash of
+/// the block's code. Two identical blocks sharing a key just share the
+/// checkmark beat.
+fn code_key(code: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    code.hash(&mut h);
+    h.finish()
+}
+
+/// The per-code-block copy affordance (req 0.2 — the TS Markdown `pre`
+/// override): a small ghost button rendered into the block's actions slot,
+/// writing the block's source to the platform clipboard with the same
+/// check-mark beat as the row copy.
+fn code_copy_actions(
+    wb: &WeakEntity<Workbench>,
+) -> impl Fn(&gpui_kit::base::text::CodeBlock, &mut Window, &mut App) -> Button
+       + Send
+       + Sync
+       + 'static {
+    let wb = wb.clone();
+    move |block, _window, cx| {
+        let code = block.code();
+        let key = code_key(&code);
+        let copied = wb
+            .upgrade()
+            .is_some_and(|w| w.read(cx).copied_code == Some(key));
+        Button::new(SharedString::from(format!("code-copy-{key:x}")))
+            .ghost()
+            .xsmall()
+            .icon(if copied {
+                KitIconName::Check
+            } else {
+                KitIconName::Copy
+            })
+            .tooltip(t!("chat.copyCode"))
+            .on_click({
+                let wb = wb.clone();
+                let code = code.to_string();
+                move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(code.clone()));
+                    if let Some(wb) = wb.upgrade() {
+                        wb.update(cx, |wb, cx| wb.mark_code_copied(key, cx));
+                    }
+                }
+            })
+    }
+}
+
+/// The chat markdown TextView wired with the code-block copy actions.
+fn chat_markdown_view(
+    state: &Entity<TextViewState>,
+    wb: &WeakEntity<Workbench>,
+) -> TextView {
+    TextView::new(state).code_block_actions(code_copy_actions(wb))
 }
 
 fn stream_motion() -> TextViewMotion {
@@ -592,6 +656,7 @@ fn new_part_view(part: &ChatPart, role: ChatRole, cx: &mut Context<Workbench>) -
             detail_head: tool_detail_head(&tc.detail),
             detail: tc.detail.clone(),
             fold_kind: tc.fold_kind.clone(),
+            kind: tc.kind.clone(),
             raw_input: tc.raw_input.clone().unwrap_or_default(),
             expanded: false,
             diff_src: tc.diffs.clone().unwrap_or_default(),
@@ -1427,6 +1492,7 @@ impl Workbench {
             update_confirm: false,
             quota_confirm: None,
             copied_row: None,
+            copied_code: None,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
             tool_run_open: std::collections::HashMap::new(),
@@ -2700,6 +2766,25 @@ impl Workbench {
                 let _ = cx.update_entity(&entity, |wb, cx| {
                     if wb.copied_row.as_deref() == Some(&row_id) {
                         wb.copied_row = None;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Same beat for a code block's copy check (req 0.2).
+    fn mark_code_copied(&mut self, key: u64, cx: &mut Context<Self>) {
+        self.copied_code = Some(key);
+        cx.notify();
+        let clear = cx.background_executor().timer(Duration::from_millis(1400));
+        cx.spawn(async move |this, cx| {
+            clear.await;
+            if let Some(entity) = this.upgrade() {
+                let _ = cx.update_entity(&entity, |wb, cx| {
+                    if wb.copied_code == Some(key) {
+                        wb.copied_code = None;
                         cx.notify();
                     }
                 });
@@ -6401,12 +6486,10 @@ fn render_user_row(
                     .text_color(theme.foreground)
                     .child(text.clone()),
             ),
-            PartView::ImageStub => bubble.child(
-                div()
-                    .text_size(ui_text(12.))
-                    .text_color(theme.muted_foreground)
-                    .child("[image attachment]"),
-            ),
+            PartView::ImageStub => bubble.child(render_image_stub(
+                theme,
+                SharedString::from(format!("img-stub-{}-{part_index}", row.id)),
+            )),
             // Click to enlarge (K2) — one stable id per row part.
             PartView::Image { src } => bubble.child(render_attachment_echo(
                 src,
@@ -6424,7 +6507,7 @@ fn render_user_row(
                     .p_2()
                     .rounded_md()
                     .bg(theme.background)
-                    .child(TextView::new(state)),
+                    .child(chat_markdown_view(state, wb)),
             ),
             PartView::ToolCall { .. } => bubble,
         };
@@ -6626,7 +6709,7 @@ fn render_assistant_row(
                             .pb_2()
                             .text_size(px(chat_font.1))
                             .text_color(theme.muted_foreground)
-                            .child(TextView::new(state)),
+                            .child(chat_markdown_view(state, wb)),
                     );
                 } else if open {
                     // A SETTLED card gets no nested scroller (batch U): the
@@ -6650,7 +6733,7 @@ fn render_assistant_row(
                             .text_size(px(chat_font.1))
                             .text_color(theme.muted_foreground)
                             .child(
-                                TextView::new(state)
+                                chat_markdown_view(state, wb)
                                     .when(!full, |view| view.max_lines(THOUGHT_CLAMP_LINES)),
                             ),
                     );
@@ -6685,7 +6768,7 @@ fn render_assistant_row(
                     div()
                         .text_size(px(chat_font.1))
                         .line_height(relative(1.55))
-                        .child(TextView::new(state)),
+                        .child(chat_markdown_view(state, wb)),
                 )
             }
             PartView::Plain { text } => column.child(
@@ -6697,12 +6780,10 @@ fn render_assistant_row(
             ),
             // Tool calls are handled by the run branch above.
             PartView::ToolCall { .. } => column,
-            PartView::ImageStub => column.child(
-                div()
-                    .text_size(ui_text(12.))
-                    .text_color(theme.muted_foreground)
-                    .child("[image attachment]"),
-            ),
+            PartView::ImageStub => column.child(render_image_stub(
+                theme,
+                SharedString::from(format!("img-stub-{}-{part_index}", row.id)),
+            )),
             PartView::Image { src } => column.child(render_attachment_echo(
                 src,
                 theme,
@@ -6755,6 +6836,48 @@ fn render_assistant_row(
         .into_any_element()
 }
 
+/// Placeholder card for an unrasterizable image echo (req 2.3): SVG and
+/// corrupt payloads cannot thumbnail, so they read as a labeled chip
+/// instead of the raw "[image attachment]" plumbing text.
+fn render_image_stub(theme: &component::Theme, id: SharedString) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .text_size(ui_text(12.))
+        .text_color(theme.muted_foreground)
+        .child(
+            Icon::new(KitIconName::Image)
+                .small()
+                .flex_none()
+                .text_color(theme.muted_foreground),
+        )
+        .child(t!("chat.imageStub").into_owned())
+        .into_any_element()
+}
+
+/// Per-kind icon for the tool card's summary row (req 2.2 — the TS per-tool
+/// cards' glyphs): the ACP kind decides; unknown kinds fall back to braces.
+fn tool_kind_icon(kind: Option<&str>) -> KitIconName {
+    match kind {
+        Some("execute") => KitIconName::SquareTerminal,
+        Some("edit") => KitIconName::FilePen,
+        Some("read") => KitIconName::FileSearch,
+        Some("search") => KitIconName::Search,
+        Some("fetch") => KitIconName::Globe,
+        Some("switch_mode") => KitIconName::RefreshCw,
+        _ => KitIconName::Braces,
+    }
+}
+
 /// One tool call's card (the TS ToolCard `<details>`): the summary row
 /// (glyph, name, detail head) is the toggle; the body is the FULL detail in
 /// a capped, scrollable window. Replay folds (`context-handoff` /
@@ -6773,6 +6896,7 @@ fn render_tool_card(
         detail_head,
         detail,
         fold_kind,
+        kind,
         raw_input,
         expanded,
         diff_src: _,
@@ -6782,13 +6906,24 @@ fn render_tool_card(
         return div().into_any_element();
     };
     let done = status == "completed";
-    let glyph = if done { "✓" } else { "…" };
+    let live = *status == "pending" || *status == "in_progress";
     let color = if done {
         theme.muted_foreground
     } else if status == "failed" {
         theme.danger
     } else {
         theme.accent
+    };
+    // Per-kind glyph (req 2.2): a spinner while the call is in flight (the
+    // TS 1.3 breathing row), the kind icon once settled.
+    let glyph: AnyElement = if live {
+        Spinner::new().xsmall().into_any_element()
+    } else {
+        Icon::new(tool_kind_icon(kind.as_deref()))
+            .small()
+            .flex_none()
+            .text_color(color)
+            .into_any_element()
     };
     // The wire title is the raw command: a heredoc/`&&` chain carries real
     // newlines, which rendered as-is turned the one-line summary into a wall.
@@ -6830,14 +6965,7 @@ fn render_tool_card(
                     }
                 }
             })
-            .child(
-                div()
-                    .flex_none()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_size(ui_text(12.))
-                    .text_color(color)
-                    .child(glyph),
-            )
+            .child(div().flex_none().child(glyph))
             .child(
                 div()
                     .min_w_0()
@@ -6860,8 +6988,30 @@ fn render_tool_card(
                         .child(detail_head.clone()),
                 )
             })
+            // On-card copy (req 2.2 — the right-click menu kept, the button
+            // made visible): the output once there is one, else the command.
+            // Stop-propagation keeps the row's expand toggle out of the click.
+            .when(!detail.trim().is_empty(), |this| {
+                let output = detail.clone();
+                this.child(
+                    div().ml_auto().flex_none().child(
+                        Button::new(SharedString::from(format!(
+                            "tool-copy-{}-{}",
+                            row_id, part_index
+                        )))
+                        .ghost()
+                        .xsmall()
+                        .icon(KitIconName::Copy)
+                        .tooltip(t!("chat.copy"))
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            cx.write_to_clipboard(ClipboardItem::new_string(output.clone()));
+                        }),
+                    ),
+                )
+            })
             .child(
-                div().ml_auto().flex_none().child(
+                div().flex_none().child(
                     Icon::new(IconName::ChevronDown)
                         .small()
                         .flex_none()
@@ -6889,13 +7039,30 @@ fn render_tool_card(
             .font_family(theme.mono_font_family.clone())
             .text_size(ui_text(12.))
             .line_height(relative(1.45));
+        // A completed call's args (TS 1.1) ride the fold head: a replayed
+        // call's rawInput is the only record of what it was invoked with.
+        // Harness folds stay clean (their rawInput is plumbing).
+        if !live && !raw_input.is_empty() && fold_kind.is_none() {
+            body = body.child(
+                div()
+                    .id(SharedString::from(format!(
+                        "tool-input-{}-{}",
+                        row_id, part_index
+                    )))
+                    .test_support()
+                    .px_2()
+                    .pt(px(6.))
+                    .text_color(theme.muted_foreground)
+                    .whitespace_normal()
+                    .child(format!("{}:\n{}", t!("chat.toolInput"), raw_input)),
+            );
+        }
         for (bi, block) in diffs.iter().enumerate() {
             body = body.child(render_diff_block(block, row_id, part_index, bi, theme));
         }
         // A live call with no output yet: the input is all there is to show —
         // a sub-agent dispatch streams nothing until it finishes, so without
         // this its expanded card is an empty fold (TS `liveInput`).
-        let live = *status == "pending" || *status == "in_progress";
         let body_text = if !detail.is_empty() {
             detail.clone()
         } else if live && !raw_input.is_empty() {
@@ -8534,6 +8701,7 @@ mod display_unit_tests {
             detail_head: String::new(),
             detail: String::new(),
             fold_kind: None,
+            kind: None,
             raw_input: String::new(),
             expanded: false,
             diff_src: Vec::new(),
