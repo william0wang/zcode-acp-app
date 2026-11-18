@@ -256,6 +256,10 @@ pub struct SessionCore {
     pub available_commands: Vec<SlashCommand>,
     /// Per-session running/permission state from bridge-wide broadcasts.
     pub session_states: HashMap<String, SessionActivity>,
+    /// Unread counts (req 0.4): a turn END for a NON-active session counts
+    /// +1 (cap 99); entering the session clears it. In-memory only — a
+    /// live-attention signal, not history.
+    pub unread: HashMap<String, u32>,
     /// Bridge marks load_earlier page updates `_meta.zcode.earlierPage`
     /// (zcode-acp-server 0.44.1+); gates the marker-based page routing.
     pub page_marker_capable: bool,
@@ -606,6 +610,12 @@ impl SessionCore {
         }
 
         if self.active_session_id.as_deref() != Some(session_id) {
+            // A turn END for a session this client is not looking at is one
+            // unread bubble's worth of attention (req 0.4, the TS counter).
+            if !running {
+                let next = self.unread.get(session_id).copied().unwrap_or(0).min(98) + 1;
+                self.unread.insert(session_id.to_owned(), next);
+            }
             return;
         }
         if running {
@@ -1131,6 +1141,8 @@ impl SessionCore {
             }
         }
         self.active_session_id = Some(session_id.to_owned());
+        // Entering the session reads it (req 0.4).
+        self.unread.remove(session_id);
         self.available_commands.clear();
         self.loading_earlier = false;
         self.loading_session = true;

@@ -251,6 +251,8 @@ pub enum UiCommand {
     /// Rewind (bridge spec §4.2): regenerate. `message_id` omitted = the
     /// bridge resolves the latest retryable turn.
     RetryTurn { message_id: Option<String> },
+    /// Pin/unpin a session row (req 0.4): local display order, persisted.
+    ToggleSessionPin { session_id: String },
     /// Manual retry from the status bar (re-runs the whole bootstrap).
     Retry,
     /// Confirms the guided token setup's previewed write (Phase::TokenGuide):
@@ -900,6 +902,13 @@ pub struct SessionRow {
     pub activity_known: bool,
     /// The tab already holding this session, if any.
     pub open_tab: Option<u64>,
+    /// Unread turns accrued while this session was not the viewed one (req
+    /// 0.4): a turn end for a non-active session counts +1; entering
+    /// clears.
+    pub unread: u32,
+    /// Locally pinned (req 0.4): the row floats to the top of its
+    /// workspace group.
+    pub pinned: bool,
 }
 
 /// Tab-strip entry.
@@ -2082,6 +2091,11 @@ struct HistoryPanel {
     seq: u64,
 }
 
+/// Pinned session ids (req 0.4): persisted display order (ui-prefs.json);
+/// pinned rows float to the top of their workspace group.
+#[derive(Default)]
+struct PinnedSessions(std::collections::HashSet<String>);
+
 #[derive(Default)]
 struct HistorySelectedInner {
     workspace_path: String,
@@ -2718,6 +2732,9 @@ struct Driver {
 
     history: HistoryPanel,
 
+    /// Pinned session ids (req 0.4) — persisted via ui-prefs.json.
+    pinned: PinnedSessions,
+
     /// The new-session chooser (TS ProjectCreateDialog state). `seq`
     /// invalidates in-flight project reads on close, the same contract the
     /// history panel's seq plays for its listings.
@@ -2845,6 +2862,7 @@ impl Driver {
             closing: HashSet::new(),
             next_tab_id: 1,
             history: HistoryPanel::default(),
+            pinned: PinnedSessions(crate::ui_prefs::load_pinned_sessions()),
             new_session: NewSessionPanel::default(),
             files: FilesPanel::default(),
             system: SystemStatusPanel {
@@ -7658,6 +7676,17 @@ impl Driver {
                     t.core.retry_turn(message_id.as_deref());
                 }
             }
+            UiCommand::ToggleSessionPin { session_id } => {
+                // Local display order only (req 0.4) — persist and repaint;
+                // the row sort reads the set on the next snapshot build.
+                if self.pinned.0.remove(&session_id) {
+                    traceln!("[driver] session {session_id} unpinned");
+                } else {
+                    self.pinned.0.insert(session_id.clone());
+                    traceln!("[driver] session {session_id} pinned");
+                }
+                crate::ui_prefs::store_pinned_sessions(&self.pinned.0);
+            }
             UiCommand::ForceSendPending => {
                 // No active tab is a refusal too: the key was pressed on
                 // nothing, and staying quiet is the dead-key symptom.
@@ -8806,6 +8835,14 @@ impl Driver {
             }
         }
         let mut rows = Vec::new();
+        // Unread counts aggregate across the tabs' cores (req 0.4) — each
+        // turnState lands on the tab that owns the session's instance.
+        let mut unread: HashMap<&str, u32> = HashMap::new();
+        for tab in &self.tabs {
+            for (sid, n) in &tab.core.unread {
+                *unread.entry(sid.as_str()).or_insert(0) += n;
+            }
+        }
         for inst in &self.instances {
             for sess in &inst.sessions {
                 rows.push(SessionRow {
@@ -8824,9 +8861,24 @@ impl Driver {
                             || t.target.as_deref() == Some(sess.session_id.as_str()))
                         .then_some(t.id)
                     }),
+                    unread: unread.get(sess.session_id.as_str()).copied().unwrap_or(0),
+                    pinned: self.pinned.0.contains(&sess.session_id),
                 });
             }
         }
+        // Pinned rows float to the top of their workspace group (req 0.4) —
+        // the sidebar's group headings stay contiguous because the workspace
+        // order itself is preserved.
+        // Owns its strings — the sort below borrows `rows` mutably while
+        // this index is captured inside the key closure.
+        let mut group_order: Vec<String> = Vec::new();
+        for row in &rows {
+            if !group_order.contains(&row.workspace) {
+                group_order.push(row.workspace.clone());
+            }
+        }
+        let group_of = move |ws: &str| group_order.iter().position(|g| g == ws).unwrap_or(0);
+        rows.sort_by_key(move |r| (group_of(&r.workspace), !r.pinned));
         rows
     }
 
@@ -8909,6 +8961,9 @@ impl Driver {
             mix(row.rest_running as u64, &mut sig);
             mix(row.activity_known as u64, &mut sig);
             mix(row.open_tab.unwrap_or(0), &mut sig);
+            // The unread badge and the pin reorder (req 0.4).
+            mix(row.unread as u64, &mut sig);
+            mix(row.pinned as u64, &mut sig);
         }
         for tab in &self.tabs {
             mix(tab.id, &mut sig);

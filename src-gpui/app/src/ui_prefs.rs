@@ -205,6 +205,24 @@ pub(crate) fn store_font_size(size: &str) {
     store_pref("fontSize", Value::String(size.to_string()));
 }
 
+/// Pinned session ids (req 0.4 — the TS `zcode-acp:pinned-sessions`
+/// localStorage key): local display order only, invalid entries drop out.
+pub(crate) fn load_pinned_sessions() -> std::collections::HashSet<String> {
+    match load_prefs().get("pinnedSessions") {
+        Some(Value::Array(list)) => list
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect(),
+        _ => Default::default(),
+    }
+}
+
+/// Persist the pinned set (the session row's pin toggle).
+pub(crate) fn store_pinned_sessions(ids: &std::collections::HashSet<String>) {
+    let list: Vec<Value> = ids.iter().map(|id| Value::String(id.clone())).collect();
+    store_pref("pinnedSessions", Value::Array(list));
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

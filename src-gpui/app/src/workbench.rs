@@ -4316,6 +4316,7 @@ impl Workbench {
         let menu_instance = sess.instance_id.clone();
         let menu_session = sess.session_id.clone();
         let menu_prefill = sess.title.clone();
+        let menu_pinned = sess.pinned;
         let menu_runtime = self.runtime.clone();
         let actions = div()
             .id(SharedString::from(format!(
@@ -4344,9 +4345,23 @@ impl Workbench {
                         menu_session.clone(),
                         menu_prefill.clone(),
                     );
+                    let pinned = menu_pinned;
                     m = m.item(PopupMenuItem::new("Rename…").on_click(move |_, _, cx| {
                         wb.update(cx, |wb, cx| {
                             wb.open_rename(inst.clone(), sid.clone(), prefill.clone(), cx)
+                        });
+                    }));
+                    // Pin (req 0.4, the TS swipe action as a desktop menu
+                    // item): local display order, persisted.
+                    let (runtime, sid) = (menu_runtime.clone(), menu_session.clone());
+                    let pin_label = if pinned {
+                        t!("chat.unpin").into_owned()
+                    } else {
+                        t!("chat.pin").into_owned()
+                    };
+                    m = m.item(PopupMenuItem::new(pin_label).on_click(move |_, _, _| {
+                        runtime.send(UiCommand::ToggleSessionPin {
+                            session_id: sid.clone(),
                         });
                     }));
                     let (runtime, inst, sid) = (
@@ -4384,6 +4399,16 @@ impl Workbench {
             .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
             .cursor_pointer()
             .child(dot)
+            .when(sess.pinned, |this| {
+                // The pin marker (req 0.4): pinned rows also float to the
+                // top of their group (the runtime's sort).
+                this.child(
+                    Icon::new(KitIconName::Pin)
+                        .xsmall()
+                        .flex_none()
+                        .text_color(theme.muted_foreground),
+                )
+            })
             .child(
                 div()
                     .id(SharedString::from(format!(
@@ -4399,6 +4424,34 @@ impl Workbench {
                     .child(title)
                     .tooltip(move |window, cx| Tooltip::new(hover_label.clone()).build(window, cx)),
             )
+            .when(sess.unread > 0, |this| {
+                // The unread badge (req 0.4): turns that ended while another
+                // session was on screen; entering the session clears it.
+                this.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "session-unread-{}",
+                            sess.session_id
+                        )))
+                        .test_support()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .min_w(px(16.))
+                        .h(px(16.))
+                        .px_1()
+                        .rounded_full()
+                        .bg(theme.accent)
+                        .text_size(ui_text(10.))
+                        .text_color(theme.accent_foreground)
+                        .child(if sess.unread > 99 {
+                            "99+".to_string()
+                        } else {
+                            sess.unread.to_string()
+                        }),
+                )
+            })
             .when(finished_fresh, |this| {
                 // The TS just-finished badge: text only, no dot (the dot
                 // above stays idle-colored while this chip shows).
@@ -9997,6 +10050,8 @@ mod ui_tests {
                 rest_running: false,
                 activity_known: false,
                 open_tab: None,
+                unread: 0,
+                pinned: false,
             })
             .collect();
         // The dialog, open on a project with a list long enough to scroll.
