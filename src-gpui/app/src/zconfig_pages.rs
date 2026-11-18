@@ -3266,9 +3266,31 @@ fn render_app_update_body(
             )
             .child(
                 div()
-                    .text_size(ui_text(12.))
-                    .text_color(theme.muted_foreground)
-                    .child(t!("zconfig.updateRestartApp").into_owned()),
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .pt(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(ui_text(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(t!("zconfig.updateRestartApp").into_owned()),
+                    )
+                    // One-tap restart (req 2.14): the new binary is already
+                    // in place — spawn it and quit, no manual reopen.
+                    .child(
+                        Button::new("update-relaunch")
+                            .primary()
+                            .small()
+                            .label(t!("zconfig.updateRelaunch").into_owned())
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(crate::workbench::RelaunchApp),
+                                    cx,
+                                );
+                            }),
+                    ),
             )
             .into_any_element()
     } else if stage == "needs-user-install" {

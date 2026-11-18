@@ -463,7 +463,8 @@
     "providerKeyKeep": "Leave blank to keep the current key",
     "providerKeyHint": "The key this provider authenticates with",
     "providerKeyKeepHint": "Stored key unchanged unless you type a new one",
-    "providerPlan": "plan"
+    "providerPlan": "plan",
+    "updateRelaunch": "Relaunch"
   },
   "system": {
     "title": "System status",

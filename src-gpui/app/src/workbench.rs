@@ -132,6 +132,7 @@ gpui_kit::actions!(
         EditPaste,
         TerminalPaneNext,
         TerminalPanePrev,
+        RelaunchApp,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -2074,6 +2075,23 @@ impl Workbench {
         _cx: &mut Context<Self>,
     ) {
         self.runtime.send(UiCommand::ReopenClosedTab);
+    }
+
+    /// One-tap update restart (req 2.14): the swap already landed on disk
+    /// (the update page's "done" stage), so spawn the new binary detached
+    /// and take the confirmed-quit path out — no manual quit-and-reopen.
+    pub(crate) fn on_relaunch_app(
+        &mut self,
+        _: &RelaunchApp,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).spawn();
+        }
+        self.quit_confirmed = true;
+        self.quit_dialog_open = false;
+        window.remove_window();
     }
 
     /// The Edit menu's Copy (req 2.7): the window's live text selection —
@@ -7792,6 +7810,7 @@ impl Render for Workbench {
              .on_action(cx.listener(Self::on_show_about))
              .on_action(cx.listener(Self::on_show_preferences))
              .on_action(cx.listener(Self::on_reopen_closed_tab))
+             .on_action(cx.listener(Self::on_relaunch_app))
              .on_action(cx.listener(Self::on_edit_copy))
              .on_action(cx.listener(Self::on_edit_paste))
              .on_action(cx.listener(|this, _: &TerminalPaneNext, window, cx| {
