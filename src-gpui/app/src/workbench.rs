@@ -246,6 +246,9 @@ pub struct Workbench {
     /// Diff blocks switched to split view (req 2.1), keyed by
     /// (row id, part index, block index).
     diff_split: std::collections::HashSet<(String, usize, usize)>,
+    /// The @-mention directory whose listing is in flight (req 0.7) — the
+    /// one-request guard; the cache itself lives in the snapshot.
+    mention_requested: Option<String>,
     quit_stopping: bool,
     quit_confirmed: bool,
     /// The left dock (view-local layout, never wire state): the sessions
@@ -471,17 +474,30 @@ enum SlashKey {
     Dismiss,
 }
 
-/// Everything the "/" menu paints or acts on, derived from the LIVE composer
-/// text (value + caret) — recomputed on every keystroke and every render, so
-/// no cached token can go stale.
+/// One completion menu row (req 0.7): a slash command or a filesystem
+/// mention entry — the label paints, `insert` replaces the token (trailing
+/// space included), `dir` marks a mention directory (Folder glyph, keeps
+/// drilling with a trailing slash).
+#[derive(Clone)]
+struct CompleteItem {
+    label: String,
+    insert: String,
+    desc: Option<String>,
+    dir: bool,
+}
+
+/// Everything the "/" (and "@", req 0.7) menu paints or acts on, derived
+/// from the LIVE composer text (value + caret) — recomputed on every
+/// keystroke and every render, so no cached token can go stale.
 struct SlashMenuState {
-    /// The token under the caret, "/" included (e.g. "/td", "/$tdd").
+    /// The token under the caret, "/" or "@" included (e.g. "/td",
+    /// "@/src/rea").
     token: String,
     /// The token's byte range in the composer text.
     start: usize,
     end: usize,
-    /// Bridge-ordered matching commands.
-    matches: Vec<protocol::acp::SlashCommand>,
+    /// Matching entries: bridge-ordered commands, or dirs-first fs entries.
+    matches: Vec<CompleteItem>,
     /// False when Escape dismissed this exact query.
     open: bool,
     highlight: usize,
@@ -1413,22 +1429,26 @@ impl Workbench {
                 .submit_on_enter(true)
         });
         let composer_sub = cx.subscribe(&composer, |this, _emitter, event, cx| {
-            if let InputEvent::PressEnter {
-                secondary: false,
-                shift: false,
-            } = event
-            {
-                // An open "/" menu swallows Enter as a commit (the TS capture
-                // handler beats the composer submit); only a closed menu sends.
-                if let Some(name) = this
-                    .slash_menu(cx)
-                    .filter(|m| m.open)
-                    .and_then(|m| m.matches.get(m.highlight).map(|c| c.name.clone()))
-                {
-                    this.stage_slash_select(&name, cx);
-                    return;
+            match event {
+                InputEvent::Change => {
+                    // Every edit re-derives the @-mention listing need (the
+                    // "/" menu itself is render-derived and needs nothing).
+                    this.sync_mention_listing(cx);
                 }
-                this.submit_composer(cx);
+                InputEvent::PressEnter {
+                    secondary: false,
+                    shift: false,
+                } => {
+                    // An open "/" or "@" menu swallows Enter as a commit (the
+                    // TS capture handler beats the composer submit); only a
+                    // closed menu sends.
+                    if this.slash_menu(cx).is_some_and(|m| m.open) {
+                        this.stage_slash_select(cx);
+                        return;
+                    }
+                    this.submit_composer(cx);
+                }
+                _ => {}
             }
         });
         // The "/" menu's keyboard half (ChatView onKeyDownCapture): arrows
@@ -1612,6 +1632,7 @@ impl Workbench {
             about_open: false,
             bell_last_at: None,
             diff_split: std::collections::HashSet::new(),
+            mention_requested: None,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
             tool_run_open: std::collections::HashMap::new(),
@@ -2787,16 +2808,44 @@ impl Workbench {
     // -- "/" completion menu (batch K, ChatView.tsx `Composer`) -------------
 
     /// The menu derived from the LIVE composer text: the word under the
-    /// caret, the bridge's matching commands, the dismissal memory, and the
-    /// clamped highlight. `None` when there is no slash token at all.
+    /// caret, its matching entries ("/" → bridge commands, "@" → the fs
+    /// listing of the token's directory, req 0.7), the dismissal memory,
+    /// and the clamped highlight. `None` when there is neither token.
     fn slash_menu(&self, cx: &App) -> Option<SlashMenuState> {
         let state = self.composer.read(cx);
         let value = state.value();
         let caret = state.cursor();
-        let (start, end) = slash_token_range(&value, caret)?;
+        let (start, end) = slash_token_range(&value, caret)
+            .or_else(|| mention_token_range(&value, caret))?;
         let token = value[start..end].to_string();
-        let commands = self.tab.as_ref()?.available_commands.clone();
-        let matches = slash_matches(&token, &commands);
+        let matches = if token.starts_with('@') {
+            mention_items(&token, &self.snap.mention_listings)
+        } else {
+            let commands = self.tab.as_ref()?.available_commands.clone();
+            slash_matches(&token, &commands)
+                .into_iter()
+                .map(|c| {
+                    // The TS row composes `description — hint`; fold the
+                    // hint in here so the menu stays one shape.
+                    let mut desc = c.description.clone().unwrap_or_default();
+                    if let Some(hint) = c.input.as_ref().and_then(|i| i.hint.as_deref()) {
+                        if !hint.is_empty() {
+                            if desc.is_empty() {
+                                desc = hint.to_string();
+                            } else {
+                                desc = format!("{desc} — {hint}");
+                            }
+                        }
+                    }
+                    CompleteItem {
+                        label: c.name.clone(),
+                        insert: format!("/{} ", c.name),
+                        desc: (!desc.is_empty()).then_some(desc),
+                        dir: false,
+                    }
+                })
+                .collect()
+        };
         if matches.is_empty() {
             return None;
         }
@@ -2810,6 +2859,28 @@ impl Workbench {
             open,
             highlight,
         })
+    }
+
+    /// The @-mention fetch trigger (req 0.7): called on every composer
+    /// edit — a directory the snapshot does not hold (and is not already
+    /// in flight) gets one listing request; cache hits cost nothing.
+    fn sync_mention_listing(&mut self, cx: &App) {
+        let state = self.composer.read(cx);
+        let value = state.value();
+        let caret = state.cursor();
+        let Some((start, end)) = mention_token_range(&value, caret) else {
+            return;
+        };
+        let token = &value[start..end];
+        let dir = mention_dir_of(token);
+        if self.snap.mention_listings.contains_key(&dir) {
+            return;
+        }
+        if self.mention_requested.as_deref() == Some(dir.as_str()) {
+            return; // in flight
+        }
+        self.mention_requested = Some(dir.clone());
+        self.runtime.send(UiCommand::MentionList { path: dir });
     }
 
     /// One intercepted keystroke while the menu is open (the TS capture
@@ -2828,8 +2899,7 @@ impl Workbench {
                 self.slash_highlight = (menu.highlight + 1).min(menu.matches.len() - 1)
             }
             SlashKey::Commit => {
-                let name = menu.matches[menu.highlight].name.clone();
-                self.stage_slash_select(&name, cx);
+                self.stage_slash_select(cx);
                 return true;
             }
             SlashKey::Dismiss => {
@@ -2842,16 +2912,20 @@ impl Workbench {
         true
     }
 
-    /// Commits one command into the draft (TS `select`): the token is
-    /// replaced by "/name " (the wire name keeps a "$" prefix verbatim),
+    /// Commits one menu entry into the draft (TS `select`): the token is
+    /// replaced by the entry's insert text ("/name " for a command,
+    /// "@/dir/name/" for a mention directory, "@/dir/name " for a file),
     /// the caret parks right after it, and the inserted token joins the
     /// dismissal memory so the menu does not instantly reopen.
-    fn stage_slash_select(&mut self, name: &str, cx: &mut Context<Self>) {
+    fn stage_slash_select(&mut self, cx: &mut Context<Self>) {
         let Some(menu) = self.slash_menu(cx) else {
             return;
         };
+        let Some(item) = menu.matches.get(menu.highlight) else {
+            return;
+        };
+        let inserted = item.insert.clone();
         let value = self.composer.read(cx).value().to_string();
-        let inserted = format!("/{name} ");
         let mut text = String::with_capacity(value.len() + inserted.len());
         text.push_str(&value[..menu.start]);
         text.push_str(&inserted);
@@ -2861,9 +2935,14 @@ impl Workbench {
             text: text.clone(),
             position: caret_position_of(&text, caret),
         });
-        self.slash_dismissed = Some(format!("/{name}"));
+        // Dismissal keyed by the inserted token WITHOUT the trailing space,
+        // so the menu stays closed for what just landed.
+        self.slash_dismissed = Some(inserted.trim_end().to_string());
         self.slash_highlight = 0;
         self.slash_token = None;
+        // A directory mention keeps drilling: its new token needs the next
+        // listing.
+        self.sync_mention_listing(cx);
         cx.notify();
     }
 
@@ -6315,9 +6394,8 @@ fn render_image_of(draft: &AttachmentDraft) -> Option<Arc<gpui::Image>> {
 /// The whitespace-delimited word around the caret (byte range), ChatView's
 /// token scan: scan back/forward while the neighboring char is not
 /// whitespace. A caret resting exactly on a following word's start edge
-/// counts as no word (`tokenStart === caret && tokenEnd > caret` → ""). Only
-/// words starting with "/" complete — the caller decides.
-fn slash_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
+/// counts as no word (`tokenStart === caret && tokenEnd > caret` → "").
+fn word_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
     let bytes = value.as_bytes();
     let caret = caret.min(bytes.len());
     // Snap the caret onto a char boundary (defensive; cursor() is a byte
@@ -6344,6 +6422,12 @@ fn slash_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
     if start == caret && end > caret {
         return None; // the caret sits on the NEXT word's start edge
     }
+    Some((start, end))
+}
+
+/// [`word_token_range`] gated on a "/" prefix — the command token.
+fn slash_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
+    let (start, end) = word_token_range(value, caret)?;
     if value[start..].starts_with('/') {
         Some((start, end))
     } else {
@@ -6370,6 +6454,68 @@ fn slash_matches(
 /// completion query strips it on BOTH sides so "/td" matches "$tdd".
 fn strip_dollar(s: &str) -> &str {
     s.strip_prefix('$').unwrap_or(s)
+}
+
+/// The @-mention token under the caret (req 0.7): the same whitespace word
+/// scan as the slash token, "@"-prefixed — "/" inside the word is a path
+/// segment, not a boundary, so "@/src/rea" is one token.
+fn mention_token_range(value: &str, caret: usize) -> Option<(usize, usize)> {
+    let (start, end) = word_token_range(value, caret)?;
+    if value[start..].starts_with('@') {
+        Some((start, end))
+    } else {
+        None
+    }
+}
+
+/// The directory part of a mention token: "@/src/rea" → "/src" (trailing
+/// incomplete segment dropped); "@" → "" (the root).
+fn mention_dir_of(token: &str) -> String {
+    let body = &token[1..];
+    match body.rfind('/') {
+        Some(ix) => body[..ix].to_string(),
+        None => String::new(),
+    }
+}
+
+/// The mention entries for a token (req 0.7): the token's directory's
+/// listing, filtered by the last segment (case-insensitive), dirs first —
+/// the server already sorts dirs-first in byte order, the filter keeps
+/// that order. Directories insert with a trailing "/" so the next
+/// keystroke drills in.
+fn mention_items(
+    token: &str,
+    listings: &std::collections::HashMap<String, protocol::hub::FsListing>,
+) -> Vec<CompleteItem> {
+    let dir = mention_dir_of(token);
+    let seg = &token[1 + dir.len()..].to_lowercase();
+    let Some(listing) = listings.get(&dir) else {
+        return Vec::new();
+    };
+    listing
+        .entries
+        .iter()
+        .filter(|e| !e.name.starts_with('.') && e.name.to_lowercase().starts_with(seg))
+        .map(|e| {
+            let dir_entry = e.kind == protocol::hub::FsEntryKind::Dir;
+            let slash_dir = if dir.is_empty() {
+                String::new()
+            } else {
+                format!("{}/", dir.trim_end_matches('/'))
+            };
+            let insert = if dir_entry {
+                format!("@{slash_dir}{}/", e.name)
+            } else {
+                format!("@{slash_dir}{} ", e.name)
+            };
+            CompleteItem {
+                label: e.name.clone(),
+                insert,
+                desc: None,
+                dir: dir_entry,
+            }
+        })
+        .collect()
 }
 
 /// lsp-style (line, character) of a byte offset — parks the caret after a
@@ -6543,15 +6689,17 @@ fn render_attachment_echo(
         .into_any_element()
 }
 
-/// The "/" completion menu surface (K2, ChatView's listbox): one row per
-/// bridge-ordered match — mono "/name" plus the truncated description (and
-/// the input hint, TS `description — hint`). Mounted by the composer through
-/// `deferred(anchored(...))`, so it floats above the workbench.
+/// The completion menu surface (K2, ChatView's listbox): one row per match
+/// — a "/command" with its truncated description (and the input hint, TS
+/// `description — hint`), or a "@-mention" entry with a Folder glyph on
+/// directories. Mounted by the composer through `deferred(anchored(...))`,
+/// so it floats above the workbench.
 fn render_slash_menu(
     menu: &SlashMenuState,
     wb: &WeakEntity<Workbench>,
     theme: &component::Theme,
 ) -> AnyElement {
+    let mention = menu.token.starts_with('@');
     let mut list = div()
         .id("slash-menu")
         .test_support()
@@ -6564,19 +6712,8 @@ fn render_slash_menu(
         .border_1()
         .border_color(theme.border)
         .bg(theme.title_bar);
-    for (ix, cmd) in menu.matches.iter().enumerate() {
+    for (ix, item) in menu.matches.iter().enumerate() {
         let selected = ix == menu.highlight;
-        let name = cmd.name.clone();
-        let mut description = cmd.description.clone().unwrap_or_default();
-        if let Some(hint) = cmd.input.as_ref().and_then(|i| i.hint.as_deref()) {
-            if !hint.is_empty() {
-                if description.is_empty() {
-                    description = hint.to_string();
-                } else {
-                    description = format!("{description} — {hint}");
-                }
-            }
-        }
         let row = div()
             .id(SharedString::from(format!("slash-row-{ix}")))
             .test_support()
@@ -6591,8 +6728,16 @@ fn render_slash_menu(
             .on_click({
                 let wb = wb.clone();
                 move |_, _, cx| {
-                    let _ = wb.update(cx, |this, cx| this.stage_slash_select(&name, cx));
+                    let _ = wb.update(cx, |this, cx| this.stage_slash_select(cx));
                 }
+            })
+            .when(item.dir, |this| {
+                this.child(
+                    Icon::new(KitIconName::Folder)
+                        .xsmall()
+                        .flex_none()
+                        .text_color(theme.muted_foreground),
+                )
             })
             .child(
                 div()
@@ -6603,17 +6748,23 @@ fn render_slash_menu(
                     } else {
                         theme.muted_foreground
                     })
-                    .child(format!("/{}", cmd.name)),
+                    .child(if mention {
+                        item.label.clone()
+                    } else {
+                        format!("/{}", item.label)
+                    }),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(ui_text(12.))
-                    .text_color(theme.muted_foreground)
-                    .child(description),
-            );
+            .when_some(item.desc.clone().filter(|d| !d.is_empty()), |this, d| {
+                this.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(ui_text(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(d),
+                )
+            });
         list = list.child(row);
     }
     list.into_any_element()

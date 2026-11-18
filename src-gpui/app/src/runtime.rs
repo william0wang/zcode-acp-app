@@ -255,6 +255,9 @@ pub enum UiCommand {
     ToggleSessionPin { session_id: String },
     /// Reopen the last closed tab (req 2.5 — ⌘⇧T / the File menu).
     ReopenClosedTab,
+    /// The composer's @-mention listing read (req 0.7): one directory of
+    /// the active session, cached driver-side.
+    MentionList { path: String },
     /// Manual retry from the status bar (re-runs the whole bootstrap).
     Retry,
     /// Confirms the guided token setup's previewed write (Phase::TokenGuide):
@@ -1408,6 +1411,9 @@ pub struct WorkbenchSnapshot {
     pub bootstrap_note: Option<String>,
     /// Live discovery rows for the sidebar.
     pub sessions: Vec<SessionRow>,
+    /// @-mention listings (req 0.7) for the ACTIVE instance+session, keyed
+    /// by directory path — the composer's completion cache.
+    pub mention_listings: HashMap<String, FsListing>,
     pub tabs: Vec<TabSummary>,
     pub active_tab: Option<u64>,
     pub active: Option<TabView>,
@@ -1500,6 +1506,7 @@ impl WorkbenchSnapshot {
             hub_addr: None,
             bootstrap_note: None,
             sessions: Vec::new(),
+            mention_listings: HashMap::new(),
             tabs: Vec::new(),
             active_tab: None,
             active: None,
@@ -1746,6 +1753,12 @@ enum LoopEvent {
     /// `/fs/list` settled for the files panel's current directory.
     FilesList {
         seq: u64,
+        result: Result<FsListing, HubApiError>,
+    },
+    /// `/fs/list` settled for the composer's @-mention cache (req 0.7);
+    /// `key` is the cache key the request rode.
+    MentionListSettled {
+        key: String,
         result: Result<FsListing, HubApiError>,
     },
     /// `/fs/file` settled for the open viewer's single line window.
@@ -2748,6 +2761,14 @@ struct Driver {
     /// Recently closed tabs (req 2.5), newest last — ⌘⇧T pops one back.
     recently_closed: Vec<ClosedTab>,
 
+    /// @-mention listings (req 0.7): a bounded cache of /fs/list answers
+    /// for the composer's completion menu, keyed `instance|session|path` —
+    /// separate from the files panel's single listing so the two surfaces
+    /// never fight over one request slot.
+    mentions: HashMap<String, FsListing>,
+    /// The mention listing currently in flight (one at a time).
+    mention_pending: Option<String>,
+
     /// One-shot for the cold-start attach (req 2.6): only the FIRST
     /// discovery may auto-open a tab.
     cold_attach_done: bool,
@@ -2882,6 +2903,8 @@ impl Driver {
             pinned: PinnedSessions(crate::ui_prefs::load_pinned_sessions()),
             recently_closed: Vec::new(),
             cold_attach_done: false,
+            mentions: HashMap::new(),
+            mention_pending: None,
             new_session: NewSessionPanel::default(),
             files: FilesPanel::default(),
             system: SystemStatusPanel {
@@ -7271,6 +7294,20 @@ impl Driver {
             }
             // ---- Session Files (batch F) ----
             LoopEvent::FilesList { seq, result } => self.on_files_list(seq, result),
+            LoopEvent::MentionListSettled { key, result } => {
+                self.mention_pending = None;
+                // Only successes cache — a failed read retriggers on the
+                // next keystroke (the pending guard just cleared).
+                if let Ok(listing) = result {
+                    // Bounded, oldest-first eviction.
+                    if !self.mentions.contains_key(&key) && self.mentions.len() >= 8 {
+                        if let Some(oldest) = self.mentions.keys().next().cloned() {
+                            self.mentions.remove(&oldest);
+                        }
+                    }
+                    self.mentions.insert(key, listing);
+                }
+            }
             LoopEvent::FilesText { seq, result } => self.on_files_text(seq, result),
             LoopEvent::FilesImage { seq, result } => self.on_files_image(seq, result),
             // ---- ZCode config sections (batch I) ----
@@ -7761,6 +7798,27 @@ impl Driver {
                     );
                     self.open_tab(closed.instance_id, closed.session_id, closed.cwd);
                 }
+            }
+            UiCommand::MentionList { path } => {
+                // @-mention (req 0.7): one listing per directory of the
+                // active session, cached; a cached or in-flight dir is a
+                // no-op (the composer retriggers on every keystroke).
+                let Some((instance_id, session_id)) = self.active_fs_target() else {
+                    return Flow::Continue;
+                };
+                let key = format!("{instance_id}|{session_id}|{path}");
+                if self.mentions.contains_key(&key)
+                    || self.mention_pending.as_deref() == Some(key.as_str())
+                {
+                    return Flow::Continue;
+                }
+                self.mention_pending = Some(key.clone());
+                let hub = self.hub_client();
+                let tx = self.loop_tx.clone();
+                tokio::spawn(async move {
+                    let result = hub.fs_list(&instance_id, &session_id, &path).await;
+                    let _ = tx.send(LoopEvent::MentionListSettled { key, result });
+                });
             }
             UiCommand::ForceSendPending => {
                 // No active tab is a refusal too: the key was pressed on
@@ -9087,6 +9145,9 @@ impl Driver {
             );
             // The approval queue footer (2.16) rides the same per-tab mix.
             mix(tab.approvals.pending_total() as u64, &mut sig);
+            // The @-mention cache (0.7): a listing landing must repaint the
+            // composer's menu even between empty states.
+            mix(self.mentions.len() as u64, &mut sig);
             // Slash commands (batch K): the composer's "/" menu contents —
             // an overwrite landing must re-emit even between empty states.
             mix(tab.core.available_commands.len() as u64, &mut sig);
@@ -9605,6 +9666,20 @@ impl Driver {
             .count();
         let awaiting = self.awaiting_sessions();
         let sessions = self.session_rows(&running, &awaiting);
+        // @-mention cache slice for the ACTIVE session (req 0.7): the keys
+        // are instance|session|path — strip the active target's prefix so
+        // the view keys by plain path.
+        let mention_listings = self
+            .active_fs_target()
+            .map(|(i, s)| format!("{i}|{s}|"))
+            .map(|prefix| {
+                self.mentions
+                    .iter()
+                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
+                    .collect::<HashMap<String, FsListing>>()
+            })
+            .unwrap_or_default();
         let tabs: Vec<TabSummary> = self
             .tabs
             .iter()
@@ -9697,6 +9772,7 @@ impl Driver {
                 .clone()
                 .or_else(|| self.discovery_note.clone()),
             sessions,
+            mention_listings,
             tabs,
             active_tab: self.active_tab,
             active,
