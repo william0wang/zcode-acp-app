@@ -113,15 +113,15 @@ export function AppUpdatePage() {
           <span className="flex-1 text-sm text-dim">
             {t("zconfig.updateChannel")}
           </span>
-          <div className="flex gap-1 rounded-lg bg-white/[0.06] p-0.5">
+          <div className="flex gap-1 rounded-lg bg-hover p-0.5">
             {(["stable", "preview"] as const).map((ch) => (
               <button
                 key={ch}
                 onClick={() => setUpdateChannel(ch)}
-                className={`rounded-md px-2.5 py-1 text-[11px] transition ${
+                className={`rounded-md px-2.5 py-1 text-2xs transition ${
                   updateChannel === ch
-                    ? "bg-white/[0.12] font-medium text-ink"
-                    : "text-faint active:bg-white/[0.06]"
+                    ? "bg-active font-medium text-ink"
+                    : "text-faint hover:bg-hover active:bg-active"
                 }`}
               >
                 {t(`zconfig.updateChannel${ch === "stable" ? "Stable" : "Preview"}`)}
@@ -143,13 +143,13 @@ export function AppUpdatePage() {
             </p>
             {pct != null && (
               <>
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-white/[0.08]">
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-selected">
                   <div
-                    className="h-full rounded-full bg-white/30"
+                    className="h-full rounded-full bg-faint"
                     style={{ width: `${pct}%` }}
                   />
                 </div>
-                <p className="pt-1 text-[11px] tabular-nums text-faint">
+                <p className="pt-1 text-2xs tabular-nums text-faint">
                   {pct}%
                 </p>
               </>
@@ -160,16 +160,16 @@ export function AppUpdatePage() {
           </div>
         ) : stage === "done" ? (
           <div className="px-4 py-4">
-            <p className="text-sm text-emerald-300">
+            <p className="text-sm text-success">
               {t("zconfig.updateDone", { version: info.latestVersion ?? "" })}
             </p>
             <p className="pt-1 text-xs text-faint">{t("zconfig.updateRestartApp")}</p>
           </div>
         ) : stage === "needs-user-install" ? (
           <div className="px-4 py-4">
-            <p className="text-sm text-amber-300">{t("zconfig.updateNeedsUser")}</p>
+            <p className="text-sm text-warning">{t("zconfig.updateNeedsUser")}</p>
             {install?.artifactPath && (
-              <p className="pt-1 font-mono text-[11px] break-all text-faint">
+              <p className="pt-1 font-mono text-2xs break-all text-faint">
                 {install.artifactPath}
               </p>
             )}
@@ -179,9 +179,9 @@ export function AppUpdatePage() {
           </div>
         ) : stage === "failed" ? (
           <div className="px-4 py-4">
-            <p className="text-sm text-red-300">{t("zconfig.updateFailed")}</p>
+            <p className="text-sm text-danger">{t("zconfig.updateFailed")}</p>
             {install?.error && (
-              <p className="pt-1 font-mono text-[11px] break-all text-faint">
+              <p className="pt-1 font-mono text-2xs break-all text-faint">
                 {install.error}
               </p>
             )}
@@ -194,13 +194,13 @@ export function AppUpdatePage() {
             <div className="mt-2 flex gap-2">
               <button
                 onClick={() => setConfirm(false)}
-                className="flex-1 rounded-lg px-3 py-2 text-xs text-faint active:bg-white/[0.06]"
+                className="flex-1 rounded-lg px-3 py-2 text-xs text-faint hover:bg-hover active:bg-active"
               >
                 {t("common.cancel")}
               </button>
               <button
                 onClick={() => void startInstall()}
-                className="flex-1 rounded-lg bg-white/[0.1] px-3 py-2 text-xs font-medium text-ink active:bg-white/[0.15]"
+                className="flex-1 rounded-lg bg-active px-3 py-2 text-xs font-medium text-ink active:bg-active"
               >
                 {t("zconfig.updateInstall")}
               </button>
@@ -210,12 +210,12 @@ export function AppUpdatePage() {
           <div className="px-4 py-4">
             <button
               onClick={() => setConfirm(true)}
-              className="flex w-full items-center justify-center gap-2 rounded-lg bg-white/[0.08] px-3 py-2.5 text-xs font-medium text-ink active:bg-white/[0.12]"
+              className="flex w-full items-center justify-center gap-2 rounded-lg bg-selected px-3 py-2.5 text-xs font-medium text-ink hover:bg-hover active:bg-active"
             >
               <Download className="size-3.5" />
               {t("zconfig.updateInstall")}
             </button>
-            <p className="pt-2 text-[11px] text-faint">
+            <p className="pt-2 text-2xs text-faint">
               {t("zconfig.updateSize", {
                 size: artifact?.size
                   ? `${Math.round(artifact.size / 1_000_000)}MB`

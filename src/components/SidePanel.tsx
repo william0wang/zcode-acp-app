@@ -40,7 +40,7 @@ export function PanelShell({
             <button
               onClick={onClose}
               aria-label={t("common.close")}
-              className="flex size-8 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+              className="flex size-8 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
             >
               <X className="size-4" />
             </button>
@@ -109,20 +109,20 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
     <PanelShell title={t("panel.title")} onClose={onClose}>
       <div className="space-y-5 px-4 pb-[max(var(--safe-bottom),1rem)] pt-2">
         <div>
-          <h3 className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+          <h3 className="pb-2 text-2xs font-medium uppercase tracking-wide text-faint">
             {t("panel.server")}
           </h3>
           {/* Entry row only — switching/add/edit all happen inside the
               server manager page (ConnectScreen). */}
           <button
             onClick={openServerManager}
-            className="flex w-full items-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-left active:bg-white/[0.05]"
+            className="flex w-full items-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-left hover:bg-hover active:bg-active"
           >
             <span className="min-w-0 flex-1">
               <span className="block truncate text-sm text-dim">
                 {activeServer?.name ?? "—"}
               </span>
-              <span className="block truncate font-mono text-[11px] text-faint">
+              <span className="block truncate font-mono text-2xs text-faint">
                 {activeServer?.hubUrl}
               </span>
             </span>
@@ -131,7 +131,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           <button
             onClick={() => void checkHubUpgrade()}
             disabled={upgradeBusy}
-            className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2 text-xs font-medium text-dim active:bg-white/[0.07] disabled:opacity-60"
+            className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2 text-xs font-medium text-dim hover:bg-hover active:bg-active disabled:opacity-60"
           >
             <RefreshCw
               className={`size-3.5 ${upgradeBusy ? "animate-spin" : ""}`}
@@ -139,7 +139,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
             {upgradeBusy ? t("panel.upgradeBusy") : t("panel.upgrade")}
           </button>
           {upgradeNote && (
-            <p className="pt-1.5 text-center text-[11px] text-faint">
+            <p className="pt-1.5 text-center text-2xs text-faint">
               {upgradeNote}
             </p>
           )}
@@ -148,7 +148,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
               the page; Back returns to this panel, never the config list). */}
           <button
             onClick={() => openConfig("system")}
-            className="mt-2 flex w-full items-center justify-between gap-2 rounded-xl bg-raised px-3 py-2.5 text-left active:bg-white/[0.05]"
+            className="mt-2 flex w-full items-center justify-between gap-2 rounded-xl bg-raised px-3 py-2.5 text-left hover:bg-hover active:bg-active"
           >
             <span className="flex min-w-0 items-center gap-2 text-sm text-dim">
               <Activity className="size-4 shrink-0 text-faint" />
@@ -166,7 +166,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
       {/* Rarely-touched preferences sit at the very bottom of the panel. */}
       <div className="space-y-5 px-4 pb-[max(var(--safe-bottom),1rem)] pt-2">
         <div>
-          <h3 className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+          <h3 className="pb-2 text-2xs font-medium uppercase tracking-wide text-faint">
             {t("panel.language")}
           </h3>
           <div className="flex gap-2 rounded-xl bg-raised p-1">
@@ -176,7 +176,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                 onClick={() => switchLang(lang)}
                 className={`flex-1 rounded-lg px-3 py-1.5 text-xs transition ${
                   i18n.language === lang
-                    ? "bg-white/[0.1] font-medium text-ink"
+                    ? "bg-active font-medium text-ink"
                     : "text-faint"
                 }`}
               >
@@ -187,7 +187,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         </div>
 
         <div>
-          <h3 className="pb-2 text-[11px] font-medium uppercase tracking-wide text-faint">
+          <h3 className="pb-2 text-2xs font-medium uppercase tracking-wide text-faint">
             {t("panel.fontSize")}
           </h3>
           <div className="flex gap-2 rounded-xl bg-raised p-1">
@@ -197,7 +197,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
                 onClick={() => setFontSize(size)}
                 className={`flex-1 rounded-lg px-3 py-1.5 text-xs transition ${
                   fontSize === size
-                    ? "bg-white/[0.1] font-medium text-ink"
+                    ? "bg-active font-medium text-ink"
                     : "text-faint"
                 }`}
               >
@@ -210,7 +210,7 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
         </div>
       </div>
 
-      <p className="px-4 pb-[max(var(--safe-bottom),1rem)] pt-4 text-center text-[11px] text-faint">
+      <p className="px-4 pb-[max(var(--safe-bottom),1rem)] pt-4 text-center text-2xs text-faint">
         v{__APP_VERSION__}
       </p>
     </PanelShell>

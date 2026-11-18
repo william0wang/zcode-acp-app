@@ -130,12 +130,12 @@ function messageText(message: ThreadMessageLike | string): string {
 // the mapping itself is ours).
 const TOOL_KIND_META: Record<string, { icon: LucideIcon; className: string }> =
   {
-    execute: { icon: Terminal, className: "text-amber-400" },
-    edit: { icon: FilePen, className: "text-sky-400" },
-    read: { icon: FileText, className: "text-zinc-400" },
-    search: { icon: Search, className: "text-violet-400" },
-    fetch: { icon: Globe, className: "text-emerald-400" },
-    switch_mode: { icon: ListChecks, className: "text-cyan-400" },
+    execute: { icon: Terminal, className: "text-warning" },
+    edit: { icon: FilePen, className: "text-info" },
+    read: { icon: FileText, className: "text-dim" },
+    search: { icon: Search, className: "text-chart-6" },
+    fetch: { icon: Globe, className: "text-success" },
+    switch_mode: { icon: ListChecks, className: "text-info" },
     other: { icon: Wrench, className: "text-faint" },
   };
 
@@ -143,8 +143,8 @@ const TOOL_KIND_META: Record<string, { icon: LucideIcon; className: string }> =
 // plumbing cards; the summary row shows the label only, full text behind expand.
 const TOOL_FOLD_META: Record<string, { icon: LucideIcon; className: string }> =
   {
-    "context-handoff": { icon: Layers, className: "text-amber-400" },
-    "tool-transcript": { icon: History, className: "text-zinc-400" },
+    "context-handoff": { icon: Layers, className: "text-warning" },
+    "tool-transcript": { icon: History, className: "text-dim" },
   };
 
 interface ToolCardArgs {
@@ -179,12 +179,12 @@ function DiffBlock({ diff }: { diff: AcpDiffContent }) {
   return (
     <div className="mt-2 overflow-hidden rounded-lg ring-1 ring-hairline">
       {diff.path && (
-        <div className="truncate border-b border-hairline bg-white/[0.04] px-2 py-1 font-mono text-[11px] text-dim">
+        <div className="truncate border-b border-hairline bg-hover px-2 py-1 font-mono text-2xs text-dim">
           {diff.path}
         </div>
       )}
       {(truncOld || truncNew) && (
-        <div className="border-b border-hairline bg-amber-950/40 px-2 py-1 text-[10px] text-amber-300">
+        <div className="border-b border-hairline bg-warning-wash px-2 py-1 text-2xs text-warning">
           {t("chat.diffTruncated")}
         </div>
       )}
@@ -227,7 +227,7 @@ function CardCopyButton({ label, text }: { label: string; text: string }) {
           .then(() => notify(t("chat.copied")))
           .catch(() => notify(t("chat.copyFailed")));
       }}
-      className="rounded-full px-2 py-0.5 text-[10px] text-faint active:bg-white/[0.06]"
+      className="rounded-full px-2 py-0.5 text-2xs text-faint hover:bg-hover active:bg-active"
     >
       {label}
     </button>
@@ -264,7 +264,7 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
       ? (a.rawInput ?? null)
       : null;
   return (
-    <details className="group my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04] text-xs">
+    <details className="group my-2 max-w-full overflow-hidden rounded-xl bg-hover text-xs">
       <summary className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 px-3 py-2 text-dim">
         <Icon className={`size-3.5 shrink-0 ${meta.className}`} />
         {/* shrink-0 keeps the tool name readable — an unprotected flex child
@@ -348,7 +348,7 @@ function ToolRunCard({
     [indexKey, parts],
   );
   return (
-    <div className="my-2 max-w-full overflow-hidden rounded-xl bg-white/[0.04]">
+    <div className="my-2 max-w-full overflow-hidden rounded-xl bg-hover">
       <button
         onClick={() => setOpen(!open)}
         className="flex w-full min-w-0 items-center gap-1.5 px-3 py-2 text-left"
@@ -356,9 +356,9 @@ function ToolRunCard({
         <Wrench
           className={`size-3.5 shrink-0 ${
             summary.running
-              ? "animate-pulse text-emerald-400"
+              ? "animate-pulse text-success"
               : summary.failed
-                ? "text-red-400"
+                ? "text-danger"
                 : "text-faint"
           }`}
         />
@@ -366,7 +366,7 @@ function ToolRunCard({
           {t("chat.toolRun", { count: summary.count })}
         </span>
         {summary.running && (
-          <span className="shrink-0 text-xs text-emerald-400">
+          <span className="shrink-0 text-xs text-success">
             {t("chat.activityRunning")}…
           </span>
         )}
@@ -389,7 +389,7 @@ function ToolRunCard({
       {open && (
         <button
           onClick={() => setOpen(false)}
-          className="flex w-full items-center justify-center gap-1 border-t border-hairline px-3 py-1.5 text-xs text-faint active:bg-white/[0.06]"
+          className="flex w-full items-center justify-center gap-1 border-t border-hairline px-3 py-1.5 text-xs text-faint hover:bg-hover active:bg-active"
         >
           <ChevronUp className="size-3.5 shrink-0" />
           {t("chat.toolRunCollapse")}
@@ -429,7 +429,7 @@ function ThoughtCard({
   });
 
   return (
-    <div className="my-2 rounded-xl bg-white/[0.04]">
+    <div className="my-2 rounded-xl bg-hover">
       <button
         onClick={() => {
           setTouched(true);
@@ -452,7 +452,7 @@ function ThoughtCard({
       {open && (
         <div
           ref={boxRef}
-          className="max-h-52 overflow-y-auto px-3 pb-2.5 text-[13px] leading-relaxed text-faint"
+          className="max-h-52 overflow-y-auto px-3 pb-2.5 text-sm leading-relaxed text-faint"
         >
           {children}
         </div>
@@ -512,7 +512,7 @@ const UserMessage = memo(function UserMessage({
   if (notice) {
     return (
       <MessagePrimitive.Root className="flex min-w-0 justify-center">
-        <div className="flex max-w-full min-w-0 items-center gap-1.5 rounded-full border border-hairline bg-surface px-3 py-1 text-[11px] text-faint">
+        <div className="flex max-w-full min-w-0 items-center gap-1.5 rounded-full border border-hairline bg-surface px-3 py-1 text-2xs text-faint">
           <Bell className="size-3 shrink-0" />
           <span className="truncate">
             {notice.summary || t("chat.taskNotice")}
@@ -531,7 +531,7 @@ const UserMessage = memo(function UserMessage({
     // one-line summary behind an expand control, not a wall of user text.
     return (
       <MessagePrimitive.Root className="flex min-w-0 justify-end">
-        <details className="group max-w-[85%] min-w-0 rounded-[22px] rounded-br-md bg-raised px-4 py-2.5 text-[13px] text-dim">
+        <details className="group max-w-[85%] min-w-0 rounded-[22px] rounded-br-md bg-raised px-4 py-2.5 text-sm text-dim">
           <summary className="flex cursor-pointer select-none list-none items-center gap-1 text-xs text-faint [&::-webkit-details-marker]:hidden">
             <ChevronDown className="size-3.5 shrink-0 transition-transform group-open:rotate-180" />
             {t("chat.contextHandoff")}
@@ -585,10 +585,10 @@ const UserMessage = memo(function UserMessage({
         <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
           <ActionBarPrimitive.Copy
             aria-label={t("chat.copy")}
-            className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06] group"
+            className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active group"
           >
             <Copy className="size-3 group-data-[copied]:hidden" />
-            <Check className="hidden size-3 text-emerald-400 group-data-[copied]:block" />
+            <Check className="hidden size-3 text-success group-data-[copied]:block" />
           </ActionBarPrimitive.Copy>
         </ActionBarPrimitive.Root>
       )}
@@ -622,7 +622,7 @@ const AssistantMessage = memo(function AssistantMessage() {
   );
   return (
     <MessagePrimitive.Root className="min-w-0">
-      <div className="w-full text-[15px] leading-relaxed text-ink">
+      <div className="w-full text-base leading-relaxed text-ink">
         <MessagePrimitive.GroupedParts
           groupBy={groupPartByType({
             reasoning: ["group-reasoning"],
@@ -668,10 +668,10 @@ const AssistantMessage = memo(function AssistantMessage() {
         <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
           <ActionBarPrimitive.Copy
             aria-label={t("chat.copy")}
-            className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06] group"
+            className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active group"
           >
             <Copy className="size-3 group-data-[copied]:hidden" />
-            <Check className="hidden size-3 text-emerald-400 group-data-[copied]:block" />
+            <Check className="hidden size-3 text-success group-data-[copied]:block" />
           </ActionBarPrimitive.Copy>
         </ActionBarPrimitive.Root>
       )}
@@ -936,7 +936,7 @@ function Composer() {
               onPointerDown={(e) => e.preventDefault()}
               onClick={() => select(c.name)}
               className={`flex w-full items-baseline gap-2 px-3 py-2 text-left ${
-                i === idx ? "bg-white/[0.06]" : "active:bg-white/[0.06]"
+                i === idx ? "bg-hover" : "hover:bg-hover active:bg-active"
               }`}
             >
               <span className="shrink-0 font-mono text-sm text-dim">
@@ -993,7 +993,7 @@ function Composer() {
           type="button"
           onClick={() => galleryRef.current?.click()}
           aria-label={t("chat.attach")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ImagePlus className="size-5" />
         </button>
@@ -1016,7 +1016,7 @@ function Composer() {
           // (the one position where 0 happens to be correct).
           onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
           onInput={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
-          className="max-h-32 min-h-9 flex-1 resize-none bg-transparent py-2 text-[15px] leading-5 text-ink placeholder:text-faint focus:outline-none"
+          className="max-h-32 min-h-9 flex-1 resize-none bg-transparent py-2 text-base leading-5 text-ink placeholder:text-faint focus:outline-none"
         />
         {/* While a turn runs the Send stays a Send: a draft queues as pending
             (sendPrompt routes it), never a dead button. Cancel stops the turn.
@@ -1097,7 +1097,7 @@ function PendingPrompts() {
                 ))}
               </div>
             )}
-            <span className="mt-1 flex items-center justify-end gap-3 text-[11px]">
+            <span className="mt-1 flex items-center justify-end gap-3 text-2xs">
               <span className="text-faint">{t("chat.pending")}</span>
               {/* No force-send while replaying (no turn to interrupt — the
                   queue fires on its own once the attach lands) or while
@@ -1241,7 +1241,7 @@ function Thread({
           <button
             onClick={onExpand}
             disabled={loadingEarlier}
-            className="mx-auto shrink-0 rounded-full bg-surface px-3 py-1 text-xs text-dim ring-1 ring-hairline active:bg-white/[0.06] disabled:opacity-50"
+            className="mx-auto shrink-0 rounded-full bg-surface px-3 py-1 text-xs text-dim ring-1 ring-hairline hover:bg-hover active:bg-active disabled:opacity-50"
           >
             {loadingEarlier
               ? t("chat.loadingEarlier")
@@ -1277,7 +1277,7 @@ function Thread({
               <ArrowDown className="size-4" />
             </ThreadPrimitive.ScrollToBottom>
             {unread > 0 && (
-              <span className="absolute -right-1 -top-1 flex size-4 min-w-4 items-center justify-center rounded-full bg-blue-500 px-1 text-[10px] font-semibold text-white">
+              <span className="absolute -right-1 -top-1 flex size-4 min-w-4 items-center justify-center rounded-full bg-info text-2xs font-semibold text-white">
                 {unread > 99 ? "99+" : unread}
               </span>
             )}

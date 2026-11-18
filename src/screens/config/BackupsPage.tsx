@@ -99,13 +99,13 @@ export function BackupsPage() {
                         <span className="flex shrink-0 items-center gap-1.5">
                           <button
                             onClick={() => setConfirm(null)}
-                            className="rounded-lg px-2 py-1 text-[11px] text-faint"
+                            className="rounded-lg px-2 py-1 text-2xs text-faint"
                           >
                             {t("common.cancel")}
                           </button>
                           <button
                             onClick={() => void restore(g.key, b.path)}
-                            className="rounded-lg bg-amber-500/20 px-2.5 py-1 text-[11px] font-medium text-amber-300"
+                            className="rounded-lg bg-warning-wash px-2.5 py-1 text-2xs font-medium text-warning"
                           >
                             {t("zconfig.confirmRestore")}
                           </button>
@@ -113,14 +113,14 @@ export function BackupsPage() {
                       ) : (
                         <button
                           onClick={() => setConfirm({ file: g.key, path: b.path })}
-                          className="flex shrink-0 items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+                          className="flex shrink-0 items-center gap-1.5 rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
                         >
                           <RotateCcw className="size-3" />
                           {t("zconfig.restore")}
                         </button>
                       )}
                     </div>
-                    <p className="pt-0.5 font-mono text-[10px] break-all text-faint">
+                    <p className="pt-0.5 font-mono text-2xs break-all text-faint">
                       {b.path}
                     </p>
                   </div>
@@ -131,7 +131,7 @@ export function BackupsPage() {
         ))
       )}
 
-      <p className="px-4 pt-3 text-center text-[11px] text-faint">
+      <p className="px-4 pt-3 text-center text-2xs text-faint">
         {t("zconfig.backupsScope")}
       </p>
     </ConfigPageFrame>

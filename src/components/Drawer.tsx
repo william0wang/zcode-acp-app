@@ -80,7 +80,7 @@ export function Drawer({
               closeSession();
             }}
             aria-label={t("chat.backToSessions")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <ArrowLeft className="size-4.5" />
           </button>
@@ -91,7 +91,7 @@ export function Drawer({
               onHistory();
             }}
             aria-label={t("historyDialog.title")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <History className="size-4.5" />
           </button>
@@ -101,14 +101,14 @@ export function Drawer({
               onCreate();
             }}
             aria-label={t("projectDialog.title")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <FolderPlus className="size-4.5" />
           </button>
           <button
             onClick={() => void refreshInstances({ probe: true })}
             aria-label={t("picker.refresh")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <RefreshCw className="size-4.5" />
           </button>
@@ -121,11 +121,11 @@ export function Drawer({
               openConfig(null);
             }}
             aria-label={t("zconfig.title")}
-            className="relative flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="relative flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <Sliders className="size-4.5" />
             {pendingRestart && (
-              <span className="absolute top-1.5 right-1.5 size-2 rounded-full bg-amber-400" />
+              <span className="absolute top-1.5 right-1.5 size-2 rounded-full bg-warning" />
             )}
           </button>
           <button
@@ -134,7 +134,7 @@ export function Drawer({
               onSettings();
             }}
             aria-label={t("panel.title")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <SlidersHorizontal className="size-4.5" />
           </button>

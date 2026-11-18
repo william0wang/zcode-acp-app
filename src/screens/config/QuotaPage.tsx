@@ -222,10 +222,10 @@ export function QuotaPage() {
                 key={id}
                 disabled={resetBusy}
                 onClick={() => void loadResetCards(id)}
-                className={`rounded-lg px-2.5 py-1.5 text-[11px] transition disabled:opacity-50 ${
+                className={`rounded-lg px-2.5 py-1.5 text-2xs transition disabled:opacity-50 ${
                   id === providerId
-                    ? "bg-white/[0.12] font-medium text-ink"
-                    : "text-faint active:bg-white/[0.06]"
+                    ? "bg-active font-medium text-ink"
+                    : "text-faint hover:bg-hover active:bg-active"
                 }`}
               >
                 {providerLabel(id, t)}
@@ -286,7 +286,7 @@ export function QuotaPage() {
       </ConfigBlock>
 
       {usageStatsAt != null && (
-        <p className="px-4 pt-3 text-center text-[11px] text-faint">
+        <p className="px-4 pt-3 text-center text-2xs text-faint">
           {t("quota.updated")} {fmtStamp(usageStatsAt)}
         </p>
       )}
@@ -347,12 +347,12 @@ function CardList({
               key={`${c.expireAt}-${i}`}
               className="flex items-center gap-2 py-0.5 text-xs text-faint"
             >
-              <Check className="size-3 shrink-0 text-emerald-400/70" />
+              <Check className="size-3 shrink-0 text-success/70" />
               <span className="tabular-nums">
                 {t("zconfig.resetExpires")} {fmtStamp(c.expireAt)}
               </span>
               {i === 0 && (
-                <span className="ml-auto shrink-0 text-[10px] text-faint">
+                <span className="ml-auto shrink-0 text-2xs text-faint">
                   {t("zconfig.resetNextUp")}
                 </span>
               )}
@@ -362,13 +362,13 @@ function CardList({
       )}
 
       {lastUsed != null && (
-        <p className="pt-1 text-[11px] text-faint">
+        <p className="pt-1 text-2xs text-faint">
           {t("zconfig.resetLastUsed")} {fmtStamp(lastUsed)}
         </p>
       )}
 
       {nextTryAt != null && nextTryAt > Date.now() && (
-        <p className="pt-1 text-[11px] text-amber-300">
+        <p className="pt-1 text-2xs text-warning">
           {t("zconfig.resetRetryAt")} {fmtStamp(nextTryAt)}
         </p>
       )}
@@ -379,7 +379,7 @@ function CardList({
             // The spend confirmation names the card, not a generic "are you
             // sure": a spend is irreversible and the user is committing to a
             // specific window and expiry.
-            <div className="mt-2 rounded-lg bg-white/[0.05] px-3 py-2.5">
+            <div className="mt-2 rounded-lg bg-hover px-3 py-2.5">
               <p className="text-xs text-dim">
                 {t("zconfig.resetConfirm", {
                   title: title.toLowerCase(),
@@ -389,14 +389,14 @@ function CardList({
               <div className="mt-2 flex gap-2">
                 <button
                   onClick={() => onConfirm(null)}
-                  className="flex-1 rounded-lg px-3 py-2 text-xs text-faint active:bg-white/[0.06]"
+                  className="flex-1 rounded-lg px-3 py-2 text-xs text-faint hover:bg-hover active:bg-active"
                 >
                   {t("common.cancel")}
                 </button>
                 <button
                   disabled={busy}
                   onClick={() => void onSpend(resetType)}
-                  className="flex-1 rounded-lg bg-white/[0.1] px-3 py-2 text-xs font-medium text-ink active:bg-white/[0.15] disabled:opacity-60"
+                  className="flex-1 rounded-lg bg-active px-3 py-2 text-xs font-medium text-ink active:bg-active disabled:opacity-60"
                 >
                   {busy ? (
                     <RefreshCw className="mx-auto size-3.5 animate-spin" />
@@ -410,20 +410,20 @@ function CardList({
             // The pre-step below the threshold: the card works, but the
             // allowance is nowhere near spent — say so before the user
             // commits to anything.
-            <div className="mt-2 rounded-lg bg-amber-500/10 px-3 py-2.5">
-              <p className="text-xs text-amber-300">
+            <div className="mt-2 rounded-lg bg-warning-wash px-3 py-2.5">
+              <p className="text-xs text-warning">
                 {t("zconfig.resetBelowWarn", { pct: SPEND_THRESHOLD_PCT })}
               </p>
               <div className="mt-2 flex gap-2">
                 <button
                   onClick={() => onConfirm(null)}
-                  className="flex-1 rounded-lg px-3 py-2 text-xs text-faint active:bg-white/[0.06]"
+                  className="flex-1 rounded-lg px-3 py-2 text-xs text-faint hover:bg-hover active:bg-active"
                 >
                   {t("common.cancel")}
                 </button>
                 <button
                   onClick={() => onConfirm({ type: resetType, warned: true })}
-                  className="flex-1 rounded-lg bg-amber-500/20 px-3 py-2 text-xs font-medium text-amber-300 active:bg-amber-500/30"
+                  className="flex-1 rounded-lg bg-warning-wash px-3 py-2 text-xs font-medium text-warning active:brightness-125"
                 >
                   {t("zconfig.resetWarnContinue")}
                 </button>
@@ -434,7 +434,7 @@ function CardList({
           <button
             disabled={busy}
             onClick={() => onAsk(resetType)}
-            className="mt-2 w-full rounded-lg bg-white/[0.08] px-3 py-2 text-xs font-medium text-ink active:bg-white/[0.12] disabled:opacity-40"
+            className="mt-2 w-full rounded-lg bg-selected px-3 py-2 text-xs font-medium text-ink hover:bg-hover active:bg-active disabled:opacity-40"
           >
             {t("zconfig.resetUse")}
           </button>
@@ -443,7 +443,7 @@ function CardList({
       {/* Below this card's OWN threshold the card still works — the note says
           what the extra step is, not that the button is dead. */}
       {!aboveThreshold && (
-        <p className="pt-1.5 text-[11px] text-faint">
+        <p className="pt-1.5 text-2xs text-faint">
           {t("zconfig.resetBelowThreshold", { pct: SPEND_THRESHOLD_PCT })}
         </p>
       )}

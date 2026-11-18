@@ -99,7 +99,7 @@ export function QuotaRow({
           {resetMs != null && ` · ${fmtResetTime(resetMs)}`}
         </span>
       </div>
-      <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
+      <div className="mt-1 h-1 overflow-hidden rounded-full bg-selected">
         <div
           className="h-full rounded-full"
           style={{ width: `${clamped}%`, backgroundColor: heatColor(clamped) }}
@@ -118,7 +118,7 @@ export function SectionLabel({
 }) {
   return (
     <h3
-      className={`px-4 pb-0.5 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint ${
+      className={`px-4 pb-0.5 pt-3 text-2xs font-medium uppercase tracking-wide text-faint ${
         divided ? "mt-2 border-t border-hairline" : ""
       }`}
     >
@@ -147,19 +147,19 @@ export function QuotaSection() {
   return (
     <>
       <div className="mt-2 flex items-center justify-between border-t border-hairline px-4 pb-0.5 pt-3">
-        <h3 className="text-[11px] font-medium uppercase tracking-wide text-faint">
+        <h3 className="text-2xs font-medium uppercase tracking-wide text-faint">
           {t("quota.title")}
         </h3>
         <div className="flex items-center gap-1.5">
           {usageStatsAt != null && (
-            <span className="text-[10px] tabular-nums text-faint">
+            <span className="text-2xs tabular-nums text-faint">
               {t("quota.updated")} {fmtRefreshedAt(usageStatsAt)}
             </span>
           )}
           <button
             onClick={() => void refreshUsageStats()}
             aria-label={t("quota.refresh")}
-            className="flex size-7 items-center justify-center rounded-full text-faint active:bg-white/[0.06]"
+            className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active"
           >
             <RefreshCw className="size-3.5" />
           </button>

@@ -175,7 +175,7 @@ export function WorkflowsPage() {
       hasLoaded={hubGroups !== null}
     >
       {!instanceId && (
-        <p className="mx-4 mt-2 rounded-xl bg-surface px-4 py-3 text-xs text-amber-300 ring-1 ring-hairline">
+        <p className="mx-4 mt-2 rounded-xl bg-surface px-4 py-3 text-xs text-warning ring-1 ring-hairline">
           {t("zconfig.workflowNeedInstance")}
         </p>
       )}
@@ -215,7 +215,7 @@ export function WorkflowsPage() {
       <div className="px-4">
         <button
           onClick={() => void createViaChat()}
-          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
         >
           <Plus className="size-4" />
           {t("zconfig.workflowCreateChat")}
@@ -319,7 +319,7 @@ function ActiveRunsBlock({
             <div className="flex items-center gap-2">
               <span className="min-w-0 flex-1 truncate text-sm text-ink">{label}</span>
               {r.updatedAt ? (
-                <span className="shrink-0 text-[10px] text-faint">{fmtStamp(r.updatedAt)}</span>
+                <span className="shrink-0 text-2xs text-faint">{fmtStamp(r.updatedAt)}</span>
               ) : null}
               <StatusBadge status={r.status} />
             </div>
@@ -327,13 +327,13 @@ function ActiveRunsBlock({
               <div className="mt-2 flex flex-wrap gap-1.5">
                 <button
                   onClick={() => onOpenRun(rowSessionId, r.runId, r.name ?? label, rowInstanceId)}
-                  className="rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+                  className="rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
                 >
                   {t("zconfig.workflowRunDetail")}
                 </button>
                 <button
                   onClick={() => void stop(r)}
-                  className="rounded-lg bg-red-500/15 px-2.5 py-1.5 text-[11px] font-medium text-red-300 active:bg-red-500/25"
+                  className="rounded-lg bg-danger-wash px-2.5 py-1.5 text-2xs font-medium text-danger active:brightness-125"
                 >
                   {t("zconfig.workflowStopRun")}
                 </button>
@@ -397,7 +397,7 @@ function RecentRunsBlock({
             <div className="flex items-baseline gap-2">
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm text-ink">{label}</span>
-                <span className="block text-[11px] text-faint">
+                <span className="block text-2xs text-faint">
                   {r.updatedAt ? `${fmtStamp(r.updatedAt)} · ` : ""}
                   {r.spentTokens ? `${fmtTokens(r.spentTokens)} · ` : ""}
                   {r.artifacts?.length ? `${r.artifacts.length}◆` : ""}
@@ -408,7 +408,7 @@ function RecentRunsBlock({
                 onClick={() => void dismiss(r)}
                 aria-label={t("zconfig.workflowDismissRun")}
                 title={t("zconfig.workflowDismissRun")}
-                className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint active:bg-white/[0.1]"
+                className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint active:bg-active"
               >
                 <X className="size-3.5" />
               </button>
@@ -417,7 +417,7 @@ function RecentRunsBlock({
               <div className="mt-2">
                 <button
                   onClick={() => onOpenRun(rowSessionId, r.runId, r.name ?? label, rowInstanceId)}
-                  className="rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+                  className="rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
                 >
                   {t("zconfig.workflowRunDetail")}
                 </button>
@@ -446,7 +446,7 @@ function GroupBlock({
   if (group.error) {
     return (
       <ConfigBlock title={label} divided>
-        <p className="px-4 py-2.5 text-[11px] text-faint">
+        <p className="px-4 py-2.5 text-2xs text-faint">
           {t("zconfig.workflowInstanceUnavailable")}
         </p>
       </ConfigBlock>
@@ -466,7 +466,7 @@ function GroupBlock({
           <button
             key={w.name}
             onClick={() => onOpen(w.name)}
-            className="flex w-full flex-col gap-1 px-4 py-3 text-left active:bg-white/[0.05]"
+            className="flex w-full flex-col gap-1 px-4 py-3 text-left hover:bg-hover active:bg-active"
           >
             <span className="flex w-full items-center gap-2">
               <span className="min-w-0 flex-1 truncate text-sm text-ink">{w.name}</span>
@@ -474,25 +474,25 @@ function GroupBlock({
               <ChevronRight className="size-4 shrink-0 text-faint" />
             </span>
             {w.description && (
-              <span className="line-clamp-2 text-[11px] leading-snug text-faint">
+              <span className="line-clamp-2 text-2xs leading-snug text-faint">
                 {w.description}
               </span>
             )}
             {(last?.updatedAt || argNames.length > 0) && (
               <span className="mt-0.5 flex w-full flex-wrap items-center gap-1.5">
                 {last?.updatedAt ? (
-                  <span className="text-[10px] text-faint">{fmtStamp(last.updatedAt)}</span>
+                  <span className="text-2xs text-faint">{fmtStamp(last.updatedAt)}</span>
                 ) : null}
                 {argNames.slice(0, 3).map((a) => (
                   <span
                     key={a}
-                    className="rounded bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] text-dim"
+                    className="rounded bg-hover px-1.5 py-0.5 font-mono text-2xs text-dim"
                   >
                     {a}
                   </span>
                 ))}
                 {argNames.length > 3 && (
-                  <span className="text-[10px] text-faint">+{argNames.length - 3}</span>
+                  <span className="text-2xs text-faint">+{argNames.length - 3}</span>
                 )}
               </span>
             )}
@@ -502,8 +502,8 @@ function GroupBlock({
       {group.invalid.length > 0 &&
         group.invalid.map((e, i) => (
           <div key={i} className="px-4 py-2.5">
-            <p className="truncate font-mono text-[10px] text-faint">{e.path}</p>
-            {e.reason && <p className="truncate text-[11px] text-amber-300/80">{e.reason}</p>}
+            <p className="truncate font-mono text-2xs text-faint">{e.path}</p>
+            {e.reason && <p className="truncate text-2xs text-warning/80">{e.reason}</p>}
           </div>
         ))}
     </ConfigBlock>
@@ -742,11 +742,11 @@ function WorkflowDetail({
     >
       <ConfigBlock>
         <div className="flex items-center gap-2 px-4 pt-3">
-          <span className="rounded-md bg-white/[0.08] px-1.5 py-0.5 text-[10px] text-dim">
+          <span className="rounded-md bg-selected px-1.5 py-0.5 text-2xs text-dim">
             {t(`zconfig.workflowScope_${scope}`)}
           </span>
           {scope === "project" && (
-            <span className="truncate text-[10px] text-faint">{instanceId}</span>
+            <span className="truncate text-2xs text-faint">{instanceId}</span>
           )}
         </div>
         {descText ? (
@@ -756,19 +756,19 @@ function WorkflowDetail({
         ) : null}
         {whenToUse ? (
           <div className="px-4 pb-2.5">
-            <p className="text-[11px] text-faint">{whenToUse}</p>
+            <p className="text-2xs text-faint">{whenToUse}</p>
           </div>
         ) : null}
         {detail?.path && (
           <div className="px-4 pb-2.5">
-            <p className="break-all font-mono text-[10px] text-faint">{detail.path}</p>
+            <p className="break-all font-mono text-2xs text-faint">{detail.path}</p>
           </div>
         )}
         {detail && (
           <div className="px-4 py-2.5">
             <button
               onClick={() => setEditingDesc(true)}
-              className="rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+              className="rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
             >
               {t("zconfig.workflowEditDescription")}
             </button>
@@ -787,14 +787,14 @@ function WorkflowDetail({
           {scope === "global" ? (
             <button
               onClick={() => void moveToProject()}
-              className="flex-1 rounded-xl bg-raised px-3 py-2 text-xs text-dim active:bg-white/[0.07]"
+              className="flex-1 rounded-xl bg-raised px-3 py-2 text-xs text-dim hover:bg-hover active:bg-active"
             >
               {t("zconfig.workflowMoveToProject")}
             </button>
           ) : (
             <button
               onClick={promoteViaChat}
-              className="flex-1 rounded-xl bg-raised px-3 py-2 text-xs text-dim active:bg-white/[0.07]"
+              className="flex-1 rounded-xl bg-raised px-3 py-2 text-xs text-dim hover:bg-hover active:bg-active"
             >
               {t("zconfig.workflowPromoteGlobal")}
             </button>
@@ -803,13 +803,13 @@ function WorkflowDetail({
             <span className="flex flex-1 items-center justify-end gap-1.5">
               <button
                 onClick={() => setConfirmDelete(false)}
-                className="rounded-lg px-2 py-1 text-[11px] text-faint"
+                className="rounded-lg px-2 py-1 text-2xs text-faint"
               >
                 {t("common.cancel")}
               </button>
               <button
                 onClick={() => void remove()}
-                className="rounded-lg bg-red-500/20 px-2.5 py-1.5 text-[11px] font-medium text-red-300"
+                className="rounded-lg bg-danger-wash px-2.5 py-1.5 text-2xs font-medium text-danger"
               >
                 {t("zconfig.workflowConfirmDelete")}
               </button>
@@ -817,7 +817,7 @@ function WorkflowDetail({
           ) : (
             <button
               onClick={() => setConfirmDelete(true)}
-              className="flex-1 rounded-xl bg-raised px-3 py-2 text-xs text-dim active:bg-white/[0.07]"
+              className="flex-1 rounded-xl bg-raised px-3 py-2 text-xs text-dim hover:bg-hover active:bg-active"
             >
               {t("zconfig.workflowDelete")}
             </button>
@@ -829,12 +829,12 @@ function WorkflowDetail({
         <ConfigBlock title={t("zconfig.workflowScript")} divided>
           <button
             onClick={() => setScriptOpen(!scriptOpen)}
-            className="w-full px-4 py-2.5 text-left text-xs text-dim active:bg-white/[0.05]"
+            className="w-full px-4 py-2.5 text-left text-xs text-dim hover:bg-hover active:bg-active"
           >
             {scriptOpen ? t("zconfig.workflowHideScript") : t("zconfig.workflowShowScript")}
           </button>
           {scriptOpen && (
-            <pre className="max-h-80 overflow-auto px-4 pb-3 font-mono text-[10px] leading-relaxed text-faint">
+            <pre className="max-h-80 overflow-auto px-4 pb-3 font-mono text-2xs leading-relaxed text-faint">
               {detail.script}
             </pre>
           )}
@@ -845,7 +845,7 @@ function WorkflowDetail({
         {runs !== null && runs.some((r) => !RUN_ACTIVE.has(r.status)) && (
           <button
             onClick={() => void clearFinished()}
-            className="w-full px-4 py-2 text-left text-[11px] text-faint active:bg-white/[0.05]"
+            className="w-full px-4 py-2 text-left text-2xs text-faint hover:bg-hover active:bg-active"
           >
             {t("zconfig.workflowClearFinished")}
           </button>
@@ -874,19 +874,19 @@ function WorkflowDetail({
                 <div className="flex items-baseline gap-2">
                   <span className="min-w-0 flex-1">
                     <span className="block text-sm text-ink">{r.name ?? r.runId.slice(0, 12)}</span>
-                    <span className="block text-[11px] text-faint">
+                    <span className="block text-2xs text-faint">
                       {r.updatedAt ? `${fmtStamp(r.updatedAt)} · ` : ""}
                       {r.spentTokens ? `${fmtTokens(r.spentTokens)} · ` : ""}
                       {r.artifacts?.length ? `${r.artifacts.length}◆` : ""}
                     </span>
                     {(summary?.resumedFrom || r.resumedFrom) && (
-                      <span className="block truncate text-[10px] text-faint">
+                      <span className="block truncate text-2xs text-faint">
                         {t("zconfig.workflowLineageFrom")} …
                         {(summary?.resumedFrom ?? r.resumedFrom)!.slice(-8)}
                       </span>
                     )}
                     {(summary?.supersededBy || r.supersededBy) && (
-                      <span className="block truncate text-[10px] text-faint">
+                      <span className="block truncate text-2xs text-faint">
                         {t("zconfig.workflowLineageBy")} …
                         {(summary?.supersededBy ?? r.supersededBy)!.slice(-8)}
                       </span>
@@ -898,7 +898,7 @@ function WorkflowDetail({
                       onClick={() => void dismissRun(r)}
                       aria-label={t("zconfig.workflowDismissRun")}
                       title={t("zconfig.workflowDismissRun")}
-                      className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint active:bg-white/[0.1]"
+                      className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint active:bg-active"
                     >
                       <X className="size-3.5" />
                     </button>
@@ -910,27 +910,27 @@ function WorkflowDetail({
                       onClick={() =>
                         onOpenRun(rowSessionId, r.runId, r.name ?? name, rowInstanceId)
                       }
-                      className="rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+                      className="rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
                     >
                       {t("zconfig.workflowRunDetail")}
                     </button>
                     <button
                       onClick={() => void openSession(rowInstanceId, rowSessionId)}
-                      className="rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+                      className="rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
                     >
                       {t("zconfig.workflowOpenSession")}
                     </button>
                     {summary?.resumable && (
                       <button
                         onClick={() => void resume(r)}
-                        className="rounded-lg bg-sky-500/20 px-2.5 py-1.5 text-[11px] font-medium text-sky-300"
+                        className="rounded-lg bg-info-wash px-2.5 py-1.5 text-2xs font-medium text-info"
                       >
                         {t("zconfig.workflowResume")}
                       </button>
                     )}
                   </div>
                 ) : (
-                  <p className="pt-1 text-[10px] text-faint">
+                  <p className="pt-1 text-2xs text-faint">
                     {t("zconfig.workflowRunUnknownSession")}
                   </p>
                 )}
@@ -1002,7 +1002,7 @@ function StartSheet({
           />
         </ConfigField>
       )}
-      {typed && form.error ? <p className="px-1 text-[11px] text-red-400">{form.error}</p> : null}
+      {typed && form.error ? <p className="px-1 text-2xs text-danger">{form.error}</p> : null}
     </ConfigFormSheet>
   );
 }

@@ -317,13 +317,13 @@ export function ModelsPage() {
               <button
                 key={key}
                 onClick={() => setEditing(m)}
-                className="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-white/[0.05]"
+                className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-hover active:bg-active"
               >
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm text-ink">
                     {m.modelId ?? key}
                   </span>
-                  <span className="block truncate text-[11px] text-faint">
+                  <span className="block truncate text-2xs text-faint">
                     {provider}
                     {contextWindow
                       ? ` · ${(contextWindow / 1000).toFixed(0)}k context`
@@ -340,7 +340,7 @@ export function ModelsPage() {
       <div className="px-4">
         <button
           onClick={() => setAdding(true)}
-          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
         >
           <Plus className="size-4" />
           {t("zconfig.modelsAdd")}
@@ -455,7 +455,7 @@ function ModelForm({
       onClose={onClose}
     >
       {target ? (
-        <p className="mt-3 font-mono text-[11px] text-faint">
+        <p className="mt-3 font-mono text-2xs text-faint">
           {[target.providerId, target.modelId].filter(Boolean).join(" / ")}
         </p>
       ) : (
@@ -506,11 +506,11 @@ function ModelForm({
         <span className="block text-xs font-medium text-dim">
           {t("zconfig.modelReasoningLevels")}
         </span>
-        <span className="mt-1 block text-[11px] text-faint">
+        <span className="mt-1 block text-2xs text-faint">
           {t("zconfig.modelLevelsHint")}
         </span>
         {candidates.length === 0 ? (
-          <p className="mt-2 text-[11px] text-faint">
+          <p className="mt-2 text-2xs text-faint">
             {t("zconfig.modelLevelsNone")}
           </p>
         ) : (
@@ -529,7 +529,7 @@ function ModelForm({
                   }
                   className={`rounded-lg px-3 py-1.5 text-xs transition ${
                     on
-                      ? "bg-white/[0.16] text-ink ring-1 ring-white/50"
+                      ? "bg-active text-ink ring-1 ring-ink/50"
                       : "bg-raised text-faint"
                   }`}
                 >

@@ -57,8 +57,8 @@ export function ConfigSheet({
               }}
               className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm ${
                 active
-                  ? "bg-white/[0.07] font-medium text-ink"
-                  : "text-dim active:bg-white/[0.05]"
+                  ? "bg-selected font-medium text-ink"
+                  : "text-dim hover:bg-hover active:bg-active"
               }`}
             >
               <span className="truncate">{v.name}</span>

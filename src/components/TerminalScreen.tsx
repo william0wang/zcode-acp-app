@@ -43,16 +43,16 @@ function ConnChip({
   // Ready + open is the non-state: no chip, just the terminal.
   if (conn === "open" && terminal?.state === "ready" && !terminal.turn) return null;
   let label: string | null = null;
-  let tone = "text-amber-400";
+  let tone = "text-warning";
   if (conn === "connecting") label = t("chat.connecting");
   else if (conn === "reconnecting") label = t("chat.reconnecting");
-  else if (conn === "closed") (label = t("remoteTerminal.closed")), (tone = "text-red-400");
+  else if (conn === "closed") (label = t("remoteTerminal.closed")), (tone = "text-danger");
   else if (terminal?.state === "opening") label = t("remoteTerminal.opening");
   else if (terminal?.state === "gone")
-    (label = t("remoteTerminal.gone")), (tone = "text-red-400");
+    (label = t("remoteTerminal.gone")), (tone = "text-danger");
   if (!label) return null;
   return (
-    <span className={`flex shrink-0 items-center gap-1 text-[10px] font-medium ${tone}`}>
+    <span className={`flex shrink-0 items-center gap-1 text-2xs font-medium ${tone}`}>
       <span className="size-1.5 animate-pulse rounded-full bg-current" />
       {label}
     </span>
@@ -64,26 +64,26 @@ function EventRow({ ev }: { ev: TerminalEvent }) {
   switch (ev.kind) {
     case "open":
       return (
-        <p className="truncate py-1 text-[10px] text-faint">
+        <p className="truncate py-1 text-2xs text-faint">
           {t("remoteTerminal.openedAt", { cwd: ev.cwd ?? "" })}
         </p>
       );
     case "close":
       return (
-        <p className="py-1 text-[10px] text-faint">{t("remoteTerminal.closedPane")}</p>
+        <p className="py-1 text-2xs text-faint">{t("remoteTerminal.closedPane")}</p>
       );
     case "note":
       return <p className="py-0.5 text-xs italic text-faint">{ev.text}</p>;
     case "input":
       return (
-        <p className="whitespace-pre-wrap break-all font-mono text-[13px] font-medium text-ink">
+        <p className="whitespace-pre-wrap break-all font-mono text-sm font-medium text-ink">
           <span className="text-faint">$ </span>
           {ev.text}
         </p>
       );
     case "output":
       return (
-        <pre className="whitespace-pre-wrap break-all font-mono text-[13px] leading-relaxed text-dim">
+        <pre className="whitespace-pre-wrap break-all font-mono text-sm leading-relaxed text-dim">
           {ev.text}
         </pre>
       );
@@ -92,7 +92,7 @@ function EventRow({ ev }: { ev: TerminalEvent }) {
       const dur = fmtDuration(ev.durationMs);
       return (
         <p
-          className={`font-mono text-[11px] ${ok ? "text-emerald-400/90" : "text-red-400"}`}
+          className={`font-mono text-2xs ${ok ? "text-success/90" : "text-danger"}`}
         >
           {t("remoteTerminal.exitLine", {
             code: ev.exitCode ?? "?",
@@ -197,7 +197,7 @@ export function TerminalScreen() {
         <button
           onClick={closeTerminalScreen}
           aria-label={t("common.back")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-lg text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-lg text-dim hover:bg-hover active:bg-active"
         >
           <ChevronLeft className="size-5" />
         </button>
@@ -206,7 +206,7 @@ export function TerminalScreen() {
             {live?.title || target.title || t("chat.untitled")}
           </h1>
           {terminal?.cwd && (
-            <p className="truncate font-mono text-[10px] text-faint">{terminal.cwd}</p>
+            <p className="truncate font-mono text-2xs text-faint">{terminal.cwd}</p>
           )}
         </div>
         <ConnChip conn={conn} terminal={terminal} />
@@ -216,7 +216,7 @@ export function TerminalScreen() {
             closeTerminalScreen();
           }}
           aria-label={t("remoteTerminal.closeAction")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <X className="size-5" />
         </button>
@@ -234,8 +234,8 @@ export function TerminalScreen() {
           ))}
         </div>
         {error && (
-          <div className="mt-3 rounded-xl bg-red-500/10 px-3 py-2 ring-1 ring-inset ring-red-500/40">
-            <p className="text-xs font-medium text-red-400">
+          <div className="mt-3 rounded-xl bg-danger-wash px-3 py-2 ring-1 ring-inset ring-danger/40">
+            <p className="text-xs font-medium text-danger">
               {error.code === "disabled"
                 ? t("remoteTerminal.disabled")
                 : error.code === "no_carrier"
@@ -256,14 +256,14 @@ export function TerminalScreen() {
           <button
             onClick={() => reopenTerminal()}
             disabled={conn === "reconnecting"}
-            className="w-full rounded-xl bg-blue-500 px-4 py-3 text-sm font-medium text-white active:bg-blue-600 disabled:opacity-50"
+            className="w-full rounded-xl bg-ink px-4 py-3 text-sm font-medium text-canvas active:brightness-90 disabled:opacity-50"
           >
             {t("remoteTerminal.reopen")}
           </button>
         ) : running ? (
           <div className="flex items-center gap-2">
             <div className="flex min-w-0 flex-1 items-center gap-2 rounded-xl bg-raised px-3 py-2.5 ring-1 ring-inset ring-hairline">
-              <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-blue-400" />
+              <span className="size-1.5 shrink-0 animate-pulse rounded-full bg-info" />
               <span className="truncate font-mono text-sm text-dim">
                 {terminal?.turn?.command}
               </span>
@@ -271,14 +271,14 @@ export function TerminalScreen() {
             <button
               onClick={() => terminalConn()?.interrupt()}
               aria-label={t("remoteTerminal.interrupt")}
-              className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-red-500/15 text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/25"
+              className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-danger-wash text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
             >
               <Square className="size-4 fill-current" />
             </button>
           </div>
         ) : (
           <div className="flex items-center gap-2">
-            <div className="flex min-w-0 flex-1 items-center rounded-xl bg-raised px-3 ring-1 ring-inset ring-hairline focus-within:ring-blue-500/50">
+            <div className="flex min-w-0 flex-1 items-center rounded-xl bg-raised px-3 ring-1 ring-inset ring-hairline focus-within:ring-2 focus-within:ring-info/50">
               <input
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -309,7 +309,7 @@ export function TerminalScreen() {
               onClick={submit}
               disabled={!canSend || !input.trim()}
               aria-label={t("remoteTerminal.send")}
-              className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-blue-500 text-white active:bg-blue-600 disabled:opacity-50"
+              className="flex size-11 shrink-0 items-center justify-center rounded-xl bg-ink text-canvas active:brightness-90 disabled:opacity-50"
             >
               <ArrowUp className="size-5" />
             </button>

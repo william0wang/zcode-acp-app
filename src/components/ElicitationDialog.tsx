@@ -60,8 +60,8 @@ function QuestionBlock({
               }
               className={`rounded-xl px-3.5 py-2.5 text-left text-sm transition ${
                 on
-                  ? "bg-blue-600 font-medium text-white"
-                  : "bg-raised text-dim ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                  ? "bg-ink text-canvas active:brightness-90"
+                  : "bg-raised text-dim ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
               }`}
             >
               {o.label}
@@ -124,7 +124,7 @@ export function ElicitationDialog() {
         <div className="flex max-h-[75vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-hairline bg-surface">
           <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3">
             <h2 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-              <ListChecks className="size-4 shrink-0 text-cyan-400" />
+              <ListChecks className="size-4 shrink-0 text-info" />
               {elicitation.message || t("permission.planTitle")}
             </h2>
             {planField.description && (
@@ -138,19 +138,19 @@ export function ElicitationDialog() {
           <div className="px-4 pb-4 pt-3">
             <button
               onClick={() => answer("approve")}
-              className="w-full rounded-xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white active:bg-emerald-700"
+              className="w-full rounded-xl bg-success px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
             >
               {approve?.label || "Approve"}
             </button>
             <button
               onClick={() => answer("reject")}
-              className="mt-2 w-full rounded-xl bg-red-600/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-600/20"
+              className="mt-2 w-full rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
             >
               {reject?.label || "Reject"}
             </button>
             <button
               onClick={() => answerElicitation(elicitation.requestId, null)}
-              className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+              className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
             >
               {t("common.cancel")}
             </button>
@@ -202,13 +202,13 @@ export function ElicitationDialog() {
         <div className="px-4 pb-4 pt-1">
           <button
             onClick={submit}
-            className="w-full rounded-xl bg-blue-600 px-4 py-3 text-sm font-semibold text-white active:bg-blue-700"
+            className="w-full rounded-xl bg-ink px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
           >
             {t("permission.submit")}
           </button>
           <button
             onClick={() => answerElicitation(elicitation.requestId, null)}
-            className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+            className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
           >
             {t("common.cancel")}
           </button>

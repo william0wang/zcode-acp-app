@@ -113,7 +113,7 @@ export function WorkflowArgsForm({
         {name}
         {decl.required ? " *" : ""}
         {decl.description ? (
-          <span className="block text-[10px] text-faint">
+          <span className="block text-2xs text-faint">
             {decl.description}
           </span>
         ) : null}

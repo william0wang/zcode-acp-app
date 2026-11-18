@@ -102,13 +102,13 @@ export function WorkflowGateSheet({ onClose }: { onClose: () => void }) {
               }}
               className={`flex w-full items-center justify-between rounded-lg px-3 py-2.5 text-left text-sm ${
                 active
-                  ? "bg-white/[0.07] font-medium text-ink"
-                  : "text-dim active:bg-white/[0.05]"
+                  ? "bg-selected font-medium text-ink"
+                  : "text-dim hover:bg-hover active:bg-active"
               }`}
             >
               <span className="min-w-0 flex-1">
                 <span className="block truncate">{o.label}</span>
-                <span className="block truncate text-[11px] font-normal text-faint">
+                <span className="block truncate text-2xs font-normal text-faint">
                   {o.hint}
                 </span>
               </span>

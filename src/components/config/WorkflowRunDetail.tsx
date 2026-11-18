@@ -60,29 +60,29 @@ import {
  * NEUTRAL: a stopped run is not an error. Unknown tokens fall back neutral.
  */
 const STATUS_DOT: Record<string, string> = {
-  completed: "bg-emerald-400",
-  ok: "bg-emerald-400",
-  settled: "bg-emerald-400",
-  errored: "bg-red-400 ring-2 ring-red-400/25",
-  failed: "bg-red-400 ring-2 ring-red-400/25",
-  running: "bg-sky-400 animate-pulse",
-  dispatched: "bg-sky-400 animate-pulse",
-  executing: "bg-sky-400 animate-pulse",
-  pending: "bg-transparent ring-1 ring-white/40",
-  queued: "bg-transparent ring-1 ring-white/40",
-  waiting: "bg-transparent ring-1 ring-white/40",
-  stopped: "bg-white/35",
-  cancelled: "bg-white/35",
-  superseded: "bg-white/35",
-  interrupted: "bg-white/35",
+  completed: "bg-success",
+  ok: "bg-success",
+  settled: "bg-success",
+  errored: "bg-danger ring-2 ring-danger/25",
+  failed: "bg-danger ring-2 ring-danger/25",
+  running: "bg-info animate-pulse",
+  dispatched: "bg-info animate-pulse",
+  executing: "bg-info animate-pulse",
+  pending: "bg-transparent ring-1 ring-ink/50",
+  queued: "bg-transparent ring-1 ring-ink/50",
+  waiting: "bg-transparent ring-1 ring-ink/50",
+  stopped: "bg-faint",
+  cancelled: "bg-faint",
+  superseded: "bg-faint",
+  interrupted: "bg-faint",
 };
 
 export function StatusBadge({ status }: { status?: string }) {
   const { t } = useTranslation();
   const token = status ?? "";
   return (
-    <span className="flex shrink-0 items-center gap-1.5 rounded-md bg-white/[0.06] px-1.5 py-0.5 text-[10px] font-medium text-dim">
-      <span className={`size-1.5 shrink-0 rounded-full ${STATUS_DOT[token] ?? "bg-white/35"}`} />
+    <span className="flex shrink-0 items-center gap-1.5 rounded-md bg-hover px-1.5 py-0.5 text-2xs font-medium text-dim">
+      <span className={`size-1.5 shrink-0 rounded-full ${STATUS_DOT[token] ?? "bg-faint"}`} />
       {token ? statusWord(t, token) : "?"}
     </span>
   );
@@ -124,16 +124,16 @@ function formatBytes(n: number): string {
  * so a long node list scans by color before it reads by text.
  */
 const OP_TILE: Array<[RegExp, string]> = [
-  [/read|file|cat|list/, "bg-sky-500/15 text-sky-300"],
-  [/search|grep|glob|find|scan/, "bg-violet-500/15 text-violet-300"],
-  [/git/, "bg-amber-500/15 text-amber-300"],
-  [/shell|bash|exec|spawn|terminal|run/, "bg-emerald-500/15 text-emerald-300"],
-  [/write|edit|patch|apply|create|delete|move/, "bg-rose-500/15 text-rose-300"],
+  [/read|file|cat|list/, "bg-info-wash text-info"],
+  [/search|grep|glob|find|scan/, "bg-chart-6/15 text-chart-6"],
+  [/git/, "bg-warning-wash text-warning"],
+  [/shell|bash|exec|spawn|terminal|run/, "bg-success/15 text-success"],
+  [/write|edit|patch|apply|create|delete|move/, "bg-chart-4/15 text-chart-4"],
 ];
 
 function opTileClass(op?: string): string {
   if (op) for (const [re, cls] of OP_TILE) if (re.test(op)) return cls;
-  return "bg-white/[0.07] text-dim";
+  return "bg-selected text-dim";
 }
 
 /** Wall time between two epoch-ms stamps, compact ("12s" / "3m41s"). */
@@ -411,13 +411,13 @@ export function WorkflowRunDetail({
             onBack();
           }}
           aria-label={t("common.close")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ArrowLeft className="size-4.5" />
         </button>
         <span className="min-w-0 flex-1">
           <h1 className="truncate text-base font-semibold">{title}</h1>
-          <p className="flex items-center gap-1.5 text-[11px] text-faint">
+          <p className="flex items-center gap-1.5 text-2xs text-faint">
             <StatusBadge status={summary?.status} />
             <span className="min-w-0 flex-1 truncate">
               {[
@@ -430,7 +430,7 @@ export function WorkflowRunDetail({
             </span>
           </p>
           {(summary?.resumedFrom || summary?.supersededBy) && (
-            <p className="mt-0.5 truncate text-[10px] text-faint">
+            <p className="mt-0.5 truncate text-2xs text-faint">
               {summary?.resumedFrom &&
                 ` ${t("zconfig.workflowLineageFrom")} …${summary.resumedFrom.slice(-8)}`}
               {summary?.supersededBy &&
@@ -444,7 +444,7 @@ export function WorkflowRunDetail({
               <button
                 onClick={() => setAmending(true)}
                 aria-label={t("zconfig.workflowConfigure")}
-                className="flex size-8 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+                className="flex size-8 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
               >
                 <SlidersHorizontal className="size-4" />
               </button>
@@ -452,7 +452,7 @@ export function WorkflowRunDetail({
                 onClick={() => void stop()}
                 disabled={stopping}
                 aria-label={t("zconfig.workflowStop")}
-                className="flex size-8 items-center justify-center rounded-full bg-red-500/15 text-red-300 active:bg-red-500/25 disabled:opacity-40"
+                className="flex size-8 items-center justify-center rounded-full bg-danger-wash text-danger active:brightness-125 disabled:opacity-40"
               >
                 <Square className="size-3.5 fill-current" />
               </button>
@@ -461,7 +461,7 @@ export function WorkflowRunDetail({
           {summary?.resumable && (
             <button
               onClick={() => void resume()}
-              className="rounded-lg bg-sky-500/20 px-2.5 py-1.5 text-[11px] font-medium text-sky-300"
+              className="rounded-lg bg-info-wash px-2.5 py-1.5 text-2xs font-medium text-info"
             >
               {t("zconfig.workflowResume")}
             </button>
@@ -475,7 +475,7 @@ export function WorkflowRunDetail({
             key={id}
             onClick={() => setTab(id)}
             className={`flex-1 rounded-lg px-2 py-1.5 text-xs ${
-              tab === id ? "bg-white/[0.1] font-medium text-ink" : "text-dim active:bg-white/[0.05]"
+              tab === id ? "bg-active font-medium text-ink" : "text-dim hover:bg-hover active:bg-active"
             }`}
           >
             {label}
@@ -485,7 +485,7 @@ export function WorkflowRunDetail({
 
       <div className="flex-1 overflow-y-auto pb-[max(var(--safe-bottom),1rem)]">
         {sessionDead && (
-          <p className="mx-4 mb-2 rounded-xl bg-surface px-4 py-3 text-xs text-amber-300 ring-1 ring-hairline">
+          <p className="mx-4 mb-2 rounded-xl bg-surface px-4 py-3 text-xs text-warning ring-1 ring-hairline">
             {t("zconfig.workflowSessionLost")}
           </p>
         )}
@@ -498,7 +498,7 @@ export function WorkflowRunDetail({
                 <button
                   onClick={() => void fetchEvents(false)}
                   disabled={eventsBusy}
-                  className="mb-3 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+                  className="mb-3 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
                 >
                   {t("zconfig.workflowLoadNewer")}
                 </button>
@@ -507,7 +507,7 @@ export function WorkflowRunDetail({
                 <button
                   onClick={() => void fetchEvents(true)}
                   disabled={eventsBusy}
-                  className="mb-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+                  className="mb-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
                 >
                   {t("zconfig.workflowRetry")}
                 </button>
@@ -546,11 +546,11 @@ export function WorkflowRunDetail({
                   <button
                     key={a.id}
                     onClick={() => setOpenArtifact(a)}
-                    className="flex w-full items-start gap-3 px-4 py-3 text-left active:bg-white/[0.05]"
+                    className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-hover active:bg-active"
                   >
                     <span className="min-w-0 flex-1">
                       <span className="block text-sm text-ink">{a.title ?? a.id}</span>
-                      <span className="block text-[11px] text-faint">
+                      <span className="block text-2xs text-faint">
                         {a.kind}
                         {a.versions?.length ? ` · v${latestVersion(a)}` : ""}
                         {a.itemCount !== undefined ? ` · ${a.itemCount}` : ""}
@@ -588,7 +588,7 @@ export function WorkflowRunDetail({
                         className="flex w-full items-center gap-2.5 text-left"
                       >
                         <span
-                          className={`flex size-7 shrink-0 items-center justify-center rounded-lg font-mono text-[10px] font-semibold uppercase ${opTileClass(n.op)}`}
+                          className={`flex size-7 shrink-0 items-center justify-center rounded-lg font-mono text-2xs font-semibold uppercase ${opTileClass(n.op)}`}
                         >
                           {(n.op ?? "?").slice(0, 2)}
                         </span>
@@ -600,8 +600,8 @@ export function WorkflowRunDetail({
                             {argsText(n) ?? n.op ?? key}
                           </span>
                           <span
-                            className={`block truncate font-mono text-[10px] ${
-                              exitBad ? "text-red-300/90" : "text-faint"
+                            className={`block truncate font-mono text-2xs ${
+                              exitBad ? "text-danger/90" : "text-faint"
                             }`}
                           >
                             {[ref, n.summary ? nodeSummaryText(n.summary) : null]
@@ -610,7 +610,7 @@ export function WorkflowRunDetail({
                           </span>
                         </span>
                         {dur && (
-                          <span className="shrink-0 text-[10px] tabular-nums text-faint">
+                          <span className="shrink-0 text-2xs tabular-nums text-faint">
                             +{dur}
                           </span>
                         )}
@@ -750,7 +750,7 @@ function AmendSheet({
           className={`${configInputClass} font-mono`}
           placeholder="zhipu/glm-4.7"
         />
-        <label className="mt-1.5 flex items-center gap-2 text-[11px] text-dim">
+        <label className="mt-1.5 flex items-center gap-2 text-2xs text-dim">
           <input
             type="checkbox"
             checked={clearModel}
@@ -782,7 +782,7 @@ function AmendSheet({
           className={configInputClass}
           placeholder="4"
         />
-        <label className="mt-1.5 flex items-center gap-2 text-[11px] text-dim">
+        <label className="mt-1.5 flex items-center gap-2 text-2xs text-dim">
           <input
             type="checkbox"
             checked={clearConcurrency}
@@ -795,7 +795,7 @@ function AmendSheet({
           {t("zconfig.workflowClearConcurrency")}
         </label>
       </ConfigField>
-      <p className="px-1 text-[10px] leading-relaxed text-faint">
+      <p className="px-1 text-2xs leading-relaxed text-faint">
         {t("zconfig.workflowAmendHint")}
       </p>
     </ConfigFormSheet>
@@ -813,17 +813,17 @@ function StepRow({ n }: { n: NodeAgg }) {
   const [open, setOpen] = useState(false);
   const dot =
     n.state === "ok"
-      ? "bg-emerald-400"
+      ? "bg-success"
       : n.state === "failed"
-        ? "bg-red-400"
+        ? "bg-danger"
         : n.state === "cancelled"
-          ? "bg-white/35"
+          ? "bg-faint"
           : n.state === "waiting" || n.state === "repairing"
-            ? "bg-amber-400"
-            : "animate-pulse bg-sky-400";
+            ? "bg-warning"
+            : "animate-pulse bg-info";
   const word = nodeStateWord(t, n.state);
   const wordCls =
-    n.state === "failed" ? "text-red-300" : n.state === "ok" ? "text-emerald-300/80" : "text-faint";
+    n.state === "failed" ? "text-danger" : n.state === "ok" ? "text-success/80" : "text-faint";
   const title = n.label ?? `${n.site || "?"}${n.ordinal !== undefined ? `@${n.ordinal}` : ""}`;
   const sub = n.activity ?? n.head;
   const rows = open ? [...n.events].sort(newestFirst) : [];
@@ -831,25 +831,25 @@ function StepRow({ n }: { n: NodeAgg }) {
     <div className="py-1">
       <button onClick={() => setOpen(!open)} className="flex w-full items-center gap-2 text-left">
         <span className={`size-1.5 shrink-0 rounded-full ${dot}`} />
-        <span className="min-w-0 flex-1 truncate text-[11px] text-dim">
+        <span className="min-w-0 flex-1 truncate text-2xs text-dim">
           {title}
           {sub ? <span className="text-faint"> — {sub}</span> : null}
         </span>
-        {word !== null && <span className={`shrink-0 text-[10px] ${wordCls}`}>{word}</span>}
+        {word !== null && <span className={`shrink-0 text-2xs ${wordCls}`}>{word}</span>}
         <ChevronRight
           className={`size-3 shrink-0 text-faint transition-transform ${open ? "rotate-90" : ""}`}
         />
       </button>
       {!open && n.state === "failed" && n.error ? (
-        <p className="mt-0.5 truncate pl-3.5 text-[10px] text-red-300/90">{n.error}</p>
+        <p className="mt-0.5 truncate pl-3.5 text-2xs text-danger/90">{n.error}</p>
       ) : null}
       {open && (
         <div className="ml-[3px] mt-1 border-l border-hairline pl-3">
           {n.head ? (
-            <p className="break-words pb-1 text-[11px] leading-snug text-dim">{n.head}</p>
+            <p className="break-words pb-1 text-2xs leading-snug text-dim">{n.head}</p>
           ) : null}
           {n.error ? (
-            <p className="break-words pb-1 text-[11px] leading-snug text-red-300/90">{n.error}</p>
+            <p className="break-words pb-1 text-2xs leading-snug text-danger/90">{n.error}</p>
           ) : null}
           {rows.map((ev) => (
             <EventRow key={ev.sequence} ev={ev} omitSite />
@@ -912,10 +912,10 @@ function PhaseSection({
     ownNodes.some((n) => n.state === "failed") ||
     (settled !== null && describeRunEvent(t, settled).tone === "failed");
   const dot = failed
-    ? "bg-red-400"
+    ? "bg-danger"
     : head && running
-      ? "animate-pulse bg-sky-400"
-      : "bg-emerald-400/80";
+      ? "animate-pulse bg-info"
+      : "bg-success/80";
   const footer = [
     ownActors.length > 0
       ? `${t("zconfig.wfEvActorCreated")} · ${ownActors.map((a) => a.label).join(" · ")}`
@@ -934,7 +934,7 @@ function PhaseSection({
         <StepRow key={n.key} n={n} />
       ))}
       {footer.map((line) => (
-        <p key={line} className="truncate py-1 text-[10px] tabular-nums text-faint">
+        <p key={line} className="truncate py-1 text-2xs tabular-nums text-faint">
           {line}
         </p>
       ))}
@@ -952,7 +952,7 @@ function PhaseSection({
           ) : null}
         </span>
         {ownNodes.length > 0 && (
-          <span className="shrink-0 text-[10px] text-faint">
+          <span className="shrink-0 text-2xs text-faint">
             {t("zconfig.workflowPhaseNodes", { n: ownNodes.length })}
           </span>
         )}
@@ -983,14 +983,14 @@ function EventRow({ ev, omitSite }: { ev: WorkflowRunEvent; omitSite?: boolean }
             desc.monoLabel
               ? "font-mono text-faint"
               : desc.tone === "failed"
-                ? "text-red-300"
+                ? "text-danger"
                 : "text-dim"
           }`}
         >
           {desc.label}
         </span>
         {desc.detail ? (
-          <span className="min-w-0 flex-1 truncate text-[11px] text-faint">{desc.detail}</span>
+          <span className="min-w-0 flex-1 truncate text-2xs text-faint">{desc.detail}</span>
         ) : null}
       </button>
       {open && <RawData value={ev.payload} />}
@@ -1030,29 +1030,29 @@ function NodeResultView({
     <div className="mt-2 rounded-xl bg-raised p-3 ring-1 ring-hairline">
       {/* v4 node status enum: running | completed | failed — red is for
           failed only; anything else (incl. unknown tokens) stays quiet. */}
-      {status === "failed" ? <p className="mb-1.5 text-[11px] text-red-300">{status}</p> : null}
+      {status === "failed" ? <p className="mb-1.5 text-2xs text-danger">{status}</p> : null}
       {typeof body === "string" ? (
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-dim">
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs leading-relaxed text-dim">
           {body}
         </pre>
       ) : run !== null ? (
         <>
           {exitCode !== null && (
             <p
-              className={`mb-1.5 font-mono text-[11px] ${
-                exitCode !== 0 ? "text-red-300" : "text-faint"
+              className={`mb-1.5 font-mono text-2xs ${
+                exitCode !== 0 ? "text-danger" : "text-faint"
               }`}
             >
               exit {exitCode}
             </p>
           )}
           {stdout && (
-            <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-dim">
+            <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs leading-relaxed text-dim">
               {stdout}
             </pre>
           )}
           {stderr && (
-            <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] leading-relaxed text-red-300/90">
+            <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap break-all font-mono text-2xs leading-relaxed text-danger/90">
               {stderr}
             </pre>
           )}
@@ -1061,17 +1061,17 @@ function NodeResultView({
         <div className="flex flex-col gap-0.5">
           {rest.map(([k, v]) => (
             <p key={k} className="flex items-baseline justify-between gap-3">
-              <span className="min-w-0 shrink-0 truncate text-[11px] text-faint">{k}</span>
-              <span className="min-w-0 break-all text-right font-mono text-[11px] text-dim">
+              <span className="min-w-0 shrink-0 truncate text-2xs text-faint">{k}</span>
+              <span className="min-w-0 break-all text-right font-mono text-2xs text-dim">
                 {cellText(v)}
               </span>
             </p>
           ))}
         </div>
       ) : (
-        <p className="break-all font-mono text-[11px] text-dim">{cellText(body)}</p>
+        <p className="break-all font-mono text-2xs text-dim">{cellText(body)}</p>
       )}
-      {truncated && <p className="mt-1 text-[10px] text-faint">{t("zconfig.workflowTruncated")}</p>}
+      {truncated && <p className="mt-1 text-2xs text-faint">{t("zconfig.workflowTruncated")}</p>}
       <RawData value={body} />
     </div>
   );
@@ -1098,7 +1098,7 @@ function ViewerShell({
         <button
           onClick={onBack}
           aria-label={t("common.close")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ArrowLeft className="size-4.5" />
         </button>
@@ -1264,7 +1264,7 @@ function ArtifactViewer({
               })}
             </p>
           ) : (
-            <pre className="whitespace-pre-wrap break-all pt-2 font-mono text-[11px] leading-relaxed text-dim">
+            <pre className="whitespace-pre-wrap break-all pt-2 font-mono text-2xs leading-relaxed text-dim">
               {text}
             </pre>
           )}
@@ -1272,7 +1272,7 @@ function ArtifactViewer({
             <button
               onClick={() => void loadChunk(nextOffset, true)}
               disabled={busy}
-              className="mt-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+              className="mt-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
             >
               {t("zconfig.workflowLoadMore")}
             </button>
@@ -1297,7 +1297,7 @@ function ArtifactViewer({
         <button
           onClick={() => void loadData(false)}
           disabled={busy}
-          className="mt-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+          className="mt-4 w-full rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
         >
           {t("zconfig.workflowLoadMore")}
         </button>

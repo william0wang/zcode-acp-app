@@ -7,7 +7,7 @@ import { useAppStore } from "../store/appStore";
 import type { SavedServer } from "../lib/types";
 
 const inputClass =
-  "mt-1 w-full rounded-xl bg-raised px-4 py-3 text-sm text-ink ring-1 ring-inset ring-hairline placeholder:text-faint focus:ring-2 focus:ring-white/40 focus:outline-none";
+  "mt-1 w-full rounded-xl bg-raised px-4 py-3 text-sm text-ink ring-1 ring-inset ring-hairline placeholder:text-faint focus:ring-2 focus:ring-ink/40 focus:outline-none";
 
 // Same-origin mode (the hub serves the web build itself): an empty URL means
 // "this page's origin". Only a real browser over http(s) qualifies — the
@@ -137,7 +137,7 @@ function ServerForm({
       />
 
       {error && (
-        <p className="mt-4 rounded-lg border border-red-900 bg-red-950 px-3 py-2 text-xs text-red-300">
+        <p className="mt-4 rounded-lg border border-danger/30 bg-danger-wash px-3 py-2 text-xs text-danger">
           {error}
         </p>
       )}
@@ -165,8 +165,8 @@ function ServerForm({
           }}
           className={`mt-2 w-full rounded-xl px-3 py-2 text-xs font-medium transition ${
             confirmDelete
-              ? "bg-red-500 text-white active:bg-red-600"
-              : "bg-red-500/10 text-red-400 active:bg-red-500/20"
+              ? "bg-danger-strong text-white active:brightness-90"
+              : "bg-danger-wash text-danger active:brightness-125"
           }`}
         >
           {confirmDelete
@@ -179,7 +179,7 @@ function ServerForm({
         <button
           type="button"
           onClick={onCancel}
-          className="mt-2 w-full rounded-xl px-3 py-2 text-xs font-medium text-dim active:bg-white/[0.06]"
+          className="mt-2 w-full rounded-xl px-3 py-2 text-xs font-medium text-dim hover:bg-hover active:bg-active"
         >
           {t("common.cancel")}
         </button>
@@ -229,7 +229,7 @@ export function ConnectScreen({ onClose }: { onClose?: () => void }) {
           <button
             onClick={onClose}
             aria-label={t("common.back")}
-            className="absolute left-0 top-10 flex size-9 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="absolute left-0 top-10 flex size-9 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <ChevronLeft className="size-5" />
           </button>
@@ -240,7 +240,7 @@ export function ConnectScreen({ onClose }: { onClose?: () => void }) {
         <p className="mt-2 text-center text-sm text-faint">
           {t("connect.subtitle")}
         </p>
-        <p className="mt-1 text-center text-[11px] text-faint">
+        <p className="mt-1 text-center text-2xs text-faint">
           v{__APP_VERSION__}
         </p>
 
@@ -265,7 +265,7 @@ export function ConnectScreen({ onClose }: { onClose?: () => void }) {
                 >
                   <button
                     onClick={() => switchServer(s.id)}
-                    className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-4 py-3 text-left active:bg-white/[0.05]"
+                    className="flex min-w-0 flex-1 items-center gap-2 rounded-xl px-4 py-3 text-left hover:bg-hover active:bg-active"
                   >
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-sm font-medium">
@@ -282,7 +282,7 @@ export function ConnectScreen({ onClose }: { onClose?: () => void }) {
                   <button
                     onClick={() => setEditing(s)}
                     aria-label={t("connect.editServer")}
-                    className="mr-1 flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+                    className="mr-1 flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
                   >
                     <Pencil className="size-4" />
                   </button>
@@ -291,7 +291,7 @@ export function ConnectScreen({ onClose }: { onClose?: () => void }) {
             </div>
             <button
               onClick={() => setAdding(true)}
-              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-hairline px-3 py-2.5 text-xs font-medium text-dim active:bg-white/[0.05]"
+              className="mt-4 flex w-full items-center justify-center gap-2 rounded-xl border border-dashed border-hairline px-3 py-2.5 text-xs font-medium text-dim hover:bg-hover active:bg-active"
             >
               <Plus className="size-4" />
               {t("connect.addServer")}

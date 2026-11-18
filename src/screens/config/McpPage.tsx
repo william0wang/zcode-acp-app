@@ -130,17 +130,17 @@ export function McpPage() {
               <button
                 key={name}
                 onClick={() => setEditing(s)}
-                className="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-white/[0.05]"
+                className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-hover active:bg-active"
               >
                 <span className="min-w-0 flex-1">
                   <span className="block text-sm text-ink">{name}</span>
-                  <span className="block truncate font-mono text-[10px] text-faint">
+                  <span className="block truncate font-mono text-2xs text-faint">
                     {s.command
                       ? [s.command, ...(s.args ?? [])].join(" ")
                       : (s.url ?? s.type ?? "")}
                   </span>
                   {s.enabled === false && (
-                    <span className="block text-[10px] text-faint">
+                    <span className="block text-2xs text-faint">
                       {t("zconfig.disabled")}
                     </span>
                   )}
@@ -155,7 +155,7 @@ export function McpPage() {
       <div className="px-4">
         <button
           onClick={() => setAdding(true)}
-          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
         >
           <Plus className="size-4" />
           {t("zconfig.mcpAdd")}

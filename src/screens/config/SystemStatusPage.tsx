@@ -87,7 +87,7 @@ function BarRow({
           {value}
         </span>
       </div>
-      <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
+      <div className="mt-1 h-1 overflow-hidden rounded-full bg-selected">
         <div
           className="h-full rounded-full"
           style={
@@ -330,7 +330,7 @@ export function SystemStatusPage() {
             )}
           </ConfigBlock>
 
-          <p className="px-4 pb-2 pt-3 text-[11px] text-faint">
+          <p className="px-4 pb-2 pt-3 text-2xs text-faint">
             {t("system.collected", { time: fmtStamp(stats.collectedAt) })}
           </p>
         </>

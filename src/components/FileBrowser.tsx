@@ -49,7 +49,7 @@ function cacheListing(path: string, listing: FsListing): void {
 
 function EntryIcon({ kind }: { kind: FsEntry["kind"] }) {
   if (kind === "dir")
-    return <Folder className="size-4.5 shrink-0 text-blue-400" />;
+    return <Folder className="size-4.5 shrink-0 text-info" />;
   if (kind === "symlink")
     return <Link2 className="size-4.5 shrink-0 text-faint" />;
   return <FileText className="size-4.5 shrink-0 text-faint" />;
@@ -182,14 +182,14 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
               : onClose
           }
           aria-label={t("files.back")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ArrowLeft className="size-5" />
         </button>
-        <nav className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-[13px] text-dim">
+        <nav className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto text-sm text-dim">
           <button
             onClick={() => setPath("")}
-            className="shrink-0 truncate text-ink active:text-blue-400"
+            className="shrink-0 truncate text-ink active:text-info"
           >
             {rootName}
           </button>
@@ -201,7 +201,7 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
                 className={
                   i === segments.length - 1
                     ? "truncate text-ink"
-                    : "truncate active:text-blue-400"
+                    : "truncate active:text-info"
                 }
               >
                 {seg}
@@ -212,8 +212,8 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
         <button
           onClick={() => setShowHidden((v) => !v)}
           aria-label={t("files.showHidden")}
-          className={`flex size-9 shrink-0 items-center justify-center rounded-full active:bg-white/[0.06] ${
-            showHidden ? "text-blue-400" : "text-dim"
+          className={`flex size-9 shrink-0 items-center justify-center rounded-full hover:bg-hover active:bg-active ${
+            showHidden ? "text-info" : "text-dim"
           }`}
         >
           {showHidden ? (
@@ -226,7 +226,7 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
           <button
             onClick={() => void openCurrentDir()}
             aria-label={t("files.openLocalDir")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <FolderOpen className="size-4.5" />
           </button>
@@ -234,7 +234,7 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
         <button
           onClick={() => setAttempt((n) => n + 1)}
           aria-label={t("files.retry")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <RefreshCw className="size-4.5" />
         </button>
@@ -242,14 +242,14 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
         <button
           onClick={onClose}
           aria-label={t("files.close")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <X className="size-5" />
         </button>
       </header>
 
       {listing?.truncated && (
-        <div className="bg-amber-950 px-4 py-1 text-center text-[11px] text-amber-300">
+        <div className="bg-warning-wash px-4 py-1 text-center text-2xs text-warning">
           {t("files.truncated")}
         </div>
       )}
@@ -263,7 +263,7 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
           <span>{t("files.loadError")}</span>
           <button
             onClick={() => setAttempt((n) => n + 1)}
-            className="text-xs text-blue-400 active:text-blue-300"
+            className="text-xs text-info active:text-info"
           >
             {t("files.retry")}
           </button>
@@ -295,14 +295,14 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
                     height: item.size,
                     transform: `translateY(${item.start}px)`,
                   }}
-                  className="flex items-center gap-2.5 border-b border-hairline px-4 text-left active:bg-white/[0.04]"
+                  className="flex items-center gap-2.5 border-b border-hairline px-4 text-left hover:bg-hover active:bg-active"
                 >
                   <EntryIcon kind={entry.kind} />
                   <span className="min-w-0 flex-1 truncate text-[14px]">
                     {entry.name}
                   </span>
                   {entry.kind === "file" && (
-                    <span className="shrink-0 text-[11px] text-faint">
+                    <span className="shrink-0 text-2xs text-faint">
                       {fmtSize(entry.size)}
                     </span>
                   )}

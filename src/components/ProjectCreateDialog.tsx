@@ -167,12 +167,12 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
               }}
               disabled={creating !== null}
               aria-label={t("files.back")}
-              className="-ml-1 flex size-6 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06] disabled:opacity-50"
+              className="-ml-1 flex size-6 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active disabled:opacity-50"
             >
               <ArrowLeft className="size-4" />
             </button>
           ) : (
-            <FolderPlus className="size-4 shrink-0 text-cyan-400" />
+            <FolderPlus className="size-4 shrink-0 text-info" />
           )}
           <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-ink">
             {browse ? t("projectDialog.browse") : t("projectDialog.title")}
@@ -184,7 +184,7 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
                 void openDir(undefined, true);
               }}
               aria-label={t("projectDialog.browse")}
-              className="flex size-6 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+              className="flex size-6 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
             >
               <Folder className="size-4" />
             </button>
@@ -194,7 +194,7 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
           </button>
         </div>
         {browse ? (
-          <p className="truncate px-4 pt-1 font-mono text-[10px] text-faint">
+          <p className="truncate px-4 pt-1 font-mono text-2xs text-faint">
             {creating ? t("projectDialog.creatingHint") : (dir?.path ?? "")}
           </p>
         ) : (
@@ -211,7 +211,7 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
               <button
                 onClick={() => dir && void pick(dir.path)}
                 disabled={!dir?.creatable || creating !== null}
-                className="flex w-full items-center justify-center gap-2 rounded-xl bg-cyan-600 px-4 py-2.5 text-sm font-medium text-white active:bg-cyan-500 disabled:opacity-40"
+                className="flex w-full items-center justify-center gap-2 rounded-xl bg-ink px-4 py-2.5 text-sm font-medium text-canvas active:brightness-90 disabled:opacity-40"
               >
                 {creating === dir?.path && (
                   <Loader2 className="size-4 animate-spin" />
@@ -219,14 +219,14 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
                 {t("projectDialog.startHere")}
               </button>
               {dir && !dir.creatable && (
-                <p className="pt-1.5 text-[10px] leading-snug text-faint">
+                <p className="pt-1.5 text-2xs leading-snug text-faint">
                   {t("projectDialog.notAllowed")}
                 </p>
               )}
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
               {dirError && (
-                <p className="mx-2 rounded-lg bg-amber-950 px-3 py-2 text-xs text-amber-300 ring-1 ring-amber-900">
+                <p className="mx-2 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning ring-1 ring-warning/30">
                   {dirError}
                 </p>
               )}
@@ -240,7 +240,7 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
                 <button
                   onClick={() => void openDir(dir.parent!)}
                   disabled={creating !== null}
-                  className="mb-1 flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm text-dim active:bg-white/[0.05] disabled:opacity-50"
+                  className="mb-1 flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left text-sm text-dim hover:bg-hover active:bg-active disabled:opacity-50"
                 >
                   <ArrowUp className="size-4 shrink-0" />
                   <span className="min-w-0 flex-1 truncate font-mono text-xs">
@@ -259,16 +259,16 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
                     key={`${dir.path}/${e.name}`}
                     onClick={() => void openDir(`${dir.path}/${e.name}`)}
                     disabled={creating !== null}
-                    className="mb-1 flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left active:bg-white/[0.05] disabled:opacity-50"
+                    className="mb-1 flex w-full items-center gap-2 rounded-xl px-3 py-2.5 text-left hover:bg-hover active:bg-active disabled:opacity-50"
                   >
-                    <Folder className="size-4 shrink-0 text-cyan-400" />
+                    <Folder className="size-4 shrink-0 text-info" />
                     <span className="min-w-0 flex-1 truncate text-sm text-ink">
                       {e.name}
                     </span>
                   </button>
                 ))}
               {dir?.truncated && dir.entries.length > 0 && (
-                <p className="px-4 py-2 text-center text-[10px] text-faint">
+                <p className="px-4 py-2 text-center text-2xs text-faint">
                   {t("projectDialog.listTruncated")}
                 </p>
               )}
@@ -288,7 +288,7 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
 
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
               {error && (
-                <p className="mx-2 rounded-lg bg-amber-950 px-3 py-2 text-xs text-amber-300 ring-1 ring-amber-900">
+                <p className="mx-2 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning ring-1 ring-warning/30">
                   {error}
                 </p>
               )}
@@ -308,21 +308,21 @@ export function ProjectCreateDialog({ onClose }: { onClose: () => void }) {
                   key={p.workspacePath}
                   onClick={() => void pick(p.workspacePath)}
                   disabled={creating !== null}
-                  className="mb-1 flex w-full flex-col items-start gap-0.5 rounded-xl px-3 py-2.5 text-left active:bg-white/[0.05] disabled:opacity-50"
+                  className="mb-1 flex w-full flex-col items-start gap-0.5 rounded-xl px-3 py-2.5 text-left hover:bg-hover active:bg-active disabled:opacity-50"
                 >
                   <span className="flex w-full items-center gap-2">
                     <span className="min-w-0 flex-1 truncate text-sm text-ink">
                       {projectName(p.workspacePath)}
                     </span>
                     {creating === p.workspacePath ? (
-                      <Loader2 className="size-4 shrink-0 animate-spin text-cyan-400" />
+                      <Loader2 className="size-4 shrink-0 animate-spin text-info" />
                     ) : (
-                      <span className="shrink-0 text-[10px] text-faint">
+                      <span className="shrink-0 text-2xs text-faint">
                         {t("projectDialog.sessionCount", { count: p.sessions })}
                       </span>
                     )}
                   </span>
-                  <span className="flex w-full items-center gap-2 text-[10px] text-faint">
+                  <span className="flex w-full items-center gap-2 text-2xs text-faint">
                     <span className="min-w-0 flex-1 truncate font-mono">
                       {p.workspacePath}
                     </span>

@@ -86,13 +86,13 @@ export function RawData({ value }: { value: unknown }) {
     <div className="mt-3">
       <button
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1 text-[11px] text-faint active:text-dim"
+        className="flex items-center gap-1 text-2xs text-faint active:text-dim"
       >
         <span className={`text-[9px] transition-transform ${open ? "rotate-90" : ""}`}>▶</span>
         {t("zconfig.workflowRawData")}
       </button>
       {open && (
-        <pre className="mt-2 max-h-72 overflow-auto rounded-xl bg-raised p-3 font-mono text-[11px] leading-relaxed text-dim ring-1 ring-hairline">
+        <pre className="mt-2 max-h-72 overflow-auto rounded-xl bg-raised p-3 font-mono text-2xs leading-relaxed text-dim ring-1 ring-hairline">
           {prettyJson(value)}
         </pre>
       )}
@@ -124,7 +124,7 @@ export function KeyValueCards({
           <div key={it.sequence} className="rounded-xl bg-surface px-3 py-2 ring-1 ring-hairline">
             {Object.entries(it.item).map(([k, v]) => (
               <div key={k} className="flex items-baseline justify-between gap-3 py-0.5">
-                <span className="min-w-0 shrink-0 truncate text-[11px] text-faint">{k}</span>
+                <span className="min-w-0 shrink-0 truncate text-2xs text-faint">{k}</span>
                 <span className="min-w-0 break-all text-right font-mono text-xs text-ink">
                   {cellText(v)}
                 </span>
@@ -183,7 +183,7 @@ export function TableView({
 
   return (
     <div className="overflow-x-auto pt-2">
-      <table className="w-full border-collapse text-left text-[11px]">
+      <table className="w-full border-collapse text-left text-2xs">
         <thead>
           <tr>
             {columns.map((c) => (
@@ -244,10 +244,10 @@ export function MetricsTiles({
     <div className="grid grid-cols-2 gap-2 pt-2">
       {fields.map((f) => (
         <div key={f.field} className="rounded-xl bg-surface px-3 py-2.5 ring-1 ring-hairline">
-          <p className="truncate text-[11px] text-faint">{fieldLabel(f)}</p>
+          <p className="truncate text-2xs text-faint">{fieldLabel(f)}</p>
           <p className="mt-0.5 truncate font-mono text-base text-ink">
             {cellText(latest.get(f.field)) || "—"}
-            {f.unit ? <span className="ml-0.5 text-[11px] text-faint">{f.unit}</span> : null}
+            {f.unit ? <span className="ml-0.5 text-2xs text-faint">{f.unit}</span> : null}
           </p>
         </div>
       ))}
@@ -340,10 +340,10 @@ export function BoardView({
           <section key={col}>
             <header className="mb-1.5 flex items-baseline gap-2 border-b border-hairline pb-1">
               <span className="text-xs font-medium text-ink">{col}</span>
-              <span className="text-[10px] text-faint">{colCards.length}</span>
+              <span className="text-2xs text-faint">{colCards.length}</span>
             </header>
             {colCards.length === 0 ? (
-              <p className="py-1 text-[11px] text-faint">{t("zconfig.workflowBoardEmpty")}</p>
+              <p className="py-1 text-2xs text-faint">{t("zconfig.workflowBoardEmpty")}</p>
             ) : (
               <div className="flex flex-col gap-1.5">
                 {colCards.map(([cardKey, c]) => (
@@ -354,10 +354,10 @@ export function BoardView({
                     <p className="truncate text-xs text-ink">{c.title}</p>
                     {c.details.map((d) => (
                       <p key={d.label} className="mt-0.5 flex items-baseline justify-between gap-3">
-                        <span className="min-w-0 shrink-0 truncate text-[10px] text-faint">
+                        <span className="min-w-0 shrink-0 truncate text-2xs text-faint">
                           {d.label}
                         </span>
-                        <span className="min-w-0 break-all text-right font-mono text-[11px] text-dim">
+                        <span className="min-w-0 break-all text-right font-mono text-2xs text-dim">
                           {d.value}
                         </span>
                       </p>
@@ -490,7 +490,19 @@ export function ChartView({
   const xMax = Math.max(...xs, categories.length > 0 ? categories.length - 1 : 0);
   const xPix = (v: number) => PAD.l + ((v - xMin) / (xMax - xMin || 1)) * iw;
 
-  const SERIES_COLORS = ["#38bdf8", "#34d399", "#f472b6", "#fbbf24", "#a78bfa"];
+  // Series colors ride the token palette; SVG attributes cannot hold var()
+  // references, so resolve the custom properties (per render, cheap).
+  const SERIES_COLORS = [
+    "--color-info",
+    "--color-success",
+    "--color-chart-4",
+    "--color-warning",
+    "--color-chart-6",
+  ].map(
+    (v, i) =>
+      getComputedStyle(document.documentElement).getPropertyValue(v).trim() ||
+      ["#38bdf8", "#34d399", "#f472b6", "#fbbf24", "#a78bfa"][i],
+  );
   const fmt = (v: number) =>
     Math.abs(v) >= 1000
       ? v.toLocaleString(undefined, { maximumFractionDigits: 0 })
@@ -508,7 +520,7 @@ export function ChartView({
               x2={W - PAD.r}
               y1={yPix(v)}
               y2={yPix(v)}
-              stroke="rgba(255,255,255,0.08)"
+              className="stroke-hairline"
               strokeWidth="1"
             />
             <text
@@ -516,7 +528,7 @@ export function ChartView({
               y={yPix(v) + 3}
               textAnchor="end"
               fontSize="8"
-              fill="rgba(255,255,255,0.45)"
+              className="fill-faint"
             >
               {fmt(v)}
             </text>
@@ -528,7 +540,7 @@ export function ChartView({
             x2={W - PAD.r}
             y1={yPix(baselinePoint)}
             y2={yPix(baselinePoint)}
-            stroke="rgba(255,255,255,0.35)"
+            className="stroke-faint"
             strokeDasharray="3 3"
             strokeWidth="1"
           />
@@ -595,7 +607,7 @@ export function ChartView({
                 y={H - 6}
                 textAnchor="middle"
                 fontSize="8"
-                fill="rgba(255,255,255,0.45)"
+                className="fill-faint"
               >
                 {c.length > 6 ? `${c.slice(0, 5)}…` : c}
               </text>
@@ -613,9 +625,9 @@ export function ChartView({
                   className="size-1.5 shrink-0 rounded-full"
                   style={{ background: SERIES_COLORS[si % SERIES_COLORS.length] }}
                 />
-                <span className="truncate text-[11px] text-dim">{s.label}</span>
+                <span className="truncate text-2xs text-dim">{s.label}</span>
               </span>
-              <span className="shrink-0 font-mono text-[11px] text-ink">
+              <span className="shrink-0 font-mono text-2xs text-ink">
                 {last ? fmt(last.y) : "—"}
                 {s.unit ? <span className="ml-0.5 text-faint"> {s.unit}</span> : null}
               </span>
@@ -623,7 +635,7 @@ export function ChartView({
           );
         })}
       </div>
-      {useLog && <p className="mt-1 text-[10px] text-faint">log scale</p>}
+      {useLog && <p className="mt-1 text-2xs text-faint">log scale</p>}
     </div>
   );
 }
@@ -651,7 +663,7 @@ export function ArtifactMetaCard({ artifact }: { artifact: WorkflowArtifact }) {
   const extras = Object.entries(artifact).filter(([k]) => !known.has(k));
   return (
     <div className="pt-2">
-      <span className="inline-block rounded-md bg-white/[0.06] px-1.5 py-0.5 font-mono text-[10px] text-dim">
+      <span className="inline-block rounded-md bg-hover px-1.5 py-0.5 font-mono text-2xs text-dim">
         {artifact.kind}
       </span>
       {typeof artifact.description === "string" && artifact.description && (
@@ -669,16 +681,16 @@ export function ArtifactMetaCard({ artifact }: { artifact: WorkflowArtifact }) {
           .filter((x): x is [string, string] => x !== null)
           .map(([k, v]) => (
             <p key={k} className="flex items-baseline justify-between gap-3 py-0.5">
-              <span className="shrink-0 text-[11px] text-faint">{k}</span>
-              <span className="min-w-0 break-all text-right font-mono text-[11px] text-dim">
+              <span className="shrink-0 text-2xs text-faint">{k}</span>
+              <span className="min-w-0 break-all text-right font-mono text-2xs text-dim">
                 {v}
               </span>
             </p>
           ))}
         {extras.map(([k, v]) => (
           <p key={k} className="flex items-baseline justify-between gap-3 py-0.5">
-            <span className="min-w-0 shrink-0 truncate text-[11px] text-faint">{k}</span>
-            <span className="min-w-0 break-all text-right font-mono text-[11px] text-dim">
+            <span className="min-w-0 shrink-0 truncate text-2xs text-faint">{k}</span>
+            <span className="min-w-0 break-all text-right font-mono text-2xs text-dim">
               {cellText(v)}
             </span>
           </p>

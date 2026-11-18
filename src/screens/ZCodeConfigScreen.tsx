@@ -176,7 +176,7 @@ export function ZCodeConfigScreen() {
     >
       {/* The machine these screens configure, so a multi-hub user can tell
           which one they are about to change. */}
-      <p className="px-4 pb-1 pt-1 text-[11px] text-faint">
+      <p className="px-4 pb-1 pt-1 text-2xs text-faint">
         {t("zconfig.scope")}
       </p>
       <div className="mt-1">
@@ -184,12 +184,12 @@ export function ZCodeConfigScreen() {
           <button
             key={id}
             onClick={() => openConfig(id)}
-            className="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-white/[0.05]"
+            className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-hover active:bg-active"
           >
             <Icon className="size-4.5 shrink-0 text-faint" />
             <span className="min-w-0 flex-1">
               <span className="block text-sm text-ink">{title}</span>
-              <span className="block truncate text-[11px] text-faint">
+              <span className="block truncate text-2xs text-faint">
                 {hint}
               </span>
             </span>
@@ -202,14 +202,14 @@ export function ZCodeConfigScreen() {
             older bridge the write 404s into the standard failure toast. */}
         <button
           onClick={() => setGateSheetOpen(true)}
-          className="flex w-full items-center gap-3 px-4 py-3 text-left active:bg-white/[0.05]"
+          className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-hover active:bg-active"
         >
           <Workflow className="size-4.5 shrink-0 text-faint" />
           <span className="min-w-0 flex-1">
             <span className="block text-sm text-ink">
               {t("zconfig.workflowGate")}
             </span>
-            <span className="block truncate text-[11px] text-faint">
+            <span className="block truncate text-2xs text-faint">
               {t(gateLabelKey)}
             </span>
           </span>
@@ -247,19 +247,19 @@ function RestartNote() {
   return (
     <div className="mx-4 mt-4 rounded-xl bg-surface px-4 py-3 ring-1 ring-hairline">
       <p className="text-xs text-dim">{t("zconfig.restartPending")}</p>
-      <p className="pt-1 text-[11px] text-faint">
+      <p className="pt-1 text-2xs text-faint">
         {t("zconfig.restartWarning")}
       </p>
       {instanceId ? (
         <button
           onClick={() => void restartConfigBackend()}
-          className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg bg-white/[0.08] px-3 py-2 text-xs font-medium text-ink active:bg-white/[0.12]"
+          className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg bg-selected px-3 py-2 text-xs font-medium text-ink hover:bg-hover active:bg-active"
         >
           <RefreshCw className="size-3.5" />
           {t("zconfig.restart")}
         </button>
       ) : (
-        <p className="pt-2 text-[11px] text-amber-300">
+        <p className="pt-2 text-2xs text-warning">
           {t("zconfig.restartNoInstance")}
         </p>
       )}

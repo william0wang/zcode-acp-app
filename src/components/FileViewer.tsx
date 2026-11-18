@@ -353,7 +353,7 @@ function TextViewer({ path }: TextViewerProps) {
         <span>{t("files.loadError")}</span>
         <button
           onClick={() => setAttempt((n) => n + 1)}
-          className="text-xs text-blue-400 active:text-blue-300"
+          className="text-xs text-info active:text-info"
         >
           {t("files.retry")}
         </button>
@@ -375,7 +375,7 @@ function TextViewer({ path }: TextViewerProps) {
           </pre>
         </div>
       </div>
-      <div className="flex items-center justify-between gap-2 border-t border-hairline px-3 py-2 text-[11px] text-faint">
+      <div className="flex items-center justify-between gap-2 border-t border-hairline px-3 py-2 text-2xs text-faint">
         <span>
           {t("viewer.lines", { count: firstLine + lines.length - 1 })}
           {truncatedLines ? ` · ${t("viewer.longLines")}` : ""}
@@ -387,7 +387,7 @@ function TextViewer({ path }: TextViewerProps) {
         ) : (
           <button
             onClick={loadMore}
-            className="rounded-full bg-white/[0.06] px-3 py-1 text-dim active:bg-white/[0.1]"
+            className="rounded-full bg-hover px-3 py-1 text-dim active:bg-active"
           >
             {t("viewer.loadMore")}
           </button>
@@ -455,7 +455,7 @@ function MarkdownView({ path }: { path: string }) {
         <span>{t("files.loadError")}</span>
         <button
           onClick={() => setAttempt((n) => n + 1)}
-          className="text-xs text-blue-400 active:text-blue-300"
+          className="text-xs text-info active:text-info"
         >
           {t("files.retry")}
         </button>
@@ -468,7 +468,7 @@ function MarkdownView({ path }: { path: string }) {
         <MarkdownText text={text ?? ""} />
       </div>
       {capped && (
-        <div className="border-t border-hairline px-3 py-2 text-center text-[11px] text-faint">
+        <div className="border-t border-hairline px-3 py-2 text-center text-2xs text-faint">
           {t("viewer.lineCap")}
         </div>
       )}
@@ -668,27 +668,27 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
         <button
           onClick={onClose}
           aria-label={t("files.back")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ArrowLeft className="size-5" />
         </button>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[15px] font-medium">{file.name}</div>
-          <div className="text-[11px] text-faint">{fmtSize(file.size)}</div>
+          <div className="truncate text-base font-medium">{file.name}</div>
+          <div className="text-2xs text-faint">{fmtSize(file.size)}</div>
         </div>
         {localPath && (
           <>
             <button
               onClick={() => void openLocal(false)}
               aria-label={t("viewer.openLocal")}
-              className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+              className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
             >
               <ExternalLink className="size-5" />
             </button>
             <button
               onClick={() => void openLocal(true)}
               aria-label={t("viewer.revealLocal")}
-              className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+              className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
             >
               <FolderOpen className="size-5" />
             </button>
@@ -698,7 +698,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
           <button
             onClick={() => setMdSource((v) => !v)}
             aria-label={mdSource ? t("viewer.preview") : t("viewer.source")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             {mdSource ? (
               <Eye className="size-5" />
@@ -711,7 +711,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
           <button
             onClick={onExit}
             aria-label={t("files.close")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <X className="size-5" />
           </button>
@@ -749,7 +749,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
               <button
                 onClick={downloadFile}
                 disabled={downloading}
-                className="flex items-center gap-1.5 rounded-full bg-blue-600 px-4 py-2 text-sm text-white active:bg-blue-500 disabled:opacity-50"
+                className="flex items-center gap-1.5 rounded-full bg-ink px-4 py-2 text-sm text-canvas active:brightness-90 disabled:opacity-50"
               >
                 {downloading ? (
                   <Spinner className="size-4" />
@@ -764,7 +764,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
                 <button
                   onClick={shareFile}
                   disabled={sharing}
-                  className="flex items-center gap-1.5 rounded-full bg-white/[0.06] px-4 py-2 text-sm text-dim active:bg-white/[0.1] disabled:opacity-50"
+                  className="flex items-center gap-1.5 rounded-full bg-hover px-4 py-2 text-sm text-dim active:bg-active disabled:opacity-50"
                 >
                   {sharing ? (
                     <Spinner className="size-4" />
@@ -776,7 +776,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
               )}
               <button
                 onClick={copyLink}
-                className="flex items-center gap-1.5 rounded-full bg-white/[0.06] px-4 py-2 text-sm text-dim active:bg-white/[0.1]"
+                className="flex items-center gap-1.5 rounded-full bg-hover px-4 py-2 text-sm text-dim active:bg-active"
               >
                 <Link2 className="size-4" />
                 {t("viewer.copyLink")}
@@ -785,7 +785,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
           )}
           <button
             onClick={() => setForcedText(true)}
-            className="text-xs text-blue-400 active:text-blue-300"
+            className="text-xs text-info active:text-info"
           >
             {t("viewer.openAsText")}
           </button>

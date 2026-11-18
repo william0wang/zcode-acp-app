@@ -6,7 +6,7 @@ import { useBackHandler } from "../../lib/backNav";
 // Input styling shared by every configuration form — the same recipe the
 // connect screen uses, so a keyboard-focus ring reads the same everywhere.
 export const configInputClass =
-  "mt-1 w-full rounded-xl bg-raised px-4 py-3 text-sm text-ink ring-1 ring-inset ring-hairline placeholder:text-faint focus:ring-2 focus:ring-white/40 focus:outline-none";
+  "mt-1 w-full rounded-xl bg-raised px-4 py-3 text-sm text-ink ring-1 ring-inset ring-hairline placeholder:text-faint focus:ring-2 focus:ring-ink/40 focus:outline-none";
 
 // A labelled form field. The label wraps the control so a tap on the text
 // focuses the input, the way the connect form behaves.
@@ -24,7 +24,7 @@ export function ConfigField({
       <span className="block text-xs font-medium text-dim">{label}</span>
       {children}
       {hint && (
-        <span className="mt-1 block text-[11px] text-faint">{hint}</span>
+        <span className="mt-1 block text-2xs text-faint">{hint}</span>
       )}
     </label>
   );
@@ -67,7 +67,7 @@ export function ConfigFormSheet({
         <button
           onClick={onClose}
           aria-label={t("common.close")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ArrowLeft className="size-4.5" />
         </button>
@@ -110,7 +110,7 @@ export function ConfigToggle({
       aria-label={label}
       onClick={() => onChange(!checked)}
       className={`mt-1 h-6 w-10 shrink-0 rounded-full transition ${
-        checked ? "bg-emerald-500/80" : "bg-white/[0.12]"
+        checked ? "bg-success/80" : "bg-active"
       }`}
     >
       <span

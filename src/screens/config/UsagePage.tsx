@@ -51,8 +51,8 @@ export function UsagePage() {
             onClick={() => setTab(id)}
             className={`flex-1 rounded-lg px-3 py-1.5 text-xs transition ${
               id === tab
-                ? "bg-white/[0.1] font-medium text-ink"
-                : "text-faint active:bg-white/[0.05]"
+                ? "bg-active font-medium text-ink"
+                : "text-faint hover:bg-hover active:bg-active"
             }`}
           >
             {t(
@@ -107,8 +107,8 @@ function PlatformUsageTab() {
             onClick={() => void pickRange(r)}
             className={`flex-1 rounded-lg px-3 py-1.5 text-xs transition ${
               r === range
-                ? "bg-white/[0.1] font-medium text-ink"
-                : "text-faint active:bg-white/[0.05]"
+                ? "bg-active font-medium text-ink"
+                : "text-faint hover:bg-hover active:bg-active"
             }`}
           >
             {t(r === "today" ? "zconfig.rangeToday" : `zconfig.range${r}`)}
@@ -169,7 +169,7 @@ function PlatformUsageTab() {
                   <Heatmap weeks={usage.activity.heatmap.weeks} />
                   {/* The caption dates the grid: a sparse-looking year with a
                       recent start beats an unexplained wall of squares. */}
-                  <p className="px-4 pb-3 pt-1 text-[11px] text-faint">
+                  <p className="px-4 pb-3 pt-1 text-2xs text-faint">
                     {usage.activity.heatmap.startDate} ~{" "}
                     {usage.activity.heatmap.endDate}
                   </p>
@@ -211,7 +211,7 @@ function PlatformUsageTab() {
               divided
             >
               <SeriesBars totals={usage.series.totals} />
-              <p className="px-4 pb-3 pt-1.5 text-[11px] text-faint">
+              <p className="px-4 pb-3 pt-1.5 text-2xs text-faint">
                 {usage.series.xTime[0]} ~ {usage.series.xTime.at(-1)}
               </p>
             </ConfigBlock>
@@ -239,9 +239,9 @@ function PlatformUsageTab() {
                   </div>
                   {/* Share of the window's tokens — models compared against
                       each other, like the local tab's bar. */}
-                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
+                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-selected">
                     <div
-                      className="h-full rounded-full bg-white/25"
+                      className="h-full rounded-full bg-faint"
                       style={{
                         width: `${
                           modelTotal > 0
@@ -287,11 +287,11 @@ function Heatmap({
   // Level 0 (a recorded zero) and a missing day both read as "nothing", but
   // only level 0 earns a square — missing days keep the week's shape.
   const LEVEL_BG = [
-    "bg-white/[0.06]",
-    "bg-emerald-500/25",
-    "bg-emerald-500/45",
-    "bg-emerald-500/70",
-    "bg-emerald-400/90",
+    "bg-hover",
+    "bg-success/25",
+    "bg-success/45",
+    "bg-success/70",
+    "bg-success/90",
   ] as const;
   return (
     <div className="overflow-x-auto px-4 pt-3">
@@ -336,8 +336,8 @@ function MetricRow({
           {value}
           {trend != null && Number.isFinite(trend) && trend !== 0 && (
             <span
-              className={`pl-1.5 text-[11px] ${
-                trend > 0 ? "text-emerald-400/80" : "text-sky-400/80"
+              className={`pl-1.5 text-2xs ${
+                trend > 0 ? "text-success/80" : "text-info"
               }`}
             >
               {trend > 0 ? "↑" : "↓"} {Math.abs(trend).toFixed(1)}%
@@ -357,7 +357,7 @@ function SeriesBars({ totals }: { totals: number[] }) {
       {totals.map((value, i) => (
         <div
           key={i}
-          className="min-w-[3px] flex-1 rounded-sm bg-white/25"
+          className="min-w-[3px] flex-1 rounded-sm bg-faint"
           style={{
             height: `${value > 0 && max > 0 ? Math.max(6, (value / max) * 100) : 2}%`,
           }}
@@ -412,8 +412,8 @@ function LocalUsageTab() {
             onClick={() => void pickRange(r)}
             className={`flex-1 rounded-lg px-3 py-1.5 text-xs transition ${
               r === range
-                ? "bg-white/[0.1] font-medium text-ink"
-                : "text-faint active:bg-white/[0.05]"
+                ? "bg-active font-medium text-ink"
+                : "text-faint hover:bg-hover active:bg-active"
             }`}
           >
             {t(`zconfig.range${r === "all" ? "All" : r}`)}
@@ -463,9 +463,9 @@ function LocalUsageTab() {
                   {/* The share bar: same heat idea as the quota card, but here
                       it compares models against each other, not against a
                       limit — so it is a flat neutral fill. */}
-                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-white/[0.08]">
+                  <div className="mt-1 h-1 overflow-hidden rounded-full bg-selected">
                     <div
-                      className="h-full rounded-full bg-white/25"
+                      className="h-full rounded-full bg-faint"
                       style={{ width: `${Math.round((m.share ?? 0) * 100)}%` }}
                     />
                   </div>

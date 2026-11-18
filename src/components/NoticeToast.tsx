@@ -12,7 +12,7 @@ export function NoticeToast() {
     <div className="pointer-events-none fixed inset-x-0 bottom-0 z-[100] flex justify-center p-4 pb-[max(var(--safe-bottom),1rem)]">
       <button
         onClick={dismissToast}
-        className="pointer-events-auto max-w-full truncate rounded-full bg-surface px-4 py-2 text-xs text-ink shadow-lg ring-1 ring-hairline active:bg-white/[0.08]"
+        className="pointer-events-auto max-w-full truncate rounded-full bg-surface px-4 py-2 text-xs text-ink shadow-lg ring-1 ring-hairline hover:bg-hover active:bg-active"
       >
         {toast.text}
       </button>

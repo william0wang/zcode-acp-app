@@ -60,9 +60,9 @@ function PlanPanel({ entries }: { entries: PlanEntry[] }) {
         {entries.map((e, i) => (
           <li key={i} className="flex items-start gap-1.5">
             {e.status === "completed" ? (
-              <Check className="mt-0.5 size-3.5 shrink-0 text-emerald-400" />
+              <Check className="mt-0.5 size-3.5 shrink-0 text-success" />
             ) : e.status === "active" ? (
-              <ChevronRight className="mt-0.5 size-3.5 shrink-0 text-blue-400" />
+              <ChevronRight className="mt-0.5 size-3.5 shrink-0 text-info" />
             ) : (
               <Circle className="mt-0.5 size-3.5 shrink-0 text-faint" />
             )}
@@ -180,10 +180,10 @@ export function ChatScreen() {
 
   const statusDot =
     connState === "open"
-      ? "bg-emerald-500"
+      ? "bg-success"
       : connState === "reconnecting"
-        ? "bg-amber-500 animate-pulse"
-        : "bg-zinc-500";
+        ? "bg-warning animate-pulse"
+        : "bg-faint";
 
   const noticeText = notice
     ? notice.startsWith("notice.")
@@ -203,14 +203,14 @@ export function ChatScreen() {
         <button
           onClick={() => setDrawerOpen(true)}
           aria-label={t("chat.sessions")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <Menu className="size-5" />
         </button>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-[15px] font-medium">{title}</div>
+          <div className="truncate text-base font-medium">{title}</div>
           {workspace && (
-            <div className="flex items-baseline text-[11px] text-faint">
+            <div className="flex items-baseline text-2xs text-faint">
               {/* Stats live in the title bar, TUI style: context `17.5%/1.0M`,
                   bare cache percent, `tok/s`, then the quota dock line — the
                   hub's preformatted string (ADR-0021), byte-identical to the
@@ -249,22 +249,22 @@ export function ChatScreen() {
         <button
           onClick={() => setPanelOpen(true)}
           aria-label={t("panel.session")}
-          className="relative flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="relative flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <SlidersHorizontal className="size-5" />
           {activeSessionId &&
             terminalLive?.sessionId === activeSessionId &&
             (terminalLive.terminal?.turn?.state === "running" ? (
-              <span className="absolute right-1.5 top-1.5 size-1.5 animate-pulse rounded-full bg-amber-400" />
+              <span className="absolute right-1.5 top-1.5 size-1.5 animate-pulse rounded-full bg-warning" />
             ) : terminalLive.conn === "open" &&
                 terminalLive.terminal?.state !== "gone" ? (
-              <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-blue-400/70" />
+              <span className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-info/70" />
             ) : null)}
         </button>
         {usage && usage.size > 0 && (
-          <div className="absolute inset-x-0 bottom-0 h-0.5 bg-white/[0.06]">
+          <div className="absolute inset-x-0 bottom-0 h-0.5 bg-hover">
             <div
-              className="h-full bg-blue-500"
+              className="h-full bg-info"
               style={{
                 width: `${Math.min(100, (usage.used / usage.size) * 100)}%`,
               }}
@@ -274,13 +274,13 @@ export function ChatScreen() {
       </header>
 
       {connState === "reconnecting" && (
-        <div className="bg-amber-950 px-4 py-1.5 text-center text-xs text-amber-300">
+        <div className="bg-warning-wash px-4 py-1.5 text-center text-xs text-warning">
           {t("chat.reconnecting")}
         </div>
       )}
 
       {noticeText && (
-        <div className="flex items-center justify-between gap-2 bg-white/[0.05] px-4 py-1.5 text-xs text-dim">
+        <div className="flex items-center justify-between gap-2 bg-hover px-4 py-1.5 text-xs text-dim">
           <span className="truncate">{noticeText}</span>
           <button onClick={dismissNotice} className="shrink-0 text-faint">
             ✕

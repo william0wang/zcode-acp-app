@@ -68,21 +68,21 @@ export function InstancePicker() {
         <button
           onClick={() => setHistoryOpen(true)}
           aria-label={t("historyDialog.title")}
-          className="flex size-9 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <History className="size-4.5" />
         </button>
         <button
           onClick={() => setCreateOpen(true)}
           aria-label={t("projectDialog.title")}
-          className="flex size-9 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <FolderPlus className="size-4.5" />
         </button>
         <button
           onClick={() => void refreshInstances({ probe: true })}
           aria-label={t("picker.refresh")}
-          className="flex size-9 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <RefreshCw className="size-4.5" />
         </button>
@@ -92,24 +92,24 @@ export function InstancePicker() {
         <button
           onClick={() => openConfig(null)}
           aria-label={t("zconfig.title")}
-          className="relative ml-1 flex size-9 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="relative ml-1 flex size-9 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <Sliders className="size-4.5" />
           {pendingRestart && (
-            <span className="absolute top-1.5 right-1.5 size-2 rounded-full bg-amber-400" />
+            <span className="absolute top-1.5 right-1.5 size-2 rounded-full bg-warning" />
           )}
         </button>
         <button
           onClick={() => setPanelOpen(true)}
           aria-label={t("panel.title")}
-          className="ml-1 flex size-9 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="ml-1 flex size-9 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <SlidersHorizontal className="size-4.5" />
         </button>
       </header>
 
       {instancesError && (
-        <p className="mx-4 mb-2 shrink-0 rounded-lg border border-amber-900 bg-amber-950 px-3 py-2 text-xs text-amber-300">
+        <p className="mx-4 mb-2 shrink-0 rounded-lg border border-warning/30 bg-warning-wash px-3 py-2 text-xs text-warning">
           {instancesError}
         </p>
       )}
@@ -124,12 +124,12 @@ export function InstancePicker() {
         </p>
       )}
       {connState === "reconnecting" && (
-        <p className="mx-4 mb-2 shrink-0 rounded-lg bg-amber-950 px-3 py-2 text-xs text-amber-300 ring-1 ring-amber-900">
+        <p className="mx-4 mb-2 shrink-0 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning ring-1 ring-warning/30">
           {t("chat.reconnecting")}
         </p>
       )}
       {notice && (
-        <div className="mx-4 mb-2 flex shrink-0 items-center justify-between gap-2 rounded-lg bg-white/[0.05] px-3 py-2 text-xs text-dim">
+        <div className="mx-4 mb-2 flex shrink-0 items-center justify-between gap-2 rounded-lg bg-hover px-3 py-2 text-xs text-dim">
           <span className="truncate">
             {notice.startsWith("notice.") ? t(notice) : notice}
           </span>

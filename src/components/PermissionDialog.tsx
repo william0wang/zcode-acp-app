@@ -43,11 +43,11 @@ function rawInputHighlights(
 }
 
 function optionClass(kind: string | undefined): string {
-  if (kind === "allow_once") return "bg-blue-600 text-white active:bg-blue-700";
+  if (kind === "allow_once") return "bg-ink text-canvas active:brightness-90";
   if (kind === "allow_always")
-    return "bg-blue-600/10 text-blue-400 ring-1 ring-inset ring-blue-500/40 active:bg-blue-600/20";
+    return "bg-info-wash text-info ring-1 ring-inset ring-info/40 active:brightness-125";
   if (kind?.startsWith("reject"))
-    return "bg-red-600/10 text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-600/20";
+    return "bg-danger-wash text-danger ring-1 ring-inset ring-danger/40 active:brightness-125";
   return "bg-raised text-ink ring-1 ring-inset ring-hairline";
 }
 
@@ -72,7 +72,7 @@ function ActionButtons({
         {approve && (
           <button
             onClick={() => onAnswer(approve.optionId)}
-            className="rounded-xl bg-emerald-600 px-4 py-3 text-sm font-semibold text-white active:bg-emerald-700"
+            className="rounded-xl bg-success px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
           >
             {approve.name || "Approve — exit plan mode"}
           </button>
@@ -80,7 +80,7 @@ function ActionButtons({
         {reject && (
           <button
             onClick={() => onAnswer(reject.optionId)}
-            className="rounded-xl bg-red-600/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-600/20"
+            className="rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
           >
             {reject.name || "Reject — keep planning"}
           </button>
@@ -138,7 +138,7 @@ export function PermissionDialog() {
           <h2 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
             {isPlan ? (
               <>
-                <ListChecks className="size-4 shrink-0 text-cyan-400" />
+                <ListChecks className="size-4 shrink-0 text-info" />
                 {t("permission.planTitle")}
               </>
             ) : isQuestion ? (
@@ -150,7 +150,7 @@ export function PermissionDialog() {
 
           {ctx?.toolName && !isPlan && !isQuestion && (
             <p className="mt-1 flex items-center gap-1.5 text-xs text-dim">
-              <Terminal className="size-3.5 shrink-0 text-amber-400" />
+              <Terminal className="size-3.5 shrink-0 text-warning" />
               <span className="font-mono">{ctx.toolName}</span>
             </p>
           )}
@@ -165,7 +165,7 @@ export function PermissionDialog() {
             <div className="mt-2 flex flex-col gap-1.5">
               {highlights.map((h) => (
                 <div key={h.label} className="min-w-0">
-                  <div className="text-[10px] uppercase tracking-wide text-faint">
+                  <div className="text-2xs uppercase tracking-wide text-faint">
                     {h.label}
                   </div>
                   <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg bg-black/30 px-2.5 py-1.5 font-mono text-xs text-dim">

@@ -100,11 +100,11 @@ export function SkillsPage() {
                       {s.name ?? path}
                     </span>
                     {s.description && (
-                      <span className="block truncate text-[11px] text-faint">
+                      <span className="block truncate text-2xs text-faint">
                         {s.description}
                       </span>
                     )}
-                    <span className="block truncate font-mono text-[10px] text-faint">
+                    <span className="block truncate font-mono text-2xs text-faint">
                       {scope ? `${t(`zconfig.scope${scope}`)} · ` : ""}
                       {path}
                     </span>
@@ -118,8 +118,8 @@ export function SkillsPage() {
                     onClick={() => void toggle(path, s.enabled === false)}
                     className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
                       s.enabled !== false
-                        ? "bg-emerald-500/80"
-                        : "bg-white/[0.12]"
+                        ? "bg-success/80"
+                        : "bg-active"
                     }`}
                   >
                     <span
@@ -136,7 +136,7 @@ export function SkillsPage() {
                   <div className="mt-2">
                     <button
                       onClick={() => void copyToUser(path)}
-                      className="flex items-center gap-1.5 rounded-lg bg-white/[0.06] px-2.5 py-1.5 text-[11px] text-dim active:bg-white/[0.1]"
+                      className="flex items-center gap-1.5 rounded-lg bg-hover px-2.5 py-1.5 text-2xs text-dim active:bg-active"
                     >
                       <Copy className="size-3" />
                       {t("zconfig.skillCopy")}

@@ -48,15 +48,17 @@ export const AGENT_COLORS = [
 
 export type AgentColor = (typeof AGENT_COLORS)[number];
 
+// Agent accent swatches: user-chosen dot colors, mapped onto the token
+// palette (status + chart hues) — no raw Tailwind palette values.
 const SWATCH: Record<AgentColor, string> = {
-  red: "bg-red-500",
-  blue: "bg-blue-500",
-  green: "bg-green-500",
-  yellow: "bg-yellow-400",
-  purple: "bg-purple-500",
-  orange: "bg-orange-500",
-  pink: "bg-pink-500",
-  cyan: "bg-cyan-500",
+  red: "bg-danger",
+  blue: "bg-chart-5",
+  green: "bg-success",
+  yellow: "bg-warning",
+  purple: "bg-chart-6",
+  orange: "bg-chart-1",
+  pink: "bg-chart-4",
+  cyan: "bg-info",
 };
 
 /** The server's name rule for a personal agent: 3–50 of [a-zA-Z0-9-]. */
@@ -174,18 +176,18 @@ export function AgentsPage() {
                 >
                   <span className="block text-sm text-ink">{name}</span>
                   {description && (
-                    <span className="block truncate text-[11px] text-faint">
+                    <span className="block truncate text-2xs text-faint">
                       {description}
                     </span>
                   )}
                   {model && (
-                    <span className="block truncate text-[10px] text-faint">
+                    <span className="block truncate text-2xs text-faint">
                       {model}
                       {thoughtLevel ? ` · ${thoughtLevel}` : ""}
                     </span>
                   )}
                   {readOnly && (
-                    <span className="block text-[10px] text-faint">
+                    <span className="block text-2xs text-faint">
                       {t("zconfig.agentBuiltIn")}
                     </span>
                   )}
@@ -200,8 +202,8 @@ export function AgentsPage() {
                     onClick={() => void toggle(name, a.enabled === false)}
                     className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
                       a.enabled !== false
-                        ? "bg-emerald-500/80"
-                        : "bg-white/[0.12]"
+                        ? "bg-success/80"
+                        : "bg-active"
                     }`}
                   >
                     <span
@@ -223,14 +225,14 @@ export function AgentsPage() {
       <div className="px-4">
         <button
           onClick={() => setAdding(true)}
-          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim active:bg-white/[0.07]"
+          className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
         >
           <Plus className="size-4" />
           {t("zconfig.agentsAdd")}
         </button>
       </div>
 
-      <p className="px-4 pt-3 text-center text-[11px] text-faint">
+      <p className="px-4 pt-3 text-center text-2xs text-faint">
         {t("zconfig.agentsCreateHint")}
       </p>
 
@@ -347,7 +349,7 @@ function BuiltInAgentForm({
       onSubmit={() => void submit()}
       onClose={onClose}
     >
-      <p className="mt-3 text-[11px] text-faint">
+      <p className="mt-3 text-2xs text-faint">
         {override?.modelId
           ? `${providers.find((p) => matchProviderId(p.id) === matchProviderId(override.providerId))?.name ?? override.providerId} / ${override.modelId}${override.thoughtLevel ? ` · ${override.thoughtLevel}` : ""}`
           : t("zconfig.agentOverrideNone")}
@@ -428,7 +430,7 @@ function BuiltInAgentForm({
         <button
           type="button"
           onClick={() => void clearOverride()}
-          className="mt-4 w-full rounded-xl px-3 py-2 text-xs font-medium text-dim active:bg-white/[0.06]"
+          className="mt-4 w-full rounded-xl px-3 py-2 text-xs font-medium text-dim hover:bg-hover active:bg-active"
         >
           {t("zconfig.agentOverrideClear")}
         </button>
@@ -821,7 +823,7 @@ function ColorPicker({
           aria-label={c}
           onClick={() => onChange(c)}
           className={`size-7 rounded-full transition ${SWATCH[c]} ${
-            value === c ? "ring-2 ring-white/80" : ""
+            value === c ? "ring-2 ring-ink/50" : ""
           }`}
         />
       ))}
@@ -829,7 +831,7 @@ function ColorPicker({
         type="button"
         onClick={() => onChange("")}
         className={`rounded-lg bg-raised px-3 py-1.5 text-xs ${
-          value === "" ? "text-ink ring-1 ring-white/60" : "text-faint"
+          value === "" ? "text-ink ring-1 ring-ink/50" : "text-faint"
         }`}
       >
         {t("zconfig.agentColorNone")}

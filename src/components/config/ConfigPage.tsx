@@ -78,7 +78,7 @@ export function ConfigPageFrame({
         <button
           onClick={onBack}
           aria-label={t("common.close")}
-          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+          className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
         >
           <ArrowLeft className="size-4.5" />
         </button>
@@ -90,7 +90,7 @@ export function ConfigPageFrame({
           <button
             onClick={onRefresh}
             aria-label={t("quota.refresh")}
-            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim active:bg-white/[0.06]"
+            className="flex size-9 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active"
           >
             <RefreshCw
               className={`size-4 ${refreshing ? "animate-spin" : ""}`}
@@ -100,7 +100,7 @@ export function ConfigPageFrame({
       </header>
 
       {noticeText && (
-        <div className="mx-4 mb-2 flex shrink-0 items-center justify-between gap-2 rounded-lg bg-white/[0.05] px-3 py-2 text-xs text-dim">
+        <div className="mx-4 mb-2 flex shrink-0 items-center justify-between gap-2 rounded-lg bg-hover px-3 py-2 text-xs text-dim">
           <span className="min-w-0 flex-1">{noticeText}</span>
           <button onClick={dismissNotice} className="shrink-0 text-faint">
             ✕
@@ -148,7 +148,7 @@ export function ConfigBlock({
   return (
     <div className={divided ? "mt-2 border-t border-hairline" : ""}>
       {title && (
-        <h2 className="px-4 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-faint">
+        <h2 className="px-4 pb-1 pt-3 text-2xs font-medium uppercase tracking-wide text-faint">
           {title}
         </h2>
       )}

@@ -206,7 +206,7 @@ export function HooksPage() {
                 )
               }
               className={`h-6 w-10 shrink-0 rounded-full transition ${
-                enabled ? "bg-emerald-500/80" : "bg-white/[0.12]"
+                enabled ? "bg-success/80" : "bg-active"
               }`}
             >
               <span
@@ -223,7 +223,7 @@ export function HooksPage() {
               <ConfigBlock key={event} divided>
                 <button
                   onClick={() => setOpen(isOpen ? null : event)}
-                  className="flex w-full items-center gap-2 px-4 py-3 text-left active:bg-white/[0.05]"
+                  className="flex w-full items-center gap-2 px-4 py-3 text-left hover:bg-hover active:bg-active"
                 >
                   {isOpen ? (
                     <ChevronDown className="size-4 shrink-0 text-faint" />
@@ -234,7 +234,7 @@ export function HooksPage() {
                     <span className="block font-mono text-sm text-ink">
                       {event}
                     </span>
-                    <span className="block text-[11px] text-faint">
+                    <span className="block text-2xs text-faint">
                       {t("zconfig.hooksEntryCount", { count: entries.length })}
                     </span>
                   </span>
@@ -252,19 +252,19 @@ export function HooksPage() {
                         return (
                           <li
                             key={h.key}
-                            className="mx-4 mb-1.5 flex items-start gap-2 rounded-lg bg-white/[0.04] py-2 pl-3 pr-2"
+                            className="mx-4 mb-1.5 flex items-start gap-2 rounded-lg bg-hover py-2 pl-3 pr-2"
                           >
                             <button
                               onClick={() => setEditing(h)}
                               className="min-w-0 flex-1 text-left active:opacity-80"
                             >
                               <div className="flex items-baseline justify-between gap-2">
-                                <span className="font-mono text-[11px] text-dim">
+                                <span className="font-mono text-2xs text-dim">
                                   {h.matcher || t("zconfig.hooksAnyMatcher")}
                                 </span>
                                 <span
-                                  className={`shrink-0 text-[10px] ${
-                                    h.enabled ? "text-faint" : "text-amber-300"
+                                  className={`shrink-0 text-2xs ${
+                                    h.enabled ? "text-faint" : "text-warning"
                                   }`}
                                 >
                                   {h.enabled
@@ -274,7 +274,7 @@ export function HooksPage() {
                                     : t("zconfig.disabled")}
                                 </span>
                               </div>
-                              <p className="pt-0.5 font-mono text-[11px] break-all text-faint">
+                              <p className="pt-0.5 font-mono text-2xs break-all text-faint">
                                 {h.command}
                               </p>
                             </button>
@@ -285,8 +285,8 @@ export function HooksPage() {
                               onClick={() => void toggleHook(h, !h.enabled)}
                               className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
                                 h.enabled
-                                  ? "bg-emerald-500/80"
-                                  : "bg-white/[0.12]"
+                                  ? "bg-success/80"
+                                  : "bg-active"
                               }`}
                             >
                               <span
@@ -306,7 +306,7 @@ export function HooksPage() {
             );
           })}
 
-          <p className="px-4 pt-3 text-center text-[11px] text-faint">
+          <p className="px-4 pt-3 text-center text-2xs text-faint">
             {t("zconfig.hooksReadOnly", { count: rows.length })}
           </p>
         </>
@@ -401,7 +401,7 @@ function HookForm({
       onSubmit={() => void submit()}
       onClose={onClose}
     >
-      <p className="mt-3 font-mono text-[11px] text-faint">
+      <p className="mt-3 font-mono text-2xs text-faint">
         {target.event} · {target.matcher || t("zconfig.hooksAnyMatcher")}
       </p>
 

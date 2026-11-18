@@ -322,12 +322,12 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
               onClick={back}
               disabled={resuming !== null}
               aria-label={t("files.back")}
-              className="-ml-1 flex size-6 items-center justify-center rounded-full text-dim active:bg-white/[0.06] disabled:opacity-50"
+              className="-ml-1 flex size-6 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active disabled:opacity-50"
             >
               <ArrowLeft className="size-4" />
             </button>
           ) : (
-            <History className="size-4 shrink-0 text-cyan-400" />
+            <History className="size-4 shrink-0 text-info" />
           )}
           <h2 className="min-w-0 flex-1 truncate text-sm font-semibold text-ink">
             {selected ? projectName(selected) : t("historyDialog.title")}
@@ -351,12 +351,12 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
             <div className="min-h-0 flex-1 px-4 py-8">
               {listError ? (
                 <div className="flex flex-col items-center gap-3">
-                  <p className="rounded-lg bg-amber-950 px-3 py-2 text-xs text-amber-300 ring-1 ring-amber-900">
+                  <p className="rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning ring-1 ring-warning/30">
                     {listError}
                   </p>
                   <button
                     onClick={() => void openProject(selected)}
-                    className="rounded-xl bg-raised px-4 py-2 text-xs font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                    className="rounded-xl bg-raised px-4 py-2 text-xs font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                   >
                     {t("historyDialog.retry")}
                   </button>
@@ -371,7 +371,7 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
           ) : (
             <>
               {listError && (
-                <p className="mx-4 mb-1 shrink-0 rounded-lg bg-amber-950 px-3 py-2 text-xs text-amber-300 ring-1 ring-amber-900">
+                <p className="mx-4 mb-1 shrink-0 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning ring-1 ring-warning/30">
                   {listError}
                 </p>
               )}
@@ -388,7 +388,7 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
                     <button
                       onClick={() => void loadMore()}
                       disabled={loadingMore}
-                      className="mx-auto mb-3 mt-1 flex items-center gap-2 rounded-xl bg-raised px-4 py-2 text-xs font-medium text-dim ring-1 ring-inset ring-hairline active:bg-white/[0.08] disabled:opacity-50"
+                      className="mx-auto mb-3 mt-1 flex items-center gap-2 rounded-xl bg-raised px-4 py-2 text-xs font-medium text-dim ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active disabled:opacity-50"
                     >
                       {loadingMore && (
                         <Loader2 className="size-3.5 animate-spin" />
@@ -400,7 +400,7 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
                       )}
                     </button>
                   ) : items.length > 0 ? (
-                    <p className="py-3 text-center text-[10px] text-faint">
+                    <p className="py-3 text-center text-2xs text-faint">
                       {t("historyDialog.end")}
                     </p>
                   ) : null
@@ -421,7 +421,7 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
             </div>
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
               {error && (
-                <p className="mx-2 rounded-lg bg-amber-950 px-3 py-2 text-xs text-amber-300 ring-1 ring-amber-900">
+                <p className="mx-2 rounded-lg bg-warning-wash px-3 py-2 text-xs text-warning ring-1 ring-warning/30">
                   {error}
                 </p>
               )}
@@ -471,7 +471,7 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
               <button
                 onClick={() => void removeProject(projAction.workspacePath)}
                 disabled={projDeleting}
-                className="flex items-center justify-center gap-2 rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/20 disabled:opacity-50"
+                className="flex items-center justify-center gap-2 rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125 disabled:opacity-50"
               >
                 {projDeleting && <Loader2 className="size-4 animate-spin" />}
                 {t("historyDialog.deleteProject")}
@@ -479,7 +479,7 @@ export function ProjectHistoryDialog({ onClose }: { onClose: () => void }) {
               <button
                 onClick={() => setProjAction(null)}
                 disabled={projDeleting}
-                className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08] disabled:opacity-50"
+                className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active disabled:opacity-50"
               >
                 {t("common.cancel")}
               </button>
@@ -511,17 +511,17 @@ function ProjectRow({
       onClick={onOpen}
       disabled={disabled}
       {...press}
-      className="mb-1 flex w-full flex-col items-start gap-0.5 rounded-xl px-3 py-2.5 text-left select-none [-webkit-touch-callout:none] active:bg-white/[0.05] disabled:opacity-50"
+      className="mb-1 flex w-full flex-col items-start gap-0.5 rounded-xl px-3 py-2.5 text-left select-none [-webkit-touch-callout:none] hover:bg-hover active:bg-active disabled:opacity-50"
     >
       <span className="flex w-full items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-sm text-ink">
           {projectName(project.workspacePath)}
         </span>
-        <span className="shrink-0 text-[10px] text-faint">
+        <span className="shrink-0 text-2xs text-faint">
           {t("projectDialog.sessionCount", { count: project.sessions })}
         </span>
       </span>
-      <span className="flex w-full items-center gap-2 text-[10px] text-faint">
+      <span className="flex w-full items-center gap-2 text-2xs text-faint">
         <span className="min-w-0 flex-1 truncate font-mono">
           {project.workspacePath}
         </span>

@@ -34,7 +34,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
     };
     return (
       <div className="flex h-full flex-col items-center justify-center gap-4 bg-canvas px-6 text-ink">
-        <AlertTriangle className="size-8 text-amber-400" />
+        <AlertTriangle className="size-8 text-warning" />
         <h1 className="text-lg font-semibold">{i18n.t("error.title")}</h1>
         <pre className="max-h-[50vh] w-full max-w-md overflow-auto whitespace-pre-wrap rounded-xl bg-raised px-4 py-3 font-mono text-xs text-dim ring-1 ring-hairline">
           {details}
@@ -42,7 +42,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, State> {
         <div className="flex gap-2">
           <button
             onClick={copy}
-            className="flex items-center gap-1.5 rounded-xl bg-raised px-4 py-2.5 text-sm text-dim ring-1 ring-inset ring-hairline active:bg-white/[0.06]"
+            className="flex items-center gap-1.5 rounded-xl bg-raised px-4 py-2.5 text-sm text-dim ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
           >
             <Copy className="size-4" />
             {i18n.t("error.copy")}

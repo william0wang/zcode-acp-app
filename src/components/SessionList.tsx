@@ -52,8 +52,8 @@ function ActivityBadge({
   if (!activity) {
     if (restRunning) {
       return (
-        <span className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-blue-400">
-          <span className="size-1.5 animate-pulse rounded-full bg-blue-400" />
+        <span className="flex shrink-0 items-center gap-1 text-2xs font-medium text-info">
+          <span className="size-1.5 animate-pulse rounded-full bg-info" />
           {t("chat.activityRunning")}
         </span>
       );
@@ -62,23 +62,23 @@ function ActivityBadge({
   }
   if (activity.awaitingPermission) {
     return (
-      <span className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-amber-400">
-        <span className="size-1.5 animate-pulse rounded-full bg-amber-400" />
+      <span className="flex shrink-0 items-center gap-1 text-2xs font-medium text-warning">
+        <span className="size-1.5 animate-pulse rounded-full bg-warning" />
         {t("chat.activityAwaiting")}
       </span>
     );
   }
   if (activity.running) {
     return (
-      <span className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-blue-400">
-        <span className="size-1.5 animate-pulse rounded-full bg-blue-400" />
+      <span className="flex shrink-0 items-center gap-1 text-2xs font-medium text-info">
+        <span className="size-1.5 animate-pulse rounded-full bg-info" />
         {t("chat.activityRunning")}
       </span>
     );
   }
   if (activity.finishedAt && Date.now() - activity.finishedAt < 60_000) {
     return (
-      <span className="shrink-0 text-[10px] font-medium text-emerald-400">
+      <span className="shrink-0 text-2xs font-medium text-success">
         {t("chat.activityFinished")}
       </span>
     );
@@ -158,7 +158,7 @@ function SessionRow({
       disabled={disabled}
       {...press}
       className={`flex w-full flex-col px-4 py-3 text-left select-none [-webkit-touch-callout:none] disabled:opacity-50 ${
-        active ? "bg-white/[0.07]" : "active:bg-white/[0.05]"
+        active ? "bg-selected" : "hover:bg-hover active:bg-active"
       }`}
     >
       <span className="flex min-w-0 items-center gap-2">
@@ -168,7 +168,7 @@ function SessionRow({
           {item.title || t("chat.untitled")}
         </span>
         {(item.workflowActive ?? 0) > 0 && (
-          <span className="flex shrink-0 items-center gap-1 text-[10px] font-medium text-violet-300">
+          <span className="flex shrink-0 items-center gap-1 text-2xs font-medium text-chart-6">
             <Workflow className="size-3 animate-pulse" />
             {item.workflowActive}
           </span>
@@ -336,13 +336,13 @@ export function SessionList({
                 <button
                   onClick={submitRename}
                   disabled={!draftTitle.trim()}
-                  className="rounded-xl bg-blue-500 px-4 py-3 text-sm font-medium text-white active:bg-blue-600 disabled:opacity-50"
+                  className="rounded-xl bg-ink px-4 py-3 text-sm font-medium text-canvas active:brightness-90 disabled:opacity-50"
                 >
                   {t("chat.save")}
                 </button>
                 <button
                   onClick={() => setActionTarget(null)}
-                  className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                  className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                 >
                   {t("common.cancel")}
                 </button>
@@ -352,7 +352,7 @@ export function SessionList({
                 {!readOnly && (
                   <button
                     onClick={openRename}
-                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                   >
                     {t("chat.renameSession")}
                   </button>
@@ -368,7 +368,7 @@ export function SessionList({
                       setActionTarget(null);
                       openTerminal(sessionId, title);
                     }}
-                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                   >
                     {t("remoteTerminal.openAction")}
                   </button>
@@ -392,7 +392,7 @@ export function SessionList({
                       setActionTarget(null);
                       void closeRemoteSession(instanceId, sessionId);
                     }}
-                    className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/20"
+                    className="rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
                   >
                     {t("chat.closeSession")}
                   </button>
@@ -404,7 +404,7 @@ export function SessionList({
                       setActionTarget(null);
                       void shutdownInstance(instanceId);
                     }}
-                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                   >
                     {t("chat.shutdownInstance")}
                   </button>
@@ -416,14 +416,14 @@ export function SessionList({
                       setActionTarget(null);
                       onDelete(target);
                     }}
-                    className="rounded-xl bg-red-500/10 px-4 py-3 text-sm font-medium text-red-400 ring-1 ring-inset ring-red-500/40 active:bg-red-500/20"
+                    className="rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
                   >
                     {t("chat.deleteSession")}
                   </button>
                 )}
                 <button
                   onClick={() => setActionTarget(null)}
-                  className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline active:bg-white/[0.08]"
+                  className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                 >
                   {t("common.cancel")}
                 </button>

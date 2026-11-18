@@ -19,7 +19,7 @@
   --color-faint: #6f6f7a; /* muted text */
 
   /* Interactive overlays: the ghost-button idiom on dark surfaces.
-     Replaces hand-rolled bg-white/[0.06] etc. across the app. */
+     Replaced the hand-rolled bg-white/[0.06]-style classes app-wide. */
   --color-hover: rgb(255 255 255 / 6%);
   --color-active: rgb(255 255 255 / 11%);
   --color-selected: rgb(255 255 255 / 8%);

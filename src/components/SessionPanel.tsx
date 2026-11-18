@@ -69,7 +69,7 @@ export function SessionPanel({
                 onClose();
                 openTerminal(activeSessionId, sessionTitle);
               }}
-              className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left active:bg-white/[0.05]"
+              className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-hover active:bg-active"
             >
               <span className="flex items-center gap-2 text-sm text-dim">
                 <SquareTerminal className="size-3.5 shrink-0 text-faint" />
@@ -78,10 +78,10 @@ export function SessionPanel({
               <span className="flex shrink-0 items-center gap-2">
                 {terminalLive?.sessionId === activeSessionId &&
                   (terminalLive.terminal?.turn?.state === "running" ? (
-                    <span className="size-1.5 animate-pulse rounded-full bg-amber-400" />
+                    <span className="size-1.5 animate-pulse rounded-full bg-warning" />
                   ) : terminalLive.conn === "open" &&
                       terminalLive.terminal?.state !== "gone" ? (
-                    <span className="size-1.5 rounded-full bg-blue-400/70" />
+                    <span className="size-1.5 rounded-full bg-info/70" />
                   ) : null)}
                 <ChevronRight className="size-4 shrink-0 text-faint" />
               </span>
@@ -93,7 +93,7 @@ export function SessionPanel({
                 onClose();
                 onOpenFiles();
               }}
-              className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left active:bg-white/[0.05]"
+              className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-hover active:bg-active"
             >
               <span className="flex items-center gap-2 text-sm text-dim">
                 <FolderOpen className="size-3.5 shrink-0 text-faint" />
@@ -118,7 +118,7 @@ export function SessionPanel({
               <button
                 key={opt.id}
                 onClick={() => setConfigOpen(opt.id)}
-                className="flex items-center justify-between gap-3 px-4 py-2.5 text-left active:bg-white/[0.05]"
+                className="flex items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-hover active:bg-active"
               >
                 <span className="shrink-0 text-sm text-dim">
                   {t(`config.${opt.id}`, { defaultValue: opt.name ?? opt.id })}
@@ -143,7 +143,7 @@ export function SessionPanel({
               nothing workflow-specific of its own. */}
           <button
             onClick={() => openConfig("workflows")}
-            className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left active:bg-white/[0.05]"
+            className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-hover active:bg-active"
           >
             <span className="flex items-center gap-2 text-sm text-dim">
               <Workflow className="size-3.5 shrink-0 text-faint" />
