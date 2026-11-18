@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { Search, Workflow } from "lucide-react";
+import { Pin, PinOff, Search, Workflow } from "lucide-react";
 import { useAppStore } from "../store/appStore";
 import { fmtRelative } from "../lib/time";
+import { haptic } from "../lib/haptic";
 import { Skeleton } from "../ui";
 
 // Shared flat session list (drawer + entry screen): search field, per-session
@@ -138,56 +139,141 @@ export function useLongPress(onLongPress: (() => void) | undefined, ms = 500) {
   };
 }
 
+// Swipe-right gesture (requirements 1.10): reveals a pin toggle behind the
+// row's leading edge. Horizontal-dominant only (a vertical scroll intent
+// never arms it) and coexists with the long-press sheet — movement cancels
+// the press timer, same as scrolling does.
+function useSwipeRight(onSwipe: (() => void) | undefined, threshold = 56) {
+  const origin = useRef<{ x: number; y: number } | null>(null);
+  const armed = useRef(false);
+  const [dx, setDx] = useState(0);
+  return {
+    dx,
+    handlers: {
+      onPointerDown: (e: React.PointerEvent) => {
+        origin.current = { x: e.clientX, y: e.clientY };
+        armed.current = false;
+      },
+      onPointerMove: (e: React.PointerEvent) => {
+        const o = origin.current;
+        if (!o) return;
+        const mx = e.clientX - o.x;
+        const my = e.clientY - o.y;
+        if (!armed.current) {
+          if (mx > 12 && mx > Math.abs(my) * 2) armed.current = true;
+          else if (Math.abs(my) > 8) {
+            origin.current = null;
+            return;
+          }
+          if (!armed.current) return;
+        }
+        // Rightward only — the reveal sits on the leading edge.
+        setDx(Math.max(0, Math.min(mx, 96)));
+      },
+      onPointerUp: (_e: React.PointerEvent) => {
+        if (armed.current && dx > threshold && onSwipe) {
+          haptic();
+          onSwipe();
+        }
+        origin.current = null;
+        armed.current = false;
+        setDx(0);
+      },
+      onPointerCancel: (_e: React.PointerEvent) => {
+        origin.current = null;
+        armed.current = false;
+        setDx(0);
+      },
+    },
+  };
+}
+
 function SessionRow({
   item,
   active,
   disabled,
+  pinned,
+  unread,
   onSelect,
   onLongPress,
+  onTogglePin,
 }: {
   item: SessionRowItem;
   active: boolean;
   disabled?: boolean;
+  pinned: boolean;
+  unread: number;
   onSelect: () => void;
   onLongPress?: () => void;
+  onTogglePin: () => void;
 }) {
   const { t, i18n } = useTranslation();
   const press = useLongPress(onLongPress);
+  const { dx, handlers: swipe } = useSwipeRight(onTogglePin);
   return (
-    <button
-      onClick={onSelect}
-      disabled={disabled}
-      {...press}
-      className={`flex w-full flex-col px-4 py-3 text-left select-none [-webkit-touch-callout:none] disabled:opacity-50 ${
-        active ? "bg-selected" : "hover:bg-hover active:bg-active"
-      }`}
-    >
-      <span className="flex min-w-0 items-center gap-2">
-        <span
-          className={`min-w-0 flex-1 truncate text-sm ${active ? "font-medium text-ink" : "text-dim"}`}
-        >
-          {item.title || t("chat.untitled")}
+    <div className="relative overflow-hidden">
+      {/* Pin reveal behind the swipe (requirements 0.4 / 1.10). */}
+      <div className="absolute inset-y-0 left-0 flex w-24 items-center justify-center bg-info-wash text-info">
+        <Pin className="size-4" />
+      </div>
+      <button
+        onClick={onSelect}
+        disabled={disabled}
+        {...press}
+        onPointerDown={(e) => {
+          press.onPointerDown(e);
+          swipe.onPointerDown(e);
+        }}
+        onPointerMove={(e) => {
+          press.onPointerMove(e);
+          swipe.onPointerMove(e);
+        }}
+        onPointerUp={(e) => {
+          press.onPointerUp();
+          swipe.onPointerUp(e);
+        }}
+        onPointerCancel={(e) => {
+          press.onPointerCancel();
+          swipe.onPointerCancel(e);
+        }}
+        style={{ transform: dx > 0 ? `translateX(${dx}px)` : undefined }}
+        className={`relative flex w-full flex-col px-4 py-3 text-left select-none [-webkit-touch-callout:none] disabled:opacity-50 ${
+          dx > 0 ? "transition-none" : "transition-transform duration-200"
+        } ${active ? "bg-selected" : "hover:bg-hover active:bg-active"}`}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          {pinned && <Pin className="size-3 shrink-0 text-info" />}
+          <span
+            className={`min-w-0 flex-1 truncate text-sm ${active ? "font-medium text-ink" : "text-dim"}`}
+          >
+            {item.title || t("chat.untitled")}
+          </span>
+          {unread > 0 && (
+            <span className="flex size-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-info px-1 text-2xs font-semibold text-white">
+              {unread > 99 ? "99+" : unread}
+            </span>
+          )}
+          {(item.workflowActive ?? 0) > 0 && (
+            <span className="flex shrink-0 items-center gap-1 text-2xs font-medium text-chart-6">
+              <Workflow className="size-3 animate-pulse" />
+              {item.workflowActive}
+            </span>
+          )}
+          <ActivityBadge
+            sessionId={item.sessionId}
+            restRunning={item.status === "running"}
+          />
         </span>
-        {(item.workflowActive ?? 0) > 0 && (
-          <span className="flex shrink-0 items-center gap-1 text-2xs font-medium text-chart-6">
-            <Workflow className="size-3 animate-pulse" />
-            {item.workflowActive}
-          </span>
-        )}
-        <ActivityBadge
-          sessionId={item.sessionId}
-          restRunning={item.status === "running"}
-        />
-      </span>
-      <span className="mt-0.5 flex items-center justify-between gap-2 text-xs text-faint">
-        <span className="min-w-0 truncate">{baseName(item.workspace)}</span>
-        {item.updatedAt && (
-          <span className="shrink-0 tabular-nums">
-            {fmtRelative(item.updatedAt, i18n.language)}
-          </span>
-        )}
-      </span>
-    </button>
+        <span className="mt-0.5 flex items-center justify-between gap-2 text-xs text-faint">
+          <span className="min-w-0 truncate">{baseName(item.workspace)}</span>
+          {item.updatedAt && (
+            <span className="shrink-0 tabular-nums">
+              {fmtRelative(item.updatedAt, i18n.language)}
+            </span>
+          )}
+        </span>
+      </button>
+    </div>
   );
 }
 
@@ -229,6 +315,9 @@ export function SessionList({
   const renameSession = useAppStore((s) => s.renameSession);
   const shutdownInstance = useAppStore((s) => s.shutdownInstance);
   const openTerminal = useAppStore((s) => s.openTerminal);
+  const pinnedSessions = useAppStore((s) => s.pinnedSessions);
+  const toggleSessionPin = useAppStore((s) => s.toggleSessionPin);
+  const unreadBySession = useAppStore((s) => s.unreadBySession);
 
   const openActions = (s: SessionRowItem) => {
     setRenaming(false);
@@ -245,15 +334,23 @@ export function SessionList({
     void renameSession(target.instanceId, target.sessionId, draftTitle);
   };
 
+  // Pinned rows float to the top (requirements 0.4); within each group the
+  // input order (recency) stands.
   const filtered = useMemo(() => {
+    const pinned = new Set(pinnedSessions);
     const q = query.trim().toLowerCase();
-    if (!q) return sessions;
-    return sessions.filter(
-      (s) =>
-        (s.title ?? "").toLowerCase().includes(q) ||
-        baseName(s.workspace).toLowerCase().includes(q),
+    const base = q
+      ? sessions.filter(
+          (s) =>
+            (s.title ?? "").toLowerCase().includes(q) ||
+            baseName(s.workspace).toLowerCase().includes(q),
+        )
+      : sessions;
+    return [...base].sort(
+      (a, b) =>
+        Number(pinned.has(b.sessionId)) - Number(pinned.has(a.sessionId)),
     );
-  }, [sessions, query]);
+  }, [sessions, query, pinnedSessions]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -302,12 +399,15 @@ export function SessionList({
                 item={s}
                 active={activeKey === `${s.instanceId}:${s.sessionId}`}
                 disabled={connecting}
+                pinned={pinnedSessions.includes(s.sessionId)}
+                unread={unreadBySession[s.sessionId] ?? 0}
                 onSelect={() => onSelect(s.instanceId, s.sessionId)}
                 onLongPress={
                   readOnly && !onDelete
                     ? undefined
                     : () => openActions(s)
                 }
+                onTogglePin={() => toggleSessionPin(s.sessionId)}
               />
             ))}
           </>
@@ -375,6 +475,27 @@ export function SessionList({
               </div>
             ) : (
               <div className="flex flex-col gap-2 px-4 pb-4 pt-3">
+                {!readOnly && (
+                  <button
+                    onClick={() => {
+                      haptic();
+                      toggleSessionPin(actionTarget.sessionId);
+                    }}
+                    className="flex items-center justify-center gap-2 rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
+                  >
+                    {pinnedSessions.includes(actionTarget.sessionId) ? (
+                      <>
+                        <PinOff className="size-4 text-faint" />
+                        {t("chat.unpin")}
+                      </>
+                    ) : (
+                      <>
+                        <Pin className="size-4 text-faint" />
+                        {t("chat.pin")}
+                      </>
+                    )}
+                  </button>
+                )}
                 {!readOnly && (
                   <button
                     onClick={openRename}

@@ -84,7 +84,9 @@
     "editMessage": "编辑重发",
     "editMessageTitle": "编辑消息",
     "resend": "重发",
-    "regenerate": "重新生成"
+    "regenerate": "重新生成",
+    "pin": "置顶",
+    "unpin": "取消置顶"
   },
   "panel": {
     "title": "设置",

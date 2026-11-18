@@ -1141,6 +1141,7 @@ function Composer() {
             onClick={() => {
               const text = value.trim();
               if (!text && images.length === 0) return;
+              haptic();
               setText("");
               setImages([]);
               void sendPrompt(text, images.length > 0 ? images : undefined);

@@ -85,7 +85,9 @@
     "editMessage": "Edit & resend",
     "editMessageTitle": "Edit message",
     "resend": "Resend",
-    "regenerate": "Regenerate"
+    "regenerate": "Regenerate",
+    "pin": "Pin to top",
+    "unpin": "Unpin"
   },
   "panel": {
     "title": "Settings",
