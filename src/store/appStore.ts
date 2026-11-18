@@ -8,12 +8,14 @@ import {
   loadFontSize,
   loadLang,
   loadPending,
+  loadPinnedSessions,
   loadServerBook,
   loadUpdateChannel,
   newServerId,
   saveFontSize,
   saveLang,
   savePending,
+  savePinnedSessions,
   saveServerBook,
   type FontSize,
   type Lang,
@@ -417,12 +419,28 @@ export interface AppState extends ConfigSlice {
   // Bridge advertised session file access (initialize agentCapabilities
   // `_meta.zcode.fs`, server 0.7.0+); gates the file browser entry (ADR-0005).
   fsCapable: boolean;
+  // Bridge advertised the rewind extensions (`_meta.zcode.rewind`,
+  // session/edit_user_message + session/retry_turn — backend spec
+  // `.zcode/docs/session-rewind-backend-requirements.md`). Gates the
+  // edit-resend / regenerate actions; against an older bridge the buttons
+  // stay hidden (quote-to-composer remains).
+  rewindCapable: boolean;
   // Bridge marks load_earlier page updates `_meta.zcode.earlierPage`
   // (zcode-acp-server 0.44.1+); gates the marker-based page routing. Against
   // an older bridge the unmarked pages fall back to the pre-marker
   // buffer-everything collection.
   pageMarkerCapable: boolean;
   loadingSession: boolean;
+  // Pinned session ids (requirements 0.4): local display order only,
+  // persisted in localStorage. Pinned rows float to the top of every
+  // session list, recency-sorted within the group.
+  pinnedSessions: string[];
+  toggleSessionPin: (sessionId: string) => void;
+  // Unread turns per session (requirements 0.4): a turn that settled while
+  // its session was NOT the one on screen counts one unread event. Local
+  // state, cleared on entering the session; the active session never
+  // counts (the viewport's own marker covers it).
+  unreadBySession: Record<string, number>;
 
   // Machine-level saved-workflow groups for the management page, served
   // pre-aggregated by the hub (/api/workflow-overview, bridge 0.60.0): one
@@ -613,6 +631,16 @@ export interface AppState extends ConfigSlice {
   // and re-enters the input as a prefill (text + staged images).
   editPending: (index: number) => void;
   cancelTurn: () => void;
+  // Rewind extensions (gated on `rewindCapable`): edit the latest user
+  // message in place / retry the latest turn (messageId omitted). The ack
+  // means history rewrote server-side — both actions reload the session
+  // tail; the resumed turn streams through the normal pipeline.
+  editUserMessage: (messageId: string, newText: string) => Promise<void>;
+  retryTurn: (messageId?: string) => Promise<void>;
+  // User cancel of a wedged connect attempt (requirements 1.9): teardown
+  // WITHOUT the reconnect loop — the user chose to stop, so no silent
+  // retry. Clears the route back to the picker.
+  abortConnection: () => void;
   answerPermission: (requestId: number, optionId: string) => void;
   // Resolves a pending elicitation form: content answers it (accept), null
   // declines. Same first-response-wins race as permissions.
@@ -918,6 +946,7 @@ function connectionResetPatch(): Partial<AppState> {
     quotaUnavailable: false,
     fsCapable: false,
     pageMarkerCapable: false,
+    rewindCapable: false,
     loadingSession: false,
     isRunning: false,
     // Configuration state describes ONE machine, so it is re-probed on the
@@ -1403,12 +1432,19 @@ export const useAppStore = create<AppState>((set, get) => {
   // is harmless.
   function retireSessionLocally(sessionId: string): void {
     closedSessionTombstones.set(sessionId, Date.now());
-    set((state) => ({
-      instances: state.instances.map((i) => ({
-        ...i,
-        sessions: (i.sessions ?? []).filter((s) => s.sessionId !== sessionId),
-      })),
-    }));
+    set((state) => {
+      const unreadBySession = { ...state.unreadBySession };
+      delete unreadBySession[sessionId];
+      return {
+        instances: state.instances.map((i) => ({
+          ...i,
+          sessions: (i.sessions ?? []).filter(
+            (s) => s.sessionId !== sessionId,
+          ),
+        })),
+        unreadBySession,
+      };
+    });
     if (get().activeSessionId === sessionId) get().closeSession();
     set({ notice: "notice.sessionClosed" });
     removeSessionCache(sessionId);
@@ -1543,6 +1579,7 @@ export const useAppStore = create<AppState>((set, get) => {
         notice: "notice.instanceGone",
         fsCapable: false,
         pageMarkerCapable: false,
+        rewindCapable: false,
         replayCursor: null,
         hasMore: false,
         totalMessages: null,
@@ -1747,6 +1784,20 @@ export const useAppStore = create<AppState>((set, get) => {
                 finishedAt: Date.now(),
               },
         );
+        // Unread badge (requirements 0.4): a turn that settled in a session
+        // the user is not looking at counts one unread event there. The
+        // active session never counts — its viewport owns its own marker.
+        if (!running && sessionId !== get().activeSessionId) {
+          set((s) => ({
+            unreadBySession: {
+              ...s.unreadBySession,
+              [sessionId]: Math.min(
+                (s.unreadBySession[sessionId] ?? 0) + 1,
+                99,
+              ),
+            },
+          }));
+        }
         if (sessionId !== get().activeSessionId) return;
         if (running) {
           set({ isRunning: true });
@@ -1881,6 +1932,7 @@ export const useAppStore = create<AppState>((set, get) => {
       connectingSince = 0;
       set({
         fsCapable: init.agentCapabilities?._meta?.zcode?.fs === true,
+        rewindCapable: init.agentCapabilities?._meta?.zcode?.rewind === true,
         pageMarkerCapable: bridgeSupportsPageMarker(
           (init.agentInfo as { version?: unknown } | undefined)?.version,
         ),
@@ -1953,7 +2005,10 @@ export const useAppStore = create<AppState>((set, get) => {
     quotaUnavailable: false,
     fsCapable: false,
     pageMarkerCapable: false,
+    rewindCapable: false,
     loadingSession: false,
+    pinnedSessions: loadPinnedSessions(),
+    unreadBySession: {},
     workflowHub: null,
     workflowActiveRuns: null,
     workflowRecentRuns: null,
@@ -2256,6 +2311,7 @@ export const useAppStore = create<AppState>((set, get) => {
         availableCommands: [],
         fsCapable: false,
         pageMarkerCapable: false,
+        rewindCapable: false,
         // usageStats stays: quota is hub-level (/api/quota), not tied to the
         // instance connection — switching instances must not blank the card.
         sessionStates: {},
@@ -2464,6 +2520,7 @@ export const useAppStore = create<AppState>((set, get) => {
         notice: "notice.instanceShutdown",
         fsCapable: false,
         pageMarkerCapable: false,
+        rewindCapable: false,
         replayCursor: null,
         hasMore: false,
         totalMessages: null,
@@ -2615,8 +2672,12 @@ export const useAppStore = create<AppState>((set, get) => {
         if (oldElicit) pendingElicitResponds.delete(oldElicit.requestId);
         delete permissions[sessionId];
         delete elicitations[sessionId];
+        // Entering the session clears its unread count (requirements 0.4).
+        const unreadBySession = { ...s.unreadBySession };
+        delete unreadBySession[sessionId];
         return {
           activeSessionId: sessionId,
+          unreadBySession,
           // A cached snapshot paints instantly and carries the last turn's
           // readouts (cacheHit/turnStats) with it — without them a switch or
           // wake-reconnect blanks the title-bar segments until the next
@@ -3221,6 +3282,97 @@ export const useAppStore = create<AppState>((set, get) => {
       if (!acp || !s.activeSessionId) return;
       // session/cancel is a NOTIFICATION in ACP (no id, no response).
       acp.notify("session/cancel", { sessionId: s.activeSessionId });
+    },
+
+    // Rewind extensions — see the interface comment. The optimistic
+    // isRunning closes the composer gap until the bridge's own busy raise
+    // (turnState broadcast) lands; a failed request must undo it.
+    editUserMessage: async (messageId, newText) => {
+      const s = get();
+      const sid = s.activeSessionId;
+      if (!acp || s.connState !== "open" || !sid) return;
+      set({ isRunning: true });
+      try {
+        await acp.request("session/edit_user_message", {
+          sessionId: sid,
+          messageId,
+          newText,
+        });
+        // History rewrote in place — the ack is the caller's cue to reload
+        // (backend spec §6); the replacement turn streams on its own.
+        await get().loadSession(sid);
+      } catch (e) {
+        set({ isRunning: false });
+        if (!isTransientConnError(e))
+          set({ notice: `edit failed: ${(e as Error).message}` });
+      }
+    },
+
+    retryTurn: async (messageId) => {
+      const s = get();
+      const sid = s.activeSessionId;
+      if (!acp || s.connState !== "open" || !sid) return;
+      set({ isRunning: true });
+      try {
+        await acp.request("session/retry_turn", {
+          sessionId: sid,
+          ...(messageId ? { messageId } : {}),
+        });
+        await get().loadSession(sid);
+      } catch (e) {
+        set({ isRunning: false });
+        if (!isTransientConnError(e))
+          set({ notice: `retry failed: ${(e as Error).message}` });
+      }
+    },
+
+    abortConnection: () => {
+      connSeq++;
+      acp?.close();
+      acp = null;
+      stopReconnect();
+      dropQueuedUpdates();
+      pendingResponds.clear();
+      pendingElicitResponds.clear();
+      connectingSince = 0;
+      reconnectRunSince = 0;
+      reconnectAttempt = 0;
+      set({
+        connState: "idle",
+        instanceId: null,
+        activeSessionId: null,
+        messages: [],
+        planEntries: null,
+        permissions: {},
+        elicitations: {},
+        notice: null,
+        replayCursor: null,
+        hasMore: false,
+        totalMessages: null,
+        loadingEarlier: false,
+        configOptions: [],
+        currentModeId: null,
+        usage: null,
+        cacheHit: null,
+        turnStats: null,
+        availableCommands: [],
+        fsCapable: false,
+        pageMarkerCapable: false,
+        rewindCapable: false,
+        sessionStates: {},
+        loadingSession: false,
+        isRunning: false,
+      });
+    },
+
+    toggleSessionPin: (sessionId) => {
+      set((s) => {
+        const pinnedSessions = s.pinnedSessions.includes(sessionId)
+          ? s.pinnedSessions.filter((x) => x !== sessionId)
+          : [...s.pinnedSessions, sessionId];
+        savePinnedSessions(pinnedSessions);
+        return { pinnedSessions };
+      });
     },
 
     answerPermission: (requestId, optionId) => {

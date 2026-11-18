@@ -1,8 +1,10 @@
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ListChecks, Terminal } from "lucide-react";
 import { Sheet } from "../ui";
+import { haptic } from "../lib/haptic";
 import {
   useAppStore,
   type ApprovalContext,
@@ -61,6 +63,7 @@ function ActionButtons({
   onAnswer: (optionId: string) => void;
   plan: boolean;
 }) {
+  const { t } = useTranslation();
   // Plan approval: the two options are fixed and well-known — make them the
   // primary actions of the card.
   if (plan) {
@@ -75,7 +78,7 @@ function ActionButtons({
             onClick={() => onAnswer(approve.optionId)}
             className="rounded-xl bg-success px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
           >
-            {approve.name || "Approve — exit plan mode"}
+            {approve.name || t("permission.approvePlan")}
           </button>
         )}
         {reject && (
@@ -83,7 +86,7 @@ function ActionButtons({
             onClick={() => onAnswer(reject.optionId)}
             className="rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
           >
-            {reject.name || "Reject — keep planning"}
+            {reject.name || t("permission.rejectPlan")}
           </button>
         )}
       </div>
@@ -114,13 +117,81 @@ export function PermissionDialog() {
     (s) => (s.activeSessionId ? s.permissions[s.activeSessionId] : undefined) ?? null,
   );
   const answerPermission = useAppStore((s) => s.answerPermission);
-  if (!permission) return null;
+  // Approval queue count (requirements 0.3): requests parked in OTHER
+  // sessions — this card answers only its own session's request, the count
+  // tells the user more are waiting elsewhere.
+  const queueCount = useAppStore((s) => {
+    let n = 0;
+    for (const sid of Object.keys(s.permissions))
+      if (sid !== s.activeSessionId) n++;
+    for (const sid of Object.keys(s.elicitations))
+      if (sid !== s.activeSessionId) n++;
+    return n;
+  });
 
-  const ctx = permission.context;
-  const optionIds = new Set(permission.options.map((o) => o.optionId));
+  const ctx = permission?.context;
+  const optionIds = new Set((permission?.options ?? []).map((o) => o.optionId));
   const isPlan =
     ctx?.kind === "switch_mode" ||
     (optionIds.has("approve") && optionIds.has("reject"));
+
+  // Keyboard answers (requirements 0.3): 1..9 pick the n-th option, Enter is
+  // the affirmative (plan approve / first allow), Escape is the explicit
+  // skip — answered with the first reject option when the wire offers one
+  // and a pure no-op otherwise (an accidental answer is worse than none).
+  useEffect(() => {
+    if (!permission) return;
+    const req = permission;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      const options = req.options;
+      const pick = (o: PermissionOption | undefined) => {
+        if (o) {
+          haptic();
+          answerPermission(req.requestId, o.optionId);
+        }
+      };
+      if (e.key === "Escape") {
+        pick(
+          options.find(
+            (o) =>
+              o.kind?.startsWith("reject") || o.optionId.startsWith("reject"),
+          ),
+        );
+        return;
+      }
+      if (e.key === "Enter") {
+        pick(
+          isPlan
+            ? (options.find(
+                (o) => o.optionId === "approve" || o.kind?.startsWith("allow"),
+              ) ?? options[0])
+            : (options.find(
+                (o) => o.kind?.startsWith("allow") || o.optionId === "allow",
+              ) ??
+              options.find(
+                (o) => o.kind?.startsWith("reject") || o.optionId === "reject",
+              ) ??
+              options[0]),
+        );
+        return;
+      }
+      const n = Number.parseInt(e.key, 10);
+      if (
+        !Number.isNaN(n) &&
+        options.length > 1 &&
+        n >= 1 &&
+        n <= options.length
+      ) {
+        pick(options[n - 1]);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [permission, isPlan, answerPermission]);
+
+  if (!permission) return null;
+
   const isQuestion = ctx?.toolName === "AskUserQuestion";
   const highlights = isPlan ? [] : rawInputHighlights(ctx ?? {});
   const bodyText = isPlan
@@ -129,8 +200,10 @@ export function PermissionDialog() {
       ? ctx?.detail
       : undefined;
 
-  const onAnswer = (optionId: string) =>
+  const onAnswer = (optionId: string) => {
+    haptic();
     answerPermission(permission.requestId, optionId);
+  };
 
   return (
     <Sheet
@@ -228,6 +301,11 @@ export function PermissionDialog() {
         <p className="mt-2.5 text-center text-xs text-faint">
           {t("permission.hint")}
         </p>
+        {queueCount > 0 && (
+          <p className="mt-1 text-center text-xs font-medium text-warning">
+            {t("permission.queueWaiting", { count: queueCount })}
+          </p>
+        )}
       </div>
     </Sheet>
   );

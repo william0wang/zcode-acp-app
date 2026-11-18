@@ -258,6 +258,26 @@ export function isEarlierPageMeta(meta: unknown): boolean {
   );
 }
 
+// `_meta.zcode.mid` on a replayed chunk (rewind spec §4.3): the backend's
+// stable message id, the handle session/edit_user_message and
+// session/retry_turn address. Live echoes carry none — absence is the
+// "not addressable" spelling. Both placements are read (notification-level
+// meta param first, then the update's own _meta), mirroring the
+// collapsed/earlierPage flags.
+export function zcodeMid(u: SessionUpdate, meta?: unknown): string | null {
+  const read = (v: unknown): string | null => {
+    if (typeof v !== "object" || v === null) return null;
+    const zcode = (v as { zcode?: { mid?: unknown } }).zcode;
+    return typeof zcode === "object" &&
+      zcode !== null &&
+      typeof zcode.mid === "string" &&
+      zcode.mid
+      ? zcode.mid
+      : null;
+  };
+  return read(meta) ?? read(u._meta);
+}
+
 // Locates the tool_call part the bridge emits right before an interaction
 // request; its content holds the plan/question text (ADR 0003).
 export function findToolCallPart(
@@ -316,6 +336,16 @@ export function applyOne(
     const text = contentText(u.content);
     if (!text) return null;
     let next = appendChunkMessage(msgs, u, role, text, "text");
+    // Stamp the rewind handle onto the chunk's message (replay only — see
+    // zcodeMid). The mid names the SAME message the chunk's own messageId
+    // groups by, so the lookup cannot miss on the create path.
+    const wireMid =
+      typeof u.messageId === "string" && u.messageId ? u.messageId : null;
+    const rewindMid = zcodeMid(u, meta);
+    if (wireMid && rewindMid) {
+      const i = next.findIndex((m) => m.id === wireMid && !m.mid);
+      if (i >= 0) next = patchMessage(next, i, { ...next[i], mid: rewindMid });
+    }
     if (role === "user" && isCollapsedMeta(meta)) {
       const mid = typeof u.messageId === "string" ? u.messageId : "";
       const i = next.findIndex((m) => m.id === mid && !m.collapsed);

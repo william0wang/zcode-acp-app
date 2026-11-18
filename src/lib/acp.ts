@@ -52,7 +52,10 @@ interface PendingEntry {
 // zcode extension rides in agentCapabilities._meta (REMOTE-CLIENTS.md).
 export interface AcpInitializeResult {
   agentCapabilities?: {
-    _meta?: { zcode?: { fs?: boolean } };
+    // `rewind` (session/edit_user_message + session/retry_turn, spec
+    // `.zcode/docs/session-rewind-backend-requirements.md`) follows the
+    // same absence-spelling as `fs`.
+    _meta?: { zcode?: { fs?: boolean; rewind?: boolean } };
     [key: string]: unknown;
   };
   [key: string]: unknown;

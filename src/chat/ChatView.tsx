@@ -43,6 +43,8 @@ import {
   Layers,
   ListChecks,
   Pencil,
+  Quote,
+  RotateCcw,
   Search,
   Square,
   Terminal,
@@ -56,6 +58,8 @@ import "highlight.js/styles/github-dark.css";
 import { useAppStore } from "../store/appStore";
 import { MarkdownText } from "../components/Markdown";
 import { Spinner } from "../components/Spinner";
+import { Sheet } from "../ui";
+import { haptic } from "../lib/haptic";
 import { MAX_IMAGES, attachmentDataUrl, prepareImage } from "../lib/image";
 import { isRunningStatus, summarizeToolRun, toolNameOf, oneLine } from "./toolRun";
 import type {
@@ -483,19 +487,34 @@ const UserMessage = memo(function UserMessage({
   collapsed,
   notice,
   images,
+  editMid,
 }: {
   collapsed?: boolean;
   notice?: { status: string; summary: string };
   /** Attachment echo data URLs (resolved per store write in ChatView). */
   images?: string[];
+  /** Rewind handle when this is the latest user message on a rewind-capable
+   *  bridge — presence arms the edit-resend action (requirements 0.1). */
+  editMid?: string;
 }) {
   const { t } = useTranslation();
   const notify = useAppStore((s) => s.notify);
+  const setComposerPrefill = useAppStore((s) => s.setComposerPrefill);
+  const onEditMessage = useAppStore((s) => s.editUserMessage);
   const [zoom, setZoom] = useState<number | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
   // An image-only prompt has no text for the copy action to write — hide the
   // dead button (desktop parity: workbench.rs gates the same way).
   const hasText = useAuiState((s) =>
     s.message.parts.some((p) => p.type === "text" && p.text.trim() !== ""),
+  );
+  // Full text for the quote/edit actions (source of truth: the parts).
+  const text = useAuiState((s) =>
+    s.message.parts
+      .filter((p) => p.type === "text")
+      .map((p) => (p as { text: string }).text)
+      .join("\n"),
   );
 
   // Long-press copy: the bubble is plain text, so the rendered text is the
@@ -580,9 +599,12 @@ const UserMessage = memo(function UserMessage({
         )}
       </div>
       {/* Same trailing copy action as the assistant side — the bubble is
-          select-none, so the button (plus long-press) is the only copy path. */}
+          select-none, so the button (plus long-press) is the only copy path.
+          Quote re-enters the text as an editable draft (requirements 0.1);
+          Edit (rewind-capable bridges only, latest user message only)
+          rewrites it in place through session/edit_user_message. */}
       {hasText && (
-        <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
+        <ActionBarPrimitive.Root className="mt-0.5 flex justify-end gap-0.5">
           <ActionBarPrimitive.Copy
             aria-label={t("chat.copy")}
             className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active group"
@@ -590,6 +612,29 @@ const UserMessage = memo(function UserMessage({
             <Copy className="size-3 group-data-[copied]:hidden" />
             <Check className="hidden size-3 text-success group-data-[copied]:block" />
           </ActionBarPrimitive.Copy>
+          <button
+            onClick={() => {
+              haptic();
+              setComposerPrefill(text);
+            }}
+            aria-label={t("chat.quote")}
+            className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active"
+          >
+            <Quote className="size-3" />
+          </button>
+          {editMid && (
+            <button
+              onClick={() => {
+                haptic();
+                setDraft(text);
+                setEditing(true);
+              }}
+              aria-label={t("chat.editMessage")}
+              className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active"
+            >
+              <Pencil className="size-3" />
+            </button>
+          )}
         </ActionBarPrimitive.Root>
       )}
       {zoom != null && images && (
@@ -602,6 +647,48 @@ const UserMessage = memo(function UserMessage({
           zoom={{ maxZoomPixelRatio: 5 }}
         />
       )}
+      {editing && editMid && (
+        <Sheet
+          open
+          blocking
+          onClose={() => setEditing(false)}
+          className="flex max-h-[75vh] w-full flex-col overflow-hidden"
+        >
+          <div className="-mx-4 min-h-0 flex-1 overflow-y-auto px-4">
+            <h2 className="text-sm font-semibold text-ink">
+              {t("chat.editMessageTitle")}
+            </h2>
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={6}
+              autoFocus
+              className="mt-2 w-full resize-none rounded-xl bg-raised px-3 py-2.5 text-sm text-ink ring-1 ring-inset ring-hairline focus:outline-none"
+            />
+          </div>
+          <div className="pb-1 pt-3">
+            <button
+              onClick={() => {
+                const text = draft.trim();
+                if (!text) return;
+                haptic();
+                setEditing(false);
+                void onEditMessage(editMid, text);
+              }}
+              disabled={!draft.trim()}
+              className="w-full rounded-xl bg-ink px-4 py-3 text-sm font-semibold text-canvas active:brightness-90 disabled:opacity-50"
+            >
+              {t("chat.resend")}
+            </button>
+            <button
+              onClick={() => setEditing(false)}
+              className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
+            >
+              {t("common.cancel")}
+            </button>
+          </div>
+        </Sheet>
+      )}
     </MessagePrimitive.Root>
   );
 });
@@ -610,7 +697,13 @@ const UserMessage = memo(function UserMessage({
 // lists) reads far better unconfined; only the user side gets a bubble.
 // A trailing copy action (library primitive, ADR 0004) copies the message's
 // markdown source.
-const AssistantMessage = memo(function AssistantMessage() {
+const AssistantMessage = memo(function AssistantMessage({
+  onRegenerate,
+}: {
+  /** Set only on the latest assistant message of a rewind-capable session:
+   *  re-runs the turn through session/retry_turn (requirements 0.1). */
+  onRegenerate?: () => void;
+}) {
   const { t } = useTranslation();
   // The trailing copy writes the message's TEXT blocks only (thoughts and
   // tool cards stay out). A tool-calls-only message — the fresh card message
@@ -665,7 +758,7 @@ const AssistantMessage = memo(function AssistantMessage() {
         </MessagePrimitive.GroupedParts>
       </div>
       {hasText && (
-        <ActionBarPrimitive.Root className="mt-0.5 flex justify-end">
+        <ActionBarPrimitive.Root className="mt-0.5 flex justify-end gap-0.5">
           <ActionBarPrimitive.Copy
             aria-label={t("chat.copy")}
             className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active group"
@@ -673,6 +766,18 @@ const AssistantMessage = memo(function AssistantMessage() {
             <Copy className="size-3 group-data-[copied]:hidden" />
             <Check className="hidden size-3 text-success group-data-[copied]:block" />
           </ActionBarPrimitive.Copy>
+          {onRegenerate && (
+            <button
+              onClick={() => {
+                haptic();
+                onRegenerate();
+              }}
+              aria-label={t("chat.regenerate")}
+              className="flex size-7 items-center justify-center rounded-full text-faint hover:bg-hover active:bg-active"
+            >
+              <RotateCcw className="size-3" />
+            </button>
+          )}
         </ActionBarPrimitive.Root>
       )}
     </MessagePrimitive.Root>
@@ -1162,6 +1267,29 @@ function Thread({
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const loadingSession = useAppStore((s) => s.loadingSession);
   const messages = useAppStore((s) => s.messages);
+  const rewindCapable = useAppStore((s) => s.rewindCapable);
+  const retryTurn = useAppStore((s) => s.retryTurn);
+
+  // Latest-role targets for the rewind actions (latest-only is the wire
+  // contract — the buttons exist only there, so the UI never offers an
+  // action the bridge would refuse). Regenerate falls back to the wire's
+  // default-latest when the tail carries no mid (e.g. a local card message).
+  let lastUserId: string | null = null;
+  let lastUserMid: string | null = null;
+  let lastAssistantId: string | null = null;
+  let lastAssistantMid: string | null = null;
+  for (const m of messages) {
+    if (m.role === "user") {
+      lastUserId = m.id;
+      lastUserMid = m.mid ?? null;
+    } else {
+      lastAssistantId = m.id;
+      lastAssistantMid = m.mid ?? null;
+    }
+  }
+  const onRegenerate = useCallback(() => {
+    void retryTurn(lastAssistantMid ?? undefined);
+  }, [retryTurn, lastAssistantMid]);
 
   // Stick-to-bottom comes from the library hook (ADR 0004); only the
   // load-earlier anchoring stays hand-rolled below. The library's
@@ -1258,9 +1386,25 @@ function Thread({
                 collapsed={collapsedIds.has(message.id)}
                 notice={taskNotices.get(message.id)}
                 images={userImages.get(message.id)}
+                editMid={
+                  rewindCapable &&
+                  message.id === lastUserId &&
+                  lastUserMid &&
+                  !collapsedIds.has(message.id) &&
+                  !taskNotices.has(message.id)
+                    ? lastUserMid
+                    : undefined
+                }
               />
             ) : (
-              <AssistantMessage key={message.id} />
+              <AssistantMessage
+                key={message.id}
+                onRegenerate={
+                  rewindCapable && message.id === lastAssistantId
+                    ? onRegenerate
+                    : undefined
+                }
+              />
             )
           }
         </ThreadPrimitive.Messages>

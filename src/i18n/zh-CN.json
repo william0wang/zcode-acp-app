@@ -78,7 +78,13 @@
     "activityAwaiting": "等待确认",
     "activityRunning": "运行中",
     "activityFinished": "已完成",
-    "diffTruncated": "差异较大——仅显示前 2 万字符"
+    "diffTruncated": "差异较大——仅显示前 2 万字符",
+    "copyCode": "复制代码",
+    "quote": "引用",
+    "editMessage": "编辑重发",
+    "editMessageTitle": "编辑消息",
+    "resend": "重发",
+    "regenerate": "重新生成"
   },
   "panel": {
     "title": "设置",
@@ -525,7 +531,14 @@
     "planTitle": "可以开始编码了吗？",
     "questionTitle": "需要你回答",
     "hint": "所有客户端中最先应答的生效",
-    "submit": "提交"
+    "submit": "提交",
+    "approvePlan": "批准——退出计划模式",
+    "rejectPlan": "拒绝——继续计划",
+    "approve": "批准",
+    "reject": "拒绝",
+    "otherValue": "或输入自定义值",
+    "otherValueMulti": "或自定义值",
+    "queueWaiting_other": "其他会话还有 {{count}} 个待审批"
   },
   "notice": {
     "unsupported": "此交互请在编辑器中应答",

@@ -16,6 +16,9 @@ const FONT_SIZE_KEY = "zcode-acp:font-size";
 const PENDING_KEY = "zcode-acp:pending";
 const UPDATE_CHANNEL_KEY = "zcode-acp:update-channel";
 const PROJECTS_KEY = "zcode-acp:projects";
+// Pinned session ids (session-list pinning, requirements 0.4): local-only
+// display order, never sent anywhere.
+const PINNED_KEY = "zcode-acp:pinned-sessions";
 
 export type Lang = "en" | "zh-CN";
 export type FontSize = "small" | "medium" | "large";
@@ -250,5 +253,29 @@ export function savePending(map: PendingPromptMap): void {
     } catch {
       // Storage unavailable — drafts stay in memory for this run.
     }
+  }
+}
+
+// Pinned sessions (flat id list, newest-pin-last order irrelevant — the list
+// sorts by recency within the pinned group).
+export function loadPinnedSessions(): string[] {
+  try {
+    const raw = localStorage.getItem(PINNED_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    return Array.isArray(parsed)
+      ? parsed.filter((v): v is string => typeof v === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function savePinnedSessions(ids: string[]): void {
+  try {
+    if (ids.length === 0) localStorage.removeItem(PINNED_KEY);
+    else localStorage.setItem(PINNED_KEY, JSON.stringify(ids));
+  } catch {
+    // Storage unavailable — pins stay in memory for this run.
   }
 }

@@ -4,6 +4,7 @@ import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ListChecks } from "lucide-react";
 import { Sheet } from "../ui";
+import { haptic } from "../lib/haptic";
 import { useAppStore, type ElicitField } from "../store/appStore";
 
 // elicitation/create forms — the bridge's preferred channel once any client
@@ -42,6 +43,7 @@ function QuestionBlock({
   onToggle: (v: string) => void;
   onOther: (v: string) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="px-4 pb-3 pt-1">
       <p className="pb-1.5 text-sm text-ink">{field.question}</p>
@@ -74,7 +76,7 @@ function QuestionBlock({
             value={other}
             onChange={(e) => onOther(e.target.value)}
             placeholder={
-              field.multi ? "or a custom value" : "or type a custom value"
+              field.multi ? t("permission.otherValueMulti") : t("permission.otherValue")
             }
             autoCapitalize="none"
             className="rounded-xl bg-raised px-3.5 py-2.5 text-sm text-ink placeholder:text-faint ring-1 ring-inset ring-hairline focus:outline-none"
@@ -93,6 +95,15 @@ export function ElicitationDialog() {
     (s) => (s.activeSessionId ? s.elicitations[s.activeSessionId] : undefined) ?? null,
   );
   const answerElicitation = useAppStore((s) => s.answerElicitation);
+  // Approval queue count (requirements 0.3) — same card as PermissionDialog.
+  const queueCount = useAppStore((s) => {
+    let n = 0;
+    for (const sid of Object.keys(s.permissions))
+      if (sid !== s.activeSessionId) n++;
+    for (const sid of Object.keys(s.elicitations))
+      if (sid !== s.activeSessionId) n++;
+    return n;
+  });
   // Local answer state; keyed fresh per request (option sets can repeat q_0).
   const [picked, setPicked] = useState<Record<string, string>>({});
   const [checked, setChecked] = useState<Record<string, boolean>>({});
@@ -105,21 +116,65 @@ export function ElicitationDialog() {
     setOther({});
   }, [requestId]);
 
-  if (!elicitation) return null;
-
   // Plan-approval form (exactly one approve/reject field): direct-answer
   // buttons instead of the pick-then-submit flow — same card as the
   // request_permission plan fallback (PermissionDialog).
   const planField =
-    elicitation.fields.length === 1 && isPlanField(elicitation.fields[0])
-      ? elicitation.fields[0]
+    (elicitation?.fields.length ?? 0) === 1 && elicitation
+      ? isPlanField(elicitation.fields[0])
+        ? elicitation.fields[0]
+        : null
       : null;
+
+  // Keyboard answers (requirements 0.3): Enter confirms (approve on the plan
+  // form, submit on the question form — including from the custom-value
+  // input), Escape declines the whole form, mirroring the Cancel button.
+  // IME-confirm Enters are skipped (isComposing).
+  useEffect(() => {
+    if (!elicitation) return;
+    const req = elicitation;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (e.key === "Enter") {
+        haptic();
+        if (planField) {
+          answerElicitation(req.requestId, { [planField.key]: "approve" });
+        } else {
+          const content: Record<string, string | string[]> = {};
+          for (const f of req.fields) {
+            const free =
+              f.otherKey != null ? (other[f.otherKey] ?? "").trim() : "";
+            if (f.multi) {
+              const sel = f.options
+                .filter((o) => checked[o.value])
+                .map((o) => o.value);
+              if (sel.length > 0) content[f.key] = sel;
+            } else if (!free) {
+              const v = picked[f.key];
+              if (v) content[f.key] = v;
+            }
+            if (free && f.otherKey != null) content[f.otherKey] = free;
+          }
+          answerElicitation(req.requestId, content);
+        }
+      } else if (e.key === "Escape") {
+        haptic();
+        answerElicitation(req.requestId, null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [elicitation, planField, picked, checked, other, answerElicitation]);
+
+  if (!elicitation) return null;
 
   if (planField) {
     const approve = planField.options.find((o) => o.value === "approve");
     const reject = planField.options.find((o) => o.value === "reject");
-    const answer = (v: string) =>
+    const answer = (v: string) => {
+      haptic();
       answerElicitation(elicitation.requestId, { [planField.key]: v });
+    };
     return (
       <Sheet
         open
@@ -145,20 +200,28 @@ export function ElicitationDialog() {
             onClick={() => answer("approve")}
             className="w-full rounded-xl bg-success px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
           >
-            {approve?.label || "Approve"}
+            {approve?.label || t("permission.approve")}
           </button>
           <button
             onClick={() => answer("reject")}
             className="mt-2 w-full rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
           >
-            {reject?.label || "Reject"}
+            {reject?.label || t("permission.reject")}
           </button>
           <button
-            onClick={() => answerElicitation(elicitation.requestId, null)}
+            onClick={() => {
+              haptic();
+              answerElicitation(elicitation.requestId, null);
+            }}
             className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
           >
             {t("common.cancel")}
           </button>
+          {queueCount > 0 && (
+            <p className="mt-2 text-center text-xs font-medium text-warning">
+              {t("permission.queueWaiting", { count: queueCount })}
+            </p>
+          )}
         </div>
       </Sheet>
     );
@@ -180,6 +243,7 @@ export function ElicitationDialog() {
       }
       if (free && f.otherKey != null) content[f.otherKey] = free;
     }
+    haptic();
     answerElicitation(elicitation.requestId, content);
   };
 
@@ -215,11 +279,19 @@ export function ElicitationDialog() {
           {t("permission.submit")}
         </button>
         <button
-          onClick={() => answerElicitation(elicitation.requestId, null)}
+          onClick={() => {
+            haptic();
+            answerElicitation(elicitation.requestId, null);
+          }}
           className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
         >
           {t("common.cancel")}
         </button>
+        {queueCount > 0 && (
+          <p className="mt-2 text-center text-xs font-medium text-warning">
+            {t("permission.queueWaiting", { count: queueCount })}
+          </p>
+        )}
       </div>
     </Sheet>
   );

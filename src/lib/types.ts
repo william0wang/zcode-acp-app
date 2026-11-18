@@ -366,6 +366,11 @@ export interface ChatMessage {
   // Replay-only: harness-injected context handoff rendered collapsed instead
   // of a wall of user text (`_meta.zcode.collapsed` on the update).
   collapsed?: boolean;
+  // Rewind handle (`_meta.zcode.mid` on replayed chunks, bridge spec §4.3):
+  // the backend's stable message id. Present ONLY on replay — live echoes
+  // and local optimistic bubbles have none, so it doubles as the
+  // "addressable for edit/resend" gate next to `rewindCapable`.
+  mid?: string;
 }
 
 // ---- ZCode configuration (bridge 0.47.0, server ADR-0025) ----

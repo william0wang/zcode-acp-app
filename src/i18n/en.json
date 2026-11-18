@@ -79,7 +79,13 @@
     "activityAwaiting": "Waiting for you",
     "activityRunning": "Running",
     "activityFinished": "Done",
-    "diffTruncated": "Large diff — showing the first 20k characters"
+    "diffTruncated": "Large diff — showing the first 20k characters",
+    "copyCode": "Copy code",
+    "quote": "Quote",
+    "editMessage": "Edit & resend",
+    "editMessageTitle": "Edit message",
+    "resend": "Resend",
+    "regenerate": "Regenerate"
   },
   "panel": {
     "title": "Settings",
@@ -527,7 +533,15 @@
     "planTitle": "Ready to code?",
     "questionTitle": "Question for you",
     "hint": "The first answer across all clients wins",
-    "submit": "Submit"
+    "submit": "Submit",
+    "approvePlan": "Approve — exit plan mode",
+    "rejectPlan": "Reject — keep planning",
+    "approve": "Approve",
+    "reject": "Reject",
+    "otherValue": "or type a custom value",
+    "otherValueMulti": "or a custom value",
+    "queueWaiting_one": "{{count}} more approval waiting in other sessions",
+    "queueWaiting_other": "{{count}} more approvals waiting in other sessions"
   },
   "notice": {
     "unsupported": "This interaction must be answered in your editor",
