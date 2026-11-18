@@ -845,7 +845,7 @@ pub(crate) fn render_file_viewer(
             Button::new("file-viewer-md-toggle")
                 .ghost()
                 .xsmall()
-                .label(if md_source { t!("files.preview").into_owned() } else { t!("files.source").into_owned() })
+                .label(if md_source { t!("viewer.preview").into_owned() } else { t!("viewer.source").into_owned() })
                 .tooltip(t!("files.togglePreview"))
                 .on_click(move |_, _, cx| {
                     let _ = wb_toggle.update(cx, |wb, cx| {
