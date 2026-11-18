@@ -1019,11 +1019,19 @@ impl TerminalView {
                     // OSC 52 read (tmux/vim paste, req 2.8): answer from the
                     // host clipboard — the reply fn formats the escape
                     // sequence, its return goes straight into the PTY.
+                    // Trust boundary: whatever runs in the pane receives the
+                    // reply — including a process reached through ssh, which
+                    // forwards escape sequences verbatim (same exposure class
+                    // as any terminal that honors OSC 52 reads). The cap
+                    // keeps a giant clipboard from being dumped into PTY
+                    // input.
+                    const MAX_CLIPBOARD_READ_BYTES: usize = 100_000;
                     let text = cx
                         .read_from_clipboard()
                         .and_then(|item| item.text())
                         .unwrap_or_default();
-                    let bytes = reply(&text);
+                    let text = truncate_on_char_boundary(&text, MAX_CLIPBOARD_READ_BYTES);
+                    let bytes = reply(text);
                     let _ = self
                         .stdin_writer
                         .lock()
@@ -1365,6 +1373,19 @@ impl Render for TerminalView {
                 .size_full(),
             )
     }
+}
+
+/// `&text[..max]` stepped back to a UTF-8 char boundary (clipboard text is
+/// arbitrary user content; a byte-index slice could panic mid-sequence).
+fn truncate_on_char_boundary(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 // Tests are omitted due to macro expansion issues with the test attribute
