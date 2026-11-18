@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { Search, Workflow } from "lucide-react";
 import { useAppStore } from "../store/appStore";
 import { fmtRelative } from "../lib/time";
+import { Skeleton } from "../ui";
 
 // Shared flat session list (drawer + entry screen): search field, per-session
 // activity badge, relative time.
@@ -196,6 +197,7 @@ export function SessionList({
   connecting,
   onSelect,
   emptyHint,
+  loading = false,
   readOnly = false,
   onDelete,
   footer,
@@ -205,6 +207,8 @@ export function SessionList({
   connecting?: boolean;
   onSelect: (instanceId: string, sessionId: string) => void;
   emptyHint: string;
+  /** First discovery poll still in flight: paint skeleton rows, not empty. */
+  loading?: boolean;
   // History mode (ADR-0008): rows are store entries a bridge may not even
   // hold, so the full action sheet (rename/retire — both instance-scoped
   // bridge ops) is off. Pass `onDelete` to arm a delete-only sheet instead
@@ -267,25 +271,47 @@ export function SessionList({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {filtered.length === 0 && (
-          <p className="mt-8 text-center text-sm text-faint">
-            {sessions.length === 0 ? emptyHint : t("chat.noMatches")}
-          </p>
+        {loading && sessions.length === 0 ? (
+          // First paint of the picker: the discovery poll hasn't answered
+          // yet — placeholder rows shaped like SessionRow (avatar dot +
+          // two-line stack), never the "no sessions" hint.
+          <div aria-hidden>
+            {[0.72, 0.55, 0.8, 0.6, 0.45, 0.75, 0.5, 0.65].map((w, i) => (
+              <div
+                key={i}
+                className="flex items-center gap-3 border-b border-hairline px-4 py-3.5"
+              >
+                <Skeleton shape="circle" className="size-9 shrink-0" />
+                <div className="flex min-w-0 flex-1 flex-col gap-2">
+                  <Skeleton className="h-3.5" style={{ width: `${w * 70}%` }} />
+                  <Skeleton className="h-3" style={{ width: `${w * 45}%` }} />
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <>
+            {filtered.length === 0 && (
+              <p className="mt-8 text-center text-sm text-faint">
+                {sessions.length === 0 ? emptyHint : t("chat.noMatches")}
+              </p>
+            )}
+            {filtered.map((s) => (
+              <SessionRow
+                key={`${s.instanceId}:${s.sessionId}`}
+                item={s}
+                active={activeKey === `${s.instanceId}:${s.sessionId}`}
+                disabled={connecting}
+                onSelect={() => onSelect(s.instanceId, s.sessionId)}
+                onLongPress={
+                  readOnly && !onDelete
+                    ? undefined
+                    : () => openActions(s)
+                }
+              />
+            ))}
+          </>
         )}
-        {filtered.map((s) => (
-          <SessionRow
-            key={`${s.instanceId}:${s.sessionId}`}
-            item={s}
-            active={activeKey === `${s.instanceId}:${s.sessionId}`}
-            disabled={connecting}
-            onSelect={() => onSelect(s.instanceId, s.sessionId)}
-            onLongPress={
-              readOnly && !onDelete
-                ? undefined
-                : () => openActions(s)
-            }
-          />
-        ))}
         {footer}
       </div>
 

@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ListChecks } from "lucide-react";
+import { Sheet } from "../ui";
 import { useAppStore, type ElicitField } from "../store/appStore";
 
 // elicitation/create forms — the bridge's preferred channel once any client
@@ -120,43 +121,46 @@ export function ElicitationDialog() {
     const answer = (v: string) =>
       answerElicitation(elicitation.requestId, { [planField.key]: v });
     return (
-      <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 p-3 pb-[max(var(--safe-bottom),1rem)]">
-        <div className="flex max-h-[75vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-hairline bg-surface">
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3">
-            <h2 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-              <ListChecks className="size-4 shrink-0 text-info" />
-              {elicitation.message || t("permission.planTitle")}
-            </h2>
-            {planField.description && (
-              <div className="prose prose-sm prose-invert mt-2 max-w-none">
-                <Markdown remarkPlugins={[remarkGfm]}>
-                  {planField.description}
-                </Markdown>
-              </div>
-            )}
-          </div>
-          <div className="px-4 pb-4 pt-3">
-            <button
-              onClick={() => answer("approve")}
-              className="w-full rounded-xl bg-success px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
-            >
-              {approve?.label || "Approve"}
-            </button>
-            <button
-              onClick={() => answer("reject")}
-              className="mt-2 w-full rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
-            >
-              {reject?.label || "Reject"}
-            </button>
-            <button
-              onClick={() => answerElicitation(elicitation.requestId, null)}
-              className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
-            >
-              {t("common.cancel")}
-            </button>
-          </div>
+      <Sheet
+        open
+        blocking
+        onClose={() => {}}
+        className="flex max-h-[75vh] w-full flex-col overflow-hidden"
+      >
+        <div className="-mx-4 min-h-0 flex-1 overflow-y-auto px-4">
+          <h2 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+            <ListChecks className="size-4 shrink-0 text-info" />
+            {elicitation.message || t("permission.planTitle")}
+          </h2>
+          {planField.description && (
+            <div className="prose prose-sm prose-invert mt-2 max-w-none">
+              <Markdown remarkPlugins={[remarkGfm]}>
+                {planField.description}
+              </Markdown>
+            </div>
+          )}
         </div>
-      </div>
+        <div className="pb-1 pt-3">
+          <button
+            onClick={() => answer("approve")}
+            className="w-full rounded-xl bg-success px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
+          >
+            {approve?.label || "Approve"}
+          </button>
+          <button
+            onClick={() => answer("reject")}
+            className="mt-2 w-full rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
+          >
+            {reject?.label || "Reject"}
+          </button>
+          <button
+            onClick={() => answerElicitation(elicitation.requestId, null)}
+            className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
+          >
+            {t("common.cancel")}
+          </button>
+        </div>
+      </Sheet>
     );
   }
 
@@ -180,40 +184,43 @@ export function ElicitationDialog() {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 p-3 pb-[max(var(--safe-bottom),1rem)]">
-      <div className="flex max-h-[75vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-hairline bg-surface">
-        <div className="min-h-0 flex-1 overflow-y-auto">
-          <h2 className="px-4 pt-3 text-sm font-semibold text-ink">
-            {elicitation.message || t("permission.questionTitle")}
-          </h2>
-          {elicitation.fields.map((f) => (
-            <QuestionBlock
-              key={f.key}
-              field={f}
-              picked={picked[f.key] ?? null}
-              checked={checked}
-              other={f.otherKey != null ? (other[f.otherKey] ?? "") : ""}
-              onPick={(v) => setPicked((p) => ({ ...p, [f.key]: v }))}
-              onToggle={(v) => setChecked((c) => ({ ...c, [v]: !c[v] }))}
-              onOther={(v) => setOther((o) => ({ ...o, [f.otherKey!]: v }))}
-            />
-          ))}
-        </div>
-        <div className="px-4 pb-4 pt-1">
-          <button
-            onClick={submit}
-            className="w-full rounded-xl bg-ink px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
-          >
-            {t("permission.submit")}
-          </button>
-          <button
-            onClick={() => answerElicitation(elicitation.requestId, null)}
-            className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
-          >
-            {t("common.cancel")}
-          </button>
-        </div>
+    <Sheet
+      open
+      blocking
+      onClose={() => {}}
+      className="flex max-h-[75vh] w-full flex-col overflow-hidden"
+    >
+      <div className="-mx-4 min-h-0 flex-1 overflow-y-auto">
+        <h2 className="px-4 pt-1 text-sm font-semibold text-ink">
+          {elicitation.message || t("permission.questionTitle")}
+        </h2>
+        {elicitation.fields.map((f) => (
+          <QuestionBlock
+            key={f.key}
+            field={f}
+            picked={picked[f.key] ?? null}
+            checked={checked}
+            other={f.otherKey != null ? (other[f.otherKey] ?? "") : ""}
+            onPick={(v) => setPicked((p) => ({ ...p, [f.key]: v }))}
+            onToggle={(v) => setChecked((c) => ({ ...c, [v]: !c[v] }))}
+            onOther={(v) => setOther((o) => ({ ...o, [f.otherKey!]: v }))}
+          />
+        ))}
       </div>
-    </div>
+      <div className="pb-1 pt-1">
+        <button
+          onClick={submit}
+          className="w-full rounded-xl bg-ink px-4 py-3 text-sm font-semibold text-canvas active:brightness-90"
+        >
+          {t("permission.submit")}
+        </button>
+        <button
+          onClick={() => answerElicitation(elicitation.requestId, null)}
+          className="mt-2 w-full rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
+        >
+          {t("common.cancel")}
+        </button>
+      </div>
+    </Sheet>
   );
 }

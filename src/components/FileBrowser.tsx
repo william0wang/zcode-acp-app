@@ -22,7 +22,7 @@ import {
 } from "../lib/localOpen";
 import { useAppStore } from "../store/appStore";
 import { FileViewer, fmtSize } from "./FileViewer";
-import { Spinner } from "./Spinner";
+import { Skeleton } from "../ui";
 
 function joinPath(dir: string, name: string): string {
   return dir ? `${dir}/${name}` : name;
@@ -255,8 +255,17 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
       )}
 
       {loading && !listing ? (
-        <div className="flex flex-1 items-center justify-center">
-          <Spinner className="size-7" />
+        <div className="flex flex-1 flex-col px-4 py-2">
+          {/* Row skeletons matching the entry-row shape: icon dot + name bar. */}
+          {[0.9, 0.65, 0.8, 0.5, 0.75, 0.6, 0.85, 0.45, 0.7, 0.55].map((w, i) => (
+            <div
+              key={i}
+              className="flex items-center gap-2.5 border-b border-hairline py-3"
+            >
+              <Skeleton shape="circle" className="size-4 shrink-0" />
+              <Skeleton className="h-3.5" style={{ width: `${w * 100}%` }} />
+            </div>
+          ))}
         </div>
       ) : failed && !listing ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-sm text-dim">

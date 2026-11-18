@@ -345,6 +345,10 @@ export interface AppState extends ConfigSlice {
   fontSize: FontSize;
   instances: HubInstance[];
   instancesError: string | null;
+  // True once the first discovery poll ANSWERED (success or failure). Before
+  // it the list shows skeletons, not the "no sessions" empty state — at
+  // launch an empty list means "not yet", not "none".
+  instancesLoaded: boolean;
   // Hub unreachable (editor exited — it re-spawns the hub on demand). Expected
   // state, rendered as a calm hint; polling continues until it returns.
   hubOffline: boolean;
@@ -1919,6 +1923,7 @@ export const useAppStore = create<AppState>((set, get) => {
     fontSize: "small" as FontSize,
     instances: [],
     instancesError: null,
+    instancesLoaded: false,
     hubOffline: false,
     connState: "idle",
     instanceId: null,
@@ -2142,6 +2147,7 @@ export const useAppStore = create<AppState>((set, get) => {
         if (get().profile !== profile) return; // hub changed mid-flight
         discoveryFailures = 0;
         const next = filterClosedSessions(instances);
+        set({ instancesLoaded: true });
         // Probe answers are a resync and always publish; background polls
         // skip the set when the list is unchanged (same content ⇒ same
         // render — re-setting an identical array re-renders every list
@@ -2170,6 +2176,7 @@ export const useAppStore = create<AppState>((set, get) => {
         }
       } catch (e) {
         if (get().profile !== profile) return;
+        set({ instancesLoaded: true });
         if (e instanceof HubApiError && e.network) {
           // Hub unreachable is expected while no editor runs (bridges
           // re-spawn it on demand) — but only say so once it has STAYED

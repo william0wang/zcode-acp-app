@@ -8,7 +8,7 @@ import { useAppStore } from "./store/appStore";
 import { ConnectScreen } from "./screens/ConnectScreen";
 import { InstancePicker } from "./screens/InstancePicker";
 import { NoticeToast } from "./components/NoticeToast";
-import { Spinner } from "./components/Spinner";
+import { Skeleton } from "./ui";
 import { TerminalScreen } from "./components/TerminalScreen";
 
 // ChatScreen carries the chat engine + diff/lightbox/highlight stack (~63%
@@ -83,8 +83,17 @@ export default function App() {
     body = (
       <Suspense
         fallback={
-          <div className="flex h-full items-center justify-center bg-canvas">
-            <Spinner className="size-6" />
+          // Chunk fallback: a bare composer bar on canvas, not a spinner —
+          // the chat screen's own skeleton (loadingSession) takes over the
+          // moment it mounts.
+          <div className="flex h-full flex-col justify-end bg-canvas p-4 pb-[max(var(--safe-bottom),1rem)]">
+            <div className="flex flex-col gap-2">
+              <Skeleton className="h-3 w-1/3" />
+              <Skeleton className="h-3 w-2/3" />
+              <div className="mt-2 flex items-center gap-2 rounded-xl bg-raised px-3 ring-1 ring-inset ring-hairline">
+                <Skeleton className="h-5 flex-1" />
+              </div>
+            </div>
           </div>
         }
       >

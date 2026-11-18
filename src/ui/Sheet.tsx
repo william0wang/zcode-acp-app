@@ -13,6 +13,8 @@ export interface SheetProps {
   onClose: () => void;
   title?: ReactNode;
   children?: ReactNode;
+  /** Disables escape/backdrop dismissal (approval asks). */
+  blocking?: boolean;
   className?: string;
 }
 
@@ -21,14 +23,19 @@ export function Sheet({
   onClose,
   title,
   children,
+  blocking = false,
   className,
 }: SheetProps) {
   return (
     <BaseDialog.Root
       open={open}
       onOpenChange={(next) => {
+        // Blocking sheets swallow every implicit close (escape included);
+        // the action buttons call onClose() / answer directly.
+        if (!next && blocking) return;
         if (!next) onClose();
       }}
+      disablePointerDismissal={blocking}
     >
       <BaseDialog.Portal>
         <BaseDialog.Backdrop className="fixed inset-0 z-50 bg-canvas/70 animate-fade-in" />

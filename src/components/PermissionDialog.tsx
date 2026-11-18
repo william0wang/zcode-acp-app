@@ -2,6 +2,7 @@ import { useTranslation } from "react-i18next";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ListChecks, Terminal } from "lucide-react";
+import { Sheet } from "../ui";
 import {
   useAppStore,
   type ApprovalContext,
@@ -132,21 +133,25 @@ export function PermissionDialog() {
     answerPermission(permission.requestId, optionId);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center bg-black/60 p-3 pb-[max(var(--safe-bottom),1rem)]">
-      <div className="flex max-h-[75vh] w-full max-w-md flex-col overflow-hidden rounded-2xl border border-hairline bg-surface">
-        <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3">
-          <h2 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
-            {isPlan ? (
-              <>
-                <ListChecks className="size-4 shrink-0 text-info" />
-                {t("permission.planTitle")}
-              </>
-            ) : isQuestion ? (
-              t("permission.questionTitle")
-            ) : (
-              t("permission.title")
-            )}
-          </h2>
+    <Sheet
+      open
+      blocking
+      onClose={() => {}}
+      className="flex max-h-[75vh] w-full flex-col overflow-hidden"
+    >
+      <div className="-mx-4 min-h-0 flex-1 overflow-y-auto px-4">
+        <h2 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+          {isPlan ? (
+            <>
+              <ListChecks className="size-4 shrink-0 text-info" />
+              {t("permission.planTitle")}
+            </>
+          ) : isQuestion ? (
+            t("permission.questionTitle")
+          ) : (
+            t("permission.title")
+          )}
+        </h2>
 
           {ctx?.toolName && !isPlan && !isQuestion && (
             <p className="mt-1 flex items-center gap-1.5 text-xs text-dim">
@@ -213,18 +218,17 @@ export function PermissionDialog() {
               {permission.options[0]?.name ?? t("permission.title")}
             </p>
           )}
-        </div>
-        <div className="px-4 pb-4 pt-3">
-          <ActionButtons
-            options={permission.options}
-            onAnswer={onAnswer}
-            plan={isPlan}
-          />
-          <p className="mt-2.5 text-center text-xs text-faint">
-            {t("permission.hint")}
-          </p>
-        </div>
       </div>
-    </div>
+      <div className="px-0 pb-1 pt-3">
+        <ActionButtons
+          options={permission.options}
+          onAnswer={onAnswer}
+          plan={isPlan}
+        />
+        <p className="mt-2.5 text-center text-xs text-faint">
+          {t("permission.hint")}
+        </p>
+      </div>
+    </Sheet>
   );
 }

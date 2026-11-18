@@ -23,6 +23,7 @@ export function InstancePicker() {
   const { t } = useTranslation();
   const instances = useAppStore((s) => s.instances);
   const instancesError = useAppStore((s) => s.instancesError);
+  const instancesLoaded = useAppStore((s) => s.instancesLoaded);
   const hubOffline = useAppStore((s) => s.hubOffline);
   const connState = useAppStore((s) => s.connState);
   const notice = useAppStore((s) => s.notice);
@@ -143,6 +144,7 @@ export function InstancePicker() {
         sessions={sessions}
         activeKey={null}
         connecting={connecting}
+        loading={!instancesLoaded && !instancesError && !hubOffline}
         onSelect={(instanceId, sessionId) =>
           void openSession(instanceId, sessionId)
         }

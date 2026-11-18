@@ -33,6 +33,7 @@ export function Drawer({
 }) {
   const { t } = useTranslation();
   const instances = useAppStore((s) => s.instances);
+  const instancesLoaded = useAppStore((s) => s.instancesLoaded);
   const instanceId = useAppStore((s) => s.instanceId);
   const activeSessionId = useAppStore((s) => s.activeSessionId);
   const refreshInstances = useAppStore((s) => s.refreshInstances);
@@ -146,6 +147,7 @@ export function Drawer({
               ? `${instanceId}:${activeSessionId}`
               : null
           }
+          loading={!instancesLoaded}
           onSelect={(instId, sessId) => {
             onClose();
             void openSession(instId, sessId);

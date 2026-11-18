@@ -55,6 +55,7 @@ import { openLocalPath } from "../lib/localOpen";
 import { useAppStore } from "../store/appStore";
 import { MarkdownText } from "./Markdown";
 import { Spinner } from "./Spinner";
+import { Skeleton } from "../ui";
 
 for (const lang of [
   bash,
@@ -342,8 +343,12 @@ function TextViewer({ path }: TextViewerProps) {
 
   if (loading && !text) {
     return (
-      <div className="flex flex-1 items-center justify-center">
-        <Spinner className="size-7" />
+      <div className="flex flex-1 flex-col gap-3 px-4 py-3">
+        {/* Line skeletons: hint at the shape of the code view instead of a
+            bare spinner. Widths jitter like a real file's ragged lines. */}
+        {[100, 62, 84, 45, 92, 70, 33, 88].map((w, i) => (
+          <Skeleton key={i} className="h-3" style={{ width: `${w}%` }} />
+        ))}
       </div>
     );
   }
@@ -444,8 +449,11 @@ function MarkdownView({ path }: { path: string }) {
 
   if (text == null && !failed) {
     return (
-      <div className="flex flex-1 items-center justify-center">
-        <Spinner className="size-7" />
+      <div className="flex flex-1 flex-col gap-3 px-4 py-3">
+        {/* Same ragged-line skeleton as the text pane's initial load. */}
+        {[100, 62, 84, 45, 92, 70, 33, 88].map((w, i) => (
+          <Skeleton key={i} className="h-3" style={{ width: `${w}%` }} />
+        ))}
       </div>
     );
   }
