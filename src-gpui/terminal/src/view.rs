@@ -1015,9 +1015,20 @@ impl TerminalView {
                         callback(window, cx, &text);
                     }
                 }
-                TerminalEvent::ClipboardLoad => {
-                    // Terminal wants to load data from clipboard
-                    // TODO: Implement clipboard integration
+                TerminalEvent::ClipboardLoad(reply) => {
+                    // OSC 52 read (tmux/vim paste, req 2.8): answer from the
+                    // host clipboard — the reply fn formats the escape
+                    // sequence, its return goes straight into the PTY.
+                    let text = cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .unwrap_or_default();
+                    let bytes = reply(&text);
+                    let _ = self
+                        .stdin_writer
+                        .lock()
+                        .write_all(bytes.as_bytes())
+                        .and_then(|_| self.stdin_writer.lock().flush());
                 }
                 TerminalEvent::Exit => {
                     if let Some(ref callback) = self.exit_callback {

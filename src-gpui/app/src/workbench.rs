@@ -130,6 +130,8 @@ gpui_kit::actions!(
         ReopenClosedTab,
         EditCopy,
         EditPaste,
+        TerminalPaneNext,
+        TerminalPanePrev,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -237,6 +239,9 @@ pub struct Workbench {
     quit_dialog_open: bool,
     /// The About modal (req 2.7) — the app menu's About target.
     about_open: bool,
+    /// The last terminal-bell notice (req 2.9) — throttle only; the notice
+    /// itself clears with the composer's other notices.
+    bell_last_at: Option<u64>,
     quit_stopping: bool,
     quit_confirmed: bool,
     /// The left dock (view-local layout, never wire state): the sessions
@@ -1514,6 +1519,7 @@ impl Workbench {
             copied_row: None,
             copied_code: None,
             about_open: false,
+            bell_last_at: None,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
             tool_run_open: std::collections::HashMap::new(),
@@ -2123,6 +2129,37 @@ impl Workbench {
             self.runtime.send(cmd);
             cx.notify();
         }
+    }
+
+    /// Pane focus cycling (req 2.11): ⌘⌥←/→ walk the active tab's terminal
+    /// panes round-robin. No panes (or none focused and one pane) is a no-op.
+    fn on_cycle_terminal_pane(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.snap.active_tab else {
+            return;
+        };
+        let Some(panes) = self.tab_terminals.get(&tab) else {
+            return;
+        };
+        if panes.len() < 2 {
+            return;
+        }
+        let focused = window.focused(cx);
+        let current = panes
+            .iter()
+            .position(|p| focused.as_ref() == Some(&p.focus))
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % panes.len()
+        } else {
+            (current + panes.len() - 1) % panes.len()
+        };
+        let handle = panes[next].focus.clone();
+        window.focus(&handle, cx);
     }
 
     /// Open the rename sheet for a sidebar row (G1). The prefill lands
@@ -2927,6 +2964,19 @@ impl Workbench {
             }
         })
         .detach();
+    }
+
+    /// A terminal pane rang its bell (req 2.9): no sound — the OS owns that
+    /// surface — a notice says so, throttled to one per window so a bell
+    /// storm does not spam the composer line.
+    pub(crate) fn terminal_bell(&mut self, cx: &mut Context<Self>) {
+        let now = now_ms();
+        if self.bell_last_at.is_some_and(|at| now.saturating_sub(at) < 10_000) {
+            return;
+        }
+        self.bell_last_at = Some(now);
+        self.notice = Some(t!("chat.terminalBell").into_owned());
+        cx.notify();
     }
 
     // -- sections ----------------------------------------------------------
@@ -7744,6 +7794,12 @@ impl Render for Workbench {
              .on_action(cx.listener(Self::on_reopen_closed_tab))
              .on_action(cx.listener(Self::on_edit_copy))
              .on_action(cx.listener(Self::on_edit_paste))
+             .on_action(cx.listener(|this, _: &TerminalPaneNext, window, cx| {
+                 this.on_cycle_terminal_pane(true, window, cx)
+             }))
+             .on_action(cx.listener(|this, _: &TerminalPanePrev, window, cx| {
+                 this.on_cycle_terminal_pane(false, window, cx)
+             }))
              .on_action(cx.listener(Self::on_approval_confirm))
              .on_action(cx.listener(|this, _: &ApprovalDigit1, _, cx| {
                  this.on_approval_digit(1, cx)

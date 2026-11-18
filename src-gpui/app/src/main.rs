@@ -56,7 +56,7 @@ use workbench::{
     ApprovalDigit5, ApprovalDigit6, ApprovalDigit7, ApprovalDigit8, ApprovalDigit9, EditCopy,
     EditPaste, FocusSessionSearch, QuitApp, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3,
     SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, ShowAbout,
-    ShowPreferences, StopTurn, ToggleTerminal, Workbench,
+    ShowPreferences, StopTurn, TerminalPaneNext, TerminalPanePrev, ToggleTerminal, Workbench,
 };
 
 // The shared catalogs (requirements §2): the mobile/web i18next JSONs are
@@ -192,6 +192,9 @@ fn install_keybindings(cx: &mut App) {
         // ⌘⇧T reopens the last closed tab (VS Code's muscle memory).
         KeyBinding::new("cmd-,", ShowPreferences, None),
         KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
+        // Terminal pane cycling (req 2.11): ⌘⌥←/→ walk the split panes.
+        KeyBinding::new("cmd-alt-right", TerminalPaneNext, None),
+        KeyBinding::new("cmd-alt-left", TerminalPanePrev, None),
     ]);
 }
 

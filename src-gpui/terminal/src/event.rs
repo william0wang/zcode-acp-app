@@ -50,7 +50,7 @@ use std::sync::mpsc::Sender;
 ///
 /// This enum represents a subset of alacritty's events that are relevant
 /// for the GPUI terminal emulator implementation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum TerminalEvent {
     /// The terminal has new content to display and needs a redraw.
     Wakeup,
@@ -64,11 +64,28 @@ pub enum TerminalEvent {
     /// The terminal wants to store data to the clipboard.
     ClipboardStore(String),
 
-    /// The terminal wants to load data from the clipboard.
-    ClipboardLoad,
+    /// The terminal wants to load data from the clipboard (OSC 52 read —
+    /// tmux/vim paste): the reply fn formats the host's answer; the view
+    /// writes its return into the PTY.
+    ClipboardLoad(std::sync::Arc<dyn Fn(&str) -> String + Sync + Send>),
 
     /// The terminal process has exited.
     Exit,
+}
+
+impl std::fmt::Debug for TerminalEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The ClipboardLoad reply fn carries no Debug — name-only is all a
+        // log line ever wants from an event.
+        match self {
+            Self::Wakeup => write!(f, "Wakeup"),
+            Self::Bell => write!(f, "Bell"),
+            Self::Title(title) => write!(f, "Title({title})"),
+            Self::ClipboardStore(data) => write!(f, "ClipboardStore({})", data.len()),
+            Self::ClipboardLoad(_) => write!(f, "ClipboardLoad"),
+            Self::Exit => write!(f, "Exit"),
+        }
+    }
 }
 
 /// An event proxy that implements alacritty's EventListener trait.
@@ -135,9 +152,11 @@ impl EventListener for GpuiEventProxy {
                 // For simplicity, we ignore the clipboard type and just store the data
                 self.send(TerminalEvent::ClipboardStore(data));
             }
-            Event::ClipboardLoad(_clipboard_type, _format) => {
-                // For simplicity, we ignore the clipboard type and format
-                self.send(TerminalEvent::ClipboardLoad);
+            Event::ClipboardLoad(_clipboard_type, reply) => {
+                // The clipboard type is ignored (Clipboard only); the reply
+                // fn travels to the view, which owns both the host clipboard
+                // read and the PTY writer.
+                self.send(TerminalEvent::ClipboardLoad(reply));
             }
             Event::Exit => {
                 self.send(TerminalEvent::Exit);
@@ -247,7 +266,7 @@ mod tests {
         proxy.send_event(Event::ClipboardLoad(ClipboardType::Clipboard, callback));
 
         let event = rx.recv().unwrap();
-        assert!(matches!(event, TerminalEvent::ClipboardLoad));
+        assert!(matches!(event, TerminalEvent::ClipboardLoad(_)));
     }
 
     #[test]

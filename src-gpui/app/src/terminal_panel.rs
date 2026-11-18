@@ -371,6 +371,19 @@ pub(crate) fn spawn_dock(
                 // OSC 52 (tmux/vim copy): into the app clipboard.
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
             })
+            .with_bell_callback({
+                let wb = wb.clone();
+                move |_, cx| {
+                    // The terminal bell (req 2.9): no sound (the OS owns
+                    // that surface); a throttled notice says which pane
+                    // rang — the workbench drops repeats inside the window.
+                    let wb = wb.clone();
+                    cx.spawn(async move |_, cx| {
+                        let _ = wb.update(cx, |wb, cx| wb.terminal_bell(cx));
+                    })
+                    .detach();
+                }
+            })
             .with_exit_callback(move |_, cx| {
                 // The shell exited (`exit`, EOF, kill): close the panel on
                 // the NEXT frame — dropping the dock here would drop the
