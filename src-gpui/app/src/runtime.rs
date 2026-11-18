@@ -253,6 +253,8 @@ pub enum UiCommand {
     RetryTurn { message_id: Option<String> },
     /// Pin/unpin a session row (req 0.4): local display order, persisted.
     ToggleSessionPin { session_id: String },
+    /// Reopen the last closed tab (req 2.5 — ⌘⇧T / the File menu).
+    ReopenClosedTab,
     /// Manual retry from the status bar (re-runs the whole bootstrap).
     Retry,
     /// Confirms the guided token setup's previewed write (Phase::TokenGuide):
@@ -2096,6 +2098,14 @@ struct HistoryPanel {
 #[derive(Default)]
 struct PinnedSessions(std::collections::HashSet<String>);
 
+/// One closed tab's reopen identity (req 2.5) — the stack behind ⌘⇧T.
+#[derive(Debug, Clone)]
+struct ClosedTab {
+    instance_id: String,
+    session_id: Option<String>,
+    cwd: String,
+}
+
 #[derive(Default)]
 struct HistorySelectedInner {
     workspace_path: String,
@@ -2735,6 +2745,13 @@ struct Driver {
     /// Pinned session ids (req 0.4) — persisted via ui-prefs.json.
     pinned: PinnedSessions,
 
+    /// Recently closed tabs (req 2.5), newest last — ⌘⇧T pops one back.
+    recently_closed: Vec<ClosedTab>,
+
+    /// One-shot for the cold-start attach (req 2.6): only the FIRST
+    /// discovery may auto-open a tab.
+    cold_attach_done: bool,
+
     /// The new-session chooser (TS ProjectCreateDialog state). `seq`
     /// invalidates in-flight project reads on close, the same contract the
     /// history panel's seq plays for its listings.
@@ -2863,6 +2880,8 @@ impl Driver {
             next_tab_id: 1,
             history: HistoryPanel::default(),
             pinned: PinnedSessions(crate::ui_prefs::load_pinned_sessions()),
+            recently_closed: Vec::new(),
+            cold_attach_done: false,
             new_session: NewSessionPanel::default(),
             files: FilesPanel::default(),
             system: SystemStatusPanel {
@@ -2976,15 +2995,26 @@ impl Driver {
         // seen so the remote-open watch never pops a tab back for a
         // conversation whose id has not reached discovery yet (our own
         // new/resumed session inside the heartbeat + poll lag, up to ~25s).
-        let (conn, held): (Option<_>, Vec<String>) = match self.tab(id) {
-            Some(t) => (
-                t.conn.clone(),
-                [t.target.clone(), t.core.active_session_id.clone()]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            ),
-            None => (None, Vec::new()),
+        let (conn, held, closed): (Option<_>, Vec<String>, Option<ClosedTab>) = match self.tab(id) {
+            Some(t) => {
+                let closed = ClosedTab {
+                    instance_id: t.instance_id.clone(),
+                    session_id: t
+                        .target
+                        .clone()
+                        .or_else(|| t.core.active_session_id.clone()),
+                    cwd: t.cwd.clone(),
+                };
+                (
+                    t.conn.clone(),
+                    [t.target.clone(), t.core.active_session_id.clone()]
+                        .into_iter()
+                        .flatten()
+                        .collect(),
+                    Some(closed),
+                )
+            }
+            None => (None, Vec::new(), None),
         };
         for sid in held {
             self.seen_at.insert(sid, now);
@@ -2992,6 +3022,12 @@ impl Driver {
         if let Some(conn) = conn {
             self.closing.insert(id);
             conn.close();
+        }
+        // The reopen stack (req 2.5): bounded, newest last.
+        if let Some(closed) = closed {
+            self.recently_closed.push(closed);
+            let overflow = self.recently_closed.len().saturating_sub(8);
+            self.recently_closed.drain(0..overflow);
         }
         self.tabs.retain(|t| t.id != id);
         if self.active_tab == Some(id) {
@@ -3212,8 +3248,37 @@ impl Driver {
                         self.seen_at.insert(s.session_id.clone(), now);
                     }
                 }
+                let was_baselined = self.discovery_baselined;
                 self.discovery_baselined = true;
                 self.instances = list;
+                // Cold-start restore (req 2.6, amending the 2026-10-22
+                // quiet rule): the FIRST snapshot with no tabs opens ONE tab
+                // on the most recently updated live session — the desktop
+                // reopens where it left off. First snapshot only: later
+                // quiet cycles keep the explicit-gesture rule.
+                if !was_baselined
+                    && !self.cold_attach_done
+                    && self.tabs.is_empty()
+                {
+                    self.cold_attach_done = true;
+                    let newest = self
+                        .instances
+                        .iter()
+                        .flat_map(|inst| inst.sessions.iter().map(move |s| (inst, s)))
+                        .max_by_key(|(_, s)| s.updated_at.unwrap_or(0));
+                    if let Some((inst, s)) = newest {
+                        let cwd = inst
+                            .workspace
+                            .clone()
+                            .filter(|w| !w.is_empty())
+                            .unwrap_or_else(|| "/".to_string());
+                        traceln!(
+                            "[driver] cold start: attaching the newest session {}",
+                            s.session_id
+                        );
+                        self.open_tab(inst.id.clone(), Some(s.session_id.clone()), cwd);
+                    }
+                }
                 for (instance_id, sid, cwd) in arrivals {
                     traceln!(
                         "[driver] remote-opened session {sid} — attaching a tab (holds the serve bridge open)"
@@ -7687,6 +7752,16 @@ impl Driver {
                 }
                 crate::ui_prefs::store_pinned_sessions(&self.pinned.0);
             }
+            UiCommand::ReopenClosedTab => {
+                if let Some(closed) = self.recently_closed.pop() {
+                    traceln!(
+                        "[driver] reopening closed tab (instance {}, session {:?})",
+                        closed.instance_id,
+                        closed.session_id
+                    );
+                    self.open_tab(closed.instance_id, closed.session_id, closed.cwd);
+                }
+            }
             UiCommand::ForceSendPending => {
                 // No active tab is a refusal too: the key was pressed on
                 // nothing, and staying quiet is the dead-key symptom.
@@ -10499,13 +10574,19 @@ mod tests {
         let (loop_tx, _loop_rx) = unbounded_channel();
         let (_cmd_tx, cmd_rx) = unbounded_channel();
         let (ev_tx, _ev_rx) = unbounded_channel();
-        super::Driver::new(
+        let mut d = super::Driver::new(
             cmd_rx,
             ev_tx,
             std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
             std::sync::Arc::new(protocol::clock::TokioClock),
             loop_tx,
-        )
+        );
+        // Plain #[test]s run without a reactor — the cold-start attach's
+        // open_tab would panic on tokio::spawn. The dedicated tokio test
+        // covers that path; every other test opts out (and encodes the
+        // discovery-quiet rule the attach amends only on the boot snapshot).
+        d.cold_attach_done = true;
+        d
     }
 
     /// A serve bridge self-exits (~1.5s) once its LAST advertised session is
@@ -11510,6 +11591,9 @@ mod tests {
     /// M1 parity with appStore's cold-start auto-attach): sessions on the
     /// hub — cold start, a remote create, anything — only repaint the
     /// sidebar; a tab needs an explicit gesture (+, sidebar row, history).
+    /// Amended by req 2.6 (2026-11-18): the FIRST boot snapshot may attach
+    /// the newest session once — covered by the cold-start test below; this
+    /// one pins the steady state after that.
     #[test]
     fn discovery_never_opens_a_tab() {
         let mut d = driver();
@@ -11531,6 +11615,37 @@ mod tests {
             1,
             "the row still lands in the sidebar list"
         );
+    }
+
+    /// Cold-start restore (req 2.6, amending the 2026-10-22 quiet rule): the
+    /// FIRST snapshot with no tabs opens ONE tab on the most recently
+    /// updated live session; later quiet cycles keep the explicit-gesture
+    /// rule, and an already-open tab world never auto-attaches.
+    #[tokio::test]
+    async fn cold_start_attaches_the_newest_session_once() {
+        let mut d = driver();
+        d.cold_attach_done = false;
+        d.on_discovery(
+            Ok(vec![
+                instance("inst-a", Some("/w/a"), vec![session("s_old", Some(1_000))]),
+                instance("inst-b", Some("/w/b"), vec![session("s_new", Some(9_000))]),
+            ]),
+            0,
+        );
+        assert_eq!(d.tabs.len(), 1, "the boot snapshot attaches one tab");
+        assert_eq!(d.tabs[0].target.as_deref(), Some("s_new"));
+        assert_eq!(d.tabs[0].instance_id, "inst-b");
+
+        // The attach is one-shot: closing it and polling again mints nothing.
+        d.close_tab(d.tabs[0].id, 10);
+        d.on_discovery(
+            Ok(vec![
+                instance("inst-a", Some("/w/a"), vec![session("s_old", Some(1_000))]),
+                instance("inst-b", Some("/w/b"), vec![session("s_new", Some(9_500))]),
+            ]),
+            1_000,
+        );
+        assert!(d.tabs.is_empty(), "only the boot snapshot attaches");
     }
 
     /// The landing note (the TS picker's empty state): with no tab open and

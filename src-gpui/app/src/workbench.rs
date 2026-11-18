@@ -125,6 +125,11 @@ gpui_kit::actions!(
         ApprovalDigit7,
         ApprovalDigit8,
         ApprovalDigit9,
+        ShowAbout,
+        ShowPreferences,
+        ReopenClosedTab,
+        EditCopy,
+        EditPaste,
         SelectTab1,
         SelectTab2,
         SelectTab3,
@@ -230,6 +235,8 @@ pub struct Workbench {
     /// flushing its cancels before the window may close, and the flag that
     /// lets the confirmed pass-through close without asking again.
     quit_dialog_open: bool,
+    /// The About modal (req 2.7) — the app menu's About target.
+    about_open: bool,
     quit_stopping: bool,
     quit_confirmed: bool,
     /// The left dock (view-local layout, never wire state): the sessions
@@ -1506,6 +1513,7 @@ impl Workbench {
             quota_confirm: None,
             copied_row: None,
             copied_code: None,
+            about_open: false,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
             tool_run_open: std::collections::HashMap::new(),
@@ -1978,6 +1986,8 @@ impl Workbench {
             // Esc on the quit dialog keeps the window — modal dismiss only
             // (a flushing stop-all below is NOT cancellable).
             self.quit_dialog_open = false;
+        } else if self.about_open {
+            self.about_open = false;
         } else if self.lightbox.take().is_some() {
             // View-local — closing it is purely ours.
         } else if self.rename_target.take().is_some() {
@@ -2023,6 +2033,83 @@ impl Workbench {
         if let Some(cmd) = card.read(cx).confirm_command(cx) {
             self.runtime.send(cmd);
             cx.notify();
+        }
+    }
+
+    /// The app menu's About (req 2.7): the About modal.
+    pub(crate) fn on_show_about(
+        &mut self,
+        _: &ShowAbout,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.about_open = true;
+        cx.notify();
+    }
+
+    /// The app menu's Preferences (req 2.7): the settings drawer, the same
+    /// surface the rail toggle opens.
+    pub(crate) fn on_show_preferences(
+        &mut self,
+        _: &ShowPreferences,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.drawer != Some(DrawerSurface::Settings) {
+            self.toggle_drawer(DrawerSurface::Settings, cx);
+        }
+    }
+
+    /// The File menu's reopen (req 2.5): the last closed tab, back as a tab.
+    pub(crate) fn on_reopen_closed_tab(
+        &mut self,
+        _: &ReopenClosedTab,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        self.runtime.send(UiCommand::ReopenClosedTab);
+    }
+
+    /// The Edit menu's Copy (req 2.7): the window's live text selection —
+    /// the same text a row's context menu would copy, without the right
+    /// click. Inputs own their ⌘C natively; this is the no-input fallback.
+    pub(crate) fn on_edit_copy(
+        &mut self,
+        _: &EditCopy,
+        window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        let selected = TextSelection::selected_text(window, _cx);
+        if !selected.trim().is_empty() {
+            _cx.write_to_clipboard(ClipboardItem::new_string(selected));
+        }
+    }
+
+    /// The Edit menu's Paste (req 2.7): clipboard images stage as
+    /// attachments, text lands in the composer (the textarea's own ⌘V
+    /// already covers the focused case; this serves the menu).
+    pub(crate) fn on_edit_paste(
+        &mut self,
+        _: &EditPaste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(inputs) = paste_inputs(&item) {
+            self.stage_inputs(inputs, cx);
+            return;
+        }
+        if let Some(text) = item.text().filter(|t| !t.is_empty()) {
+            let composer = self.composer.clone();
+            let cur = composer.read(cx).value().to_string();
+            let next = if cur.is_empty() {
+                text
+            } else {
+                format!("{cur}\n{text}")
+            };
+            composer.update(cx, |state, cx| state.set_value(&next, window, cx));
         }
     }
 
@@ -5825,6 +5912,31 @@ impl Workbench {
                     .on_click(move |_, _, _| runtime.send(UiCommand::CancelTurn)),
             );
         }
+        // One-tap compact (req 0.5): the bridge's /compact slash command as
+        // a button — offered only while the bridge advertises the command
+        // and no turn is running (a running turn's compaction window would
+        // refuse it anyway).
+        if self.tab.as_ref().is_some_and(|t| {
+            !t.running
+                && t.available_commands
+                    .iter()
+                    .any(|c| c.name.trim_start_matches('$') == "compact")
+        }) {
+            let runtime = self.runtime.clone();
+            controls = controls.child(
+                Button::new("compact")
+                    .ghost()
+                    .xsmall()
+                    .icon(KitIconName::Archive)
+                    .tooltip(t!("chat.compact"))
+                    .on_click(move |_, _, _| {
+                        runtime.send(UiCommand::SendPrompt {
+                            text: "/compact".to_string(),
+                            images: Vec::new(),
+                        });
+                    }),
+            );
+        }
         let runtime = self.runtime.clone();
         let composer = self.composer.clone();
         let wb = cx.entity();
@@ -7627,6 +7739,11 @@ impl Render for Workbench {
              .on_action(cx.listener(Self::on_focus_search))
              .on_action(cx.listener(Self::on_stop_turn))
              .on_action(cx.listener(Self::on_toggle_terminal))
+             .on_action(cx.listener(Self::on_show_about))
+             .on_action(cx.listener(Self::on_show_preferences))
+             .on_action(cx.listener(Self::on_reopen_closed_tab))
+             .on_action(cx.listener(Self::on_edit_copy))
+             .on_action(cx.listener(Self::on_edit_paste))
              .on_action(cx.listener(Self::on_approval_confirm))
              .on_action(cx.listener(|this, _: &ApprovalDigit1, _, cx| {
                  this.on_approval_digit(1, cx)
@@ -7818,6 +7935,11 @@ impl Render for Workbench {
             // app-level, and ⌘Q can fire over any open layer.
             .when(self.quit_dialog_open || self.quit_stopping, |this| {
                 this.child(self.render_quit_dialog(window, cx))
+            })
+            // The About modal (req 2.7): same overlay shape, below the quit
+            // dialog (⌘Q over it still works).
+            .when(self.about_open, |this| {
+                this.child(self.render_about_dialog(window, cx))
             })
     }
 }
@@ -8161,6 +8283,103 @@ impl Workbench {
         .with_priority(3)
         .into_any_element()
     }
+
+    /// The About modal (req 2.7): app name, version, and the hub's version —
+    /// the quit dialog's overlay shape at a lower priority.
+    fn render_about_dialog(&self, window: &mut Window, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let viewport = window.viewport_size();
+        let hub = self
+            .snap
+            .hub_version
+            .as_deref()
+            .filter(|_| matches!(self.snap.phase, Phase::Connected))
+            .map(|v| format!(" · hub {v}"))
+            .unwrap_or_default();
+        let card = div()
+            .id("about-dialog")
+            .test_support()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .w_full()
+            .max_w(px(380.))
+            .p_4()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.title_bar)
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                div()
+                    .text_size(ui_text(14.))
+                    .text_color(theme.foreground)
+                    .child("ZCode ACP"),
+            )
+            .child(
+                div()
+                    .text_size(ui_text(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(format!("Version {}{}", env!("CARGO_PKG_VERSION"), hub)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .child(
+                        Button::new("about-close")
+                            .primary()
+                            .small()
+                            .label(t!("common.close").into_owned())
+                            .on_click({
+                                let wb = wb.clone();
+                                move |_, _, cx| {
+                                    wb.update(cx, |this, cx| {
+                                        this.about_open = false;
+                                        cx.notify();
+                                    });
+                                }
+                            }),
+                    ),
+            );
+        let backdrop = div()
+            .id("about-backdrop")
+            .occlude()
+            .test_support()
+            .flex()
+            .items_center()
+            .justify_center()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w(viewport.width)
+            .h(viewport.height)
+            .bg(gpui::black().opacity(0.55))
+            .on_mouse_down(MouseButton::Left, {
+                let wb = wb.clone();
+                move |_, _, cx| {
+                    wb.update(cx, |this, cx| {
+                        this.about_open = false;
+                        cx.notify();
+                    });
+                }
+            })
+            .child(card);
+        deferred(
+            anchored()
+                .anchor(Anchor::TopLeft)
+                .position(point(px(0.), px(0.)))
+                .child(backdrop),
+        )
+        // Below the quit dialog's 3, above the lightbox's 2.
+        .with_priority(2)
+        .into_any_element()
+    }
+
     /// The rename sheet (G1, TS SessionList's action sheet in rename mode):
     /// a prefilled single-line draft; Save dispatches the UiCommand and
     /// closes (the driver owns trim/cap; the toast owns the outcome). Esc

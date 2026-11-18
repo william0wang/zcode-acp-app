@@ -47,15 +47,16 @@ use gpui_kit::base::{TextViewDefaults, TextViewStyle};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::gpui::{HighlightStyle, StyleRefinement, Styled as _};
 use gpui_kit::{
-    px, rgb, size, App, AppContext as _, Bounds, Hsla, KeyBinding, Menu, MenuItem, QuitMode,
-    TitlebarOptions, WindowBounds, WindowOptions,
+    px, rgb, size, App, AppContext as _, Bounds, Hsla, KeyBinding, Menu, MenuItem, OsAction,
+    QuitMode, SystemMenuType, TitlebarOptions, WindowBounds, WindowOptions,
 };
 use runtime::ProtocolRuntime;
 use workbench::{
     ApprovalConfirm, ApprovalDigit1, ApprovalDigit2, ApprovalDigit3, ApprovalDigit4,
-    ApprovalDigit5, ApprovalDigit6, ApprovalDigit7, ApprovalDigit8, ApprovalDigit9,
-    FocusSessionSearch, QuitApp, SelectTab1, SelectTab2, SelectTab3, SelectTab4, SelectTab5,
-    SelectTab6, SelectTab7, SelectTab8, SelectTab9, StopTurn, ToggleTerminal, Workbench,
+    ApprovalDigit5, ApprovalDigit6, ApprovalDigit7, ApprovalDigit8, ApprovalDigit9, EditCopy,
+    EditPaste, FocusSessionSearch, QuitApp, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3,
+    SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, ShowAbout,
+    ShowPreferences, StopTurn, ToggleTerminal, Workbench,
 };
 
 // The shared catalogs (requirements §2): the mobile/web i18next JSONs are
@@ -187,6 +188,10 @@ fn install_keybindings(cx: &mut App) {
         KeyBinding::new("7", ApprovalDigit7, None),
         KeyBinding::new("8", ApprovalDigit8, None),
         KeyBinding::new("9", ApprovalDigit9, None),
+        // The standard app shortcuts (req 2.7): ⌘, opens Preferences,
+        // ⌘⇧T reopens the last closed tab (VS Code's muscle memory).
+        KeyBinding::new("cmd-,", ShowPreferences, None),
+        KeyBinding::new("cmd-shift-t", ReopenClosedTab, None),
     ]);
 }
 
@@ -220,8 +225,30 @@ fn main() {
             // conventional application-menu Quit (key equivalent derived
             // from the binding).
             install_keybindings(cx);
+            // The standard menu bar (req 2.7): app menu (About / Services /
+            // Preferences / Quit), a File menu carrying the tab-reopen, and
+            // an Edit menu whose items carry the native selectors — inputs
+            // keep their own ⌘C/⌘V handling; the app actions serve the
+            // no-input case (window selection copy; clipboard-to-composer
+            // paste).
             cx.set_menus(vec![
-                Menu::new("ZCode ACP").items([MenuItem::action("Quit ZCode ACP", QuitApp)])
+                Menu::new("ZCode ACP").items(vec![
+                    MenuItem::action("About ZCode ACP", ShowAbout),
+                    MenuItem::separator(),
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Preferences…", ShowPreferences),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit ZCode ACP", QuitApp),
+                ]),
+                Menu::new("File").items(vec![MenuItem::action(
+                    "Reopen Closed Tab",
+                    ReopenClosedTab,
+                )]),
+                Menu::new("Edit").items(vec![
+                    MenuItem::os_action("Copy", EditCopy, OsAction::Copy),
+                    MenuItem::os_action("Paste", EditPaste, OsAction::Paste),
+                ]),
             ]);
 
             let (runtime, mut event_rx) = ProtocolRuntime::start();
