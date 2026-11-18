@@ -92,7 +92,13 @@
     "statsCache": "缓存命中",
     "statsSpeed": "上一回合",
     "contextHigh": "上下文接近上限——压缩以释放空间",
-    "connectSlow": "连接时间较长——请检查网络或 hub"
+    "connectSlow": "连接时间较长——请检查网络或 hub",
+    "toolInput": "输入参数",
+    "expandOutput": "展开全部",
+    "collapseOutput": "收起",
+    "viewFullFile": "查看完整文件",
+    "splitView": "双栏对比",
+    "dropUnsupported": "仅支持拖入图片或小文本文件"
   },
   "panel": {
     "title": "设置",
@@ -546,6 +552,7 @@
     "reject": "拒绝",
     "otherValue": "或输入自定义值",
     "otherValueMulti": "或自定义值",
+    "queueWaiting_one": "其他会话还有 {{count}} 个待审批",
     "queueWaiting_other": "其他会话还有 {{count}} 个待审批"
   },
   "notice": {

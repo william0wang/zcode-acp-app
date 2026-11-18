@@ -249,6 +249,8 @@ export function ChatScreen() {
   const notify = useAppStore((s) => s.notify);
   const configOpen = useAppStore((s) => s.configOpen);
   const closeSession = useAppStore((s) => s.closeSession);
+  const fileBrowserTarget = useAppStore((s) => s.fileBrowserTarget);
+  const clearFileBrowserTarget = useAppStore((s) => s.clearFileBrowserTarget);
   // The header is too narrow for per-tool buttons: terminal and files enter
   // from the session panel. The panel button still carries this session's
   // Remote Terminal (ADR-0011) background state — amber pulse while a turn
@@ -454,7 +456,15 @@ export function ChatScreen() {
         <ProjectHistoryDialog onClose={() => setHistoryOpen(false)} />
       )}
       {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} />}
-      {filesOpen && <FileBrowser onClose={() => setFilesOpen(false)} />}
+      {(filesOpen || fileBrowserTarget != null) && (
+        <FileBrowser
+          onClose={() => {
+            setFilesOpen(false);
+            clearFileBrowserTarget();
+          }}
+          initialPath={fileBrowserTarget ?? undefined}
+        />
+      )}
       <PermissionDialog />
       <ElicitationDialog />
 

@@ -35,9 +35,11 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Columns2,
   Copy,
   FilePen,
   FileText,
+  Folder,
   Globe,
   History,
   ImagePlus,
@@ -69,6 +71,7 @@ import type {
   AcpDiffContent,
   AttachmentDraft,
   ChatMessage,
+  FsEntry,
 } from "../lib/types";
 
 // ACP chat model -> assistant-ui message model (the ACP runtime adapter).
@@ -181,18 +184,41 @@ const MAX_DIFF_CHARS = 20000;
 
 function DiffBlock({ diff }: { diff: AcpDiffContent }) {
   const { t } = useTranslation();
+  const [split, setSplit] = useState(false);
   const truncOld = (diff.oldText ?? "").length > MAX_DIFF_CHARS;
   const truncNew = diff.newText.length > MAX_DIFF_CHARS;
+  const truncated = truncOld || truncNew;
   return (
     <div className="mt-2 overflow-hidden rounded-lg ring-1 ring-hairline">
-      {diff.path && (
-        <div className="truncate border-b border-hairline bg-hover px-2 py-1 font-mono text-2xs text-dim">
+      <div className="flex items-center gap-1 border-b border-hairline bg-hover pl-2 pr-1">
+        <span className="min-w-0 flex-1 truncate py-1 font-mono text-2xs text-dim">
           {diff.path}
-        </div>
-      )}
-      {(truncOld || truncNew) && (
-        <div className="border-b border-hairline bg-warning-wash px-2 py-1 text-2xs text-warning">
-          {t("chat.diffTruncated")}
+        </span>
+        {/* Split/unified toggle (requirements 1.4). */}
+        <button
+          onClick={() => setSplit((s) => !s)}
+          aria-label={t("chat.splitView")}
+          aria-pressed={split}
+          className="flex size-6 shrink-0 items-center justify-center rounded-md text-faint hover:bg-hover active:bg-active"
+        >
+          <Columns2 className="size-3.5" />
+        </button>
+      </div>
+      {truncated && (
+        <div className="flex items-center justify-between gap-2 border-b border-hairline bg-warning-wash px-2 py-1 text-2xs text-warning">
+          <span className="min-w-0 truncate">{t("chat.diffTruncated")}</span>
+          {/* Truncation seam (requirements 1.5): the full file is one tap
+              away in the session file browser (fs-capable bridges). */}
+          {diff.path && (
+            <button
+              onClick={() =>
+                useAppStore.getState().openFileAt(diff.path as string)
+              }
+              className="shrink-0 rounded-full px-2 py-0.5 font-medium text-warning hover:bg-hover active:bg-active"
+            >
+              {t("chat.viewFullFile")}
+            </button>
+          )}
         </div>
       )}
       <ReactDiffViewer
@@ -204,9 +230,8 @@ function DiffBlock({ diff }: { diff: AcpDiffContent }) {
         newValue={
           truncNew ? diff.newText.slice(0, MAX_DIFF_CHARS) : diff.newText
         }
-        splitView={false}
+        splitView={split}
         useDarkTheme
-        hideLineNumbers
         showDiffOnly={false}
         styles={{
           contentText: {
@@ -238,6 +263,56 @@ function CardCopyButton({ label, text }: { label: string; text: string }) {
     >
       {label}
     </button>
+  );
+}
+
+// Tool card body (requirements 1.1-1.3): the output pre with a
+// collapse/expand seam for long text, and a running state with a real
+// spinner (not "…") when nothing has streamed yet.
+function ToolCardBody({
+  text,
+  running,
+  bordered = true,
+}: {
+  text: string | null;
+  running: boolean;
+  bordered?: boolean;
+}) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  if (!text) {
+    if (!running) return null;
+    return (
+      <div
+        className={`flex items-center gap-2 px-3 py-2 text-xs text-faint ${bordered ? "border-t border-hairline" : ""}`}
+      >
+        <Spinner className="size-3.5" />
+        {t("chat.activityRunning")}…
+      </div>
+    );
+  }
+  return (
+    <>
+      <pre
+        className={`overflow-auto whitespace-pre-wrap ${bordered ? "border-t border-hairline" : ""} px-3 py-2 text-faint ${
+          expanded ? "max-h-none" : "max-h-64"
+        }`}
+      >
+        {text}
+      </pre>
+      {/* ~25 lines fills max-h-64; past that the seam earns its place. */}
+      {text.length > 600 && (
+        <button
+          onClick={() => setExpanded((e) => !e)}
+          className="flex w-full items-center justify-center gap-1 border-t border-hairline py-1 text-xs text-faint hover:bg-hover active:bg-active"
+        >
+          <ChevronDown
+            className={`size-3 shrink-0 transition-transform ${expanded ? "rotate-180" : ""}`}
+          />
+          {expanded ? t("chat.collapseOutput") : t("chat.expandOutput")}
+        </button>
+      )}
+    </>
   );
 }
 
@@ -291,19 +366,37 @@ function ToolCard({ part }: { part: { toolName: string; args?: unknown } }) {
             <DiffBlock key={`${d.path}-${i}`} diff={d} />
           ))}
           {(detail || liveInput) && (
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap border-t border-hairline px-3 py-2 text-faint">
-              {detail || liveInput}
-            </pre>
+            <div className="mt-2">
+              <ToolCardBody
+                text={detail || liveInput}
+                running={isRunningStatus(a.status ?? "")}
+                bordered={false}
+              />
+            </div>
           )}
         </div>
       ) : (
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap border-t border-hairline px-3 py-2 text-faint">
-          {detail ||
+        <ToolCardBody
+          text={
+            detail ||
             liveInput ||
-            (isRunningStatus(a.status ?? "")
-              ? `${t("chat.activityRunning")}…`
-              : "…")}
-        </pre>
+            (isRunningStatus(a.status ?? "") ? null : "…")
+          }
+          running={isRunningStatus(a.status ?? "")}
+        />
+      )}
+      {/* Completed args stay reachable (requirements 1.1): collapsed input
+          fold under the body. Hidden while the live-input preview is showing
+          the same rawInput above (running card, no output yet). */}
+      {!foldKind && a.rawInput && !liveInput && (
+        <details className="border-t border-hairline px-3 py-1.5">
+          <summary className="cursor-pointer select-none text-2xs text-faint">
+            {t("chat.toolInput")}
+          </summary>
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-faint">
+            {a.rawInput}
+          </pre>
+        </details>
       )}
       {/* Inside <details>: rides the open state, so a collapsed card — which
           exposes nothing copyable — shows no copy affordance at all. Mobile
@@ -790,6 +883,24 @@ const AssistantMessage = memo(function AssistantMessage({
 // Whitespace class for composer word scanning (slash-completion tokens).
 const WS = /\s/;
 
+// @-mention directory listings (requirements 0.7): cached per instance+dir
+// for the composer's lifetime — workspace files change slowly enough that a
+// per-keystroke fs/list round-trip would be pure noise. Bounded LRU like
+// FileBrowser's listing cache, but instance-keyed here because the composer
+// outlives single browser mounts.
+const MENTION_CACHE_LIMIT = 16;
+const mentionListingCache = new Map<string, FsEntry[]>();
+
+function cacheMentionListing(key: string, entries: FsEntry[]): void {
+  mentionListingCache.delete(key);
+  mentionListingCache.set(key, entries);
+  while (mentionListingCache.size > MENTION_CACHE_LIMIT) {
+    const oldest = mentionListingCache.keys().next().value;
+    if (oldest === undefined) break;
+    mentionListingCache.delete(oldest);
+  }
+}
+
 // In-session mode/model pills + one-tap compact (requirements 0.5): the
 // session panel's config rows in chip form, living above the composer.
 // Compact rides the bridge's own /compact slash command — sendPrompt
@@ -877,6 +988,9 @@ function Composer() {
   const sendPrompt = useAppStore((s) => s.sendPrompt);
   const forceSendPending = useAppStore((s) => s.forceSendPending);
   const notify = useAppStore((s) => s.notify);
+  const fsCapable = useAppStore((s) => s.fsCapable);
+  const fsList = useAppStore((s) => s.fsList);
+  const instanceId = useAppStore((s) => s.instanceId);
   // Queue depth of the active session — an empty-composer Enter with a
   // non-empty queue force-sends its head instead of doing nothing.
   const pendingCount = useAppStore((s) =>
@@ -929,21 +1043,88 @@ function Composer() {
       ? ""
       : value.slice(tokenStart, tokenEnd);
 
-  const matches = useMemo(() => {
-    if (!token.startsWith("/")) return [];
-    // Skill commands ride a "$" visual-grouping prefix (e.g. "$tdd"); the
-    // wire form is "/$name", but users naturally type "/td" — strip the
-    // marker on BOTH sides so either spelling matches. Insertion keeps the
-    // real name (the bridge passes "/$name" through verbatim).
-    const strip = (s: string) => s.replace(/^\$/, "");
-    const q = strip(token.slice(1).toLowerCase());
-    return commands.filter((c) => strip(c.name.toLowerCase()).startsWith(q));
-  }, [token, commands]);
+  // ---- completion: "/" commands and "@" workspace files (0.7) ----
+
+  const mentionKind = token.startsWith("@") && fsCapable;
+  const mentionDir = mentionKind
+    ? token.slice(1).split("/").slice(0, -1).join("/")
+    : "";
+  const mentionSeg = mentionKind
+    ? (token.slice(1).split("/").pop() ?? "")
+    : "";
+  // Directory listing for the mention's current directory; fetched when the
+  // DIR changes (segment filtering is client-side), served from cache.
+  const [mentionEntries, setMentionEntries] = useState<FsEntry[] | null>(null);
+  useEffect(() => {
+    if (!mentionKind) {
+      setMentionEntries(null);
+      return;
+    }
+    let alive = true;
+    const key = `${instanceId ?? "-"}:${mentionDir}`;
+    const hit = mentionListingCache.get(key);
+    if (hit) {
+      setMentionEntries(hit);
+      return;
+    }
+    setMentionEntries(null);
+    void fsList(mentionDir).then((res) => {
+      if (!alive) return;
+      const entries = res
+        ? res.entries.filter((e) => e.kind !== "symlink")
+        : [];
+      cacheMentionListing(key, entries);
+      setMentionEntries(entries);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [mentionKind, mentionDir, fsList, instanceId]);
+
+  const options = useMemo(() => {
+    if (token.startsWith("/")) {
+      // Skill commands ride a "$" visual-grouping prefix (e.g. "$tdd"); the
+      // wire form is "/$name", but users naturally type "/td" — strip the
+      // marker on BOTH sides so either spelling matches. Insertion keeps the
+      // real name (the bridge passes "/$name" through verbatim).
+      const strip = (s: string) => s.replace(/^\$/, "");
+      const q = strip(token.slice(1).toLowerCase());
+      return commands
+        .filter((c) => strip(c.name.toLowerCase()).startsWith(q))
+        .map((c) => ({
+          key: c.name,
+          insert: `/${c.name} `,
+          name: `/${c.name}`,
+          desc: `${c.description ?? ""}${c.input?.hint ? ` — ${c.input.hint}` : ""}`,
+          dir: false,
+        }));
+    }
+    if (mentionKind && mentionEntries) {
+      const seg = mentionSeg.toLowerCase();
+      return mentionEntries
+        .filter(
+          (e) => !e.name.startsWith(".") || seg.startsWith("."),
+        )
+        .filter((e) => e.name.toLowerCase().startsWith(seg))
+        .sort((a, b) =>
+          a.kind === b.kind ? 0 : a.kind === "dir" ? -1 : 1,
+        )
+        .slice(0, 20)
+        .map((e) => ({
+          key: `${e.kind}:${e.name}`,
+          insert: `@${mentionDir ? `${mentionDir}/` : ""}${e.name}${e.kind === "dir" ? "/" : " "}`,
+          name: e.name,
+          desc: "",
+          dir: e.kind === "dir",
+        }));
+    }
+    return [];
+  }, [token, commands, mentionKind, mentionEntries, mentionDir, mentionSeg]);
 
   // Not dismissed for this query — the caret-in-token part of the old gate is
   // inherent now that the token itself is derived from the caret position.
-  const open = matches.length > 0 && dismissedToken !== token;
-  const idx = Math.min(highlight, matches.length - 1);
+  const open = options.length > 0 && dismissedToken !== token;
+  const idx = Math.min(highlight, options.length - 1);
 
   useEffect(() => {
     setHighlight(0);
@@ -955,17 +1136,17 @@ function Composer() {
   }, [idx, open]);
 
   const select = useCallback(
-    (name: string) => {
+    (opt: { insert: string }) => {
       setText(
         value.slice(0, tokenStart) +
-          `/${name} ` +
+          opt.insert +
           value.slice(tokenStart + token.length).trimStart(),
       );
-      setDismissedToken(`/${name}`);
+      setDismissedToken(opt.insert.trimEnd());
       // setText's value swap resets the caret to the draft's end; park it
-      // right after the inserted command instead. rAF runs after React
+      // right after the inserted completion instead. rAF runs after React
       // commits the new value but before paint.
-      const pos = tokenStart + name.length + 2;
+      const pos = tokenStart + opt.insert.length;
       requestAnimationFrame(() => {
         const el = inputRef.current;
         if (el && pos <= el.value.length) {
@@ -1038,7 +1219,7 @@ function Composer() {
     if (e.key === "ArrowDown") {
       e.preventDefault();
       e.stopPropagation();
-      setHighlight((h) => Math.min(h + 1, matches.length - 1));
+      setHighlight((h) => Math.min(h + 1, options.length - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       e.stopPropagation();
@@ -1046,7 +1227,7 @@ function Composer() {
     } else if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey)) {
       e.preventDefault();
       e.stopPropagation();
-      select(matches[idx].name);
+      select(options[idx]);
     } else if (e.key === "Escape") {
       setDismissedToken(token);
     }
@@ -1089,6 +1270,37 @@ function Composer() {
     }
   };
 
+  // Dropped files routed from the thread viewport (see Thread's onDrop):
+  // images stage as attachments, text inserts at the caret.
+  useEffect(() => {
+    const onFiles = (e: Event) => {
+      const files = (e as CustomEvent<{ files: File[] }>).detail?.files;
+      if (files?.length) void addFiles(files);
+    };
+    const onText = (e: Event) => {
+      const text = (e as CustomEvent<{ text: string }>).detail?.text;
+      if (!text) return;
+      const el = inputRef.current;
+      const pos = el?.selectionStart ?? value.length;
+      setText(value.slice(0, pos) + text + value.slice(pos));
+      const p = pos + text.length;
+      requestAnimationFrame(() => {
+        const node = inputRef.current;
+        if (node) {
+          node.focus();
+          node.setSelectionRange(p, p);
+          setCaret(p);
+        }
+      });
+    };
+    window.addEventListener("chat:files-dropped", onFiles);
+    window.addEventListener("chat:text-dropped", onText);
+    return () => {
+      window.removeEventListener("chat:files-dropped", onFiles);
+      window.removeEventListener("chat:text-dropped", onText);
+    };
+  }, [addFiles, setText, value]);
+
   return (
     <ThreadPrimitive.ViewportFooter className="sticky bottom-0 bg-canvas pb-[max(var(--safe-bottom),0.5rem)] pt-2">
       <ComposerPills />
@@ -1098,26 +1310,32 @@ function Composer() {
           role="listbox"
           className="mb-2 max-h-56 overflow-y-auto rounded-2xl bg-surface py-1 shadow-2xl ring-1 ring-hairline"
         >
-          {matches.map((c, i) => (
+          {options.map((o, i) => (
             <button
-              key={c.name}
+              key={o.key}
               data-idx={i}
               role="option"
               aria-selected={i === idx}
               // Keep the software keyboard open: focus stays in the textarea.
               onPointerDown={(e) => e.preventDefault()}
-              onClick={() => select(c.name)}
-              className={`flex w-full items-baseline gap-2 px-3 py-2 text-left ${
+              onClick={() => select(o)}
+              className={`flex w-full items-center gap-2 px-3 py-2 text-left ${
                 i === idx ? "bg-hover" : "hover:bg-hover active:bg-active"
               }`}
             >
-              <span className="shrink-0 font-mono text-sm text-dim">
-                /{c.name}
+              {o.dir ? (
+                <Folder className="size-3.5 shrink-0 text-info" />
+              ) : token.startsWith("@") ? (
+                <FileText className="size-3.5 shrink-0 text-faint" />
+              ) : null}
+              <span className="min-w-0 shrink-0 truncate font-mono text-sm text-dim">
+                {o.name}
               </span>
-              <span className="min-w-0 truncate text-xs text-faint">
-                {c.description}
-                {c.input?.hint ? ` — ${c.input.hint}` : ""}
-              </span>
+              {o.desc && (
+                <span className="min-w-0 truncate text-xs text-faint">
+                  {o.desc}
+                </span>
+              )}
             </button>
           ))}
         </div>
@@ -1310,6 +1528,13 @@ function PendingPrompts() {
 // "at the bottom" for the jump button and unread reset.
 const NEAR_BOTTOM_PX = 64;
 
+// Text-ish files whose dropped CONTENT can be inlined (requirements 0.8):
+// the browser hides full local paths, so the desktop's path-reference
+// behavior is impossible — filename + body is the closest useful form.
+const TEXT_FILE_RE =
+  /\.(md|markdown|txt|json|jsonc|ya?ml|toml|ini|xml|html?|css|scss|less|jsx?|tsx?|mjs|cjs|py|rb|rs|go|java|kt|c|h|cpp|hpp|cs|swift|sh|bash|zsh|fish|sql|lua|pl|php|dart|gradle|properties|env|gitignore)$/i;
+const DROP_TEXT_LIMIT = 65536;
+
 function Thread({
   viewportRef,
   onScroll,
@@ -1411,11 +1636,55 @@ function Thread({
     [viewportRef, autoScrollRef],
   );
 
+  // Drag-and-drop (requirements 0.8): dropped files land anywhere on the
+  // thread; images ride the attachment pipeline (same as paste), small text
+  // files inline their content. The staged-images state lives in the
+  // Composer, so the drop routes there as a DOM event (the zcode:download
+  // pattern).
+  const notify = useAppStore((s) => s.notify);
+  const onDragOver = useCallback((e: React.DragEvent) => {
+    if (e.dataTransfer.types.includes("Files")) e.preventDefault();
+  }, []);
+  const onDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      const files = Array.from(e.dataTransfer.files);
+      if (files.length === 0) return;
+      const images = files.filter((f) => f.type.startsWith("image/"));
+      if (images.length > 0) {
+        window.dispatchEvent(
+          new CustomEvent("chat:files-dropped", {
+            detail: { files: images },
+          }),
+        );
+      }
+      for (const f of files) {
+        if (f.type.startsWith("image/")) continue;
+        const textLike =
+          f.type.startsWith("text/") || TEXT_FILE_RE.test(f.name);
+        if (textLike && f.size <= DROP_TEXT_LIMIT) {
+          void f.text().then((text) => {
+            window.dispatchEvent(
+              new CustomEvent("chat:text-dropped", {
+                detail: { text: `\`\`\`\n# ${f.name}\n${text}\n\`\`\`\n\n` },
+              }),
+            );
+          });
+        } else {
+          notify(t("chat.dropUnsupported"));
+        }
+      }
+    },
+    [notify, t],
+  );
+
   return (
     <ThreadPrimitive.Root className="relative flex h-full flex-col">
       <ThreadPrimitive.Viewport
         ref={composeRef}
         onScroll={onScroll}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
         className="flex flex-1 flex-col gap-4 overflow-y-auto overflow-x-hidden px-3.5 py-4"
       >
         <AuiIf condition={(s) => s.thread.isEmpty}>

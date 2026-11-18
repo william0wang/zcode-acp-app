@@ -57,9 +57,12 @@ function EntryIcon({ kind }: { kind: FsEntry["kind"] }) {
 
 interface FileBrowserProps {
   onClose: () => void;
+  /** Deep link (requirements 1.5): open straight at one file — the parent
+   *  directory lists and the file enters the viewer. */
+  initialPath?: string;
 }
 
-export function FileBrowser({ onClose }: FileBrowserProps) {
+export function FileBrowser({ onClose, initialPath }: FileBrowserProps) {
   const { t } = useTranslation();
   const fsList = useAppStore((s) => s.fsList);
   // Cache key ingredient: a listing belongs to the INSTANCE that served it.
@@ -69,7 +72,9 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
   const instanceId = useAppStore((s) => s.instanceId);
   const profile = useAppStore((s) => s.profile);
   const notify = useAppStore((s) => s.notify);
-  const [path, setPath] = useState("");
+  const [path, setPath] = useState(
+    initialPath ? initialPath.split("/").slice(0, -1).join("/") : "",
+  );
   const [listing, setListing] = useState<FsListing | null>(null);
   const [loading, setLoading] = useState(true);
   const [failed, setFailed] = useState(false);
@@ -146,6 +151,20 @@ export function FileBrowser({ onClose }: FileBrowserProps) {
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: 0 });
   }, [path, attempt]);
+
+  // Deep link (requirements 1.5): once the PARENT directory's listing is in,
+  // open the named file straight into the viewer. Once per mount — the user
+  // navigating away and back must not re-trigger it.
+  const openedInitial = useRef(false);
+  useEffect(() => {
+    if (openedInitial.current || !initialPath || !listing) return;
+    const name = initialPath.split("/").pop() ?? "";
+    const entry = listing.entries.find(
+      (e) => e.name === name && e.kind === "file",
+    );
+    openedInitial.current = true;
+    if (entry) setViewing({ entry, path: initialPath });
+  }, [initialPath, listing]);
 
   const entries = (listing?.entries ?? []).filter(
     (e) => showHidden || !e.name.startsWith("."),

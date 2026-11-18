@@ -93,7 +93,13 @@
     "statsCache": "Cache hit",
     "statsSpeed": "Last turn",
     "contextHigh": "Context nearly full — compact to free space",
-    "connectSlow": "Still connecting — check the network or the hub"
+    "connectSlow": "Still connecting — check the network or the hub",
+    "toolInput": "Input",
+    "expandOutput": "Show all",
+    "collapseOutput": "Collapse",
+    "viewFullFile": "View full file",
+    "splitView": "Side by side",
+    "dropUnsupported": "Only images and small text files can be dropped"
   },
   "panel": {
     "title": "Settings",

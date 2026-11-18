@@ -529,6 +529,11 @@ export interface AppState extends ConfigSlice {
   terminalTarget: { sessionId: string; title?: string } | null;
   openTerminal: (sessionId: string, title?: string) => void;
   closeTerminal: () => void;
+  // Session file browser deep link (requirements 1.5): the truncated-diff
+  // "view full file" seam. Pure routing state, like terminalTarget.
+  fileBrowserTarget: string | null;
+  openFileAt: (path: string) => void;
+  clearFileBrowserTarget: () => void;
   setLang: (lang: Lang) => void;
   setFontSize: (size: FontSize) => void;
   refreshInstances: (opts?: { probe?: boolean }) => Promise<void>;
@@ -1971,6 +1976,7 @@ export const useAppStore = create<AppState>((set, get) => {
     activeServerId: null,
     manageOpen: false,
     terminalTarget: null,
+    fileBrowserTarget: null,
     lang: "en",
     fontSize: "small" as FontSize,
     instances: [],
@@ -2181,6 +2187,10 @@ export const useAppStore = create<AppState>((set, get) => {
       set({ terminalTarget: { sessionId, title } }),
 
     closeTerminal: () => set({ terminalTarget: null }),
+
+    openFileAt: (path) => set({ fileBrowserTarget: path }),
+
+    clearFileBrowserTarget: () => set({ fileBrowserTarget: null }),
 
     setLang: (lang) => {
       saveLang(lang);
