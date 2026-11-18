@@ -246,9 +246,6 @@ pub struct Workbench {
     /// Diff blocks switched to split view (req 2.1), keyed by
     /// (row id, part index, block index).
     diff_split: std::collections::HashSet<(String, usize, usize)>,
-    /// The @-mention directory whose listing is in flight (req 0.7) — the
-    /// one-request guard; the cache itself lives in the snapshot.
-    mention_requested: Option<String>,
     quit_stopping: bool,
     quit_confirmed: bool,
     /// The left dock (view-local layout, never wire state): the sessions
@@ -868,7 +865,10 @@ fn render_diff_block(
     if split {
         // Side-by-side (req 2.1): old left, new right, per hunk pair.
         for (old, new) in crate::diff_view::split_pairs(&block.lines) {
-            let cell = |l: Option<DiffLine>| {
+            // `right` picks the gutter's side: added lines have no old_no,
+            // deleted no new_no — the new column must number by new_no or
+            // every + row renders an empty gutter cell.
+            let cell = |l: Option<DiffLine>, right: bool| {
                 let mut cell = div().flex_1().min_w_0().flex().gap_1();
                 match l {
                     Some(l) => {
@@ -877,11 +877,12 @@ fn render_diff_block(
                             DiffLineKind::Del => ("-", diff.del_text, Some(diff.del_bg)),
                             DiffLineKind::Context => (" ", theme.muted_foreground, None),
                         };
+                        let no = if right { l.new_no } else { l.old_no };
                         let mut row = div().min_w_0().flex().gap_1().text_color(text_color);
                         if let Some(bg) = bg {
                             row = row.bg(bg);
                         }
-                        cell = cell.child(row.child(diff_no_cell(l.old_no, theme)).child(
+                        cell = cell.child(row.child(diff_no_cell(no, theme)).child(
                             div().flex_none().child(glyph).child(l.text.clone()),
                         ));
                     }
@@ -895,7 +896,7 @@ fn render_diff_block(
                     div()
                         .flex()
                         .min_w_0()
-                        .child(cell(old))
+                        .child(cell(old, false))
                         .child(
                             div()
                                 .flex_none()
@@ -903,7 +904,7 @@ fn render_diff_block(
                                 .bg(theme.border)
                                 .child("\u{a0}"),
                         )
-                        .child(cell(new)),
+                        .child(cell(new, true)),
                 );
         }
     } else {
@@ -1632,7 +1633,6 @@ impl Workbench {
             about_open: false,
             bell_last_at: None,
             diff_split: std::collections::HashSet::new(),
-            mention_requested: None,
             plan_open: false,
             thought_full: std::collections::HashSet::new(),
             tool_run_open: std::collections::HashMap::new(),
@@ -2864,6 +2864,10 @@ impl Workbench {
     /// The @-mention fetch trigger (req 0.7): called on every composer
     /// edit — a directory the snapshot does not hold (and is not already
     /// in flight) gets one listing request; cache hits cost nothing.
+    /// In-flight dedupe rides the driver's session-scoped `mention_pending`
+    /// (mirrored into the snapshot): a FAILED listing leaves neither a
+    /// cache entry nor a pending guard, so the next keystroke retries —
+    /// and a request from one session can never wedge another's guard.
     fn sync_mention_listing(&mut self, cx: &App) {
         let state = self.composer.read(cx);
         let value = state.value();
@@ -2876,10 +2880,9 @@ impl Workbench {
         if self.snap.mention_listings.contains_key(&dir) {
             return;
         }
-        if self.mention_requested.as_deref() == Some(dir.as_str()) {
+        if self.snap.mention_pending.as_deref() == Some(dir.as_str()) {
             return; // in flight
         }
-        self.mention_requested = Some(dir.clone());
         self.runtime.send(UiCommand::MentionList { path: dir });
     }
 

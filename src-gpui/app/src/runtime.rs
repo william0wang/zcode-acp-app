@@ -1414,6 +1414,11 @@ pub struct WorkbenchSnapshot {
     /// @-mention listings (req 0.7) for the ACTIVE instance+session, keyed
     /// by directory path — the composer's completion cache.
     pub mention_listings: HashMap<String, FsListing>,
+    /// The in-flight @-mention listing request for the ACTIVE
+    /// instance+session (directory path), if any — the composer's
+    /// one-request guard. A FAILED read clears it without caching, which
+    /// is exactly what lets the next keystroke retry.
+    pub mention_pending: Option<String>,
     pub tabs: Vec<TabSummary>,
     pub active_tab: Option<u64>,
     pub active: Option<TabView>,
@@ -1507,6 +1512,7 @@ impl WorkbenchSnapshot {
             bootstrap_note: None,
             sessions: Vec::new(),
             mention_listings: HashMap::new(),
+            mention_pending: None,
             tabs: Vec::new(),
             active_tab: None,
             active: None,
@@ -7299,10 +7305,12 @@ impl Driver {
                 // Only successes cache — a failed read retriggers on the
                 // next keystroke (the pending guard just cleared).
                 if let Ok(listing) = result {
-                    // Bounded, oldest-first eviction.
+                    // Bounded cache: at the cap evict an arbitrary entry
+                    // (HashMap order — NOT oldest-first); the composer
+                    // simply refetches whichever directory lost its slot.
                     if !self.mentions.contains_key(&key) && self.mentions.len() >= 8 {
-                        if let Some(oldest) = self.mentions.keys().next().cloned() {
-                            self.mentions.remove(&oldest);
+                        if let Some(victim) = self.mentions.keys().next().cloned() {
+                            self.mentions.remove(&victim);
                         }
                     }
                     self.mentions.insert(key, listing);
@@ -9146,8 +9154,31 @@ impl Driver {
             // The approval queue footer (2.16) rides the same per-tab mix.
             mix(tab.approvals.pending_total() as u64, &mut sig);
             // The @-mention cache (0.7): a listing landing must repaint the
-            // composer's menu even between empty states.
-            mix(self.mentions.len() as u64, &mut sig);
+            // composer's menu even between empty states. Content, not count
+            // — at the 8-dir cap an evict+insert leaves len unchanged. The
+            // per-entry hashes SUM (order-independent): HashMap iteration
+            // order must not jitter the signature into constant redraws.
+            mix(
+                self.mentions
+                    .iter()
+                    .map(|(k, v)| {
+                        (k.len() as u64)
+                            .wrapping_mul(131)
+                            .wrapping_add(v.entries.len() as u64)
+                    })
+                    .sum(),
+                &mut sig,
+            );
+            // The in-flight guard rides along: a request starting — and
+            // especially one FAILING (no cache change) — must reach the
+            // composer or its stale guard wedges the menu.
+            mix(
+                self.mention_pending
+                    .as_ref()
+                    .map(|p| p.len() as u64)
+                    .unwrap_or(u64::MAX),
+                &mut sig,
+            );
             // Slash commands (batch K): the composer's "/" menu contents —
             // an overwrite landing must re-emit even between empty states.
             mix(tab.core.available_commands.len() as u64, &mut sig);
@@ -9668,18 +9699,28 @@ impl Driver {
         let sessions = self.session_rows(&running, &awaiting);
         // @-mention cache slice for the ACTIVE session (req 0.7): the keys
         // are instance|session|path — strip the active target's prefix so
-        // the view keys by plain path.
-        let mention_listings = self
+        // the view keys by plain path. The pending request mirrors the same
+        // stripping (a pending key from ANOTHER session strips to None —
+        // it must not guard this session's composer).
+        let active_prefix = self
             .active_fs_target()
-            .map(|(i, s)| format!("{i}|{s}|"))
+            .map(|(i, s)| format!("{i}|{s}|"));
+        let mention_listings = active_prefix
+            .as_ref()
             .map(|prefix| {
                 self.mentions
                     .iter()
-                    .filter(|(k, _)| k.starts_with(&prefix))
+                    .filter(|(k, _)| k.starts_with(prefix.as_str()))
                     .map(|(k, v)| (k[prefix.len()..].to_string(), v.clone()))
                     .collect::<HashMap<String, FsListing>>()
             })
             .unwrap_or_default();
+        let mention_pending = active_prefix.as_ref().and_then(|prefix| {
+            self.mention_pending
+                .as_deref()
+                .filter(|k| k.starts_with(prefix.as_str()))
+                .map(|k| k[prefix.len()..].to_string())
+        });
         let tabs: Vec<TabSummary> = self
             .tabs
             .iter()
@@ -9773,6 +9814,7 @@ impl Driver {
                 .or_else(|| self.discovery_note.clone()),
             sessions,
             mention_listings,
+            mention_pending,
             tabs,
             active_tab: self.active_tab,
             active,
