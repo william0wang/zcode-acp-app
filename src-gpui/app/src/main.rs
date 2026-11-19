@@ -53,10 +53,8 @@ use gpui_kit::{
 use runtime::ProtocolRuntime;
 use rust_i18n::t;
 use workbench::{
-    ApprovalConfirm, ApprovalDigit1, ApprovalDigit2, ApprovalDigit3, ApprovalDigit4,
-    ApprovalDigit5, ApprovalDigit6, ApprovalDigit7, ApprovalDigit8, ApprovalDigit9, EditCopy,
-    EditPaste, FocusSessionSearch, QuitApp, ReopenClosedTab, SelectTab1, SelectTab2, SelectTab3,
-    SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, ShowAbout,
+    EditCopy, EditPaste, FocusSessionSearch, QuitApp, ReopenClosedTab, SelectTab1, SelectTab2,
+    SelectTab3, SelectTab4, SelectTab5, SelectTab6, SelectTab7, SelectTab8, SelectTab9, ShowAbout,
     ShowPreferences, StopTurn, TerminalPaneNext, TerminalPanePrev, ToggleTerminal, Workbench,
 };
 
@@ -175,20 +173,12 @@ fn install_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-7", SelectTab7, None),
         KeyBinding::new("cmd-8", SelectTab8, None),
         KeyBinding::new("cmd-9", SelectTab9, None),
-        // The approval card at keyboard distance (req 0.3): Enter answers
-        // with the primary action, plain digits pick the nth option. Both
-        // stay the composer's while a text input is focused — input key
-        // listeners consume Enter/digits before these bindings dispatch.
-        KeyBinding::new("enter", ApprovalConfirm, None),
-        KeyBinding::new("1", ApprovalDigit1, None),
-        KeyBinding::new("2", ApprovalDigit2, None),
-        KeyBinding::new("3", ApprovalDigit3, None),
-        KeyBinding::new("4", ApprovalDigit4, None),
-        KeyBinding::new("5", ApprovalDigit5, None),
-        KeyBinding::new("6", ApprovalDigit6, None),
-        KeyBinding::new("7", ApprovalDigit7, None),
-        KeyBinding::new("8", ApprovalDigit8, None),
-        KeyBinding::new("9", ApprovalDigit9, None),
+        // NOTE: no bare-key bindings here, ever. A context-less binding on a
+        // bare key (enter/digits) races the composer's focused-textarea key
+        // handling and can swallow the keystroke — Enter-to-send broke this
+        // way (2026-11-19). Approval cards answer by click; Esc stays via
+        // the StopTurn chain above.
+
         // The standard app shortcuts (req 2.7): ⌘, opens Preferences,
         // ⌘⇧T reopens the last closed tab (VS Code's muscle memory).
         KeyBinding::new("cmd-,", ShowPreferences, None),

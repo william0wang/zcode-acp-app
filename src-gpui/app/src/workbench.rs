@@ -104,10 +104,10 @@ const DRAWER_WIDTH: f32 = 380.;
 // `Workbench::on_quit_action` for the quit guard. `FocusSessionSearch` is ⌘K;
 // `SelectTab1..9` are ⌘1..⌘9 (requirements §4's basic desktop shortcuts).
 // `StopTurn` is Esc — `session/cancel` on the running turn (ChatView's
-// Cancel, at keyboard distance). `ApprovalConfirm` (Enter) and
-// `ApprovalDigit1..9` answer the pending approval card at keyboard distance
-// (req 0.3) — they fire only while no text input owns the key (input key
-// listeners consume Enter/digits before global bindings dispatch).
+// Cancel, at keyboard distance; a pending approval card answers Esc first
+// inside `on_stop_turn`). No bare-key actions: a context-less enter/digit
+// binding races the composer's own key handling (Enter-to-send broke that
+// way, 2026-11-19).
 gpui_kit::actions!(
     workbench,
     [
@@ -115,16 +115,6 @@ gpui_kit::actions!(
         FocusSessionSearch,
         StopTurn,
         ToggleTerminal,
-        ApprovalConfirm,
-        ApprovalDigit1,
-        ApprovalDigit2,
-        ApprovalDigit3,
-        ApprovalDigit4,
-        ApprovalDigit5,
-        ApprovalDigit6,
-        ApprovalDigit7,
-        ApprovalDigit8,
-        ApprovalDigit9,
         ShowAbout,
         ShowPreferences,
         ReopenClosedTab,
@@ -1180,32 +1170,6 @@ fn chat_row_menu(
     }
 }
 
-/// The quote affordance (requirements 0.1 — pure client): re-enter the row's
-/// text into the composer as an editable draft. An occupied composer keeps
-/// its text (the quote appends on its own paragraph).
-fn quote_button(row: &RowModel, text: String, wb: &WeakEntity<Workbench>) -> Button {
-    Button::new(SharedString::from(format!("quote-{}", row.id)))
-        .ghost()
-        .xsmall()
-        .icon(KitIconName::Quote)
-        .tooltip(t!("chat.quote"))
-        .on_click({
-            let wb = wb.clone();
-            move |_, window, cx| {
-                if let Some(wb) = wb.upgrade() {
-                    let composer = wb.read(cx).composer.clone();
-                    let cur = composer.read(cx).value().to_string();
-                    let next = if cur.trim().is_empty() {
-                        text.clone()
-                    } else {
-                        format!("{}\n\n{}", cur, text)
-                    };
-                    composer.update(cx, |state, cx| state.set_value(&next, window, cx));
-                }
-            }
-        })
-}
-
 /// The edit-and-resend affordance (requirements 0.1, rewind spec §4.1):
 /// opens the inline editor on the latest addressable user message.
 fn edit_button(row: &RowModel, mid: &str, text: String, wb: &WeakEntity<Workbench>) -> Button {
@@ -2139,22 +2103,6 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The approval card's Enter (req 0.3): the shape's primary answer.
-    pub(crate) fn on_approval_confirm(
-        &mut self,
-        _: &ApprovalConfirm,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(card) = self.card.clone() else {
-            return;
-        };
-        if let Some(cmd) = card.read(cx).confirm_command(cx) {
-            self.runtime.send(cmd);
-            cx.notify();
-        }
-    }
-
     /// The app menu's About (req 2.7): the About modal.
     pub(crate) fn on_show_about(
         &mut self,
@@ -2246,18 +2194,6 @@ impl Workbench {
                 format!("{cur}\n{text}")
             };
             composer.update(cx, |state, cx| state.set_value(&next, window, cx));
-        }
-    }
-
-    /// The approval card's digit picks (req 0.3): the nth permission option,
-    /// only with more than one option on the table.
-    fn on_approval_digit(&mut self, n: usize, cx: &mut Context<Self>) {
-        let Some(card) = self.card.clone() else {
-            return;
-        };
-        if let Some(cmd) = card.read(cx).digit_command(n) {
-            self.runtime.send(cmd);
-            cx.notify();
         }
     }
 
@@ -6240,31 +6176,8 @@ impl Workbench {
                     .on_click(move |_, _, _| runtime.send(UiCommand::CancelTurn)),
             );
         }
-        // One-tap compact (req 0.5): the bridge's /compact slash command as
-        // a button — offered only while the bridge advertises the command
-        // and no turn is running (a running turn's compaction window would
-        // refuse it anyway).
-        if self.tab.as_ref().is_some_and(|t| {
-            !t.running
-                && t.available_commands
-                    .iter()
-                    .any(|c| c.name.trim_start_matches('$') == "compact")
-        }) {
-            let runtime = self.runtime.clone();
-            controls = controls.child(
-                Button::new("compact")
-                    .ghost()
-                    .xsmall()
-                    .icon(KitIconName::Archive)
-                    .tooltip(t!("chat.compact"))
-                    .on_click(move |_, _, _| {
-                        runtime.send(UiCommand::SendPrompt {
-                            text: "/compact".to_string(),
-                            images: Vec::new(),
-                        });
-                    }),
-            );
-        }
+        // (One-tap compact removed 2026-11-19: the composer's "/compact"
+        // slash command covers it — the button added nothing.)
         let runtime = self.runtime.clone();
         let composer = self.composer.clone();
         let wb = cx.entity();
@@ -7168,10 +7081,8 @@ fn render_user_row(
             copied == Some(row.id.as_str()),
             wb,
         ));
-        // Quote is the always-available fallback action (0.1); edit-resend
-        // exists only on the latest addressable user message (the wire's
-        // latest-only gate, mirrored from the TS editMid gate).
-        side = side.child(quote_button(row, text.clone(), wb));
+        // Edit-resend exists only on the latest addressable user message
+        // (the wire's latest-only gate, mirrored from the TS editMid gate).
         if actions.rewind_capable
             && actions.last_user_id.as_deref() == Some(row.id.as_str())
             && !row.collapsed
@@ -7443,10 +7354,9 @@ fn render_assistant_row(
                 copied == Some(row.id.as_str()),
                 wb,
             ))
-            // Quote works everywhere; regenerate rides the latest assistant
-            // row only. A tail row without a mid (local card message) sends
-            // None — the bridge's default-latest resolves the target.
-            .child(quote_button(row, text.clone(), wb))
+            // Regenerate rides the latest assistant row only. A tail row
+            // without a mid (local card message) sends None — the bridge's
+            // default-latest resolves the target.
             .when(
                 actions.rewind_capable
                     && actions.last_assistant_id.as_deref() == Some(row.id.as_str()),
@@ -8159,34 +8069,6 @@ impl Render for Workbench {
              }))
              .on_action(cx.listener(|this, _: &TerminalPanePrev, window, cx| {
                  this.on_cycle_terminal_pane(false, window, cx)
-             }))
-             .on_action(cx.listener(Self::on_approval_confirm))
-             .on_action(cx.listener(|this, _: &ApprovalDigit1, _, cx| {
-                 this.on_approval_digit(1, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit2, _, cx| {
-                 this.on_approval_digit(2, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit3, _, cx| {
-                 this.on_approval_digit(3, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit4, _, cx| {
-                 this.on_approval_digit(4, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit5, _, cx| {
-                 this.on_approval_digit(5, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit6, _, cx| {
-                 this.on_approval_digit(6, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit7, _, cx| {
-                 this.on_approval_digit(7, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit8, _, cx| {
-                 this.on_approval_digit(8, cx)
-             }))
-             .on_action(cx.listener(|this, _: &ApprovalDigit9, _, cx| {
-                 this.on_approval_digit(9, cx)
              }))
              .on_action(cx.listener(Self::on_select_tab1))
             .on_action(cx.listener(Self::on_select_tab2))

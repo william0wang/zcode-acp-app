@@ -35,7 +35,7 @@ use gpui_kit::component::text::{TextView, TextViewMotion, TextViewState};
 use gpui_kit::component::{ActiveTheme as _, Sizable as _};
 use protocol::approval::{
     build_elicitation_answers, permission_shape, plan_field, raw_input_highlights, ApprovalShape,
-    ElicitValue, PendingAsk, PermissionOption,
+    ElicitValue, PendingAsk,
 };
 use rust_i18n::t;
 
@@ -86,49 +86,6 @@ impl ApprovalCard {
         )
     }
 
-    /// The Enter answer (req 0.3 — PermissionDialog's keyboard): the shape's
-    /// primary action. Plan → approve; tool/question permission → the first
-    /// allow_* option (fallback: the first option); elicitation form → submit
-    /// with the current picks (a plan-form approves directly).
-    pub fn confirm_command(&self, cx: &App) -> Option<UiCommand> {
-        match &self.ask {
-            PendingAsk::Permission(p) => {
-                let approve = p.options.iter().find(|o| {
-                    o.option_id == "approve"
-                        || o.kind.as_deref().is_some_and(|k| k.starts_with("allow"))
-                });
-                let pick = approve.or_else(|| p.options.first())?;
-                Some(UiCommand::AnswerPermission {
-                    request_id: p.request_id,
-                    option_id: pick.option_id.clone(),
-                })
-            }
-            PendingAsk::Elicitation(form) => {
-                if let Some(field) = plan_field(form) {
-                    return Some(UiCommand::AnswerElicitation {
-                        request_id: form.request_id,
-                        answers: Some(vec![(
-                            field.key.clone(),
-                            ElicitValue::One("approve".to_string()),
-                        )]),
-                    });
-                }
-                // The submit button's exact answer shape, built from the
-                // live picks.
-                let mut others: HashMap<String, String> = HashMap::new();
-                for (key, input) in &self.others {
-                    others.insert(key.clone(), input.read(cx).value().to_string());
-                }
-                let answers =
-                    build_elicitation_answers(&form.fields, &self.picked, &self.checked, &others);
-                Some(UiCommand::AnswerElicitation {
-                    request_id: form.request_id,
-                    answers: Some(answers),
-                })
-            }
-        }
-    }
-
     /// The Esc answer (req 0.3): the first reject-kind option — no fallback
     /// when the server sent none (TS's "else no-op"); an elicitation form
     /// declines.
@@ -151,21 +108,6 @@ impl ApprovalCard {
                 answers: None,
             }),
         }
-    }
-
-    /// Digits 1-9 (req 0.3 — TS binds them only with more than one option):
-    /// the nth permission option. Out-of-range digits are a no-op (TS parity,
-    /// PermissionDialog.tsx — clamping would answer with an option the digit
-    /// never named, e.g. "5" on a 3-option ask landing on reject).
-    pub fn digit_command(&self, n: usize) -> Option<UiCommand> {
-        let PendingAsk::Permission(p) = &self.ask else {
-            return None;
-        };
-        let pick = digit_permission_option(&p.options, n)?;
-        Some(UiCommand::AnswerPermission {
-            request_id: p.request_id.clone(),
-            option_id: pick.option_id.clone(),
-        })
     }
 
     pub fn new(window: &mut Window, ask: PendingAsk, cx: &mut Context<Self>) -> Self {
@@ -759,15 +701,6 @@ fn slug(text: &str) -> String {
         .collect()
 }
 
-/// The nth permission option for the digit shortcuts (req 0.3): `None`
-/// unless 1 <= n <= options.len() and there is a choice to make — out of
-/// range is a no-op (TS parity, PermissionDialog.tsx: clamping would answer
-/// with an option the digit never named, e.g. "5" on a 3-option ask
-/// landing on reject).
-fn digit_permission_option(options: &[PermissionOption], n: usize) -> Option<&PermissionOption> {
-    (options.len() >= 2 && n >= 1 && n <= options.len()).then(|| &options[n - 1])
-}
-
 /// The ephemeral toast strip (notify-toast semantics live in the driver):
 /// text plus a dismiss control, rendered above the composer.
 pub fn render_toast_strip(
@@ -806,37 +739,4 @@ pub fn render_toast_strip(
                 }),
         )
         .into_any_element()
-}
-
-#[cfg(test)]
-mod tests {
-    // No `use super::*` here: this file's glob imports blow the test
-    // macro's expansion budget (the same reason view.rs has no tests).
-    use protocol::approval::PermissionOption;
-
-    fn option(id: &str) -> PermissionOption {
-        PermissionOption {
-            option_id: id.to_string(),
-            kind: Some(id.to_string()),
-            name: None,
-        }
-    }
-
-    /// Out-of-range digits must no-op instead of clamping to the last
-    /// option ("5" on the 3-option allow_once/allow_always/reject ask used
-    /// to answer reject).
-    #[test]
-    fn digit_permission_option_range_checks_instead_of_clamping() {
-        let options = vec![option("allow_once"), option("allow_always"), option("reject")];
-        let id = |n: usize| super::digit_permission_option(&options, n).map(|o| o.option_id.as_str());
-        assert_eq!(id(1), Some("allow_once"));
-        assert_eq!(id(3), Some("reject"));
-        assert_eq!(id(0), None);
-        assert_eq!(id(4), None);
-        assert_eq!(id(9), None);
-        // A single option is a binary ask — buttons/Enter cover it (TS
-        // binds digits only with more than one option).
-        let single = vec![option("proceed")];
-        assert_eq!(super::digit_permission_option(&single, 1), None);
-    }
 }
