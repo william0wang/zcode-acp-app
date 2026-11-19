@@ -11,7 +11,7 @@
 //! read-modify-written so one preference's save never drops another's.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use gpui_kit::gpui::{px, Pixels};
 use serde_json::{Map, Value};
@@ -77,6 +77,25 @@ impl FontScale {
 /// trees that do not carry the workbench handle. One window, one scale
 /// (ADR-0009's single-window workbench); the value never varies mid-paint.
 static UI_SCALE: AtomicU8 = AtomicU8::new(1);
+
+/// OSC 52 clipboard reads in terminal panes: OFF by default, fail-closed.
+/// A pane hosts arbitrary programs — ssh forwards escape sequences
+/// verbatim, so answering the `?` query hands a possibly-remote process
+/// the host clipboard. Published as a process global for the same reason
+/// as [`UI_SCALE`]: the terminal view's event path carries no workbench
+/// handle. Set at startup and on the settings flip; new panes seed from
+/// it, live panes are updated by the flip's broadcast.
+static TERMINAL_OSC52_READ: AtomicBool = AtomicBool::new(false);
+
+/// Publish the OSC 52 read gate (startup seed + the settings flip).
+pub(crate) fn set_terminal_osc52_read(enabled: bool) {
+    TERMINAL_OSC52_READ.store(enabled, Ordering::Relaxed);
+}
+
+/// The OSC 52 read gate's current value (pane spawn seeds from this).
+pub(crate) fn terminal_osc52_read() -> bool {
+    TERMINAL_OSC52_READ.load(Ordering::Relaxed)
+}
 
 /// Publish the current ladder step for [`ui_text`].
 pub(crate) fn set_current_ui_scale(scale: FontScale) {
@@ -205,6 +224,17 @@ pub(crate) fn store_font_size(size: &str) {
     store_pref("fontSize", Value::String(size.to_string()));
 }
 
+/// Read the persisted OSC 52 read gate (missing/corrupt/anything but an
+/// explicit `true` reads as off — fail-closed).
+pub(crate) fn load_terminal_osc52_read() -> bool {
+    load_prefs().get("terminalOsc52Read") == Some(&Value::Bool(true))
+}
+
+/// Persist the OSC 52 read gate (the settings segment's click).
+pub(crate) fn store_terminal_osc52_read(enabled: bool) {
+    store_pref("terminalOsc52Read", Value::Bool(enabled));
+}
+
 /// Pinned session ids (req 0.4 — the TS `zcode-acp:pinned-sessions`
 /// localStorage key): local display order only, invalid entries drop out.
 pub(crate) fn load_pinned_sessions() -> std::collections::HashSet<String> {
@@ -226,8 +256,8 @@ pub(crate) fn store_pinned_sessions(ids: &std::collections::HashSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        set_current_ui_scale, stored_channel, stored_font_size, stored_locale, ui_text,
-        FontScale, CHANNEL_PREVIEW, CHANNEL_STABLE, LOCALE_EN, LOCALE_ZH,
+        set_current_ui_scale, stored_channel, stored_font_size, stored_locale, ui_text, FontScale,
+        CHANNEL_PREVIEW, CHANNEL_STABLE, LOCALE_EN, LOCALE_ZH,
     };
 
     #[test]

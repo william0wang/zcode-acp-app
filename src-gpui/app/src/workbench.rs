@@ -4107,6 +4107,75 @@ impl Workbench {
             .into_any_element()
     }
 
+    // -- terminal OSC 52 read --------------------------------------------------
+
+    /// Apply the settings panel's OSC 52 read pick: persist, publish the
+    /// process global (new panes seed from it), and push the value into
+    /// every LIVE pane across all tabs — the flip is immediate, no pane
+    /// restart. Fail-closed both ends: the default is off, and an unwired
+    /// view never answers.
+    fn set_osc52_read(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        if crate::ui_prefs::terminal_osc52_read() == enabled {
+            return;
+        }
+        crate::ui_prefs::store_terminal_osc52_read(enabled);
+        crate::ui_prefs::set_terminal_osc52_read(enabled);
+        for pane in self.tab_terminals.values().flatten() {
+            pane.view.update(cx, |view, _| view.set_clipboard_read_enabled(enabled));
+        }
+        cx.notify();
+    }
+
+    /// The settings panel's OSC 52 read segment: a two-step on/off
+    /// ButtonGroup beside the appearance picks. The hint spells the trust
+    /// boundary — a pane's programs (ssh forwards escape sequences
+    /// verbatim) would receive the host clipboard while this is on.
+    fn render_osc52_section(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let on = crate::ui_prefs::terminal_osc52_read();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .min_w_0()
+            .child(
+                div()
+                    .text_size(ui_text(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("panel.clipboardRead").into_owned()),
+            )
+            .child(
+                div()
+                    .text_size(ui_text(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("panel.clipboardReadHint").into_owned()),
+            )
+            .child(
+                ButtonGroup::new("osc52-segment")
+                    .small()
+                    .flex_1()
+                    .min_w_0()
+                    .child(
+                        Button::new("osc52-off")
+                            .label(t!("panel.clipboardReadOff").into_owned())
+                            .selected(!on),
+                    )
+                    .child(
+                        Button::new("osc52-on")
+                            .label(t!("panel.clipboardReadOn").into_owned())
+                            .selected(on),
+                    )
+                    .on_click(move |clicks, _, cx| {
+                        // Single-select group: the click's index is the pick.
+                        if let Some(&ix) = clicks.first() {
+                            wb.update(cx, |wb, cx| wb.set_osc52_read(ix == 1, cx));
+                        }
+                    }),
+            )
+            .into_any_element()
+    }
+
     /// The settings drawer's body (formerly the config dock panel): the
     /// entry list for the high-frequency config pages (requirements §4 —
     /// the TS app reaches these from the settings panel), plus the server
@@ -4133,6 +4202,10 @@ impl Workbench {
         // The font-size segment (SidePanel.tsx:189-210): the chat ladder,
         // beside the language pick — both are appearance preferences.
         column = column.child(self.render_font_size_section(cx));
+
+        // The OSC 52 clipboard-read gate (req 2.8 follow-up): off by
+        // default, fail-closed — the flip applies to live panes at once.
+        column = column.child(self.render_osc52_section(cx));
 
         // The hub staleness check (TS SettingsPanel `checkHubUpgrade`): one
         // button, busy while POST /api/upgrade flies, the verdict note under

@@ -371,6 +371,9 @@ pub(crate) fn spawn_dock(
                 // OSC 52 (tmux/vim copy): into the app clipboard.
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_string()));
             })
+            // OSC 52 READ (tmux/vim paste) seeds from the persisted gate —
+            // off unless the settings panel turned it on (fail-closed).
+            .with_clipboard_read_enabled(crate::ui_prefs::terminal_osc52_read())
             .with_bell_callback({
                 let wb = wb.clone();
                 move |_, cx| {
@@ -436,6 +439,7 @@ pub(crate) fn spawn_memory_dock(cx: &mut Context<Workbench>) -> TerminalDock {
             config,
             cx,
         )
+        .with_clipboard_read_enabled(crate::ui_prefs::terminal_osc52_read())
     });
     let focus = view.read(cx).focus_handle().clone();
     TerminalDock {

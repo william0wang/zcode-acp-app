@@ -219,6 +219,9 @@ fn main() {
             ui_prefs::set_current_ui_scale(
                 ui_prefs::load_font_size().unwrap_or(ui_prefs::FontScale::Medium),
             );
+            // OSC 52 clipboard reads: fail-closed (off) until the settings
+            // panel's pick says otherwise; pane spawns seed from this.
+            ui_prefs::set_terminal_osc52_read(ui_prefs::load_terminal_osc52_read());
             // Dark theme only in P0 (requirements §2), polished onto the
             // product's quiet-dark palette (see apply_quiet_dark).
             Theme::change(ThemeMode::Dark, None, cx);

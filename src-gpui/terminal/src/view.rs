@@ -413,6 +413,12 @@ pub struct TerminalView {
     /// Callback for clipboard store requests
     clipboard_store_callback: Option<ClipboardStoreCallback>,
 
+    /// Whether OSC 52 clipboard READS (the `?` query) are answered at all.
+    /// Off unless the embedding app wires it in — fail-closed: a bare view
+    /// never hands the host clipboard to whatever runs in the pane (ssh
+    /// forwards the query verbatim to possibly-remote processes).
+    clipboard_read_enabled: bool,
+
     /// Callback for terminal exit events
     exit_callback: Option<ExitCallback>,
 
@@ -566,6 +572,7 @@ impl TerminalView {
             stdin_writer,
             event_rx,
             config,
+            clipboard_read_enabled: false,
             _reader_task: reader_task,
             resize_callback: None,
             key_handler: None,
@@ -698,6 +705,29 @@ impl TerminalView {
     ) -> Self {
         self.clipboard_store_callback = Some(Box::new(callback));
         self
+    }
+
+    /// Enable or disable answering OSC 52 clipboard READS (the `?` query).
+    ///
+    /// Disabled by default and fail-closed — the embedding app wires this
+    /// from its own preference. Reads only affect the answer path; clipboard
+    /// writes (`with_clipboard_store_callback`) are always on.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// terminal.with_clipboard_read_enabled(prefs.terminal_osc52_read)
+    /// ```
+    pub fn with_clipboard_read_enabled(mut self, enabled: bool) -> Self {
+        self.clipboard_read_enabled = enabled;
+        self
+    }
+
+    /// Live counterpart of [`with_clipboard_read_enabled`] for panes that
+    /// already exist when the preference flips (no repaint needed — the
+    /// gate only steers the answer path).
+    pub fn set_clipboard_read_enabled(&mut self, enabled: bool) {
+        self.clipboard_read_enabled = enabled;
     }
 
     /// Set a callback to be invoked when the terminal process exits.
@@ -1016,15 +1046,18 @@ impl TerminalView {
                     }
                 }
                 TerminalEvent::ClipboardLoad(reply) => {
-                    // OSC 52 read (tmux/vim paste, req 2.8): answer from the
-                    // host clipboard — the reply fn formats the escape
-                    // sequence, its return goes straight into the PTY.
-                    // Trust boundary: whatever runs in the pane receives the
-                    // reply — including a process reached through ssh, which
-                    // forwards escape sequences verbatim (same exposure class
-                    // as any terminal that honors OSC 52 reads). The cap
-                    // keeps a giant clipboard from being dumped into PTY
-                    // input.
+                    // OSC 52 read (tmux/vim paste, req 2.8), gated by the
+                    // embedding app's settings (fail-closed: off unless
+                    // wired in). On answer: the host clipboard read — the
+                    // reply fn formats the escape sequence, its return goes
+                    // straight into the PTY. Trust boundary: whatever runs
+                    // in the pane receives the reply — including a process
+                    // reached through ssh, which forwards escape sequences
+                    // verbatim. The cap keeps a giant clipboard from being
+                    // dumped into PTY input.
+                    if !self.clipboard_read_enabled {
+                        return;
+                    }
                     const MAX_CLIPBOARD_READ_BYTES: usize = 100_000;
                     let text = cx
                         .read_from_clipboard()
