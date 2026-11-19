@@ -47,43 +47,21 @@ function fmtContext(used: number, size: number): string {
   return `${Math.min(100, (used / size) * 100).toFixed(1)}%/${fmtTokens(size)}`;
 }
 
-// Plan panel (requirements 1.8): auto-expands while a turn runs (the plan
-// is live progress then), collapses when idle; the first manual toggle wins
-// permanently (the ThoughtCard rule). The summary carries a done/total
-// progress bar.
+// Plan panel: a plain collapsed `<details>` row with the done/total count.
+// (The 0.39.0 progress bar and run-time auto-expand were removed 2026-11-19
+// — user feedback: the bar adds nothing; /compact-style furniture stays out.)
 function PlanPanel({ entries }: { entries: PlanEntry[] }) {
   const { t } = useTranslation();
-  const isRunning = useAppStore((s) => s.isRunning);
-  const [open, setOpen] = useState(false);
-  const [touched, setTouched] = useState(false);
-  useEffect(() => {
-    if (!touched) setOpen(isRunning);
-  }, [isRunning, touched]);
   const done = entries.filter((e) => e.status === "completed").length;
   return (
-    <div className="border-b border-hairline bg-surface/60 px-4 py-2 text-xs text-dim">
-      <button
-        onClick={() => {
-          setTouched(true);
-          setOpen((o) => !o);
-        }}
-        className="flex w-full select-none items-center gap-1.5 text-left text-dim"
-      >
-        <ChevronDown
-          className={`size-3.5 shrink-0 text-faint transition-transform ${open ? "rotate-180" : ""}`}
-        />
+    <details className="border-b border-hairline bg-surface/60 px-4 py-2 text-xs text-dim">
+      <summary className="group flex cursor-pointer select-none items-center gap-1.5 text-dim [&::-webkit-details-marker]:hidden">
+        <ChevronDown className="size-3.5 shrink-0 text-faint transition-transform group-open:rotate-180" />
         <span className="shrink-0">
           {t("chat.plan")} · {done}/{entries.length}
         </span>
-        <span className="ml-2 h-1 min-w-8 flex-1 overflow-hidden rounded-full bg-hover">
-          <span
-            className="block h-full rounded-full bg-info transition-[width] duration-300"
-            style={{ width: `${(done / Math.max(entries.length, 1)) * 100}%` }}
-          />
-        </span>
-      </button>
-      {open && (
-        <ul className="mt-1.5 flex flex-col gap-1 pb-1">
+      </summary>
+      <ul className="mt-1.5 flex flex-col gap-1 pb-1">
           {entries.map((e, i) => (
             <li key={i} className="flex items-start gap-1.5">
               {e.status === "completed" ? (
@@ -104,9 +82,8 @@ function PlanPanel({ entries }: { entries: PlanEntry[] }) {
               </span>
             </li>
           ))}
-        </ul>
-      )}
-    </div>
+      </ul>
+    </details>
   );
 }
 

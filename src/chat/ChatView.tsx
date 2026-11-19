@@ -27,7 +27,6 @@ import Zoom from "yet-another-react-lightbox/plugins/zoom";
 import "yet-another-react-lightbox/styles.css";
 import { AUTO_EXPAND_TOP_PX, shouldAutoExpand } from "./autoExpand";
 import {
-  Archive,
   ArrowDown,
   ArrowUp,
   Bell,
@@ -61,10 +60,8 @@ import "highlight.js/styles/github-dark.css";
 import { useAppStore } from "../store/appStore";
 import { MarkdownText } from "../components/Markdown";
 import { Spinner } from "../components/Spinner";
-import { ConfigSheet } from "../components/ConfigSheet";
 import { Sheet } from "../ui";
 import { haptic } from "../lib/haptic";
-import { bareModelIdFromConfigValue, currentChoice } from "../lib/modelValue";
 import { MAX_IMAGES, attachmentDataUrl, prepareImage } from "../lib/image";
 import { isRunningStatus, summarizeToolRun, toolNameOf, oneLine } from "./toolRun";
 import type {
@@ -901,68 +898,10 @@ function cacheMentionListing(key: string, entries: FsEntry[]): void {
   }
 }
 
-// In-session mode/model pills + one-tap compact (requirements 0.5): the
-// session panel's config rows in chip form, living above the composer.
-// Compact rides the bridge's own /compact slash command — sendPrompt
-// executes it harness-side, same as typing it.
-function ComposerPills() {
-  const { t } = useTranslation();
-  const activeSessionId = useAppStore((s) => s.activeSessionId);
-  const configOptions = useAppStore((s) => s.configOptions);
-  const availableCommands = useAppStore((s) => s.availableCommands);
-  const isRunning = useAppStore((s) => s.isRunning);
-  const sendPrompt = useAppStore((s) => s.sendPrompt);
-  const [sheet, setSheet] = useState<string | null>(null);
-  if (!activeSessionId) return null;
-  const mode = configOptions.find((o) => o.id === "mode");
-  const model = configOptions.find((o) => o.id === "model");
-  // Skill commands ride a "$" grouping prefix (same normalization as the
-  // "/" menu); disabled while a turn runs — a queued /compact fires only
-  // after the turn settles, which reads as a dead button.
-  const compactOk =
-    !isRunning &&
-    availableCommands.some((c) => c.name.replace(/^\$/, "") === "compact");
-  if (!mode && !model && !compactOk) return null;
-  const pill =
-    "flex shrink-0 items-center gap-1 rounded-full bg-raised px-2.5 py-1 text-2xs text-dim ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active";
-  return (
-    <>
-      <div className="mb-1.5 flex items-center gap-1.5 overflow-x-auto">
-        {mode && (
-          <button type="button" onClick={() => setSheet("mode")} className={pill}>
-            {currentChoice(mode)?.name ?? mode.currentValue ?? t("config.mode")}
-          </button>
-        )}
-        {model && (
-          <button
-            type="button"
-            onClick={() => setSheet("model")}
-            className={pill}
-          >
-            {currentChoice(model)?.name ??
-              bareModelIdFromConfigValue(model.currentValue ?? "")}
-          </button>
-        )}
-        {compactOk && (
-          <button
-            type="button"
-            onClick={() => {
-              haptic();
-              void sendPrompt("/compact");
-            }}
-            className={pill}
-          >
-            <Archive className="size-3" />
-            {t("chat.compact")}
-          </button>
-        )}
-      </div>
-      {sheet && (
-        <ConfigSheet optionId={sheet} onClose={() => setSheet(null)} />
-      )}
-    </>
-  );
-}
+// (In-session mode/model pills + one-tap compact were removed 2026-11-19,
+// user feedback: the extra always-visible row above the composer broke the
+// input area's layout. Mode/model live in the side panel's config rows;
+// compact is the /compact slash command.)
 
 
 // Touch devices have a software keyboard with no Shift key, so Enter is the
@@ -1303,7 +1242,6 @@ function Composer() {
 
   return (
     <ThreadPrimitive.ViewportFooter className="sticky bottom-0 bg-canvas pb-[max(var(--safe-bottom),0.5rem)] pt-2">
-      <ComposerPills />
       {open && (
         <div
           ref={listRef}
@@ -1406,7 +1344,7 @@ function Composer() {
           // (the one position where 0 happens to be correct).
           onSelect={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
           onInput={(e) => setCaret(e.currentTarget.selectionStart ?? 0)}
-          className="max-h-32 min-h-9 flex-1 resize-none bg-transparent py-2 text-base leading-5 text-ink placeholder:text-faint focus:outline-none"
+          className="max-h-32 min-h-9 flex-1 resize-none bg-transparent py-2 text-[15px] leading-5 text-ink placeholder:text-faint focus:outline-none"
         />
         {/* While a turn runs the Send stays a Send: a draft queues as pending
             (sendPrompt routes it), never a dead button. Cancel stops the turn.

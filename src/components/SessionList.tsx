@@ -139,55 +139,10 @@ export function useLongPress(onLongPress: (() => void) | undefined, ms = 500) {
   };
 }
 
-// Swipe-right gesture (requirements 1.10): reveals a pin toggle behind the
-// row's leading edge. Horizontal-dominant only (a vertical scroll intent
-// never arms it) and coexists with the long-press sheet — movement cancels
-// the press timer, same as scrolling does.
-function useSwipeRight(onSwipe: (() => void) | undefined, threshold = 56) {
-  const origin = useRef<{ x: number; y: number } | null>(null);
-  const armed = useRef(false);
-  const [dx, setDx] = useState(0);
-  return {
-    dx,
-    handlers: {
-      onPointerDown: (e: React.PointerEvent) => {
-        origin.current = { x: e.clientX, y: e.clientY };
-        armed.current = false;
-      },
-      onPointerMove: (e: React.PointerEvent) => {
-        const o = origin.current;
-        if (!o) return;
-        const mx = e.clientX - o.x;
-        const my = e.clientY - o.y;
-        if (!armed.current) {
-          if (mx > 12 && mx > Math.abs(my) * 2) armed.current = true;
-          else if (Math.abs(my) > 8) {
-            origin.current = null;
-            return;
-          }
-          if (!armed.current) return;
-        }
-        // Rightward only — the reveal sits on the leading edge.
-        setDx(Math.max(0, Math.min(mx, 96)));
-      },
-      onPointerUp: (_e: React.PointerEvent) => {
-        if (armed.current && dx > threshold && onSwipe) {
-          haptic();
-          onSwipe();
-        }
-        origin.current = null;
-        armed.current = false;
-        setDx(0);
-      },
-      onPointerCancel: (_e: React.PointerEvent) => {
-        origin.current = null;
-        armed.current = false;
-        setDx(0);
-      },
-    },
-  };
-}
-
+// (Swipe-to-pin was removed 2026-11-19, user feedback: the reveal's wide
+// tinted background clashed with the row and the reveal itself was not a
+// tappable target. Pinning lives in the long-press sheet below — mobile's
+// context menu.)
 function SessionRow({
   item,
   active,
@@ -196,7 +151,6 @@ function SessionRow({
   unread,
   onSelect,
   onLongPress,
-  onTogglePin,
 }: {
   item: SessionRowItem;
   active: boolean;
@@ -205,42 +159,18 @@ function SessionRow({
   unread: number;
   onSelect: () => void;
   onLongPress?: () => void;
-  onTogglePin: () => void;
 }) {
   const { t, i18n } = useTranslation();
   const press = useLongPress(onLongPress);
-  const { dx, handlers: swipe } = useSwipeRight(onTogglePin);
   return (
-    <div className="relative overflow-hidden">
-      {/* Pin reveal behind the swipe (requirements 0.4 / 1.10). */}
-      <div className="absolute inset-y-0 left-0 flex w-24 items-center justify-center bg-info-wash text-info">
-        <Pin className="size-4" />
-      </div>
-      <button
-        onClick={onSelect}
-        disabled={disabled}
-        {...press}
-        onPointerDown={(e) => {
-          press.onPointerDown(e);
-          swipe.onPointerDown(e);
-        }}
-        onPointerMove={(e) => {
-          press.onPointerMove(e);
-          swipe.onPointerMove(e);
-        }}
-        onPointerUp={(e) => {
-          press.onPointerUp();
-          swipe.onPointerUp(e);
-        }}
-        onPointerCancel={(e) => {
-          press.onPointerCancel();
-          swipe.onPointerCancel(e);
-        }}
-        style={{ transform: dx > 0 ? `translateX(${dx}px)` : undefined }}
-        className={`relative flex w-full flex-col px-4 py-3 text-left select-none [-webkit-touch-callout:none] disabled:opacity-50 ${
-          dx > 0 ? "transition-none" : "transition-transform duration-200"
-        } ${active ? "bg-selected" : "hover:bg-hover active:bg-active"}`}
-      >
+    <button
+      onClick={onSelect}
+      disabled={disabled}
+      {...press}
+      className={`relative flex w-full flex-col px-4 py-3 text-left select-none [-webkit-touch-callout:none] disabled:opacity-50 ${
+        active ? "bg-selected" : "hover:bg-hover active:bg-active"
+      }`}
+    >
         <span className="flex min-w-0 items-center gap-2">
           {pinned && <Pin className="size-3 shrink-0 text-info" />}
           <span
@@ -272,8 +202,7 @@ function SessionRow({
             </span>
           )}
         </span>
-      </button>
-    </div>
+    </button>
   );
 }
 
@@ -407,7 +336,6 @@ export function SessionList({
                     ? undefined
                     : () => openActions(s)
                 }
-                onTogglePin={() => toggleSessionPin(s.sessionId)}
               />
             ))}
           </>
