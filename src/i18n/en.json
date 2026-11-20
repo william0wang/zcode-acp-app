@@ -588,7 +588,15 @@
     "opening": "opening the terminal…",
     "gone": "closed on the desktop",
     "reopen": "Reopen terminal",
-    "closeAction": "Close terminal"
+    "closeAction": "Close terminal",
+    "listTitle": "Desktop terminals",
+    "listEmpty": "No terminal panes open on the desktop",
+    "paneRunning": "running",
+    "paneIdle": "idle",
+    "paneUnknown": "unknown",
+    "stop": "Stop",
+    "openSessionTerminal": "Open session terminal",
+    "paneExit": "exit {{code}}"
   },
   "permission": {
     "title": "Permission requested",

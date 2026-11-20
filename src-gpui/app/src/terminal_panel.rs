@@ -11,6 +11,7 @@
 //! the restart button drops the dock (drop → child kill) and the next open
 //! spawns fresh in the current session's directory.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use gpui::{div, px, AnyElement, Context, Entity, FocusHandle, WeakEntity};
@@ -37,6 +38,10 @@ pub(crate) struct TerminalDock {
     /// The view's focus handle, cloned at spawn — the workbench's Esc
     /// ladder yields to the shell while this is the focused element.
     pub(crate) focus: FocusHandle,
+    /// The pane's remote side-channel (ADR-0011): v1 remote turns ride it,
+    /// and the Terminal Mirror (2026-11-20) reads it for EVERY pane — busy
+    /// markers scan all streams, interrupts can target any pane.
+    pub(crate) tap: RemotePaneTap,
     /// The dock's own handle on the PTY master (the resize callback holds
     /// the other Arc clone) — kept so the struct reads as the owner. `None`
     /// for the in-memory test dock, which has no PTY.
@@ -79,6 +84,11 @@ struct TeeBuffer {
     /// The view's exit callback only runs on render, so a HIDDEN dock never
     /// reports the death; the driver's settle tick polls this instead.
     closed: bool,
+    /// Terminal Mirror (2026-11-20 addition): OSC 642/643 busy markers parse
+    /// on EVERY pane's stream (armed or not) into this queue; the unprocessed
+    /// tail window below carries split markers across reads.
+    busy_events: VecDeque<BusyEvent>,
+    busy_scan: Vec<u8>,
 }
 
 /// Keep the tail window bounded: a `yes`-grade turn must not grow memory;
@@ -96,6 +106,8 @@ impl TeeBuffer {
     }
 
     fn append(&mut self, bytes: &[u8]) {
+        // The mirror's markers scan every pane's stream, armed or not.
+        self.scan_busy(bytes);
         if !self.armed {
             return;
         }
@@ -164,6 +176,112 @@ fn parse_code(digits: &[u8]) -> i32 {
         code = code.saturating_mul(10).saturating_add((d - b'0') as i32);
     }
     code
+}
+
+// ---------------------------------------------------------------------------
+// Terminal Mirror busy markers (2026-11-20 addition): OSC 642 (command
+// start) / OSC 643 (prompt return) emitted by the shell hooks the spawn
+// injects. Like 641, the emulator swallows them from display — detection
+// lives HERE, on the byte stream, for every pane.
+// ---------------------------------------------------------------------------
+
+/// One parsed busy marker, drained by the driver's mirror tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BusyEvent {
+    /// OSC 642 — a command started (preexec), the hook-sanitized line.
+    CommandStart(String),
+    /// OSC 643 — the prompt returned (precmd), the shell's `$?`.
+    PromptReturn(i32),
+}
+
+/// Bound the busy scan: a partial marker survives the trim (they are ~200
+/// bytes with payload), a `yes`-grade flood keeps the memory bounded.
+const BUSY_WINDOW_CAP: usize = 1024;
+const BUSY_WINDOW_KEEP: usize = 768;
+const MAX_BUSY_EVENTS: usize = 64;
+
+impl TeeBuffer {
+    /// Feed the busy scanner and drain what completed. Markers may split
+    /// across reads; the unprocessed window keeps the tail for the next one.
+    fn scan_busy(&mut self, bytes: &[u8]) {
+        self.busy_scan.extend_from_slice(bytes);
+        while let Some((consume, event)) = find_busy_marker(&self.busy_scan) {
+            self.busy_scan.drain(..consume);
+            if self.busy_events.len() >= MAX_BUSY_EVENTS {
+                self.busy_events.pop_front();
+            }
+            self.busy_events.push_back(event);
+        }
+        if self.busy_scan.len() > BUSY_WINDOW_CAP {
+            let drop = self.busy_scan.len() - BUSY_WINDOW_KEEP;
+            self.busy_scan.drain(..drop);
+        }
+    }
+}
+
+/// The first COMPLETE busy marker in `window`: `(bytes to consume — any
+/// prefix plus the marker through its terminator — the event)`. A marker
+/// whose terminator has not arrived yet is left for the next chunk (a later
+/// complete marker still wins). Payload rules: 642 takes anything but the
+/// two terminators (the hook already stripped control bytes), 643 digits
+/// only — anything else is not ours (v1's 641 included).
+fn find_busy_marker(window: &[u8]) -> Option<(usize, BusyEvent)> {
+    const MAX_PAYLOAD: usize = 512;
+    let mut i = 0;
+    while i + 5 < window.len() {
+        if window[i] != 0x1b || window.get(i + 1) != Some(&b']') {
+            i += 1;
+            continue;
+        }
+        let kind = match (
+            window.get(i + 2),
+            window.get(i + 3),
+            window.get(i + 4),
+            window.get(i + 5),
+        ) {
+            (Some(b'6'), Some(b'4'), Some(b'2'), Some(b';')) => 2,
+            (Some(b'6'), Some(b'4'), Some(b'3'), Some(b';')) => 3,
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let start = i + 6;
+        let mut j = start;
+        let terminated = if kind == 2 {
+            while j < window.len()
+                && window[j] != 0x07
+                && window[j] != 0x1b
+                && j - start < MAX_PAYLOAD
+            {
+                j += 1;
+            }
+            j < window.len()
+                && (window[j] == 0x07
+                    || (window[j] == 0x1b && window.get(j + 1) == Some(&b'\\')))
+        } else {
+            while j < window.len() && window[j].is_ascii_digit() {
+                j += 1;
+            }
+            j > start
+                && j < window.len()
+                && (window[j] == 0x07
+                    || (window[j] == 0x1b && window.get(j + 1) == Some(&b'\\')))
+        };
+        if !terminated {
+            i += 1;
+            continue;
+        }
+        let end = if window[j] == 0x07 { j + 1 } else { j + 2 };
+        let payload = &window[start..j];
+        let event = if kind == 2 {
+            BusyEvent::CommandStart(String::from_utf8_lossy(payload).to_string())
+        } else {
+            BusyEvent::PromptReturn(parse_code(payload))
+        };
+        return Some((end, event));
+    }
+    None
 }
 
 /// Writer both the view's key handling and the driver's remote turns write
@@ -259,6 +377,11 @@ impl RemotePaneTap {
         self.tee.lock().unwrap().closed
     }
 
+    /// Drain the parsed busy markers (Terminal Mirror; the driver's tick).
+    pub(crate) fn take_busy_events(&self) -> Vec<BusyEvent> {
+        self.tee.lock().unwrap().busy_events.drain(..).collect()
+    }
+
     /// A sink-backed tap with no PTY (tests): registry-flow wiring only.
     #[cfg(test)]
     pub(crate) fn in_memory_for_test() -> Self {
@@ -303,11 +426,91 @@ impl RemotePaneTap {
     }
 }
 
+/// zsh's init-file shims, written under `config_dir()/terminal-shim/zsh`:
+/// ZDOTDIR points there, the ORIGINAL zdotdir rides `ZCODE_ACP_ORIG_ZDOTDIR`,
+/// both files pass through to the user's own init first (the hooks append
+/// AFTER the user's rc so a framework cannot order itself ahead of them).
+const ZSH_ZSHENV_SHIM: &str = r#"__zcode_orig="${ZCODE_ACP_ORIG_ZDOTDIR:-$HOME}"
+[[ -f "$__zcode_orig/.zshenv" ]] && source "$__zcode_orig/.zshenv"
+unset __zcode_orig
+"#;
+
+const ZSH_ZSHRC_SHIM: &str = r#"__zcode_orig="${ZCODE_ACP_ORIG_ZDOTDIR:-$HOME}"
+[[ -f "$__zcode_orig/.zshrc" ]] && source "$__zcode_orig/.zshrc"
+# Terminal Mirror busy hooks: printable-only payload (no BEL/ESC can smuggle
+# past the marker terminator), capped where the scanner stops caring.
+__zcode_acp_preexec() {
+  local c=${1//[^[:print:]]/}
+  printf '\e]642;%s\a' "${c[1,200]}"
+}
+__zcode_acp_precmd() { printf '\e]643;%s\a' "$?" }
+preexec_functions+=(__zcode_acp_preexec)
+precmd_functions+=(__zcode_acp_precmd)
+unset __zcode_orig
+"#;
+
+/// bash runs with `--rcfile` pointing here (the user's own rc sources
+/// first). bash has no preexec — the DEBUG trap approximates it and fires
+/// per simple command; the mirror keeps the last text while busy, and our
+/// own hook commands are skipped so the prompt machinery stays quiet.
+const BASH_RC_SHIM: &str = r#"[[ -f "$HOME/.bashrc" ]] && source "$HOME/.bashrc"
+__zcode_acp_preexec() {
+  case "$BASH_COMMAND" in __zcode_acp_*) return ;; esac
+  local c="$BASH_COMMAND"
+  c=${c//[^[:print:]]/}
+  printf '\e]642;%s\a' "${c:0:200}"
+}
+__zcode_acp_precmd() { printf '\e]643;%s\a' "$?"; }
+trap '__zcode_acp_preexec' DEBUG
+PROMPT_COMMAND="__zcode_acp_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+"#;
+
+/// Inject the busy hooks for shells we know how to shim (zsh via ZDOTDIR,
+/// bash via --rcfile); foreign shells and failed shim writes run unhooked
+/// (Busy State `unknown` — the spec's degradation, never a spawn failure).
+fn apply_busy_shim(cmd: &mut CommandBuilder, shell: &str) {
+    let base = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let shim_dir = protocol::profiles::config_dir().join("terminal-shim");
+    if base.contains("zsh") {
+        let dir = shim_dir.join("zsh");
+        if write_shim(&dir, ".zshenv", ZSH_ZSHENV_SHIM)
+            && write_shim(&dir, ".zshrc", ZSH_ZSHRC_SHIM)
+        {
+            cmd.env("ZDOTDIR", &dir);
+            // The original ZDOTDIR the user's init lives in ($HOME when
+            // unset — the common case; keep empty-var noise out of the env).
+            let orig = std::env::var("ZDOTDIR").unwrap_or_default();
+            let orig = if orig.is_empty() {
+                std::env::var("HOME").unwrap_or_default()
+            } else {
+                orig
+            };
+            if !orig.is_empty() {
+                cmd.env("ZCODE_ACP_ORIG_ZDOTDIR", orig);
+            }
+        }
+    } else if base.contains("bash") {
+        if write_shim(&shim_dir, "bashrc", BASH_RC_SHIM) {
+            cmd.arg("--rcfile");
+            cmd.arg(shim_dir.join("bashrc"));
+        }
+    }
+}
+
+/// Best-effort shim write (dir + file); false means "run unhooked".
+fn write_shim(dir: &std::path::Path, name: &str, contents: &str) -> bool {
+    std::fs::create_dir_all(dir).is_ok() && std::fs::write(dir.join(name), contents).is_ok()
+}
+
 /// Spawn the login shell in a fresh PTY at `workspace` (None = home) and
 /// wire the view's callbacks into the workbench. `wb` is weak: the exit
 /// callback closes the panel from the next frame, past the view's own
 /// render borrow. The returned tap is the pane's remote side-channel
-/// (ADR-0011) — local panes simply never arm it.
+/// (ADR-0011) — the mirror scans it on every pane, v1 turns arm it.
 pub(crate) fn spawn_dock(
     workspace: Option<&str>,
     wb: WeakEntity<Workbench>,
@@ -330,6 +533,12 @@ pub(crate) fn spawn_dock(
     // Richer output on: the same env the vendored crate's README asks for.
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
+    // Terminal Mirror busy hooks (2026-11-20): the app owns this spawn, so
+    // it hands the shell preexec/precmd hooks that report command start and
+    // prompt return as OSC 642/643 markers. Shells we cannot shim (or a
+    // failed shim write) run unhooked — the pane's Busy State stays
+    // `unknown`, interrupts still work (`\x03` needs no detection).
+    apply_busy_shim(&mut cmd, &shell);
     let child = pair.slave.spawn_command(cmd).map_err(|e| e.to_string())?;
     let writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> =
         Arc::new(Mutex::new(pair.master.take_writer().map_err(|e| e.to_string())?));
@@ -407,6 +616,7 @@ pub(crate) fn spawn_dock(
         TerminalDock {
             view,
             focus,
+            tap: tap.clone(),
             _pty: Some(pty),
             child: Mutex::new(Some(child)),
         },
@@ -445,6 +655,7 @@ pub(crate) fn spawn_memory_dock(cx: &mut Context<Workbench>) -> TerminalDock {
     TerminalDock {
         view,
         focus,
+        tap: RemotePaneTap::in_memory_for_test(),
         _pty: None,
         child: Mutex::new(None),
     }
@@ -678,7 +889,7 @@ fn render_pane(
 mod remote_tap_tests {
     // Explicit imports only — the file-root kit glob shadows #[test] with
     // gpui's macro (see workbench.rs's test modules / pending_store.rs).
-    use super::{RemotePaneTap, TeeReader, TEE_CAP};
+    use super::{BusyEvent, RemotePaneTap, TeeReader, TEE_CAP};
     use std::io::Read;
 
     /// Feed bytes through a tap the way the view's reader thread would.
@@ -752,6 +963,56 @@ mod remote_tap_tests {
         tap.arm();
         feed(&tap, &marker(2));
         assert_eq!(tap.exit_code(), Some(2));
+    }
+
+    // ---- Terminal Mirror busy markers (2026-11-20 addition) ----
+
+    #[test]
+    fn busy_markers_scan_armed_or_not_and_split_across_reads() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        feed(&tap, b"\x1b]642;npm test\x07");
+        feed(&tap, b"\x1b]643;"); // terminator arrives in a later read
+        feed(&tap, b"0\x07");
+        assert_eq!(
+            tap.take_busy_events(),
+            vec![
+                BusyEvent::CommandStart("npm test".to_string()),
+                BusyEvent::PromptReturn(0),
+            ]
+        );
+        // Drained.
+        assert!(tap.take_busy_events().is_empty());
+    }
+
+    #[test]
+    fn busy_marker_st_terminator_and_flood_bounded_window() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        feed(&tap, b"\x1b]642;hello\x1b\\");
+        assert_eq!(
+            tap.take_busy_events(),
+            vec![BusyEvent::CommandStart("hello".to_string())]
+        );
+        // A marker-less flood keeps the scan window bounded; a later marker
+        // still parses.
+        feed(&tap, &vec![b'x'; 4 * 1024]);
+        feed(&tap, b"\x1b]643;130\x07");
+        assert_eq!(
+            tap.take_busy_events(),
+            vec![BusyEvent::PromptReturn(130)]
+        );
+    }
+
+    #[test]
+    fn busy_markers_ignore_641_and_unterminated_or_malformed_payloads() {
+        let (tap, _) = RemotePaneTap::in_memory();
+        feed(&tap, b"\x1b]641;0\x07"); // v1's exit marker — not ours
+        feed(&tap, b"\x1b]642;never-terminated");
+        feed(&tap, b"\x1b]643;x\x07"); // non-digit payload
+        feed(&tap, b"\x1b]642;\x07"); // empty command: valid, empty text
+        assert_eq!(
+            tap.take_busy_events(),
+            vec![BusyEvent::CommandStart(String::new())]
+        );
     }
 
     #[test]

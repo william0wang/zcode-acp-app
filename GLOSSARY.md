@@ -35,3 +35,15 @@ _Avoid_: executor
 The completion report of a Command Turn — exit code plus the tail of the
 output; process output is never streamed while the command runs.
 _Avoid_: output streaming, output relay
+
+**Terminal Mirror**:
+The state-only projection of the desktop workbench's open terminal panes onto
+a remote client: the pane list, open/close lifecycle, and Busy State sync
+live. Pane content (scrollback, running output) never syncs, and control over
+a mirrored pane stops at interrupting the running command.
+_Avoid_: terminal sync, pane clone, remote desktop terminals
+
+**Busy State**:
+One terminal pane's running signal — busy or idle, the current command line,
+and when it started; unknown when the pane's shell cannot report it.
+_Avoid_: running flag, process status

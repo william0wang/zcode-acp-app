@@ -432,16 +432,17 @@ export function SessionList({
                     {t("chat.renameSession")}
                   </button>
                 )}
-                {/* Remote Terminal (ADR-0011): wire into the desktop
-                    workbench's session terminal. Live rows only — a history
-                    row's session may not be held by any bridge, and the
-                    workbench answers unknown_session anyway. */}
+                {/* Remote Terminal (ADR-0011 + mirror): list-first — the
+                    desktop pane mirror opens, the v1 session terminal sits
+                    behind the session affordance / a remote-pane tap. Live
+                    rows only — a history row's session may not be held by
+                    any bridge, and the workbench answers unknown_session
+                    anyway. */}
                 {!readOnly && (
                   <button
                     onClick={() => {
-                      const { sessionId, title } = actionTarget;
                       setActionTarget(null);
-                      openTerminal(sessionId, title);
+                      openTerminal();
                     }}
                     className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
                   >

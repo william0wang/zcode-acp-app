@@ -6,6 +6,11 @@
 // one-line turns. Reconnect re-`open`s (idempotent — the workbench replays
 // its whole ring) and the seq-keyed fold deduplicates; a turn running
 // through a drop settles into the log and replays with everything else.
+//
+// Terminal Mirror (2026-11-20 addition): the SAME socket also carries the
+// mirror of the desktop's open panes — `panes` snapshots on (re)connect, live
+// `pane` deltas, `pane_interrupt` for the running ones. The mirror has no
+// history: reconnect is a fresh snapshot, never a replay.
 
 export type TerminalConnState = "connecting" | "open" | "reconnecting" | "closed";
 
@@ -35,11 +40,29 @@ export interface TerminalEvent {
   durationMs?: number;
 }
 
+/** One mirrored desktop pane (spec §"The mirrored pane object"): state only —
+ *  content never syncs, `busy` is what the shell hooks reported. */
+export interface MirroredPane {
+  paneId: string;
+  sessionId: string;
+  cwd: string;
+  state: "open" | "gone";
+  busy: "busy" | "idle" | "unknown";
+  command: string | null;
+  sinceMs: number | null;
+  lastExit: number | null;
+  terminalId: string | null;
+}
+
 export interface TerminalHandlers {
   onState: (state: TerminalConnState) => void;
   onTerminal: (terminal: TerminalInfo) => void;
   onEvents: (events: TerminalEvent[]) => void;
   onError: (code: string, message: string) => void;
+  /** Terminal Mirror: the snapshot answer (and the reconnect resync). */
+  onPanes?: (panes: MirroredPane[]) => void;
+  /** Terminal Mirror: one live delta, folded by paneId. */
+  onPane?: (pane: MirroredPane) => void;
 }
 
 // Codes that make retrying pointless until the user acts: the exec switch is
@@ -63,7 +86,8 @@ export class TerminalConnection {
   constructor(
     private readonly hubUrl: string,
     private readonly token: string,
-    private readonly sessionId: string,
+    /** null = mirror-only (the list view); set by `attach` on entry. */
+    private sessionId: string | null,
     private readonly handlers: TerminalHandlers,
   ) {}
 
@@ -76,9 +100,13 @@ export class TerminalConnection {
       if (this.ws !== ws) return;
       this.attempt = 0;
       this.handlers.onState("open");
+      // The mirror resyncs first — a fresh snapshot, never a replay (the
+      // mirror keeps no history by design).
+      ws.send(JSON.stringify({ v: 1, type: "panes" }));
       // Open (re)attaches and replays the whole ring — idempotent, and the
       // seq-keyed fold upstream deduplicates against what we already hold.
-      ws.send(JSON.stringify({ v: 1, type: "open", sessionId: this.sessionId }));
+      if (this.sessionId)
+        ws.send(JSON.stringify({ v: 1, type: "open", sessionId: this.sessionId }));
     };
     ws.onmessage = (ev) => {
       if (typeof ev.data === "string") this.handleMessage(ev.data);
@@ -99,22 +127,46 @@ export class TerminalConnection {
 
   /** Submit one command turn. The workbench answers `error busy` while one runs. */
   sendCommand(command: string): void {
+    if (!this.sessionId) return;
     this.send({ v: 1, type: "turn", sessionId: this.sessionId, command });
   }
 
   /** Ctrl-C for the running turn (same byte a local Ctrl-C writes). */
   interrupt(): void {
+    if (!this.sessionId) return;
     this.send({ v: 1, type: "interrupt", sessionId: this.sessionId });
+  }
+
+  /** Terminal Mirror: Ctrl-C for ANY desktop pane — same byte, repeatable,
+   *  never escalated; the busy→idle delta is the feedback. */
+  interruptPane(paneId: string): void {
+    this.send({ v: 1, type: "pane_interrupt", paneId });
+  }
+
+  /** Attach a session's terminal (list→transcript entry, or a session
+   *  switch on the shared connection): the wire `open` rides now when the
+   *  socket is up and every reconnect after. */
+  attach(sessionId: string): void {
+    this.sessionId = sessionId;
+    this.send({ v: 1, type: "open", sessionId });
+  }
+
+  /** Drop the session attachment (back to mirror-only). The pane itself
+   *  stays alive on the desktop — no wire frame. */
+  detach(): void {
+    this.sessionId = null;
   }
 
   /** Close the pane itself (wire `close`): the workbench kills the pane and
    *  reports `gone`; a later `open` spawns a fresh one. */
   requestClose(): void {
+    if (!this.sessionId) return;
     this.send({ v: 1, type: "close", sessionId: this.sessionId });
   }
 
   /** Ask for a fresh pane after `gone` (same frame as the attach open). */
   reopen(): void {
+    if (!this.sessionId) return;
     this.send({ v: 1, type: "open", sessionId: this.sessionId });
   }
 
@@ -153,6 +205,8 @@ export class TerminalConnection {
       type?: unknown;
       terminal?: unknown;
       events?: unknown;
+      panes?: unknown;
+      pane?: unknown;
       code?: unknown;
       message?: unknown;
     };
@@ -174,6 +228,16 @@ export class TerminalConnection {
         }
         break;
       }
+      case "panes": {
+        // The mirror snapshot replaces whatever we held (reconnect resync —
+        // there is no cursor, the mirror keeps no history).
+        if (Array.isArray(frame.panes))
+          this.handlers.onPanes?.(frame.panes.filter(isMirroredPane));
+        break;
+      }
+      case "pane":
+        if (isMirroredPane(frame.pane)) this.handlers.onPane?.(frame.pane);
+        break;
       case "error": {
         const code = typeof frame.code === "string" ? frame.code : "error";
         const message = typeof frame.message === "string" ? frame.message : code;
@@ -225,6 +289,35 @@ function isTerminalEvent(v: unknown): v is TerminalEvent {
       e.kind === "note" ||
       e.kind === "close")
   );
+}
+
+function isMirroredPane(v: unknown): v is MirroredPane {
+  if (typeof v !== "object" || v === null) return false;
+  const p = v as Record<string, unknown>;
+  return (
+    typeof p.paneId === "string" &&
+    typeof p.sessionId === "string" &&
+    typeof p.cwd === "string" &&
+    (p.state === "open" || p.state === "gone") &&
+    (p.busy === "busy" || p.busy === "idle" || p.busy === "unknown") &&
+    (p.command === null || typeof p.command === "string") &&
+    (p.sinceMs === null || typeof p.sinceMs === "number") &&
+    (p.lastExit === null || typeof p.lastExit === "number") &&
+    (p.terminalId === null || typeof p.terminalId === "string")
+  );
+}
+
+/**
+ * Fold one live `pane` delta into the mirror list (idempotent by paneId): a
+ * `gone` delta drops the row — there is nothing to re-open, a NEW pane the
+ * user opens is a new paneId. A snapshot supersedes everything prior.
+ */
+export function foldPane(panes: MirroredPane[], delta: MirroredPane): MirroredPane[] {
+  const kept = panes.filter((p) => p.paneId !== delta.paneId);
+  if (delta.state === "gone") return kept;
+  kept.push(delta);
+  kept.sort((a, b) => (a.paneId < b.paneId ? -1 : a.paneId > b.paneId ? 1 : 0));
+  return kept;
 }
 
 /**

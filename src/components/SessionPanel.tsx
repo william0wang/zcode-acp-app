@@ -25,12 +25,6 @@ export function SessionPanel({
 }) {
   const { t } = useTranslation();
   const activeSessionId = useAppStore((s) => s.activeSessionId);
-  const sessionTitle = useAppStore(
-    (s) =>
-      s.instances
-        .find((i) => i.id === s.instanceId)
-        ?.sessions?.find((x) => x.sessionId === s.activeSessionId)?.title,
-  );
   const fsCapable = useAppStore((s) => s.fsCapable);
   const openTerminal = useAppStore((s) => s.openTerminal);
   const terminalLive = useTerminalLive();
@@ -59,15 +53,16 @@ export function SessionPanel({
       {(activeSessionId != null || fsCapable) && (
         <>
           <SectionLabel title={t("panel.tools")} />
-          {/* Remote Terminal (ADR-0011) is session-bound: this always
-              re-enters THIS session's one terminal. The dot mirrors the
-              header badge — amber pulse while a turn runs, blue while the
-              socket is up. */}
+          {/* Remote Terminal (ADR-0011 + mirror) is list-first: this opens
+              the desktop pane mirror; the session's own terminal sits behind
+              the list's session affordance. The dot still reports THIS
+              session's background terminal — amber pulse while a turn runs,
+              blue while its socket is up. */}
           {activeSessionId != null && (
             <button
               onClick={() => {
                 onClose();
-                openTerminal(activeSessionId, sessionTitle);
+                openTerminal();
               }}
               className="flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left hover:bg-hover active:bg-active"
             >

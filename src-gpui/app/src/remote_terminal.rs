@@ -8,9 +8,10 @@
 //!
 //! Frame summary (all JSON, `v: 1`; the hub relays verbatim):
 //! - phone → here: `open {sessionId}` / `replay {afterSeq}` / `turn
-//!   {command}` / `interrupt` / `close`
-//! - here → phone: `state {terminal}` / `events {events}` / `error
-//!   {code, message}`
+//!   {command}` / `interrupt` / `close` / `panes` / `pane_interrupt {paneId}`
+//!   (the last two: Terminal Mirror, 2026-11-20 addition)
+//! - here → phone: `state {terminal}` / `events {events}` / `panes {panes}`
+//!   / `pane {pane}` / `error {code, message}`
 //! - here → hub (consumed, never relayed): `push {title, body}` / `audit
 //!   {line}` — composed by the driver, not this module
 //! - hub → here (generated, never relayed): `subs {count}` — driver-only
@@ -686,6 +687,213 @@ impl TerminalRegistry {
             t.state = TermState::Gone;
         }
     }
+
+    /// The workbench terminal id bound to a session (a mirrored pane's
+    /// `terminalId`, so the phone can deep-link into the v1 view).
+    pub(crate) fn terminal_id_for(&self, session_id: &str) -> Option<String> {
+        self.get(session_id).map(|t| t.terminal_id.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal Mirror (2026-11-20 addition): state-only sync of every open
+// desktop pane — list, lifecycle, Busy State. Content never syncs; there is
+// no transcript to replay, so the client reconnects with a fresh snapshot.
+// ---------------------------------------------------------------------------
+
+/// One pane's Busy State: what the pane's shell hooks reported, never
+/// inferred from output. `Unknown` is a pane whose shell carries no hooks (a
+/// foreign shell, or one opened before the upgrade) — interrupt works there
+/// regardless (`\x03` needs no detection).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneBusy {
+    Unknown,
+    Idle {
+        /// The last seen command (kept as context once idle).
+        command: Option<String>,
+        last_exit: Option<i32>,
+    },
+    Busy {
+        command: Option<String>,
+        since_ms: u64,
+    },
+}
+
+/// One mirrored pane. The pane id is the dock view's entity id — stable for
+/// the workbench process's life and never reused (a restarted pane is a NEW
+/// pane), so `upsert` never has to field-update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MirroredPane {
+    pane_id: String,
+    session_id: String,
+    cwd: String,
+    terminal_id: Option<String>,
+    busy: PaneBusy,
+}
+
+impl MirroredPane {
+    fn pane_json(&self, gone: bool) -> Value {
+        let (busy, command, since_ms, last_exit) = match &self.busy {
+            PaneBusy::Unknown => ("unknown", None, None, None),
+            PaneBusy::Idle { command, last_exit } => {
+                ("idle", command.clone(), None, *last_exit)
+            }
+            PaneBusy::Busy { command, since_ms } => {
+                ("busy", command.clone(), Some(*since_ms), None)
+            }
+        };
+        json!({
+            "paneId": self.pane_id,
+            "sessionId": self.session_id,
+            "cwd": self.cwd,
+            "state": if gone { "gone" } else { "open" },
+            "busy": busy,
+            "command": command,
+            "sinceMs": since_ms,
+            "lastExit": last_exit,
+            "terminalId": self.terminal_id,
+        })
+    }
+}
+
+/// All mirrored panes (the driver feeds it dock lifecycle and tee markers).
+/// Pure state like [`TerminalRegistry`]; frame strings out, no gpui.
+#[derive(Debug, Default)]
+pub(crate) struct PaneMirror {
+    panes: HashMap<String, MirroredPane>,
+}
+
+impl PaneMirror {
+    /// The `panes` snapshot frame (phone `panes` / every reconnect).
+    pub(crate) fn snapshot_frame(&self) -> String {
+        let mut panes: Vec<&MirroredPane> = self.panes.values().collect();
+        panes.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+        let rows: Vec<Value> = panes.iter().map(|p| p.pane_json(false)).collect();
+        frame(json!({ "type": "panes", "panes": rows }))
+    }
+
+    /// A pane exists (the workbench's inventory names it): registers it,
+    /// frames it once. A repeat report is quiet unless the resolvable
+    /// identity moved — a tab can GAIN its session after the pane already
+    /// existed (a local dock the v1 flow adopts), and that refresh must
+    /// reach the phone or the pane stays session-less forever. Busy State
+    /// is the scan's to own; it is never touched here.
+    pub(crate) fn upsert(
+        &mut self,
+        pane_id: &str,
+        session_id: &str,
+        cwd: &str,
+        terminal_id: Option<String>,
+    ) -> Option<String> {
+        if let Some(pane) = self.panes.get_mut(pane_id) {
+            if pane.session_id == session_id && pane.cwd == cwd && pane.terminal_id == terminal_id
+            {
+                return None;
+            }
+            pane.session_id = session_id.to_string();
+            pane.cwd = cwd.to_string();
+            pane.terminal_id = terminal_id;
+            return Some(frame(json!({ "type": "pane", "pane": pane.pane_json(false) })));
+        }
+        let pane = MirroredPane {
+            pane_id: pane_id.to_string(),
+            session_id: session_id.to_string(),
+            cwd: cwd.to_string(),
+            terminal_id,
+            busy: PaneBusy::Unknown,
+        };
+        let out = frame(json!({ "type": "pane", "pane": pane.pane_json(false) }));
+        self.panes.insert(pane_id.to_string(), pane);
+        Some(out)
+    }
+
+    /// A pane is gone (inventory diff or a dead tap): one final `gone`
+    /// delta, then the record drops (the next snapshot no longer lists it —
+    /// there is nothing to re-open; a NEW pane is a new paneId).
+    pub(crate) fn gone(&mut self, pane_id: &str) -> Option<String> {
+        let pane = self.panes.remove(pane_id)?;
+        Some(frame(json!({ "type": "pane", "pane": pane.pane_json(true) })))
+    }
+
+    /// OSC 642 (preexec): the pane went busy with this command. A repeat
+    /// with the same command while busy stays quiet (bash's DEBUG trap fires
+    /// per simple command); a changed command updates in place.
+    pub(crate) fn busy_start(
+        &mut self,
+        pane_id: &str,
+        command: Option<String>,
+        now_ms: u64,
+    ) -> Option<String> {
+        let pane = self.panes.get_mut(pane_id)?;
+        match &mut pane.busy {
+            PaneBusy::Busy { command: cur, .. } => {
+                if *cur == command {
+                    return None;
+                }
+                *cur = command;
+            }
+            state => {
+                *state = PaneBusy::Busy { command, since_ms: now_ms };
+            }
+        }
+        Some(frame(json!({ "type": "pane", "pane": pane.pane_json(false) })))
+    }
+
+    /// OSC 643 (precmd): the prompt returned. The busy command becomes the
+    /// idle context; the exit code is the settled result an interrupt's
+    /// feedback rides on (spec: state, not ack).
+    pub(crate) fn busy_end(&mut self, pane_id: &str, exit: i32) -> Option<String> {
+        let pane = self.panes.get_mut(pane_id)?;
+        let new_busy = match std::mem::replace(&mut pane.busy, PaneBusy::Unknown) {
+            PaneBusy::Busy { command, .. } => {
+                PaneBusy::Idle { command, last_exit: Some(exit) }
+            }
+            // A quiet repeat (bare Enter re-runs precmd with an unchanged
+            // $?): nothing new, no frame.
+            PaneBusy::Idle { command, last_exit: Some(same) } if same == exit => {
+                pane.busy = PaneBusy::Idle { command, last_exit: Some(same) };
+                return None;
+            }
+            PaneBusy::Idle { command, .. } => PaneBusy::Idle { command, last_exit: Some(exit) },
+            PaneBusy::Unknown => PaneBusy::Idle { command: None, last_exit: Some(exit) },
+        };
+        pane.busy = new_busy;
+        Some(frame(json!({ "type": "pane", "pane": pane.pane_json(false) })))
+    }
+
+    /// Whether an interrupt target exists.
+    pub(crate) fn has(&self, pane_id: &str) -> bool {
+        self.panes.contains_key(pane_id)
+    }
+
+    /// The live pane ids (the driver's inventory diff).
+    pub(crate) fn pane_ids(&self) -> Vec<String> {
+        self.panes.keys().cloned().collect()
+    }
+
+    /// Drop everything (a hub switch: the panes died with their tabs, the
+    /// new hub's sessions owe the old mirror nothing).
+    pub(crate) fn clear(&mut self) {
+        self.panes.clear();
+    }
+}
+
+/// What the mirror shows as a command: the user's line, not v1's marker
+/// scaffolding. Cuts the injected `; printf '\e]641;…` tail and collapses a
+/// scaffolding-only line (the interrupt companion) to nothing.
+pub(crate) fn strip_injection(command: &str) -> String {
+    const SCAFFOLD: &str = "printf '\\e]641";
+    match command.find(SCAFFOLD) {
+        Some(0) => String::new(),
+        // `cmd ; printf …` — drop the scaffolding and the separator it rode
+        // in on (whitespace, then the `;`, then whitespace again).
+        Some(ix) => command[..ix]
+            .trim_end()
+            .trim_end_matches(';')
+            .trim_end()
+            .to_string(),
+        None => command.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -1054,5 +1262,109 @@ mod tests {
         let tail = turn_tail(&wide);
         assert!(tail.len() <= MAX_TAIL_BYTES);
         assert!(tail.chars().all(|c| c == 'a'));
+    }
+
+    // ---- Terminal Mirror (2026-11-20 addition) ----
+
+    fn pane_of(frame: &str) -> Value {
+        let v: Value = serde_json::from_str(frame).unwrap();
+        v["pane"].clone()
+    }
+
+    #[test]
+    fn mirror_snapshot_and_upsert_frame_the_open_pane() {
+        let mut m = PaneMirror::default();
+        let frame = m.upsert("p_1", "s1", "/w", None).unwrap();
+        let pane = pane_of(&frame);
+        assert_eq!(pane["paneId"], "p_1");
+        assert_eq!(pane["state"], "open");
+        assert_eq!(pane["busy"], "unknown");
+        assert_eq!(pane["command"], Value::Null);
+        // A repeat report is quiet — pane ids are never reused.
+        assert!(m.upsert("p_1", "s1", "/w", None).is_none());
+        m.upsert("p_2", "s1", "/w", Some("t_1".into()));
+        let snap: Value = serde_json::from_str(&m.snapshot_frame()).unwrap();
+        assert_eq!(snap["type"], "panes");
+        let ids: Vec<&str> = snap["panes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["paneId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["p_1", "p_2"]); // sorted, deterministic
+        assert_eq!(snap["panes"][1]["terminalId"], "t_1");
+    }
+
+    #[test]
+    fn mirror_upsert_refreshes_the_identity_a_late_session_brings() {
+        let mut m = PaneMirror::default();
+        m.upsert("p_1", "", "/w", None); // a pane whose tab has no session yet
+        // The tab gains its session (the v1 flow adopts this dock): the
+        // identity refresh must reach the phone — a stale "" sessionId
+        // strands the pane outside every session group forever.
+        let frame = m.upsert("p_1", "s9", "/w", Some("t_9".into())).unwrap();
+        let pane = pane_of(&frame);
+        assert_eq!(pane["sessionId"], "s9");
+        assert_eq!(pane["terminalId"], "t_9");
+        // A true repeat (same identity) stays quiet.
+        assert!(m.upsert("p_1", "s9", "/w", Some("t_9".into())).is_none());
+    }
+
+    #[test]
+    fn mirror_busy_transitions_frame_only_changes() {
+        let mut m = PaneMirror::default();
+        m.upsert("p_1", "s1", "/w", None);
+        let frame = m.busy_start("p_1", Some("npm test".into()), 1_000).unwrap();
+        assert_eq!(pane_of(&frame)["busy"], "busy");
+        assert_eq!(pane_of(&frame)["command"], "npm test");
+        assert_eq!(pane_of(&frame)["sinceMs"], 1_000);
+        // Same command while busy (bash's per-command DEBUG hits): quiet.
+        assert!(m.busy_start("p_1", Some("npm test".into()), 1_100).is_none());
+        // A changed command updates in place.
+        let frame = m.busy_start("p_1", Some("npm run build".into()), 1_200).unwrap();
+        assert_eq!(pane_of(&frame)["command"], "npm run build");
+        // Prompt return: idle with the exit as the interrupt's feedback.
+        let frame = m.busy_end("p_1", 130).unwrap();
+        let pane = pane_of(&frame);
+        assert_eq!(pane["busy"], "idle");
+        assert_eq!(pane["lastExit"], 130);
+        assert_eq!(pane["command"], "npm run build");
+        assert_eq!(pane["sinceMs"], Value::Null);
+        // A quiet precmd repeat (bare Enter): nothing new.
+        assert!(m.busy_end("p_1", 130).is_none());
+        // Unknown → idle settles without a command.
+        m.upsert("p_2", "s1", "/w", None);
+        let frame = m.busy_end("p_2", 0).unwrap();
+        assert_eq!(pane_of(&frame)["busy"], "idle");
+        assert_eq!(pane_of(&frame)["command"], Value::Null);
+    }
+
+    #[test]
+    fn mirror_gone_frames_once_then_drops_from_the_snapshot() {
+        let mut m = PaneMirror::default();
+        m.upsert("p_1", "s1", "/w", None);
+        let frame = m.gone("p_1").unwrap();
+        assert_eq!(pane_of(&frame)["state"], "gone");
+        // Idempotent (the EOF sweep and the inventory diff can both fire).
+        assert!(m.gone("p_1").is_none());
+        let snap: Value = serde_json::from_str(&m.snapshot_frame()).unwrap();
+        assert_eq!(snap["panes"].as_array().unwrap().len(), 0);
+        // Markers for an unknown pane (a race with the drop) are dropped.
+        assert!(m.busy_start("p_1", Some("x".into()), 0).is_none());
+        assert!(m.busy_end("p_1", 0).is_none());
+        assert!(!m.has("p_1"));
+    }
+
+    #[test]
+    fn strip_injection_cuts_the_v1_scaffolding() {
+        // The full injected line as preexec sees it.
+        assert_eq!(
+            strip_injection("echo hi; printf '\\e]641;%s\\a' \"$?\""),
+            "echo hi"
+        );
+        // The interrupt's standalone companion marker line collapses.
+        assert_eq!(strip_injection("printf '\\e]641;%s\\a' \"$?\""), "");
+        // A plain local command passes through untouched.
+        assert_eq!(strip_injection("npm test"), "npm test");
     }
 }

@@ -6,6 +6,7 @@
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import {
   TerminalConnection,
+  foldPane,
   mergeEvents,
   loadHistory,
   pushHistory,
@@ -75,10 +76,14 @@ afterEach(() => {
   (globalThis as Record<string, unknown>).localStorage = undefined;
 });
 
-test("dials /api/terminals/ws with the token in the query and sends open on connect", () => {
+test("dials /api/terminals/ws with the token in the query and sends panes+open on connect", () => {
   const { h, ws } = opened("sess_9");
   expect(ws.url).toBe("ws://hub/api/terminals/ws?token=tok");
-  expect(ws.sent).toEqual([{ v: 1, type: "open", sessionId: "sess_9" }]);
+  // The mirror resyncs first (fresh snapshot, no replay), then the v1 open.
+  expect(ws.sent).toEqual([
+    { v: 1, type: "panes" },
+    { v: 1, type: "open", sessionId: "sess_9" },
+  ]);
   expect(h.onState).toHaveBeenCalledWith("connecting");
   expect(h.onState).toHaveBeenCalledWith("open");
 });
@@ -114,8 +119,8 @@ test("turn and interrupt frames carry the session id", () => {
   const { conn, ws } = opened();
   conn.sendCommand("npm test");
   conn.interrupt();
-  expect(ws.sent[1]).toEqual({ v: 1, type: "turn", sessionId: "s1", command: "npm test" });
-  expect(ws.sent[2]).toEqual({ v: 1, type: "interrupt", sessionId: "s1" });
+  expect(ws.sent[2]).toEqual({ v: 1, type: "turn", sessionId: "s1", command: "npm test" });
+  expect(ws.sent[3]).toEqual({ v: 1, type: "interrupt", sessionId: "s1" });
 });
 
 test("a fatal error (disabled) surfaces the code and stops the ladder", () => {
@@ -147,7 +152,10 @@ test("transport drops reconnect on the 1s-doubling ladder and open resets it", a
   const b = FakeWebSocket.current!;
   expect(b).not.toBe(a);
   b.onopen?.();
-  expect(b.sent).toEqual([{ v: 1, type: "open", sessionId: "s1" }]);
+  expect(b.sent).toEqual([
+    { v: 1, type: "panes" },
+    { v: 1, type: "open", sessionId: "s1" },
+  ]);
   b.close(); // b opened, so the counter reset: 1s again
   await vi.advanceTimersByTimeAsync(1_000);
   const c = FakeWebSocket.current!;
@@ -222,4 +230,81 @@ test("history: push collapses consecutive duplicates, caps at 50, survives bad s
   // Absent storage reads as empty.
   (globalThis as Record<string, unknown>).localStorage = undefined;
   expect(loadHistory()).toEqual([]);
+});
+
+// ---- Terminal Mirror (ADR-0011 amendment 2) ----
+
+function pane(id: string, over: Record<string, unknown> = {}) {
+  return {
+    paneId: id,
+    sessionId: "s1",
+    cwd: "/w",
+    state: "open",
+    busy: "idle",
+    command: null,
+    sinceMs: null,
+    lastExit: null,
+    terminalId: null,
+    ...over,
+  };
+}
+
+test("mirror-only connection: panes on connect, no open; session frames stay silent", () => {
+  const h = { ...makeHandlers(), onPanes: vi.fn(), onPane: vi.fn() };
+  const conn = new TerminalConnection("http://hub/", "tok", null, h);
+  conn.connect();
+  const ws = FakeWebSocket.current!;
+  ws.onopen?.();
+  expect(ws.sent).toEqual([{ v: 1, type: "panes" }]);
+  // Unattached: every session-scoped send is a no-op (no pane to target).
+  conn.sendCommand("ls");
+  conn.interrupt();
+  conn.requestClose();
+  conn.reopen();
+  expect(ws.sent).toHaveLength(1);
+  // The pane interrupt needs no session at all.
+  conn.interruptPane("p_7");
+  expect(ws.sent[1]).toEqual({ v: 1, type: "pane_interrupt", paneId: "p_7" });
+  // attach lands the open on the live socket immediately.
+  conn.attach("s2");
+  expect(ws.sent[2]).toEqual({ v: 1, type: "open", sessionId: "s2" });
+  conn.sendCommand("ls");
+  expect(ws.sent[3]).toEqual({ v: 1, type: "turn", sessionId: "s2", command: "ls" });
+  // detach is wire-silent: the desktop pane stays alive.
+  conn.detach();
+  conn.sendCommand("ls");
+  expect(ws.sent).toHaveLength(4);
+});
+
+test("dispatches panes snapshots and pane deltas, dropping malformed rows", () => {
+  const h = { ...makeHandlers(), onPanes: vi.fn(), onPane: vi.fn() };
+  const conn = new TerminalConnection("http://hub/", "tok", null, h);
+  conn.connect();
+  const ws = FakeWebSocket.current!;
+  ws.onopen?.();
+  ws.server({ v: 1, type: "panes", panes: [pane("p_2"), { paneId: 5 }, pane("p_1", { busy: "busy", command: "npm test" })] });
+  expect(h.onPanes).toHaveBeenCalledTimes(1);
+  expect(h.onPanes).toHaveBeenCalledWith([
+    pane("p_2"),
+    pane("p_1", { busy: "busy", command: "npm test" }),
+  ]);
+  ws.server({ v: 1, type: "pane", pane: pane("p_2", { busy: "busy", command: "cargo test" }) });
+  expect(h.onPane).toHaveBeenCalledWith(pane("p_2", { busy: "busy", command: "cargo test" }));
+  ws.server({ v: 1, type: "pane", pane: { paneId: "p_9" } }); // malformed: dropped
+  ws.server({ v: 1, type: "panes", panes: "nope" }); // non-array: dropped
+  expect(h.onPane).toHaveBeenCalledTimes(1);
+  expect(h.onPanes).toHaveBeenCalledTimes(1);
+});
+
+test("foldPane: upsert by paneId sorted, gone drops, snapshot supersedes upstream", () => {
+  const a = foldPane([], pane("p_5"));
+  const b = foldPane(a, pane("p_1"));
+  expect(b.map((p) => p.paneId)).toEqual(["p_1", "p_5"]);
+  // Update replaces in place (one row per pane, idempotent by paneId).
+  const c = foldPane(b, pane("p_1", { busy: "busy", command: "npm test" }));
+  expect(c.map((p) => p.paneId)).toEqual(["p_1", "p_5"]);
+  expect(c[0]).toMatchObject({ busy: "busy", command: "npm test" });
+  // gone is transient: fold drops the row — a new pane is a new paneId.
+  const d = foldPane(c, pane("p_5", { state: "gone" }));
+  expect(d.map((p) => p.paneId)).toEqual(["p_1"]);
 });

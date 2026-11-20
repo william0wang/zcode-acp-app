@@ -724,6 +724,10 @@ pub enum UiCommand {
     },
     /// A bound remote pane is gone (× button, shell exit, its tab closed).
     TerminalPaneGone { session_id: String },
+    /// The workbench's live pane inventory (Terminal Mirror, 2026-11-20):
+    /// one fact per open dock — the driver diffs it into the mirror and
+    /// keeps every pane's tap for busy-marker polling and interrupts.
+    TerminalPaneInventory(Vec<PaneFact>),
 }
 
 /// Why a remote pane could not be created (ADR-0011).
@@ -733,6 +737,21 @@ pub enum TerminalPaneError {
     Cap,
     /// The PTY spawn itself failed.
     Failed(String),
+}
+
+/// One open workbench pane as the inventory reports it (Terminal Mirror).
+#[derive(Debug, Clone)]
+pub struct PaneFact {
+    /// The dock view's entity id — the wire's paneId (`p_<id>`, stable and
+    /// never reused within a workbench process).
+    pub pane: u64,
+    /// The owning session tab.
+    pub tab: u64,
+    /// Set when this pane is a v1 Remote Terminal pane.
+    pub remote_session: Option<String>,
+    /// The pane's side-channel: busy markers read here, interrupts write
+    /// here.
+    pub tap: terminal_panel::RemotePaneTap,
 }
 
 /// What the driver surfaces to the window. One shape: a full snapshot —
@@ -2746,6 +2765,11 @@ struct Driver {
     terminals: remote_terminal::TerminalRegistry,
     terminal_handles: HashMap<String, terminal_panel::RemotePaneTap>,
     terminal_wire: Option<Arc<dyn WsStream>>,
+    /// Terminal Mirror (2026-11-20): every open pane's tap keyed by paneId
+    /// (the workbench's inventory supplies them), and the mirrored pane
+    /// registry the phone's `panes`/`pane` frames read.
+    pane_taps: HashMap<String, terminal_panel::RemotePaneTap>,
+    panes: remote_terminal::PaneMirror,
     /// A control connect is in flight (dedupes the tick's retry).
     terminal_connecting: bool,
     terminal_attempts: u32,
@@ -2896,6 +2920,8 @@ impl Driver {
             hub_respawn_next_at: 0,
             terminals: remote_terminal::TerminalRegistry::new(),
             terminal_handles: HashMap::new(),
+            pane_taps: HashMap::new(),
+            panes: remote_terminal::PaneMirror::default(),
             terminal_wire: None,
             terminal_connecting: false,
             terminal_attempts: 0,
@@ -5699,8 +5725,78 @@ impl Driver {
                     }
                 }
             }
+            // Terminal Mirror (2026-11-20): the phone's list view.
+            "panes" => {
+                self.terminal_send(vec![self.panes.snapshot_frame()]);
+            }
+            "pane_interrupt" => match frame.get("paneId").and_then(|v| v.as_str()) {
+                Some(pane_id) => self.pane_interrupt(pane_id),
+                None => self.terminal_error("bad_request", "pane_interrupt: missing paneId"),
+            },
             _ => {}
         }
+    }
+
+    /// Phone `pane_interrupt {paneId}` (Terminal Mirror): the same byte a
+    /// local Ctrl-C writes, repeatable, never escalated — a SIGINT-trapping
+    /// process stays (the desktop is the escape hatch). Feedback is the
+    /// busy→idle `pane` frame the hooks produce, not an ack.
+    fn pane_interrupt(&mut self, pane_id: &str) {
+        if !self.panes.has(pane_id) {
+            self.terminal_error("unknown_pane", "no such pane");
+            return;
+        }
+        if let Some(tap) = self.pane_taps.get(pane_id) {
+            tap.write_raw(&[0x03]);
+        }
+    }
+
+    /// The workbench's pane inventory (Terminal Mirror): diff it into the
+    /// mirror — new panes frame open, missing ones frame gone — and refresh
+    /// every tap (a restarted pane is a new id, so repeats are no-ops).
+    fn apply_pane_inventory(&mut self, facts: Vec<PaneFact>) {
+        let mut frames = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for fact in facts {
+            let pane_id = format!("p_{}", fact.pane);
+            seen.insert(pane_id.clone());
+            self.pane_taps.insert(pane_id.clone(), fact.tap);
+            let session_id = fact
+                .remote_session
+                .clone()
+                .or_else(|| self.session_for_tab(fact.tab))
+                .unwrap_or_default();
+            let cwd = self.cwd_for_tab(fact.tab).unwrap_or_default();
+            let terminal_id = fact
+                .remote_session
+                .as_deref()
+                .and_then(|s| self.terminals.terminal_id_for(s));
+            if let Some(frame) = self.panes.upsert(&pane_id, &session_id, &cwd, terminal_id) {
+                frames.push(frame);
+            }
+        }
+        for pane_id in self.panes.pane_ids() {
+            if !seen.contains(&pane_id) {
+                if let Some(frame) = self.panes.gone(&pane_id) {
+                    frames.push(frame);
+                }
+                self.pane_taps.remove(&pane_id);
+            }
+        }
+        self.terminal_send(frames);
+    }
+
+    /// The session a tab holds (a mirrored pane's `sessionId`).
+    fn session_for_tab(&self, tab: u64) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.id == tab)
+            .and_then(|t| t.core.active_session_id.clone().or_else(|| t.target.clone()))
+    }
+
+    /// The tab's workspace (a mirrored pane's `cwd`).
+    fn cwd_for_tab(&self, tab: u64) -> Option<String> {
+        self.tabs.iter().find(|t| t.id == tab).map(|t| t.cwd.clone())
     }
 
     /// Phone `open {sessionId}`: resolve the surface (an existing tab, else
@@ -5769,6 +5865,31 @@ impl Driver {
     /// shell answered — tail + exit events out, plus the hub-consumed pair
     /// (one audit line per turn; one WeCom push when nobody watches).
     fn terminal_settle_tick(&mut self, now: u64) {
+        // Terminal Mirror first (2026-11-20): drain every pane's busy
+        // markers into the mirror and frame the transitions — the running
+        // state the phone sees and an interrupt's feedback ride on these.
+        let pane_ids: Vec<String> = self.pane_taps.keys().cloned().collect();
+        for pane_id in pane_ids {
+            let Some(tap) = self.pane_taps.get(&pane_id) else {
+                continue;
+            };
+            for event in tap.take_busy_events() {
+                let frame = match event {
+                    terminal_panel::BusyEvent::CommandStart(text) => {
+                        let clean = remote_terminal::strip_injection(&text);
+                        let command = if clean.is_empty() { None } else { Some(clean) };
+                        self.panes.busy_start(&pane_id, command, now)
+                    }
+                    terminal_panel::BusyEvent::PromptReturn(exit) => {
+                        self.panes.busy_end(&pane_id, exit)
+                    }
+                };
+                if let Some(frame) = frame {
+                    self.terminal_send(vec![frame]);
+                }
+            }
+        }
+
         let running: Vec<String> = self
             .terminal_handles
             .keys()
@@ -5837,6 +5958,21 @@ impl Driver {
             self.terminal_send(frames);
             if let Some(tab) = self.tab_for_session(&session_id) {
                 let _ = self.ev_tx.send(RuntimeEvent::TerminalClosePane { tab });
+            }
+        }
+
+        // The mirror's twin sweep: a dead pane leaves the mirror here too
+        // (the workbench's inventory diff reports the same — idempotent).
+        let dead_panes: Vec<String> = self
+            .pane_taps
+            .iter()
+            .filter(|(_, tap)| tap.is_closed())
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for pane_id in dead_panes {
+            self.pane_taps.remove(&pane_id);
+            if let Some(frame) = self.panes.gone(&pane_id) {
+                self.terminal_send(vec![frame]);
             }
         }
     }
@@ -8929,6 +9065,9 @@ impl Driver {
                 let frames = self.terminals.pane_gone(&session_id);
                 self.terminal_send(frames);
             }
+            UiCommand::TerminalPaneInventory(facts) => {
+                self.apply_pane_inventory(facts);
+            }
             UiCommand::ProbeWorkflowGate => {
                 if self.workflows.gate.is_none() {
                     self.spawn_workflow_gate_probe();
@@ -10345,9 +10484,11 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         // The Remote Terminal pair names the OLD hub (ADR-0011): reset the
         // registry and drop the taps' driver-side state — the panes die with
         // their tabs (close_all_tabs above), and closing the wire drops the
-        // hub's client sockets promptly.
+        // hub's client sockets promptly. The mirror dies with the panes.
         d.terminals.reset();
         d.terminal_handles.clear();
+        d.panes.clear();
+        d.pane_taps.clear();
         if let Some(wire) = d.terminal_wire.take() {
             wire.close();
         }
@@ -11834,7 +11975,7 @@ mod tests {
 
 #[cfg(test)]
 mod remote_terminal_driver_tests {
-    use super::{Driver, LoopEvent, Phase, RuntimeEvent, TerminalPaneError, UiCommand};
+    use super::{Driver, LoopEvent, PaneFact, Phase, RuntimeEvent, TerminalPaneError, UiCommand};
     use crate::terminal_panel::RemotePaneTap;
     use protocol::hub::{HubInstance, HubSessionInfo, InstanceOrigin};
     use protocol::ws::{WsEvent, WsStream};
@@ -11908,6 +12049,111 @@ mod remote_terminal_driver_tests {
 
     fn phone_frame(d: &mut Driver, body: serde_json::Value) {
         d.handle_loop_event(LoopEvent::TerminalWs(WsEvent::Text(body.to_string())), 0);
+    }
+
+    /// Terminal Mirror (2026-11-20): `panes` snapshot → inventory diff →
+    /// busy markers through the tick → interrupt bytes → gone → the unknown
+    /// error. One pane, one tab, both directions.
+    #[tokio::test]
+    async fn terminal_mirror_snapshot_inventory_interrupt_and_gone() {
+        let (mut d, wire, _ev_rx) = harness();
+
+        // The phone asks: an empty snapshot.
+        phone_frame(&mut d, serde_json::json!({"v":1,"type":"panes"}));
+        {
+            let sent = wire.sent.lock().unwrap();
+            let frame = sent.last().unwrap();
+            assert_eq!(frame["type"], "panes");
+            assert_eq!(frame["panes"].as_array().unwrap().len(), 0);
+        }
+
+        // The workbench reports a LOCAL pane (the tab holds s1, workspace /w).
+        let tab = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let (tap, sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneInventory(vec![PaneFact {
+                pane: 7,
+                tab,
+                remote_session: None,
+                tap: tap.clone(),
+            }]),
+            0,
+        );
+        {
+            let sent = wire.sent.lock().unwrap();
+            let frame = sent.last().unwrap();
+            assert_eq!(frame["type"], "pane");
+            assert_eq!(frame["pane"]["paneId"], "p_7");
+            assert_eq!(frame["pane"]["sessionId"], "s1");
+            assert_eq!(frame["pane"]["cwd"], "/w");
+            assert_eq!(frame["pane"]["busy"], "unknown");
+        }
+
+        // Busy markers parse through the settle tick: busy, then idle with
+        // the exit (an interrupt's feedback rides on this transition).
+        tap.feed_output_for_test(b"\x1b]642;npm test\x07");
+        d.terminal_settle_tick(1_000);
+        {
+            let sent = wire.sent.lock().unwrap();
+            let frame = sent.last().unwrap();
+            assert_eq!(frame["pane"]["busy"], "busy");
+            assert_eq!(frame["pane"]["command"], "npm test");
+            assert_eq!(frame["pane"]["sinceMs"], 1_000);
+        }
+        tap.feed_output_for_test(b"\x1b]643;130\x07");
+        d.terminal_settle_tick(2_000);
+        {
+            let sent = wire.sent.lock().unwrap();
+            let frame = sent.last().unwrap();
+            assert_eq!(frame["pane"]["busy"], "idle");
+            assert_eq!(frame["pane"]["lastExit"], 130);
+        }
+
+        // The interrupt is the same byte a local Ctrl-C writes.
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"pane_interrupt","paneId":"p_7"}),
+        );
+        assert_eq!(&*sink.lock().unwrap(), b"\x03");
+
+        // A pane missing from the next inventory is framed gone; the
+        // follow-up interrupt on it errors.
+        d.handle_cmd(UiCommand::TerminalPaneInventory(vec![]), 0);
+        {
+            let sent = wire.sent.lock().unwrap();
+            assert_eq!(sent.last().unwrap()["pane"]["state"], "gone");
+        }
+        phone_frame(
+            &mut d,
+            serde_json::json!({"v":1,"type":"pane_interrupt","paneId":"p_7"}),
+        );
+        {
+            let sent = wire.sent.lock().unwrap();
+            assert_eq!(sent.last().unwrap()["code"], "unknown_pane");
+        }
+    }
+
+    /// A v1 remote turn's hook text carries the injection scaffolding — the
+    /// mirror shows the command the user meant.
+    #[tokio::test]
+    async fn terminal_mirror_strips_v1_injection_from_command_text() {
+        let (mut d, wire, _ev_rx) = harness();
+        let tab = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let (tap, _sink) = RemotePaneTap::in_memory();
+        d.handle_cmd(
+            UiCommand::TerminalPaneInventory(vec![PaneFact {
+                pane: 8,
+                tab,
+                remote_session: None,
+                tap: tap.clone(),
+            }]),
+            0,
+        );
+        tap.feed_output_for_test(b"\x1b]642;echo hi; printf '\\e]641;%s\\a' \"$?\"\x07");
+        d.terminal_settle_tick(0);
+        let sent = wire.sent.lock().unwrap();
+        let frame = sent.last().unwrap();
+        assert_eq!(frame["pane"]["command"], "echo hi");
     }
 
     /// The full happy path: open → spawn ask → bind → turn → marker →

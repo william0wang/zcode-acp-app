@@ -527,13 +527,14 @@ export interface AppState extends ConfigSlice {
   manageOpen: boolean;
   openServerManager: () => void;
   closeServerManager: () => void;
-  // Remote Terminal overlay (app ADR-0011): the mobile command-line wiring
-  // into the desktop workbench's session terminal, opened from a SessionList
-  // row action. Pure routing state — the screen owns its own WebSocket
-  // (src/lib/remoteTerminal.ts); closing the screen leaves the desktop pane
-  // alive by design.
-  terminalTarget: { sessionId: string; title?: string } | null;
-  openTerminal: (sessionId: string, title?: string) => void;
+  // Remote Terminal overlay (app ADR-0011 + mirror amendment): the mobile
+  // command-line wiring into the desktop workbench. List-first — a null
+  // sessionId opens the desktop pane mirror; a set one enters that session's
+  // v1 transcript directly (deep link). Pure routing state — the screen owns
+  // its own WebSocket (src/lib/remoteTerminal.ts); closing the screen leaves
+  // the desktop panes alive by design.
+  terminalTarget: { sessionId: string | null; title?: string } | null;
+  openTerminal: (sessionId?: string | null, title?: string) => void;
   closeTerminal: () => void;
   // Session file browser deep link (requirements 1.5): the truncated-diff
   // "view full file" seam. Pure routing state, like terminalTarget.
@@ -2193,7 +2194,7 @@ export const useAppStore = create<AppState>((set, get) => {
     closeServerManager: () => set({ manageOpen: false }),
 
     openTerminal: (sessionId, title) =>
-      set({ terminalTarget: { sessionId, title } }),
+      set({ terminalTarget: { sessionId: sessionId ?? null, title } }),
 
     closeTerminal: () => set({ terminalTarget: null }),
 

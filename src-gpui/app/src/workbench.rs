@@ -71,6 +71,7 @@ use crate::quota_page::SpendStage;
 use crate::runtime::{
     FsBrowseView, HistoryRow, HistorySelected, NewSessionView, Phase, ProtocolRuntime,
     RuntimeEvent, SessionRow, TabPhase, TabSummary, TabView, TerminalPaneError, UiCommand,
+    PaneFact,
     WorkbenchSnapshot,
 };
 use crate::server_form::ServerForm;
@@ -1726,6 +1727,7 @@ impl Workbench {
                 .is_none_or(|panes| panes.is_empty());
             if no_panes && !cfg!(test) {
                 self.spawn_terminal(cx);
+                self.report_pane_inventory();
             }
         }
         cx.notify();
@@ -1756,6 +1758,7 @@ impl Workbench {
                 // The new pane takes the keyboard — it is what the click
                 // asked for.
                 window.focus(&focus, cx);
+                self.report_pane_inventory();
                 cx.notify();
             }
             Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
@@ -1801,6 +1804,7 @@ impl Workbench {
             self.remote_panes.remove(&id);
             self.runtime.send(UiCommand::TerminalPaneGone { session_id });
         }
+        self.report_pane_inventory();
         cx.notify();
     }
 
@@ -1867,6 +1871,7 @@ impl Workbench {
                         panes[ix] = dock;
                     }
                 }
+                self.report_pane_inventory();
                 cx.notify();
             }
             Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
@@ -1885,6 +1890,32 @@ impl Workbench {
             }
             Err(e) => self.notice = Some(format!("{}: {e}", t!("terminal.spawnFailed"))),
         }
+    }
+
+    /// Report every open pane to the driver (Terminal Mirror, 2026-11-20):
+    /// one fact per dock — the driver diffs this inventory into the mirror
+    /// registry and keeps each pane's tap for busy-marker polling and
+    /// interrupts. Idempotent; call after ANY `tab_terminals` mutation.
+    fn report_pane_inventory(&mut self) {
+        let mut facts = Vec::new();
+        for (tab, panes) in &self.tab_terminals {
+            for dock in panes {
+                let pane = dock.view.entity_id().as_u64();
+                let remote_session = self
+                    .remote_panes
+                    .get(tab)
+                    .filter(|b| b.pane.as_u64() == pane)
+                    .map(|b| b.session_id.clone());
+                facts.push(PaneFact {
+                    pane,
+                    tab: *tab,
+                    remote_session,
+                    tap: dock.tap.clone(),
+                });
+            }
+        }
+        self.runtime
+            .send(UiCommand::TerminalPaneInventory(facts));
     }
 
     /// The active tab's workspace path — the shell's cwd (the tab strip's
@@ -2336,6 +2367,8 @@ impl Workbench {
                 let live: std::collections::HashSet<u64> =
                     self.snap.tabs.iter().map(|t| t.id).collect();
                 self.tab_drafts.retain(|id, _| live.contains(id));
+                let panes_before: usize =
+                    self.tab_terminals.values().map(Vec::len).sum::<usize>();
                 self.tab_terminals.retain(|id, _| live.contains(id));
                 self.tab_terminal_open.retain(|id| live.contains(id));
                 // Tabs that died take their remote pane bindings with them —
@@ -2351,6 +2384,13 @@ impl Workbench {
                     for session_id in dead_remote {
                         self.runtime.send(UiCommand::TerminalPaneGone { session_id });
                     }
+                }
+                // Any pane that died with its tab (remote OR local) leaves
+                // the Terminal Mirror — report when the retain dropped any.
+                let panes_after: usize =
+                    self.tab_terminals.values().map(Vec::len).sum::<usize>();
+                if panes_before != panes_after {
+                    self.report_pane_inventory();
                 }
                 // Full config pages replace the drawer's navigation context —
                 // their entries live IN the drawer, so the page taking over
@@ -2562,6 +2602,7 @@ impl Workbench {
                     session_id,
                     result: Ok(tap),
                 });
+                self.report_pane_inventory();
                 cx.notify();
             }
             Err(e) => {
@@ -3107,15 +3148,32 @@ impl Workbench {
 
     /// A terminal pane rang its bell (req 2.9): no sound — the OS owns that
     /// surface — a notice says so, throttled to one per window so a bell
-    /// storm does not spam the composer line.
+    /// storm does not spam the composer line. The notice is transient: it
+    /// expires on its own (the composer's clear-on-send used to be the ONLY
+    /// way out, pinning a red line over a quiet composer). The text guard
+    /// leaves a NEWER notice (attach error, spawn failure) untouched.
     pub(crate) fn terminal_bell(&mut self, cx: &mut Context<Self>) {
         let now = now_ms();
         if self.bell_last_at.is_some_and(|at| now.saturating_sub(at) < 10_000) {
             return;
         }
         self.bell_last_at = Some(now);
-        self.notice = Some(t!("chat.terminalBell").into_owned());
+        let text = t!("chat.terminalBell").into_owned();
+        self.notice = Some(text.clone());
         cx.notify();
+        let clear = cx.background_executor().timer(Duration::from_secs(8));
+        cx.spawn(async move |this, cx| {
+            clear.await;
+            if let Some(entity) = this.upgrade() {
+                let _ = cx.update_entity(&entity, |wb, cx| {
+                    if wb.notice.as_deref() == Some(text.as_str()) {
+                        wb.notice = None;
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
     }
 
     // -- sections ----------------------------------------------------------
@@ -6024,11 +6082,23 @@ impl Workbench {
             }
         }
         if let Some(notice) = &self.notice {
+            // Click-to-dismiss: the notice used to clear only on the next
+            // send, which pinned error/bell notices over a quiet composer
+            // with no way out. The bell notice also self-expires (see
+            // `terminal_bell`); this row covers every other producer.
+            let wb = cx.entity();
             column = column.child(
                 div()
+                    .id("composer-notice")
                     .text_size(ui_text(12.))
                     .text_color(theme.danger)
-                    .child(notice.clone()),
+                    .child(notice.clone())
+                    .on_click(move |_, _, cx| {
+                        wb.update(cx, |this, cx| {
+                            this.notice = None;
+                            cx.notify();
+                        });
+                    }),
             );
         }
         // Staged thumbnails (ChatView's strip): raster + remove button.
