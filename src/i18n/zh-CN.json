@@ -596,7 +596,10 @@
     "paneUnknown": "状态未知",
     "stop": "停止",
     "openSessionTerminal": "打开会话终端",
-    "paneExit": "退出码 {{code}}"
+    "paneExit": "退出码 {{code}}",
+    "newTerminal": "新建终端",
+    "pickSessionHint": "将在桌面端按所选会话的目录新开一个终端面板",
+    "pickSessionEmpty": "没有可以打开终端的在线会话"
   },
   "permission": {
     "title": "权限请求",

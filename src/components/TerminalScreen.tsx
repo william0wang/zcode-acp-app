@@ -4,10 +4,12 @@ import {
   ArrowUp,
   ChevronLeft,
   Monitor,
+  Plus,
   Square,
   SquareTerminal,
   X,
 } from "lucide-react";
+import { Sheet } from "../ui";
 import {
   loadHistory,
   pushHistory,
@@ -33,7 +35,10 @@ import { useAppStore } from "../store/appStore";
 // Full-screen Remote Terminal overlay (app ADR-0011 + mirror amendment),
 // list-first: the desktop pane mirror (state only — busy badge, current
 // command, duration, stop) with the v1 transcript behind a remote-pane tap
-// or the per-session affordance. The v1 transcript is the workbench's
+// or the per-session affordance. A header "new terminal" button lists every
+// LIVE session — picking one rides the v1 `open`, which spawns the desktop
+// pane at the session's cwd, so an empty mirror list is not a dead end. The
+// v1 transcript is the workbench's
 // seq-numbered event log folded by seq (reconnect replays deduplicate);
 // the composer submits one-line turns; a running turn swaps it to an
 // interrupt. One shared socket (lib/terminalSession) carries both
@@ -239,6 +244,9 @@ export function TerminalScreen() {
   const [open, setOpen] = useState<{ sessionId: string; title?: string } | null>(
     target?.sessionId ? { sessionId: target.sessionId, title: target.title } : null,
   );
+  // The "new terminal" session picker (list view only): picking a session
+  // opens its v1 transcript — the wire `open` spawns the desktop pane.
+  const [pickerOpen, setPickerOpen] = useState(false);
 
   // Input history is local to the composer; everything terminal-shaped is
   // owned by the session holder and survives this screen.
@@ -276,9 +284,10 @@ export function TerminalScreen() {
   }, [transcript]);
 
   useBackHandler(() => {
-    // Transcript → list → close: the hardware back walks one level at a
-    // time, mirroring the chevron.
-    if (open) setOpen(null);
+    // Picker → transcript → list → close: the hardware back walks one level
+    // at a time, mirroring the chevron.
+    if (pickerOpen && !open) setPickerOpen(false);
+    else if (open) setOpen(null);
     else closeTerminalScreen();
     return true;
   });
@@ -368,6 +377,13 @@ export function TerminalScreen() {
           <h1 className="truncate text-sm font-semibold">{t("remoteTerminal.listTitle")}</h1>
         </div>
         <ConnChip conn={listConn} terminal={null} />
+        <button
+          onClick={() => setPickerOpen(true)}
+          aria-label={t("remoteTerminal.newTerminal")}
+          className="flex size-9 shrink-0 items-center justify-center rounded-lg text-dim hover:bg-hover active:bg-active"
+        >
+          <Plus className="size-5" />
+        </button>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-3 py-2">
@@ -406,9 +422,17 @@ export function TerminalScreen() {
           </section>
         ))}
         {groups.size === 0 && listConn === "open" && !listError && (
-          <p className="mt-6 text-center text-xs text-faint">
-            {t("remoteTerminal.listEmpty")}
-          </p>
+          <div className="mt-6 flex flex-col items-center gap-3">
+            <p className="text-center text-xs text-faint">
+              {t("remoteTerminal.listEmpty")}
+            </p>
+            <button
+              onClick={() => setPickerOpen(true)}
+              className="rounded-xl bg-ink px-4 py-2 text-xs font-medium text-canvas active:brightness-90"
+            >
+              {t("remoteTerminal.newTerminal")}
+            </button>
+          </div>
         )}
         {listError && (
           <div className="mt-3 rounded-xl bg-danger-wash px-3 py-2 ring-1 ring-inset ring-danger/40">
@@ -565,10 +589,62 @@ export function TerminalScreen() {
     </div>
   );
 
+  // The "new terminal" picker: every live session (the same discovery list
+  // the session list renders), grouped by instance with the workspace as
+  // context — that workspace is the cwd the spawned pane opens at. Picking
+  // reuses the existing openTranscript entry (wire `open` is idempotent:
+  // spawn when no pane exists, re-attach when one does).
+  const picker = (
+    <Sheet
+      open={pickerOpen && !open}
+      onClose={() => setPickerOpen(false)}
+      title={t("remoteTerminal.newTerminal")}
+      className="max-h-[70%] overflow-y-auto"
+    >
+      <p className="mb-2 px-1 text-2xs text-faint">
+        {t("remoteTerminal.pickSessionHint")}
+      </p>
+      {instances.some((i) => i.sessions.length > 0) ? (
+        <div className="flex flex-col gap-3">
+          {instances
+            .filter((i) => i.sessions.length > 0)
+            .map((inst) => (
+              <div key={inst.id}>
+                <p className="mb-1 truncate px-1 font-mono text-2xs text-faint">
+                  {inst.workspace ?? inst.id}
+                </p>
+                <div className="flex flex-col gap-1">
+                  {inst.sessions.map((s) => (
+                    <button
+                      key={s.sessionId}
+                      onClick={() => {
+                        setPickerOpen(false);
+                        openTranscript(s.sessionId, s.title);
+                      }}
+                      className="rounded-lg px-3 py-2.5 text-left hover:bg-hover active:bg-active"
+                    >
+                      <span className="block truncate text-sm text-ink">
+                        {s.title ?? t("chat.untitled")}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+        </div>
+      ) : (
+        <p className="px-1 pb-1 text-xs text-faint">
+          {t("remoteTerminal.pickSessionEmpty")}
+        </p>
+      )}
+    </Sheet>
+  );
+
   return (
     <>
       {listView}
       {transcriptView}
+      {picker}
     </>
   );
 }

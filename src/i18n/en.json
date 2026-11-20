@@ -596,7 +596,10 @@
     "paneUnknown": "unknown",
     "stop": "Stop",
     "openSessionTerminal": "Open session terminal",
-    "paneExit": "exit {{code}}"
+    "paneExit": "exit {{code}}",
+    "newTerminal": "New terminal",
+    "pickSessionHint": "Opens a new pane on the desktop at the session's directory",
+    "pickSessionEmpty": "No live sessions to open a terminal in"
   },
   "permission": {
     "title": "Permission requested",
