@@ -102,13 +102,6 @@ fn amber_300() -> Hsla {
     }
 }
 
-/// `notice.*` i18n keys resolved through the shared catalog (`t!` falls
-/// back to its input — plain-text notify messages pass through, the TS
-/// `startsWith("notice.")` check generalized).
-fn notice_text(notice: &str) -> String {
-    t!(notice).into_owned()
-}
-
 /// Compact token count (`fmtTokens`): `1.2M`, `34k`, `870`.
 fn fmt_tokens(n: f64) -> String {
     if n >= 1_000_000.0 {
@@ -151,7 +144,7 @@ fn date_tail(date: &str) -> String {
 /// card, first-load spinner) around the two tabs' content.
 pub fn render_usage_page(
     view: &UsagePageView,
-    notice: Option<&str>,
+    notice: Option<&crate::config_notice::ConfigNotice>,
     pending_restart: bool,
     restart_available: bool,
     runtime: &ProtocolRuntime,
@@ -165,72 +158,19 @@ pub fn render_usage_page(
         .min_w_0()
         .bg(theme.background);
 
-    // Header: back arrow + title (ConfigPageFrame's row).
-    let rt = runtime.clone();
-    page = page.child(
-        div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap_1()
-            .h_10()
-            .px_2()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .child(
-                Button::new("usage-back")
-                    .ghost()
-                    .small()
-                    .icon(IconName::ArrowLeft)
-                    .tooltip(t!("common.backToWorkbench"))
-                    .on_click(move |_, _, _| rt.send(UiCommand::CloseUsage)),
-            )
-            .child(
-                div()
-                    .text_size(ui_text(13.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.foreground)
-                    .child(t!("zconfig.usage").into_owned()),
-            ),
-    );
+    // The overlay's top bar carries the title and back (ADR-0014 §1) —
+    // the page body starts at the notice banner.
 
     // The notice banner every config page renders (an Effect Class outcome
-    // must be visible wherever the user lands, ConfigPage.tsx:52).
-    if let Some(text) = notice {
-        let rt = runtime.clone();
-        page = page.child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .mx_3()
-                .mt_2()
-                .px_3()
-                .py_2()
-                .rounded_md()
-                .bg(white_alpha(0.05))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(ui_text(12.))
-                        .text_color(theme.muted_foreground)
-                        .child(notice_text(text)),
-                )
-                .child(
-                    div()
-                        .id("usage-notice-dismiss")
-                        .flex_none()
-                        .cursor_pointer()
-                        .text_size(ui_text(12.))
-                        .text_color(theme.muted_foreground.opacity(0.7))
-                        .child("✕")
-                        .on_click(move |_, _, _| rt.send(UiCommand::DismissConfigNotice)),
-                ),
-        );
+    // must be visible wherever the user lands, ConfigPage.tsx:52) — the
+    // one shared renderer (ADR-0014 §2).
+    if let Some(notice) = notice {
+        page = page.child(crate::config_notice::notice_banner(
+            theme,
+            notice,
+            runtime,
+            "usage-notice-dismiss",
+        ));
     }
 
     // The Backend Restart affordance (RestartNote): absent unless armed.

@@ -20,6 +20,7 @@
 #![recursion_limit = "256"]
 
 mod approval_card;
+mod config_notice;
 mod diff_view;
 mod file_browser;
 mod http_transport;
@@ -33,6 +34,8 @@ mod readout_store;
 mod remote_terminal;
 mod runtime;
 mod server_form;
+mod settings_overlay;
+mod settings_search;
 mod system_status;
 mod terminal_panel;
 mod ui_prefs;

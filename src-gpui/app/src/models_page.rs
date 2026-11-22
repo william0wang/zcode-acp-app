@@ -45,13 +45,6 @@ use crate::ui_prefs::ui_text;
 use crate::workbench::Workbench;
 use crate::zconfig_pages::prefill;
 
-/// The config-screen notice (TS `notice`): a `notice.*` i18n key resolves
-/// through the shared catalog, anything else is plain failure text shown
-/// as-is (t! falls back to its input when the key misses).
-fn notice_text(notice: &str) -> String {
-    t!(notice).into_owned()
-}
-
 /// The add/edit form's state, owned by the workbench (the TS `ModelForm`
 /// component's local state). One form at a time; rebuilt on open with the
 /// rule's prefill (`rule_for` — the join that survives the two coding-plan
@@ -73,6 +66,15 @@ pub struct ModelsForm {
     levels: Vec<String>,
     /// Every level any rule declares plus this model's own — the chips.
     candidates: Vec<String>,
+    pub(crate) enabled: bool,
+    /// The opened values (edit mode) — the dirty gate compares against these.
+    orig: ModelFormOrig,
+}
+
+/// The model form's opened values (the dirty gate's baseline).
+pub(crate) struct ModelFormOrig {
+    context_window: String,
+    levels: Vec<String>,
     enabled: bool,
 }
 
@@ -85,12 +87,20 @@ pub struct ModelsForm {
 pub struct ProviderFormState {
     provider_id: String,
     provider_name: String,
-    base_url: Entity<InputState>,
+    pub(crate) base_url: Entity<InputState>,
     /// The key box. The current key is never shown — the server does not send
     /// it — so a blank box means "keep the stored key", not "clear it".
     api_key: Entity<InputState>,
     has_api_key: bool,
-    api_type: String,
+    /// The provider's declared wire format, as the server sent it. `None`
+    /// means "no type declared" and an untouched save sends `None` back — the
+    /// form never materializes a default. An unknown spelling renders
+    /// verbatim behind a DISABLED picker and survives the save unchanged
+    /// (ADR-0014 form contract, fixes #9's silent downgrade).
+    pub(crate) api_type: Option<String>,
+    /// The opened values — the dirty gate compares against these.
+    orig_url: String,
+    orig_api_type: Option<String>,
 }
 
 impl Workbench {
@@ -147,31 +157,58 @@ impl Workbench {
             context_window.update(cx, |state, cx| state.set_value(text, window, cx));
         }
         // Re-render per keystroke: canSubmit depends on the typed values.
-        let sub_model = cx.subscribe(&model_id, |_, _, _: &InputEvent, cx| cx.notify());
-        let sub_window =
-            cx.subscribe(&context_window, |_, _, _: &InputEvent, cx| cx.notify());
+        // Typing also stands down the discard confirmation — the user went
+        // back to editing, so "leave discards" must re-arm before firing.
+        let sub_model = cx.subscribe(&model_id, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_window = cx.subscribe(&context_window, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
 
+        let levels = rule
+            .and_then(|r| r.reasoning_levels.clone())
+            .unwrap_or_default();
         self.models_form = Some(ModelsForm {
-            target,
             provider_index: 0,
             providers,
             model_id,
             context_window,
-            levels: rule
-                .and_then(|r| r.reasoning_levels.clone())
-                .unwrap_or_default(),
-            candidates,
-            // TS `rule?.enabled !== false` — absent means on.
             enabled: rule.and_then(|r| r.enabled) != Some(false),
+            orig: ModelFormOrig {
+                context_window: rule
+                    .and_then(|r| r.context_window)
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+                levels: levels.clone(),
+                enabled: rule.and_then(|r| r.enabled) != Some(false),
+            },
+            target,
+            levels,
+            candidates,
         });
         self.models_form_subs = vec![sub_model, sub_window];
+        // Focus the first input on open (add: the model id; edit: the context
+        // window — the ids are fixed above it).
+        let focus = match self.models_form.as_ref().map(|f| f.target.is_some()) {
+            Some(true) => self.models_form.as_ref().unwrap().context_window.clone(),
+            _ => self.models_form.as_ref().unwrap().model_id.clone(),
+        };
+        self.settings_form_confirm_discard = false;
+        window.defer(cx, move |window, cx| {
+            let handle = focus.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
         cx.notify();
     }
 
     /// Closes the form (the header back / a successful save).
-    fn close_models_form(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_models_form(&mut self, cx: &mut Context<Self>) {
         self.models_form = None;
         self.models_form_subs.clear();
+        self.settings_form_confirm_discard = false;
         cx.notify();
     }
 
@@ -205,39 +242,83 @@ impl Workbench {
                 },
             )
         });
-        let sub_url = cx.subscribe(&base_url, |_, _, _: &InputEvent, cx| cx.notify());
-        let sub_key = cx.subscribe(&api_key, |_, _, _: &InputEvent, cx| cx.notify());
+        let sub_url = cx.subscribe(&base_url, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_key = cx.subscribe(&api_key, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let opened_url = provider.base_url.clone().unwrap_or_default();
+        let api_type = provider.api_type.clone();
         self.provider_form = Some(ProviderFormState {
             provider_id,
             provider_name: provider.provider_name.clone().unwrap_or_default(),
             base_url,
             api_key,
             has_api_key: provider.has_api_key,
-            api_type: provider
-                .api_type
-                .clone()
-                .unwrap_or_else(|| "openai-chat-completions".to_string()),
+            api_type: api_type.clone(),
+            orig_url: opened_url,
+            orig_api_type: api_type,
         });
         self.provider_form_subs = vec![sub_url, sub_key];
+        self.settings_form_confirm_discard = false;
+        // Focus the first input on open.
+        let focus = self.provider_form.as_ref().unwrap().base_url.clone();
+        window.defer(cx, move |window, cx| {
+            let handle = focus.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
         cx.notify();
     }
 
     pub fn close_provider_form(&mut self, cx: &mut Context<Self>) {
         self.provider_form = None;
         self.provider_form_subs.clear();
+        self.settings_form_confirm_discard = false;
         cx.notify();
+    }
+
+    /// A base URL the route can use: a scheme, a host, and no whitespace
+    /// anywhere (the form contract's validation — an invalid URL disables
+    /// Save with the inline reason instead of toasting after the fact).
+    pub(crate) fn provider_url_ok(text: &str) -> bool {
+        let trimmed = text.trim();
+        match trimmed.split_once("://") {
+            Some((scheme, host)) => {
+                !scheme.is_empty()
+                    && !host.is_empty()
+                    && !trimmed.chars().any(char::is_whitespace)
+            }
+            None => false,
+        }
+    }
+
+    /// The provider form's dirty gate: any field diverged from the opened
+    /// values (a typed key is always a change — the box starts empty because
+    /// the secret never comes back).
+    pub(crate) fn provider_form_dirty(&self, cx: &Context<Self>) -> bool {
+        let Some(form) = &self.provider_form else {
+            return false;
+        };
+        form.base_url.read(cx).value().trim() != form.orig_url.trim()
+            || !form.api_key.read(cx).value().trim().is_empty()
+            || form.api_type != form.orig_api_type
     }
 
     /// Save the provider form. The key travels only when the box is non-empty:
     /// a blank box means "keep the stored key", because the value was never
-    /// shown to be retyped.
-    fn submit_provider_form(&mut self, cx: &mut Context<Self>) {
+    /// shown to be retyped. The api type travels as the form holds it — an
+    /// absent or unknown spelling is sent back untouched (None = keep).
+    pub(crate) fn submit_provider_form(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &self.provider_form else {
             return;
         };
         let base_url = form.base_url.read(cx).value().trim().to_string();
         let api_key = form.api_key.read(cx).value().trim().to_string();
-        self.runtime.send(UiCommand::UpdateProvider {
+        let api_type = form.api_type.clone();
+        let command = UiCommand::UpdateProvider {
             provider_id: form.provider_id.clone(),
             enabled: None,
             provider_name: if form.provider_name.is_empty() {
@@ -246,21 +327,25 @@ impl Workbench {
                 Some(form.provider_name.clone())
             },
             base_url: Some(base_url),
-            api_type: Some(form.api_type.clone()),
+            api_type,
             api_key: if api_key.is_empty() {
                 None
             } else {
                 Some(api_key)
             },
-        });
+        };
+        self.runtime.send(command);
         self.provider_form = None;
         self.provider_form_subs.clear();
+        self.settings_form_confirm_discard = false;
         cx.notify();
     }
 
     /// Toggles one reasoning-level chip (TS `setLevels(on ? filter :
-    /// [...levels, l])`).
-    fn toggle_models_level(&mut self, level: &str, cx: &mut Context<Self>) {
+    /// [...levels, l])`). pub(crate) for the discard-arm tests.
+    pub(crate) fn toggle_models_level(&mut self, level: &str, cx: &mut Context<Self>) {
+        // Any edit stands the discard confirm down, not just typing.
+        self.settings_form_confirm_discard = false;
         if let Some(form) = &mut self.models_form {
             if let Some(pos) = form.levels.iter().position(|l| l == level) {
                 form.levels.remove(pos);
@@ -308,6 +393,21 @@ impl Workbench {
             && context_window_ok(&window)
     }
 
+    /// The model form's dirty gate. Add mode counts as dirty whenever it is
+    /// valid (a valid add has content by definition); edit mode compares the
+    /// draft against the opened values.
+    pub(crate) fn models_form_dirty(&self, cx: &Context<Self>) -> bool {
+        let Some(form) = &self.models_form else {
+            return false;
+        };
+        if form.target.is_none() {
+            return true;
+        }
+        form.context_window.read(cx).value().trim() != form.orig.context_window.trim()
+            || form.levels != form.orig.levels
+            || form.enabled != form.orig.enabled
+    }
+
     /// Save: the TS `submit` — blank fields OMITTED (merge = keep), levels
     /// only when at least one is selected (an empty array is a no-op, not a
     /// clear), enabled always sent.
@@ -315,7 +415,6 @@ impl Workbench {
         let Some(form) = &self.models_form else {
             return;
         };
-        let adding = form.target.is_none();
         let (provider_id, model_id) = self.models_form_ids(cx);
         let window_text = form.context_window.read(cx).value().trim().to_string();
         let mut body = ModelUpsert {
@@ -331,96 +430,32 @@ impl Workbench {
         if !form.levels.is_empty() {
             body.reasoning_levels = Some(form.levels.clone());
         }
-        self.runtime.send(UiCommand::UpsertModel { adding, body });
+        self.runtime.send(UiCommand::UpsertModel { body });
         cx.notify();
     }
 
     // ---- the page ----
 
-    /// The Models page: a full page of its own below the status bar (the TS
-    /// ConfigPageFrame — back header, refresh, notice banner, then the
-    /// unsupported / error / loading / list states).
+    /// The Models page body, hosted in the settings overlay's content pane
+    /// (ADR-0014 §1): notice banner, then the unsupported / error / loading
+    /// / list states. The overlay's top bar carries the title, back, and
+    /// refresh — the page's own header is gone.
     pub fn render_models_page(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let page = self.snap.models_page.clone().unwrap_or_default();
         let mut column = div().flex().flex_col().flex_1().min_h_0();
 
-        // Header: back, title, refresh.
-        let runtime = self.runtime.clone();
-        column = column.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .h_9()
-                .px_3()
-                .flex_none()
-                .border_b_1()
-                .border_color(theme.border)
-                .bg(theme.title_bar)
-                .child(
-                    Button::new("models-back")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::ArrowLeft)
-                        .tooltip(t!("common.backToWorkbench"))
-                        .on_click(move |_, _, _| runtime.send(UiCommand::CloseModels)),
-                )
-                .child(
-                    div()
-                        .text_size(ui_text(13.))
-                        .text_color(theme.foreground)
-                        .child(t!("zconfig.models").into_owned()),
-                )
-                .child(div().flex_1())
-                .child({
-                    let runtime = self.runtime.clone();
-                    Button::new("models-refresh")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::RefreshCw)
-                        .tooltip(t!("zconfig.modelsReload"))
-                        .disabled(page.loading)
-                        .on_click(move |_, _, _| runtime.send(UiCommand::RefreshModels))
-                }),
-        );
-
         // The notice banner (effect-class and restart outcomes land here —
         // the config pages replace the chat surface, which is the only
-        // other place a banner renders).
-        if let Some(notice) = self.snap.config_notice.as_deref() {
-            let runtime = self.runtime.clone();
-            column = column.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .mx_3()
-                    .mt_2()
-                    .px_3()
-                    .py_2()
-                    .flex_none()
-                    .rounded_md()
-                    .bg(theme.secondary)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .flex_1()
-                            .text_size(ui_text(12.))
-                    .text_color(theme.foreground)
-                    .child(notice_text(notice)),
-            )
-                    .child(
-                        Button::new("models-notice-dismiss")
-                            .ghost()
-                            .xsmall()
-                            .label("×")
-                            .tooltip(t!("common.dismiss"))
-                            .on_click(move |_, _, _| {
-                                runtime.send(UiCommand::DismissConfigNotice)
-                            }),
-                    ),
-            );
+        // other place a banner renders); the banner itself is the one
+        // shared renderer (ADR-0014 §2).
+        if let Some(notice) = self.snap.config_notice.as_ref() {
+            column = column.child(crate::config_notice::notice_banner(
+                &theme,
+                notice,
+                &self.runtime,
+                "models-notice-dismiss",
+            ));
         }
 
         // The three frame states, in the TS order: unsupported → error →
@@ -707,22 +742,6 @@ impl Workbench {
                 &self.runtime,
                 cx,
             ))
-            .child(render_model_delete(
-                index,
-                m,
-                busy,
-                self.model_delete_confirm.as_deref()
-                    == Some(
-                        format!(
-                            "{}/{}",
-                            m.provider_id.as_deref().unwrap_or_default(),
-                            m.model_id.as_deref().unwrap_or_default()
-                        )
-                        .as_str(),
-                    ),
-                &self.runtime,
-                cx,
-            ))
             .child(
                 div()
                     .size_3()
@@ -752,6 +771,9 @@ impl Workbench {
         let mut column = div().flex().flex_col().flex_1().min_h_0();
         let wb_close = cx.entity();
         let wb_save = cx.entity();
+        let url_text = form.base_url.read(cx).value().to_string();
+        let url_ok = Self::provider_url_ok(&url_text);
+        let dirty = self.provider_form_dirty(cx);
         column = column.child(
             div()
                 .flex()
@@ -769,7 +791,9 @@ impl Workbench {
                         .xsmall()
                         .icon(IconName::ArrowLeft)
                         .on_click(move |_, _, cx| {
-                            wb_close.update(cx, |this, cx| this.close_provider_form(cx));
+                            wb_close.update(cx, |this, cx| {
+                                this.request_close_settings_form(cx)
+                            });
                         }),
                 )
                 .child(
@@ -788,12 +812,19 @@ impl Workbench {
                         .primary()
                         .small()
                         .label(t!("common.save").into_owned())
-                        .disabled(busy)
+                        // Valid AND dirty: an untouched form has nothing to
+                        // save, an invalid URL would only toast after the
+                        // fact (the form contract).
+                        .disabled(busy || !url_ok || !dirty)
                         .on_click(move |_, _, cx| {
                             wb_save.update(cx, |this, cx| this.submit_provider_form(cx));
                         }),
                 ),
         );
+
+        if let Some(strip) = self.discard_armed_strip(&theme, cx) {
+            column = column.child(strip);
+        }
 
         let mut body = div()
             .id("provider-form-body")
@@ -806,7 +837,18 @@ impl Workbench {
             .min_h_0();
         body = body
             .child(field_label(&t!("zconfig.providerBaseUrl"), None, &theme))
-            .child(div().max_w(rems(46.)).child(Input::new(&form.base_url)))
+            .child(div().max_w(rems(46.)).child(Input::new(&form.base_url)));
+        // The inline reason appears only once something is typed — an empty
+        // box's verdict is just "Save is disabled", not an error to read.
+        if !url_text.trim().is_empty() && !url_ok {
+            body = body.child(
+                div()
+                    .text_size(ui_text(10.))
+                    .text_color(theme.danger_foreground)
+                    .child(t!("zconfig.providerUrlInvalid").into_owned()),
+            );
+        }
+        body = body
             .child(field_label(&t!("zconfig.providerApiType"), None, &theme))
             .child(div().max_w(rems(46.)).child(provider_api_type_picker(form, cx)))
             .child(field_label(
@@ -858,7 +900,7 @@ impl Workbench {
                         .icon(IconName::ArrowLeft)
                         .tooltip(t!("zconfig.backToModels"))
                         .on_click(move |_, _, cx| {
-                            wb.update(cx, |this, cx| this.close_models_form(cx));
+                            wb.update(cx, |this, cx| this.request_close_settings_form(cx));
                         }),
                 )
                 .child(
@@ -872,6 +914,10 @@ impl Workbench {
                         }),
                 ),
         );
+
+        if let Some(strip) = self.discard_armed_strip(&theme, cx) {
+            column = column.child(strip);
+        }
 
         let mut body = div().flex().flex_col().gap_2().p_4();
 
@@ -900,6 +946,7 @@ impl Workbench {
                         let wb = cx.entity();
                         move |ix: &usize, _, cx| {
                             wb.update(cx, |this, cx| {
+                                this.settings_form_confirm_discard = false;
                                 if let Some(form) = &mut this.models_form {
                                     form.provider_index = *ix;
                                 }
@@ -988,6 +1035,7 @@ impl Workbench {
                     let wb = cx.entity();
                     move |checked: &bool, _, cx| {
                         wb.update(cx, |this, cx| {
+                            this.settings_form_confirm_discard = false;
                             if let Some(form) = &mut this.models_form {
                                 form.enabled = *checked;
                             }
@@ -997,28 +1045,41 @@ impl Workbench {
                 })),
         );
 
-        // Save: disabled while busy or invalid; the write outcome (not the
-        // click) closes the form.
+        // Footer (the form contract): Delete LEFT in the edit form's footer —
+        // never on rows — and Save disabled while busy, invalid, or CLEAN
+        // (valid AND dirty); the write outcome, not the click, closes the
+        // form.
         let wb = cx.entity();
-        body = body.child(
-            div()
+        let save = Button::new("model-save")
+            .primary()
+            .label(if busy {
+                t!("zconfig.saving").into_owned()
+            } else {
+                t!("common.save").into_owned()
+            })
+            .disabled(busy || !self.models_form_can_submit(cx) || !self.models_form_dirty(cx))
+            .on_click(move |_, _, cx| {
+                wb.update(cx, |this, cx| this.submit_models_form(cx));
+            });
+        let footer = match &form.target {
+            Some(target) => div()
                 .pt_4()
                 .max_w(rems(46.))
-                .child(
-                    Button::new("model-save")
-                        .primary()
-                        .w_full()
-                        .label(if busy {
-                            t!("zconfig.saving").into_owned()
-                        } else {
-                            t!("common.save").into_owned()
-                        })
-                        .disabled(busy || !self.models_form_can_submit(cx))
-                        .on_click(move |_, _, cx| {
-                            wb.update(cx, |this, cx| this.submit_models_form(cx));
-                        }),
-                ),
-        );
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(render_model_delete(
+                    target,
+                    busy,
+                    self.model_delete_confirm.as_deref() == Some(model_delete_key(target).as_str()),
+                    &self.runtime,
+                    cx,
+                ))
+                .child(div().flex_1())
+                .child(save),
+            None => div().pt_4().max_w(rems(46.)).child(save.w_full()),
+        };
+        body = body.child(footer);
 
         column
             .child(
@@ -1299,7 +1360,10 @@ fn render_provider_row(
 
 /// The provider form's API-protocol dropdown. Each option is one wire format;
 /// picking a different one changes how auth and the request body are shaped,
-/// so the choice is spelled out rather than abbreviated.
+/// so the choice is spelled out rather than abbreviated. An UNKNOWN spelling
+/// renders verbatim behind a disabled picker with a hint — the form contract
+/// forbids rewriting what it cannot represent; an absent type shows the
+/// default label and stays absent until the user actively picks one.
 fn provider_api_type_picker(
     form: &ProviderFormState,
     cx: &Context<Workbench>,
@@ -1309,19 +1373,51 @@ fn provider_api_type_picker(
         "openai-chat-completions",
         "openai-responses",
     ];
+    let theme = cx.theme();
+    let unknown = form
+        .api_type
+        .as_deref()
+        .is_some_and(|v| !TYPES.contains(&v));
+    if unknown {
+        let verbatim = form.api_type.clone().unwrap_or_default();
+        return div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                Button::new("provider-api-type")
+                    .secondary()
+                    .small()
+                    .w_full()
+                    .disabled(true)
+                    .label(verbatim),
+            )
+            .child(
+                div()
+                    .text_size(ui_text(10.))
+                    .text_color(theme.muted_foreground)
+                    .child(t!("zconfig.providerApiTypeUnknown").into_owned()),
+            )
+            .into_any_element();
+    }
     let wb = cx.entity();
     let current = form.api_type.clone();
+    let label = current.clone().unwrap_or_else(|| {
+        // Absent: the effective wire format is the server's default — say so
+        // instead of freezing a spelling the file never carried.
+        t!("zconfig.providerApiTypeDefault").into_owned()
+    });
     Button::new("provider-api-type")
         .secondary()
         .small()
         .w_full()
-        .label(current.clone())
+        .label(label)
         .dropdown_menu(move |menu, _, _| {
             let mut m = menu;
             for api_type in TYPES {
                 let wb = wb.clone();
                 let value = api_type.to_string();
-                let active = current == value;
+                let active = current.as_deref() == Some(api_type);
                 m = m.item(
                     PopupMenuItem::new(value.clone())
                         .checked(active)
@@ -1329,7 +1425,8 @@ fn provider_api_type_picker(
                             let value = value.clone();
                             wb.update(cx, |this, cx| {
                                 if let Some(form) = &mut this.provider_form {
-                                    form.api_type = value.clone();
+                                    form.api_type = Some(value.clone());
+                                    this.settings_form_confirm_discard = false;
                                 }
                                 cx.notify();
                             });
@@ -1341,11 +1438,21 @@ fn provider_api_type_picker(
         .into_any_element()
 }
 
-/// A model's delete control, two gestures. Deleting a model removes its rule
-/// and its entry in the provider's model list — the model stops being offered
-/// anywhere in the app, so a stray click must not do it.
+/// The arm key of the edit form's delete control (provider/model).
+fn model_delete_key(m: &ModelRef) -> String {
+    format!(
+        "{}/{}",
+        m.provider_id.as_deref().unwrap_or_default(),
+        m.model_id.as_deref().unwrap_or_default()
+    )
+}
+
+/// A model's delete control, two gestures, in the edit form's footer (the
+/// form contract: delete lives in the edit form's footer, never on rows).
+/// Deleting a model removes its rule and its entry in the provider's model
+/// list — the model stops being offered anywhere in the app, so a stray
+/// click must not do it.
 fn render_model_delete(
-    index: usize,
     m: &ModelRef,
     busy: bool,
     armed: bool,
@@ -1379,7 +1486,7 @@ fn render_model_delete(
             .gap_1()
             .flex_none()
             .child(
-                Button::new(SharedString::from(format!("model-delete-cancel-{index}")))
+                Button::new("model-delete-cancel")
                     .ghost()
                     .xsmall()
                     .label(t!("common.cancel").into_owned())
@@ -1392,7 +1499,7 @@ fn render_model_delete(
                     }),
             )
             .child(
-                Button::new(SharedString::from(format!("model-delete-confirm-{index}")))
+                Button::new("model-delete-confirm")
                     .primary()
                     .xsmall()
                     .label(t!("zconfig.modelDelete").into_owned())
@@ -1412,8 +1519,8 @@ fn render_model_delete(
             .into_any_element();
     }
 
-    let arm_key = format!("{provider_id}/{model_id}");
-    Button::new(SharedString::from(format!("model-delete-{index}")))
+    let arm_key = model_delete_key(m);
+    Button::new("model-delete")
         .ghost()
         .xsmall()
         .icon(KitIconName::Trash)
@@ -1428,4 +1535,26 @@ fn render_model_delete(
             });
         })
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports, NOT `use super::*`: the module-level kit glob
+    // re-exports GPUI's `test` macro, which would shadow Rust's built-in
+    // #[test] (the kit's own doc note).
+    use super::Workbench;
+
+    /// The provider form's URL gate (ADR-0014 form contract): scheme + host,
+    /// no whitespace — an invalid URL disables Save instead of toasting
+    /// after the fact.
+    #[test]
+    fn provider_url_ok_requires_scheme_and_host() {
+        assert!(Workbench::provider_url_ok("https://api.example.com"));
+        assert!(Workbench::provider_url_ok(" http://localhost:8080 "));
+        assert!(!Workbench::provider_url_ok("api.example.com"));
+        assert!(!Workbench::provider_url_ok("https://"));
+        assert!(!Workbench::provider_url_ok("://host"));
+        assert!(!Workbench::provider_url_ok("https://ho st"));
+        assert!(!Workbench::provider_url_ok(""));
+    }
 }

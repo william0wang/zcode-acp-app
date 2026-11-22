@@ -75,12 +75,10 @@ use crate::runtime::{
     WorkbenchSnapshot,
 };
 use crate::server_form::ServerForm;
-use crate::system_status::render_system_status_page;
 use crate::terminal_panel;
 use gpui_terminal::TerminalView;
 use crate::ui_prefs::ui_text;
 use crate::ui_tokens::diff_colors;
-use crate::usage_page::render_usage_page;
 use crate::workflows_page::{WorkflowAmendForm, WorkflowMetaForm, WorkflowStartForm};
 use crate::zconfig_pages::ZConfigForm;
 
@@ -135,32 +133,6 @@ gpui_kit::actions!(
         SelectTab9
     ]
 );
-
-/// What the left overlay drawer shows. The drawer slides out beside the
-/// rail and floats above the workbench (a drawer, not a docked panel):
-/// nothing below is reflowed or replaced, and it closes through its X, Esc,
-/// or the rail toggle — never a modal backdrop. Both surfaces are view-
-/// local; each seeds its reads on open (see [`Workbench::toggle_drawer`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrawerSurface {
-    /// The settings list (TS SettingsPanel): the server book, appearance,
-    /// and the config-page entries.
-    Settings,
-    /// The full quota display (TS QuotaSection at drawer scale): every
-    /// provider section the hub reports. The plan-quota page with its reset
-    /// cards is a separate full page — its entry lives in Settings.
-    Quota,
-}
-
-impl DrawerSurface {
-    /// Stable element-id fragment for the rail toggles.
-    fn key(self) -> &'static str {
-        match self {
-            DrawerSurface::Settings => "config",
-            DrawerSurface::Quota => "quota",
-        }
-    }
-}
 
 /// One tab's Remote Terminal binding (ADR-0011): which pane in the tab's
 /// dock row pairs with the phone's command-line view, and the session it
@@ -247,9 +219,17 @@ pub struct Workbench {
     /// resets both splitters (their stored PIXEL sizes belong to the OLD
     /// width and otherwise pin the chat past a narrowed window).
     last_viewport_w: Option<gpui::Pixels>,
-    /// The right overlay drawer (view-local layout): settings or plan quota,
-    /// floating above the surfaces below without reflowing them.
-    drawer: Option<DrawerSurface>,
+    /// The settings overlay (ADR-0014 §1, view-local): `None` = closed. The
+    /// full-width surface the old 380px settings drawer became — see
+    /// `settings_overlay`.
+    pub(crate) settings: Option<crate::settings_overlay::SettingsSection>,
+    /// The last-visited overlay section: reopening lands here (acceptance
+    /// scenario 1).
+    pub(crate) settings_last: crate::settings_overlay::SettingsSection,
+    /// The right quota drawer (view-local layout): the all-providers plan
+    /// quota glance, floating above the surfaces below without reflowing
+    /// them. The only drawer left — the settings half became the overlay.
+    pub(crate) quota_drawer: bool,
     /// The right session panel: the active session's file browser. View-local
     /// like the left dock, with its own splitter.
     session_panel_open: bool,
@@ -355,12 +335,20 @@ pub struct Workbench {
     /// The Skills page's armed delete: the skill path whose delete has been
     /// pressed once — the directory removal has no undo either.
     pub(crate) skill_delete_confirm: Option<String>,
+    /// The Hooks edit form's armed delete: the row key (`event/m/h`) whose
+    /// delete has been pressed once — the remove write is fingerprint-guarded
+    /// but still undoless from the app.
+    pub(crate) hook_delete_confirm: Option<String>,
     /// The MCP page's armed delete: the server name whose delete has been
     /// pressed once — the config entry is gone with no undo.
     pub(crate) mcp_delete_confirm: Option<String>,
     /// The Models page's armed delete: `providerId/modelId` of the row whose
     /// delete has been pressed once.
     pub(crate) model_delete_confirm: Option<String>,
+    /// The settings forms' armed discard (the form contract: leaving a dirty
+    /// form asks). The first back/Esc on a dirty form arms it, the second
+    /// closes; typing stands it back down.
+    pub(crate) settings_form_confirm_discard: bool,
     /// The servers panel's armed remove (TS two-click delete): the profile
     /// id and when the 3s confirm window opened.
     pub(crate) server_remove_armed: Option<(String, std::time::Instant)>,
@@ -427,6 +415,17 @@ pub struct Workbench {
     pending_slash_insert: Option<PendingSlashInsert>,
     /// Keeps the "/" menu's keystroke interceptor alive.
     _slash_key_sub: Subscription,
+    /// The settings overlay's search palette (ADR-0014 §4): open flag,
+    /// the reused input entity, and the highlighted result row. View-local.
+    pub(crate) settings_search_open: bool,
+    pub(crate) settings_search_input: Option<Entity<gpui_kit::component::input::InputState>>,
+    pub(crate) settings_search_selected: usize,
+    /// A search navigation's row highlight: (anchor, expires-at epoch-ms) —
+    /// rings the mounted row ~2s without stealing focus, then expires on
+    /// its own (upstream `SettingsSearchTarget`).
+    pub(crate) settings_highlight: Option<(String, u64)>,
+    /// Keeps the search palette's arrow-key interceptor alive.
+    _settings_search_key_sub: Subscription,
     /// Keeps the terminal's keystroke interceptor alive (the shell gets keys
     /// BEFORE the app's action bindings while it owns the keyboard).
     _terminal_key_sub: Subscription,
@@ -1460,6 +1459,38 @@ impl Workbench {
                 cx.stop_propagation();
             }
         });
+        // The settings search palette's arrows (ADR-0014 §4): while the
+        // palette's input owns the keyboard, up/down move the highlight —
+        // consumed so the input's caret never jumps behind the list. Enter
+        // rides the input's own PressEnter event; Escape the app ladder.
+        let search_weak = cx.entity().downgrade();
+        let settings_search_key_sub = cx.intercept_keystrokes(move |event, window, cx| {
+            let Some(wb) = search_weak.upgrade() else {
+                return;
+            };
+            let (open, input) = {
+                let wb = wb.read(cx);
+                (wb.settings_search_open, wb.settings_search_input.clone())
+            };
+            if !open {
+                return;
+            }
+            let focused = input
+                .as_ref()
+                .is_some_and(|i| i.read(cx).focus_handle(cx).is_focused(window));
+            if !focused {
+                return;
+            }
+            let m = &event.keystroke.modifiers;
+            let platform_mod = m.control || m.alt || m.platform || m.function;
+            let down = match event.keystroke.key.as_str() {
+                "up" if !platform_mod => false,
+                "down" if !platform_mod => true,
+                _ => return,
+            };
+            wb.update(cx, |this, cx| this.move_settings_search(down, cx));
+            cx.stop_propagation();
+        });
         // The embedded terminal's keyboard half. gpui resolves keymap actions
         // BEFORE key listeners, and the kit's Root binds bare `tab`/`shift-tab`
         // to focus traversal while this app binds `escape` app-wide — so a
@@ -1532,6 +1563,7 @@ impl Workbench {
             scroller,
             rows: Vec::new(),
             rows_session: None,
+            settings_form_confirm_discard: false,
             composer,
             clear_composer: false,
             composer_prefill: None,
@@ -1549,7 +1581,9 @@ impl Workbench {
             dock_open: true,
             dock_sizes,
             last_viewport_w: None,
-            drawer: None,
+            settings: None,
+            settings_last: crate::settings_overlay::SettingsSection::General,
+            quota_drawer: false,
             session_panel_open: false,
             files_panel_session: None,
             tab_terminals: std::collections::HashMap::new(),
@@ -1587,6 +1621,7 @@ impl Workbench {
             backup_confirm: None,
             agent_delete_confirm: None,
             skill_delete_confirm: None,
+            hook_delete_confirm: None,
             mcp_delete_confirm: None,
             model_delete_confirm: None,
             server_remove_armed: None,
@@ -1611,6 +1646,11 @@ impl Workbench {
             slash_dismissed: None,
             pending_slash_insert: None,
             _slash_key_sub: slash_key_sub,
+            settings_search_open: false,
+            settings_search_input: None,
+            settings_search_selected: 0,
+            settings_highlight: None,
+            _settings_search_key_sub: settings_search_key_sub,
             _terminal_key_sub: terminal_key_sub,
             lightbox: None,
             _composer_sub: composer_sub,
@@ -1952,20 +1992,24 @@ impl Workbench {
         })
     }
 
-    /// Rail toggle for the overlay drawer: one slot, so opening a surface
-    /// closes the other. Both surfaces are view-local, but each seeds its
-    /// reads on open — both paint the quota card state, so the open kicks
-    /// its read (TS QuotaSection's mount effect); settings additionally
-    /// seeds the workflow gate probe (the gated entry cannot render without
-    /// the verdict; unprobed is fail-closed).
-    fn toggle_drawer(&mut self, surface: DrawerSurface, cx: &mut Context<Self>) {
-        let opening = self.drawer != Some(surface);
-        self.drawer = opening.then_some(surface);
-        if opening {
-            self.runtime.send(UiCommand::RefreshQuota);
-            if surface == DrawerSurface::Settings && self.snap.workflow_gate.is_none() {
-                self.runtime.send(UiCommand::ProbeWorkflowGate);
+    /// Rail toggle for the quota drawer: view-local, seeding its read on
+    /// open (TS QuotaSection's mount effect). One overlay slot — an open
+    /// settings overlay folds so the drawer's rail anchor stays honest.
+    fn toggle_quota_drawer(&mut self, cx: &mut Context<Self>) {
+        self.quota_drawer = !self.quota_drawer;
+        if self.quota_drawer {
+            if self.settings.is_some() && self.settings_form_rung(cx) {
+                // A settings form answered the drawer's open; the flip
+                // unwinds and the user retries once the form has closed
+                // (the form contract — one action never skips a level).
+                self.quota_drawer = false;
+                cx.notify();
+                return;
             }
+            if self.settings.take().is_some() {
+                self.close_settings_pages();
+            }
+            self.runtime.send(UiCommand::RefreshQuota);
         }
         cx.notify();
     }
@@ -2022,23 +2066,20 @@ impl Workbench {
         cx.notify();
     }
 
-    /// ⌘K: dock the sessions panel and focus its search field. A config
-    /// page replaces the workbench surfaces (the dock included), so the
-    /// action has nothing to focus there; the overlay drawer replaces
-    /// nothing — search works underneath it.
+    /// ⌘K: inside the settings overlay it opens the settings search
+    /// palette (ADR-0014 §4); otherwise it docks the sessions panel and
+    /// focuses its search field. The quota drawer replaces nothing — the
+    /// session search works underneath it.
     fn on_focus_search(
         &mut self,
         _: &FocusSessionSearch,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.snap.system_status.is_some()
-            || self.snap.models_page.is_some()
-            || self.snap.quota_page.is_some()
-            || self.snap.usage_page.is_some()
-            || self.snap.config_section_page.is_some()
-            || self.snap.workflows_page.is_some()
-        {
+        if self.settings.is_some() {
+            if !self.settings_search_open {
+                self.open_settings_search(window, cx);
+            }
             return;
         }
         self.dock_open = true;
@@ -2052,39 +2093,112 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The open full-page config surface's close command, if one is up.
-    /// Esc-on-page is the TS settings screen's back button (backNav/Android
-    /// back); ChatView's cancel only applies on the chat surface the page
-    /// replaced. The overlay drawer is NOT here — the drawer branch in
-    /// on_stop_turn owns it (it replaces no surface).
-    fn open_config_page_close(&self) -> Option<UiCommand> {
-        if self.snap.system_status.is_some() {
-            Some(UiCommand::CloseSystemStatus)
-        } else if self.snap.models_page.is_some() {
-            Some(UiCommand::CloseModels)
-        } else if let Some(page) = self.snap.config_section_page.as_ref() {
-            Some(UiCommand::CloseConfigPage { page: page.kind })
-        } else if self.snap.quota_page.is_some() {
-            Some(UiCommand::CloseQuota)
-        } else if self.snap.usage_page.is_some() {
-            Some(UiCommand::CloseUsage)
-        } else if self.snap.workflows_page.is_some() {
-            Some(UiCommand::CloseWorkflows)
-        } else {
-            None
+    /// Any open settings form's dirty verdict (the discard gate's question).
+    fn settings_form_dirty(&self, cx: &Context<Self>) -> bool {
+        self.provider_form_dirty(cx)
+            || self.models_form_dirty(cx)
+            || self.zconfig_form_dirty(cx)
+    }
+
+    /// Close the open settings form — or, when it is DIRTY, ask first: the
+    /// first request arms the discard confirm, the second closes (typing
+    /// stands the arm down). The form contract's "leaving a dirty form asks".
+    pub(crate) fn request_close_settings_form(&mut self, cx: &mut Context<Self>) {
+        let _ = self.close_open_settings_form(cx);
+    }
+
+    /// Esc's form rung (ADR-0014 §3 ladder): the open add/edit form closes
+    /// before its page, before the overlay — one keystroke never skips a
+    /// level. A DIRTY form answers the first Esc by arming the discard
+    /// confirm instead of closing; the second Esc closes. True when a form
+    /// was open (the rung fired).
+    fn close_open_settings_form(&mut self, cx: &mut Context<Self>) -> bool {
+        let form_open = self.provider_form.is_some()
+            || self.models_form.is_some()
+            || self.zconfig_form.is_some();
+        if form_open && self.settings_form_dirty(cx) && !self.settings_form_confirm_discard {
+            self.settings_form_confirm_discard = true;
+            cx.notify();
+            return true;
         }
+        self.settings_form_confirm_discard = false;
+        if self.provider_form.is_some() {
+            self.close_provider_form(cx);
+        } else if self.models_form.is_some() {
+            self.close_models_form(cx);
+        } else if self.zconfig_form.is_some() {
+            self.close_zconfig_form(cx);
+        } else if self.workflow_start_form.is_some()
+            || self.workflow_amend_form.is_some()
+            || self.workflow_meta_form.is_some()
+        {
+            self.close_workflow_form(cx);
+        } else {
+            return false;
+        }
+        true
+    }
+
+    /// The form rung for overlay-level closes (the form contract: leaving a
+    /// dirty form asks). True when an open settings form answered the
+    /// request — armed the discard confirm (dirty, first request) or just
+    /// closed (second) — so the caller's own close must wait: one action
+    /// never skips a level, the Esc ladder's rule.
+    pub(crate) fn settings_form_rung(&mut self, cx: &mut Context<Self>) -> bool {
+        let settings_form_open = self.provider_form.is_some()
+            || self.models_form.is_some()
+            || self.zconfig_form.is_some();
+        settings_form_open && self.close_open_settings_form(cx)
+    }
+
+    /// The visible half of the discard confirm (ADR-0014 §3): a strip under
+    /// the open form's header while the next back/Esc/close will discard it
+    /// — without it the arming press reads as a dead key. The strip's button
+    /// IS that second press: clicking discards right away.
+    pub(crate) fn discard_armed_strip(
+        &self,
+        theme: &component::Theme,
+        cx: &Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.settings_form_confirm_discard {
+            return None;
+        }
+        let wb = cx.entity();
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_4()
+                .py(px(6.))
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.title_bar)
+                .child(
+                    Button::new("discard-armed")
+                        .danger()
+                        .xsmall()
+                        .label(t!("zconfig.discardArmed").into_owned())
+                        .on_click(move |_, _, cx| {
+                            wb.update(cx, |this, cx| {
+                                let _ = this.close_open_settings_form(cx);
+                            });
+                        }),
+                ),
+        )
+        .map(|el| el.into_any_element())
     }
 
     /// Esc: close the topmost layer first — the quit dialog swallows it
     /// (dismiss, keep the window; a flushing stop-all is NOT cancellable),
     /// then the lightbox (K2), the rename sheet, the new-session sheet (the
     /// TS back-handler stack, `creating` guard included via the command's
-    /// no-op-while-busy); then an open config page closes (the settings
-    /// screen's back); the overlay drawer before it (a drawer above a page
-    /// is the closer layer, though opening a page normally closes the
-    /// drawer already); otherwise it is ChatView's Cancel — `session/cancel`
-    /// on the running turn. (The "/" menu's Escape never reaches here: the
-    /// keystroke interceptor consumes it before the global binding.)
+    /// no-op-while-busy); then the settings ladder (ADR-0014 §3): the gate
+    /// sheet → an open form → the overlay itself; the quota drawer; then an
+    /// approval card or ChatView's Cancel — `session/cancel` on the running
+    /// turn. (The "/" menu's Escape never reaches here: the keystroke
+    /// interceptor consumes it before the global binding.)
     pub(crate) fn on_stop_turn(
         &mut self,
         _: &StopTurn,
@@ -2116,10 +2230,45 @@ impl Workbench {
             // The file viewer is the topmost layer (mounted after every
             // page) — Esc unwinds it before anything it covers.
             self.runtime.send(UiCommand::FilesCloseView);
-        } else if self.drawer.take().is_some() {
-            // The drawer is view-local — closing it is purely ours.
-        } else if let Some(cmd) = self.open_config_page_close() {
+        } else if self.settings_search_open {
+            // The palette's Esc (upstream): clear the query first, close
+            // second.
+            let query = self
+                .settings_search_input
+                .as_ref()
+                .is_some_and(|i| !i.read(cx).value().trim().is_empty());
+            if query {
+                if let Some(input) = self.settings_search_input.clone() {
+                    input.update(cx, |s, cx| s.set_value("", window, cx));
+                }
+                self.settings_search_selected = 0;
+            } else {
+                self.settings_search_open = false;
+            }
+        } else if self.workflow_gate_sheet {
+            // The settings Esc ladder (ADR-0014 §3): the gate sheet is a
+            // modal inside the overlay — it unwinds first.
+            self.workflow_gate_sheet = false;
+        } else if self.close_open_settings_form(cx) {
+            // …then an open add/edit form (form → page → overlay, never a
+            // level skipped — Esc on a form used to close the whole page).
+        } else if let Some(cmd) = self
+            .snap
+            .workflows_page
+            .as_ref()
+            .and_then(crate::workflows_page::workflows_crumb)
+            .map(|(_, back)| back)
+        {
+            // …then the Workflows section's own layers (run → detail),
+            // unwinding one level per press like its breadcrumb bar.
             self.runtime.send(cmd);
+        } else if self.settings.is_some() {
+            // …then the settings overlay (which retires the section page it
+            // hosts).
+            self.close_settings(cx);
+        } else if self.quota_drawer {
+            // The quota drawer is view-local — closing it is purely ours.
+            self.quota_drawer = false;
         } else if let Some(cmd) = self
             .card
             .as_ref()
@@ -2145,17 +2294,15 @@ impl Workbench {
         cx.notify();
     }
 
-    /// The app menu's Preferences (req 2.7): the settings drawer, the same
-    /// surface the rail toggle opens.
+    /// The app menu's Preferences (req 2.7): the settings overlay, the same
+    /// surface the rail gear opens (⌘,).
     pub(crate) fn on_show_preferences(
         &mut self,
         _: &ShowPreferences,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.drawer != Some(DrawerSurface::Settings) {
-            self.toggle_drawer(DrawerSurface::Settings, cx);
-        }
+        self.toggle_settings(cx);
     }
 
     /// The File menu's reopen (req 2.5): the last closed tab, back as a tab.
@@ -2386,24 +2533,11 @@ impl Workbench {
                     }
                 }
                 // Any pane that died with its tab (remote OR local) leaves
-                // the Terminal Mirror — report when the retain dropped any.
+                // the Remote Terminal Mirror — report when the retain dropped any.
                 let panes_after: usize =
                     self.tab_terminals.values().map(Vec::len).sum::<usize>();
                 if panes_before != panes_after {
                     self.report_pane_inventory();
-                }
-                // Full config pages replace the drawer's navigation context —
-                // their entries live IN the drawer, so the page taking over
-                // below closes it. The drawer itself is view-local, so
-                // closing is purely ours.
-                let full_page_open = self.snap.system_status.is_some()
-                    || self.snap.models_page.is_some()
-                    || self.snap.quota_page.is_some()
-                    || self.snap.usage_page.is_some()
-                    || self.snap.config_section_page.is_some()
-                    || self.snap.workflows_page.is_some();
-                if full_page_open {
-                    self.drawer = None;
                 }
                 // The quit dialog's reason can expire under it: the last own
                 // turn settled while the user was deciding. Drop the modal —
@@ -2427,6 +2561,7 @@ impl Workbench {
                     self.hooks_open_event = None;
                     self.backup_confirm = None;
                     self.skill_delete_confirm = None;
+                    self.hook_delete_confirm = None;
                     self.mcp_delete_confirm = None;
                     self.agent_delete_confirm = None;
                 }
@@ -2516,6 +2651,11 @@ impl Workbench {
                 if ok && self.zconfig_form.is_some() {
                     self.zconfig_form = None;
                     self.zconfig_form_subs.clear();
+                    // A footer delete left armed must not survive into the
+                    // next form (same rule as close_zconfig_form).
+                    self.mcp_delete_confirm = None;
+                    self.agent_delete_confirm = None;
+                    self.hook_delete_confirm = None;
                 }
                 cx.notify();
             }
@@ -3359,18 +3499,8 @@ impl Workbench {
             "Sessions — live sessions, history, and the ⌘K search",
             cx,
         ));
-        rail = rail.child(self.render_rail_drawer(
-            DrawerSurface::Settings,
-            IconName::Settings2,
-            "Settings — servers, language, models, usage, system status",
-            cx,
-        ));
-        rail = rail.child(self.render_rail_drawer(
-            DrawerSurface::Quota,
-            KitIconName::Gauge,
-            "Plan quota — allowance windows and reset cards",
-            cx,
-        ));
+        rail = rail.child(self.render_rail_settings(cx));
+        rail = rail.child(self.render_rail_quota(cx));
         // The terminal's visible door: the ⌃` binding alone left the dock
         // undiscoverable. Painted as selected while the ACTIVE tab's
         // terminal is open (the dock is per-tab, the door is one slot).
@@ -3726,28 +3856,19 @@ impl Workbench {
             })
     }
 
-    /// A rail toggle that opens the overlay DRAWER rather than docking a
-    /// panel: painted as selected while its surface is the open drawer (the
-    /// drawer rides above this rail, so the toggle doubles as the close
-    /// affordance).
-    fn render_rail_drawer(
-        &self,
-        surface: DrawerSurface,
-        icon: impl Into<gpui_kit::component::Icon> + Clone,
-        tooltip: &str,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
+    /// The rail's settings gear: opens/closes the full-width settings
+    /// overlay (ADR-0014 §1), painted as selected while it is open.
+    fn render_rail_settings(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let wb = cx.entity();
-        let active = self.drawer == Some(surface);
+        let active = self.settings.is_some();
         let color = if active {
             theme.foreground
         } else {
             theme.muted_foreground
         };
-        let label = tooltip.to_string();
         div()
-            .id(SharedString::from(format!("dock-rail-{}", surface.key())))
+            .id("dock-rail-settings")
             .flex()
             .items_center()
             .justify_center()
@@ -3756,11 +3877,44 @@ impl Workbench {
             .cursor_pointer()
             .when(active, |this| this.bg(theme.secondary))
             .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
-            .child(Icon::new(icon).size_4().text_color(color))
-            .tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))
+            .child(Icon::new(IconName::Settings2).size_4().text_color(color))
+            .tooltip(move |window, cx| {
+                Tooltip::new("Settings — connections, models, agents, usage, system status")
+                    .build(window, cx)
+            })
             .test_support()
             .on_click(move |_, _, cx| {
-                wb.update(cx, |wb, cx| wb.toggle_drawer(surface, cx));
+                wb.update(cx, |wb, cx| wb.toggle_settings(cx));
+            })
+    }
+
+    /// The rail's quota gauge: opens/closes the all-providers quota drawer.
+    fn render_rail_quota(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let wb = cx.entity();
+        let active = self.quota_drawer;
+        let color = if active {
+            theme.foreground
+        } else {
+            theme.muted_foreground
+        };
+        div()
+            .id("dock-rail-quota")
+            .flex()
+            .items_center()
+            .justify_center()
+            .size_8()
+            .rounded_md()
+            .cursor_pointer()
+            .when(active, |this| this.bg(theme.secondary))
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
+            .child(Icon::new(KitIconName::Gauge).size_4().text_color(color))
+            .tooltip(move |window, cx| {
+                Tooltip::new("Plan quota — allowance windows and reset cards").build(window, cx)
+            })
+            .test_support()
+            .on_click(move |_, _, cx| {
+                wb.update(cx, |wb, cx| wb.toggle_quota_drawer(cx));
             })
     }
 
@@ -3768,7 +3922,7 @@ impl Workbench {
     /// (CONTEXT.md): the implicit local hub, every saved remote hub, and the
     /// Add button. Add and Edit open the `ServerForm` dialog, so the section
     /// stays a list; switching restarts the dial on the new target.
-    fn render_servers_section(&self, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_servers_section(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
         let mut column = div().flex().flex_col().gap_1();
@@ -3994,7 +4148,7 @@ impl Workbench {
     /// native-named options in one kit ButtonGroup, the active one selected.
     /// The catalogs carry exactly `en` + `zh-CN` (i18n.rs collapsed any zh*
     /// system locale already), so the segment never needs a third option.
-    fn render_language_section(&self, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_language_section(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let wb = cx.entity();
         let zh = rust_i18n::locale().starts_with("zh");
@@ -4051,7 +4205,7 @@ impl Workbench {
     /// three ladder steps in one kit ButtonGroup, the active one selected.
     /// A global preference, so it sits in the left dock beside the language
     /// segment — not in the session panel.
-    fn render_font_size_section(&self, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_font_size_section(&self, cx: &Context<Self>) -> AnyElement {
         use crate::ui_prefs::FontScale;
         let theme = cx.theme();
         let wb = cx.entity();
@@ -4124,7 +4278,7 @@ impl Workbench {
     /// ButtonGroup beside the appearance picks. The hint spells the trust
     /// boundary — a pane's programs (ssh forwards escape sequences
     /// verbatim) would receive the host clipboard while this is on.
-    fn render_osc52_section(&self, cx: &Context<Self>) -> AnyElement {
+    pub(crate) fn render_osc52_section(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let wb = cx.entity();
         let on = crate::ui_prefs::terminal_osc52_read();
@@ -4170,272 +4324,103 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// The settings drawer's body (formerly the config dock panel): the
-    /// entry list for the high-frequency config pages (requirements §4 —
-    /// the TS app reaches these from the settings panel), plus the server
-    /// book, appearance picks, the hub upgrade check and the workflow gate
-    /// switch. The account quota has its own rail toggle and drawer
-    /// (`DrawerSurface::Quota`) plus a page entry in the list below, so it
-    /// does not repeat here. The drawer frame (`render_drawer`) provides
-    /// the chrome — header, close, border; scrolling lives here.
-    fn render_config_panel(&self, cx: &Context<Self>) -> AnyElement {
+    /// The hub staleness check (TS SettingsPanel `checkHubUpgrade`): one
+    /// button, busy while POST /api/upgrade flies, the verdict note under
+    /// it. The hub alone decides whether to restart; discovery's poll and
+    /// the tabs' reconnect ride out a respawn. Lives in the overlay's
+    /// General pane (ADR-0014 §1).
+    pub(crate) fn render_hub_upgrade_section(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
-        // No caption row: the drawer frame's header already names the panel
-        // (the old dock panel needed its own — it had no frame).
-        let mut column = div().flex().flex_col().gap_2().p_2();
-
-        column = column.child(self.render_servers_section(cx));
-
-        // The language segment (batch H3, SidePanel.tsx:167-187): two
-        // native-named options in one rounded track, the active one raised.
-        // Both the header and the flip's effect resolve through t!() at
-        // paint time, so the pick re-renders the whole chrome at once.
-        column = column.child(self.render_language_section(cx));
-
-        // The font-size segment (SidePanel.tsx:189-210): the chat ladder,
-        // beside the language pick — both are appearance preferences.
-        column = column.child(self.render_font_size_section(cx));
-
-        // The OSC 52 clipboard-read gate (req 2.8 follow-up): off by
-        // default, fail-closed — the flip applies to live panes at once.
-        column = column.child(self.render_osc52_section(cx));
-
-        // The hub staleness check (TS SettingsPanel `checkHubUpgrade`): one
-        // button, busy while POST /api/upgrade flies, the verdict note under
-        // it. The hub alone decides whether to restart; discovery's poll and
-        // the tabs' reconnect ride out a respawn.
-        {
-            let runtime = runtime.clone();
-            let busy = self.snap.hub_upgrade_busy;
-            let mut block = div().flex().flex_col().gap_1().min_w_0().child(
-                Button::new("hub-upgrade-check")
-                    .secondary()
-                    .small()
-                    .w_full()
-                    .label(
-                        if busy {
-                            t!("panel.upgradeBusy")
-                        } else {
-                            t!("panel.upgrade")
-                        }
-                        .into_owned(),
-                    )
-                    .disabled(busy)
-                    .on_click(move |_, _, _| runtime.send(UiCommand::UpgradeHub)),
-            );
-            if let Some(note) = self.snap.hub_upgrade_note.as_deref() {
-                block = block.child(
-                    div()
-                        .id("hub-upgrade-note")
-                        .test_support()
-                        .text_size(ui_text(12.))
-                        .text_color(theme.muted_foreground)
-                        .child(note.to_string()),
-                );
-            }
-            column = column.child(block);
-        }
-
-        // (icon, title, description, entry command constructor). The command
-        // is built inside the click closure — click listeners are `Fn`, so a
-        // prebuilt command would have to be Clone for nothing. The five
-        // batch-I sections ride the same list (requirements §7); the
-        // Workflows page joins only while the gate verdict says the feature
-        // is ON (batch M — TS hides the row unless `workflowGate?.enabled
-        // === true`; fail-closed, the gate switch row below is the way in).
-        let mut entries: Vec<(KitIconName, String, String, fn() -> UiCommand)> = vec![
-            (
-                KitIconName::Boxes,
-                t!("zconfig.entryModels").into_owned(),
-                t!("zconfig.entryModelsDesc").into_owned(),
-                || UiCommand::OpenModels,
-            ),
-            (
-                KitIconName::ChartColumn,
-                t!("zconfig.entryUsage").into_owned(),
-                t!("zconfig.entryUsageDesc").into_owned(),
-                || UiCommand::OpenUsage,
-            ),
-            (
-                KitIconName::Gauge,
-                t!("zconfig.entryQuota").into_owned(),
-                t!("zconfig.entryQuotaDesc").into_owned(),
-                || UiCommand::OpenQuota,
-            ),
-            (
-                KitIconName::Activity,
-                t!("zconfig.entrySystem").into_owned(),
-                t!("zconfig.entrySystemDesc").into_owned(),
-                || UiCommand::OpenSystemStatus,
-            ),
-            (
-                KitIconName::Puzzle,
-                t!("zconfig.entrySkills").into_owned(),
-                t!("zconfig.entrySkillsDesc").into_owned(),
-                || UiCommand::OpenConfigPage {
-                    page: crate::runtime::ConfigPageKind::Skills,
-                },
-            ),
-            (
-                KitIconName::PlugZap,
-                t!("zconfig.entryMcp").into_owned(),
-                t!("zconfig.entryMcpDesc").into_owned(),
-                || UiCommand::OpenConfigPage {
-                    page: crate::runtime::ConfigPageKind::Mcp,
-                },
-            ),
-            (
-                KitIconName::Webhook,
-                t!("zconfig.entryHooks").into_owned(),
-                t!("zconfig.entryHooksDesc").into_owned(),
-                || UiCommand::OpenConfigPage {
-                    page: crate::runtime::ConfigPageKind::Hooks,
-                },
-            ),
-            (
-                KitIconName::Bot,
-                t!("zconfig.entryAgents").into_owned(),
-                t!("zconfig.entryAgentsDesc").into_owned(),
-                || UiCommand::OpenConfigPage {
-                    page: crate::runtime::ConfigPageKind::Agents,
-                },
-            ),
-            (
-                KitIconName::ArchiveRestore,
-                t!("zconfig.entryBackups").into_owned(),
-                t!("zconfig.entryBackupsDesc").into_owned(),
-                || UiCommand::OpenConfigPage {
-                    page: crate::runtime::ConfigPageKind::Backups,
-                },
-            ),
-            (
-                KitIconName::Download,
-                t!("zconfig.entryAppUpdate").into_owned(),
-                t!("zconfig.entryAppUpdateDesc").into_owned(),
-                || UiCommand::OpenConfigPage {
-                    page: crate::runtime::ConfigPageKind::AppUpdate,
-                },
-            ),
-        ];
-        if self.snap.workflow_gate.as_ref().is_some_and(|g| g.enabled) {
-            entries.push((
-                KitIconName::Workflow,
-                t!("zconfig.entryWorkflows").into_owned(),
-                t!("zconfig.entryWorkflowsDesc").into_owned(),
-                || UiCommand::OpenWorkflows,
-            ));
-        }
-        for (icon, title, description, open) in entries {
-            let runtime = runtime.clone();
-            column = column.child(
+        let busy = self.snap.hub_upgrade_busy;
+        let mut block = div().flex().flex_col().gap_1().min_w_0().child(
+            Button::new("hub-upgrade-check")
+                .secondary()
+                .small()
+                .w_full()
+                .label(
+                    if busy {
+                        t!("panel.upgradeBusy")
+                    } else {
+                        t!("panel.upgrade")
+                    }
+                    .into_owned(),
+                )
+                .disabled(busy)
+                .on_click(move |_, _, _| runtime.send(UiCommand::UpgradeHub)),
+        );
+        if let Some(note) = self.snap.hub_upgrade_note.as_deref() {
+            block = block.child(
                 div()
-                    .id(SharedString::from(format!("config-entry-{title}")))
+                    .id("hub-upgrade-note")
                     .test_support()
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .px_2()
-                    .py_2()
-                    .rounded_md()
-                    .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
-                    .cursor_pointer()
-                    .child(
-                        Icon::new(icon)
-                            .size_4()
-                            .flex_none()
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(px(2.))
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .text_size(ui_text(13.))
-                                    .text_color(theme.foreground)
-                                    .child(title.to_string()),
-                            )
-                            .child(
-                                div()
-                                    .text_size(ui_text(10.))
-                                    .text_color(theme.muted_foreground)
-                                    .child(description.to_string()),
-                            ),
-                    )
-                    .on_click(move |_, _, _| runtime.send(open())),
+                    .text_size(ui_text(12.))
+                    .text_color(theme.muted_foreground)
+                    .child(note.to_string()),
             );
         }
+        block.into_any_element()
+    }
 
-        // The machine-level workflow switch (J2, bridge ≥0.53): ALWAYS
-        // visible — with the remote verdict off this override is the only
-        // way in, so unlike the gated page above it must not hide. The
-        // subtitle names the switch's current position (auto until a probe
-        // or a write says otherwise — fail-closed, never "off").
+    /// The machine-level workflow switch (J2, bridge ≥0.53) row — ALWAYS
+    /// visible in the overlay's General pane: with the remote verdict off
+    /// this override is the only way in (the Workflows rail row hides
+    /// while disabled), so it must not hide either. The subtitle names the
+    /// switch's current position (auto until a probe or a write says
+    /// otherwise — fail-closed, never "off").
+    pub(crate) fn render_workflow_gate_entry(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
         let wb_gate = cx.entity();
         let gate_label = crate::workflows_page::gate_position_label(
             crate::workflows_page::gate_position(self.snap.workflow_gate.as_ref()),
         );
-        column = column.child(
-            div()
-                .id("config-entry-Workflow switch")
-                .test_support()
-                .flex()
-                .items_start()
-                .gap_2()
-                .px_2()
-                .py_2()
-                .rounded_md()
-                .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
-                .cursor_pointer()
-                .child(
-                    Icon::new(KitIconName::Workflow)
-                        .size_4()
-                        .flex_none()
-                        .text_color(theme.muted_foreground),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(2.))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(ui_text(13.))
-                                .text_color(theme.foreground)
-                                .child(t!("zconfig.workflowGate").into_owned()),
-                        )
-                        .child(
-                            div()
-                                .text_size(ui_text(10.))
-                                .text_color(theme.muted_foreground)
-                                .child(gate_label),
-                        ),
-                )
-                .on_click(move |_, _, cx| {
-                    // Opening the sheet also seeds the verdict probe (the
-                    // position label is only honest once read).
-                    wb_gate.update(cx, |this, cx| {
-                        this.workflow_gate_sheet = true;
-                        if this.snap.workflow_gate.is_none() {
-                            this.runtime.send(UiCommand::ProbeWorkflowGate);
-                        }
-                        cx.notify();
-                    });
-                }),
-        );
-
         div()
-            .id("config-panel")
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .overflow_y_scroll()
-            .overflow_x_hidden()
-            .child(column)
+            .id("config-entry-Workflow switch")
+            .test_support()
+            .flex()
+            .items_start()
+            .gap_2()
+            .px_2()
+            .py_2()
+            .rounded_md()
+            .hover(|this| this.bg(crate::ui_tokens::hover_bg()))
+            .cursor_pointer()
+            .child(
+                Icon::new(KitIconName::Workflow)
+                    .size_4()
+                    .flex_none()
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(ui_text(13.))
+                            .text_color(theme.foreground)
+                            .child(t!("zconfig.workflowGate").into_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui_text(10.))
+                            .text_color(theme.muted_foreground)
+                            .child(gate_label),
+                    ),
+            )
+            .on_click(move |_, _, cx| {
+                // Opening the sheet also seeds the verdict probe (the
+                // position label is only honest once read).
+                wb_gate.update(cx, |this, cx| {
+                    this.workflow_gate_sheet = true;
+                    if this.snap.workflow_gate.is_none() {
+                        this.runtime.send(UiCommand::ProbeWorkflowGate);
+                    }
+                    cx.notify();
+                });
+            })
             .into_any_element()
     }
 
@@ -8077,18 +8062,14 @@ impl Render for Workbench {
         // The inline approval card reconciles here: its interactive state
         // entities need a window (see reconcile_card).
         self.reconcile_card(window, cx);
-        let toast = self.snap.toast.as_ref().map(|t| t.text.clone());
         let runtime = self.runtime.clone();
-        let theme = cx.theme();
-        // A snap page (driver-owned) replaces the workbench surfaces below
-        // the status bar. The drawer rides ABOVE the current surface — the
-        // rail's quota drawer never replaces anything.
-        let snap_page_open = self.snap.system_status.is_some()
-            || self.snap.models_page.is_some()
-            || self.snap.quota_page.is_some()
-            || self.snap.usage_page.is_some()
-            || self.snap.config_section_page.is_some()
-            || self.snap.workflows_page.is_some();
+        // The settings overlay (ADR-0014 §1) replaces the workbench
+        // surfaces below the status bar, hosting every config page in its
+        // content pane. Built before the chain: it needs the window for the
+        // rail's collapse verdict.
+        let settings_overlay = self
+            .settings
+            .map(|_| self.render_settings_overlay(window, cx));
         div()
             .size_full()
             .flex()
@@ -8150,12 +8131,12 @@ impl Render for Workbench {
             .on_action(cx.listener(Self::on_select_tab8))
             .on_action(cx.listener(Self::on_select_tab9))
             .child(self.render_status_bar(cx))
-            // The content region: the current surface — the dock and chat, or
-            // an open configuration page replacing them (the TS configuration
-            // screens replace the chat/picker screens wholesale) — plus the
-            // overlay drawer riding ON TOP of it. `relative` anchors the
-            // drawer; later root siblings (sheets, viewer, dialogs) still
-            // paint above it.
+            // The content region: the current surface — the dock and chat,
+            // or the settings overlay replacing them (every config page
+            // lives in its content pane, ADR-0014 §1) — plus the quota
+            // drawer riding ON TOP of it. `relative` anchors the drawer;
+            // later root siblings (sheets, viewer, dialogs) still paint
+            // above it.
             .child(
                 div()
                     .relative()
@@ -8163,88 +8144,23 @@ impl Render for Workbench {
                     .flex_1()
                     .min_h_0()
                     .when_some(
-                        if !snap_page_open {
+                        if self.settings.is_none() {
                             Some(self.render_dock(cx))
                         } else {
                             None
                         },
                         |this, content| this.child(content),
                     )
-                    .when_some(
-                        self.snap.models_page.clone(),
-                        // The form replaces the page while open (TS ConfigFormSheet:
-                        // "a full screen of its own … a half-open form never sits
-                        // behind the section list").
-                        |this, _page| {
-                            this.child(if let Some(_form) = &self.provider_form {
-                                self.render_provider_form(cx)
-                            } else if self.models_form.is_some() {
-                                self.render_models_form(cx)
-                            } else {
-                                self.render_models_page(cx)
-                            })
-                        },
-                    )
-                    .when_some(self.snap.system_status.clone(), |this, page| {
-                        this.child(render_system_status_page(
-                            &page,
-                            self.snap.config_notice.as_deref(),
-                            self.snap.pending_restart,
-                            // The restart addresses the ACTIVE TAB's bridge (the
-                            // desktop's connected-session instance); with no tab
-                            // open the note shows its no-instance hint instead.
-                            self.snap.active_tab.is_some(),
-                            toast.as_deref(),
-                            &runtime,
-                            cx,
-                        ))
+                    // The settings overlay: one full-width surface hosting
+                    // every section (the driver-side page views below it
+                    // feed its content pane).
+                    .when_some(settings_overlay, |this, overlay| {
+                        this.child(overlay)
                     })
-                    .when_some(
-                        self.snap.quota_page.clone(),
-                        // The plan-quota page (settings entry): a full page
-                        // like every config section. The RAIL quota drawer is
-                        // the separate all-providers surface.
-                        |this, _page| this.child(self.render_quota_page(cx)),
-                    )
-                    .when_some(self.snap.usage_page.clone(), |this, page| {
-                        this.child(render_usage_page(
-                            &page,
-                            self.snap.config_notice.as_deref(),
-                            self.snap.pending_restart,
-                            // The restart addresses the ACTIVE TAB's bridge (the
-                            // desktop's connected-session instance); with no tab
-                            // open the note shows its no-instance hint instead.
-                            self.snap.active_tab.is_some(),
-                            &runtime,
-                            &theme,
-                        ))
-                    })
-                    // The ZCode-config section pages (batch I): the open form
-                    // replaces the page while open, exactly like the Models form.
-                    .when_some(self.snap.config_section_page.clone(), |this, _page| {
-                        this.child(if self.zconfig_form.is_some() {
-                            self.render_zconfig_form(cx)
-                        } else {
-                            crate::zconfig_pages::render_config_section_page(self, cx)
-                        })
-                    })
-                    // The Workflows page (batch J): the same contract — the open
-                    // start/amend/meta form replaces the page while open.
-                    .when_some(self.snap.workflows_page.clone(), |this, _page| {
-                        this.child(if self.workflow_start_form.is_some() {
-                            self.render_workflow_start_form(cx)
-                        } else if self.workflow_amend_form.is_some() {
-                            self.render_workflow_amend_form(cx)
-                        } else if self.workflow_meta_form.is_some() {
-                            self.render_workflow_meta_form(cx)
-                        } else {
-                            crate::workflows_page::render_workflows_page(self, cx)
-                        })
-                    })
-                    // The overlay drawer floats above whichever surface is
-                    // current — settings or the all-providers quota display.
-                    .when_some(self.drawer, |this, surface| {
-                        this.child(self.render_drawer(surface, cx))
+                    // The quota drawer floats above whichever surface is
+                    // current — the all-providers quota display.
+                    .when(self.quota_drawer, |this| {
+                        this.child(self.render_quota_drawer(cx))
                     }),
             )
             // The WorkflowGate sheet (J2) sits above the config surfaces —
@@ -8321,40 +8237,23 @@ impl Workbench {
     /// interactive; the X, Esc, and the rail toggle close it. Later root
     /// siblings (sheets, file viewer) and the deferred layers (lightbox,
     /// quit dialog) paint above.
-    fn render_drawer(&self, surface: DrawerSurface, cx: &Context<Self>) -> AnyElement {
+    /// The all-providers quota drawer (the one drawer left): slides out
+    /// beside the rail, floating above the current surface. The refresh
+    /// rides the header; the body is pure content from the shared card
+    /// renderer.
+    fn render_quota_drawer(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let wb = cx.entity();
-        let (panel_id, title, header_trail, body) = match surface {
-            DrawerSurface::Settings => (
-                "drawer-settings",
-                t!("panel.title").into_owned(),
-                None,
-                self.render_config_panel(cx),
-            ),
-            // The all-providers quota display (the mobile side panels' card
-            // at drawer scale). The refresh rides the header; the body is
-            // pure content from the shared card renderer.
-            DrawerSurface::Quota => {
-                let refresh = self.runtime.clone();
-                (
-                    "drawer-quota",
-                    t!("quota.title").into_owned(),
-                    Some(
-                        Button::new("quota-refresh")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::RefreshCw)
-                            .tooltip(t!("quota.refresh").into_owned())
-                            .on_click(move |_, _, _| refresh.send(UiCommand::RefreshQuota))
-                            .into_any_element(),
-                    ),
-                    crate::quota_card::render_quota_drawer_body(&self.snap.quota_card, &theme),
-                )
-            }
-        };
-        let close_surface = surface;
+        let refresh = self.runtime.clone();
+        let header_trail = Button::new("quota-refresh")
+            .ghost()
+            .xsmall()
+            .icon(IconName::RefreshCw)
+            .tooltip(t!("quota.refresh").into_owned())
+            .on_click(move |_, _, _| refresh.send(UiCommand::RefreshQuota))
+            .into_any_element();
         div()
-            .id(SharedString::from(panel_id))
+            .id("drawer-quota")
             .test_support()
             .flex()
             .flex_col()
@@ -8400,9 +8299,9 @@ impl Workbench {
                             .truncate()
                             .text_size(ui_text(13.))
                             .text_color(theme.foreground)
-                            .child(title),
+                            .child(t!("quota.title").into_owned()),
                     )
-                    .when_some(header_trail, |this, trail| this.child(trail))
+                    .child(header_trail)
                     .child(
                         Button::new("drawer-close")
                             .ghost()
@@ -8410,11 +8309,14 @@ impl Workbench {
                             .icon(KitIconName::X)
                             .tooltip(t!("panel.close"))
                             .on_click(move |_, _, cx| {
-                                wb.update(cx, |wb, cx| wb.toggle_drawer(close_surface, cx));
+                                wb.update(cx, |wb, cx| wb.toggle_quota_drawer(cx));
                             }),
                     ),
             )
-            .child(body)
+            .child(crate::quota_card::render_quota_drawer_body(
+                &self.snap.quota_card,
+                &theme,
+            ))
             .into_any_element()
     }
 
@@ -10269,12 +10171,12 @@ mod ui_tests {
         .unwrap();
     }
 
-    /// The overlay drawer (settings + the all-providers quota) floats above
-    /// the chat WITHOUT replacing it: the rail toggles open it over a
-    /// still-mounted composer (and seed the quota read), the drawer is
-    /// anchored flush right of the rail at full height, Esc closes, and the
-    /// plan-quota PAGE (the settings entry) is the separate full-page
-    /// surface that also dismisses the drawer.
+    /// The settings overlay (ADR-0014 §1) replaces the chat surfaces with
+    /// its rail + content pane; the all-providers quota drawer still floats
+    /// above an intact chat. The gear opens the overlay (seeding its reads
+    /// + the fail-closed gate probe), Esc closes it (retiring the hosted
+    /// section page), and the last-visited section persists across
+    /// reopens.
     #[gpui_kit::test]
     fn drawers_overlay_the_chat_without_replacing_it(cx: &mut TestAppContext) {
         let _windows = super::window_test_lock();
@@ -10284,37 +10186,36 @@ mod ui_tests {
         });
         let (handle, wb, runtime) = cx.update(|cx| open(cx, connected_snapshot(), 1000.));
 
-        // Settings: the rail toggle opens the drawer over an intact chat.
+        // The gear opens the overlay; the General pane is the landing.
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            assert!(window.try_find("drawer-settings").is_none());
+            assert!(window.try_find("settings-overlay").is_none());
             assert!(window.find("composer").visible());
-            window.click("dock-rail-config", cx);
+            window.click("dock-rail-settings", cx);
             window.draw(cx).clear(cx);
-            assert!(window.find("drawer-settings").visible());
-            // The drawer's body is up (the server book's Add button rides
-            // its top section — the scroll container itself paints nothing).
+            assert!(window.find("settings-overlay").visible());
+            assert!(window.find("settings-nav-general").visible());
+            // The General pane is up (the server book's Add button rides its
+            // top section — the scroll container itself paints nothing).
             assert!(window.find("server-add").visible());
-            // The chat below stays mounted — the drawer replaced nothing.
-            assert!(window.find("composer").visible());
-            // Left-anchored flush against the rail, full height below the
-            // status bar (36px): the inset positioning resolves on the FIRST
-            // layout, not only after a resize.
-            let drawer = window.find("drawer-settings").bounds();
-            assert_eq!(drawer.origin.x, px(super::RAIL_WIDTH));
-            assert_eq!(drawer.size.width, px(super::DRAWER_WIDTH));
-            // Below the h_9 (36px) status bar: the content region's top.
-            assert_eq!(drawer.origin.y, px(36.));
+            // The overlay REPLACES the chat surfaces (the old drawer floated).
+            assert!(window.try_find("composer").is_none());
+            // Full-width: the overlay starts flush at the content region's
+            // left and reaches the window's right edge on the FIRST layout.
+            let overlay = window.find("settings-overlay").bounds();
+            assert_eq!(overlay.origin.x, px(0.));
+            assert_eq!(overlay.origin.y, px(36.));
+            assert!(overlay.size.width > px(800.));
             assert!(
-                drawer.size.height > px(600.),
-                "the drawer spans the content region's height"
+                overlay.size.height > px(600.),
+                "the overlay spans the content region's height"
             );
             assert!(
                 runtime
                     .recorded_commands()
                     .iter()
-                    .any(|c| matches!(c, UiCommand::RefreshQuota)),
-                "opening the drawer seeds the quota read"
+                    .any(|c| matches!(c, UiCommand::RefreshQuota | UiCommand::ProbeWorkflowGate)),
+                "opening the overlay seeds its reads (quota + the gate probe)"
             );
             wb.update(cx, |wb, cx| wb.on_stop_turn(&super::StopTurn, window, cx));
         })
@@ -10322,8 +10223,16 @@ mod ui_tests {
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
             assert!(
-                window.try_find("drawer-settings").is_none(),
-                "Esc closes the settings drawer"
+                window.try_find("settings-overlay").is_none(),
+                "Esc closes the overlay"
+            );
+            assert!(window.find("composer").visible());
+            assert!(
+                !runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::CloseQuota)),
+                "no driver page was open to retire"
             );
         })
         .unwrap();
@@ -10339,7 +10248,6 @@ mod ui_tests {
                 window.find("composer").visible(),
                 "still no surface replaced"
             );
-            assert!(window.try_find("quota-back").is_none(), "not the plan page");
             wb.update(cx, |wb, cx| wb.on_stop_turn(&super::StopTurn, window, cx));
         })
         .unwrap();
@@ -10359,24 +10267,27 @@ mod ui_tests {
         })
         .unwrap();
 
-        // The plan-quota PAGE (settings entry → OpenQuota): a full page that
-        // replaces the surfaces and dismisses any open drawer.
+        // The plan-quota SECTION (overlay rail → Quota): the hosted page
+        // replaces the overlay's content pane, and closing the overlay
+        // retires it.
         cx.update_window(handle.into(), |_, window, cx| {
-            window.click("dock-rail-quota", cx);
+            window.click("dock-rail-settings", cx);
+            window.click("settings-nav-quota", cx);
             let mut snap = connected_snapshot();
             snap.quota_page = Some(crate::runtime::QuotaPageView::default());
             wb.update(cx, |wb, cx| {
                 wb.on_runtime_event(RuntimeEvent::Snapshot(snap), cx)
             });
             window.draw(cx).clear(cx);
-            assert!(window.find("quota-back").visible(), "the plan page mounted");
+            assert!(window.find("quota-body").visible(), "the plan page hosted");
+            assert!(window.find("settings-overlay").visible());
             assert!(
                 window.try_find("composer").is_none(),
-                "a page replaces the chat"
+                "the overlay still replaces the chat"
             );
             assert!(
                 window.try_find("drawer-quota").is_none(),
-                "the page dismisses the drawer"
+                "the section dismisses the drawer"
             );
             // The page fills the content region on the FIRST layout (the
             // wrapper must not clip it until a resize): the body's bottom
@@ -10385,6 +10296,40 @@ mod ui_tests {
             assert!(
                 page_body.bottom() >= px(695.),
                 "the page body reaches the region's bottom, not a truncated slice"
+            );
+            assert!(
+                runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::OpenQuota)),
+                "selecting the section seeded the page"
+            );
+            wb.update(cx, |wb, cx| wb.on_stop_turn(&super::StopTurn, window, cx));
+        })
+        .unwrap();
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("settings-overlay").is_none(),
+                "Esc closes the overlay"
+            );
+            assert!(
+                runtime
+                    .recorded_commands()
+                    .iter()
+                    .any(|c| matches!(c, UiCommand::CloseQuota)),
+                "closing the overlay retired the hosted page"
+            );
+        })
+        .unwrap();
+
+        // Reopen lands on the LAST-VISITED section (acceptance scenario 1).
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.click("dock-rail-settings", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("quota-body").visible(),
+                "the overlay reopens on the quota section"
             );
         })
         .unwrap();
@@ -10545,7 +10490,7 @@ mod ui_tests {
         let (handle, _wb, runtime) = cx.update(|cx| open(cx, snap, 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
             window.draw(cx).clear(cx);
-            window.click("dock-rail-config", cx);
+            window.click("dock-rail-settings", cx);
             window.draw(cx).clear(cx);
             assert!(
                 window.try_find("server-form").is_none(),
@@ -10867,14 +10812,29 @@ mod ui_tests {
             busy: false,
         });
 
-        let (handle, _wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
-            // Painting the page is the regression: before the fix this frame
+            // The page renders inside the settings overlay now (ADR-0014 §1).
+            wb.update(cx, |wb, cx| {
+                wb.open_settings(
+                    crate::settings_overlay::SettingsSection::Models,
+                    cx,
+                )
+            });
+            // The delete control lives in the EDIT form's footer (the form
+            // contract), so the deletable surface is the open form.
+            let target = ModelRef {
+                provider_id: Some("prov_1".to_string()),
+                provider_name: Some("Provider One".to_string()),
+                model_id: Some("model_1".to_string()),
+            };
+            wb.update(cx, |this, cx| this.open_models_form(Some(target), window, cx));
+            // Painting the form is the regression: before the fix this frame
             // aborted the process on the double lease.
             window.draw(cx).clear(cx);
             assert!(
-                window.find("model-delete-0").visible(),
-                "the deletable row's control rendered (its presence is what \
+                window.find("model-delete").visible(),
+                "the edit form's delete control rendered (its presence is what \
                  used to trigger the panic)"
             );
         })
@@ -10920,6 +10880,13 @@ mod ui_tests {
 
         let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
         cx.update_window(handle.into(), |_, window, cx| {
+            // The page renders inside the settings overlay now (ADR-0014 §1).
+            wb.update(cx, |wb, cx| {
+                wb.open_settings(
+                    crate::settings_overlay::SettingsSection::Models,
+                    cx,
+                )
+            });
             window.draw(cx).clear(cx);
             // The row's edit control — the gesture that crashed.
             let target = ModelRef {
@@ -10942,6 +10909,294 @@ mod ui_tests {
                 window.find("model-save").visible(),
                 "the save control rendered (its disabled state reads the form)"
             );
+            assert!(
+                window.find("model-delete").visible(),
+                "the edit form's footer carries the delete control (the form \
+                 contract: delete lives in the edit form's footer, not rows)"
+            );
+        })
+        .unwrap();
+    }
+
+    /// The provider form's contract (ADR-0014): an UNKNOWN api_type rides
+    /// verbatim through the save (never downgraded to a default), the form
+    /// starts clean (Save disabled until dirty), and a typed valid URL makes
+    /// it dirty — the write carries exactly what the form holds.
+    #[gpui_kit::test]
+    fn the_provider_form_keeps_unknown_api_types_and_gates_on_dirty(
+        cx: &mut TestAppContext,
+    ) {
+        use protocol::config_decode::ProviderRef;
+
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let snap = connected_snapshot();
+        let (handle, wb, rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            wb.update(cx, |this, cx| {
+                this.open_provider_form(
+                    ProviderRef {
+                        provider_id: Some("prov_1".to_string()),
+                        provider_name: Some("Provider One".to_string()),
+                        base_url: Some(String::new()),
+                        api_type: Some("weird-vendor".to_string()),
+                        has_api_key: false,
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                );
+            });
+            wb.update(cx, |this, cx| {
+                let form = this.provider_form.as_ref().expect("form open");
+                // The unknown spelling rides verbatim; the untouched form is
+                // clean (Save stays disabled) and the empty URL is invalid.
+                assert_eq!(form.api_type.as_deref(), Some("weird-vendor"));
+                assert!(!this.provider_form_dirty(cx));
+                assert!(!Workbench::provider_url_ok(""));
+                // Typing a valid URL flips both gates.
+                form.base_url.update(cx, |state, cx| {
+                    state.set_value("https://api.example.com".to_string(), window, cx)
+                });
+                assert!(this.provider_form_dirty(cx));
+                this.submit_provider_form(cx);
+            });
+            let cmds = rt.recorded_commands();
+            match cmds.as_slice() {
+                [UiCommand::UpdateProvider {
+                    api_type, base_url, ..
+                }] => {
+                    assert_eq!(
+                        api_type.as_deref(),
+                        Some("weird-vendor"),
+                        "the unknown api_type rides verbatim"
+                    );
+                    assert_eq!(
+                        base_url.as_deref(),
+                        Some("https://api.example.com")
+                    );
+                }
+                other => panic!("expected one UpdateProvider, got {other:?}"),
+            }
+        })
+        .unwrap();
+    }
+
+    /// The form contract's dirty leave: the first Esc on a dirty form ARMS
+    /// the discard confirm (the form stays open), the second closes it. A
+    /// clean form closes on the first Esc.
+    #[gpui_kit::test]
+    fn esc_on_a_dirty_form_asks_before_discarding(cx: &mut TestAppContext) {
+        use protocol::config_decode::{ModelRef, ModelsBlock, ModelsPayload};
+
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.models_page = Some(crate::runtime::ModelsPageView {
+            supported: Some(true),
+            loading: false,
+            error: None,
+            models: Some(ModelsPayload {
+                ok: Some(true),
+                models: Some(ModelsBlock {
+                    available: Some(vec![ModelRef {
+                        provider_id: Some("prov_1".to_string()),
+                        provider_name: Some("Provider One".to_string()),
+                        model_id: Some("model_1".to_string()),
+                    }]),
+                    providers: None,
+                    model_rules: None,
+                }),
+            }),
+            busy: false,
+        });
+
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            // The form renders inside the settings overlay, so the strip is
+            // findable only with the overlay hosting the models page.
+            wb.update(cx, |wb, cx| {
+                wb.open_settings(
+                    crate::settings_overlay::SettingsSection::Models,
+                    cx,
+                )
+            });
+            let target = ModelRef {
+                provider_id: Some("prov_1".to_string()),
+                provider_name: Some("Provider One".to_string()),
+                model_id: Some("model_1".to_string()),
+            };
+            wb.update(cx, |this, cx| this.open_models_form(Some(target), window, cx));
+            // A clean edit form closes on the first Esc... but flipping the
+            // enabled switch makes it dirty first.
+            wb.update(cx, |this, cx| {
+                assert!(!this.models_form_dirty(cx), "untouched edit form is clean");
+                if let Some(form) = &mut this.models_form {
+                    form.enabled = !form.enabled;
+                }
+                assert!(this.models_form_dirty(cx));
+                // First Esc: the discard confirm arms, the form stays open.
+                assert!(this.close_open_settings_form(cx));
+                assert!(this.models_form.is_some(), "the armed discard keeps the form");
+                assert!(this.settings_form_confirm_discard);
+            });
+            // The arm is VISIBLE, or the press reads as a dead key (the form
+            // contract's "ask"). Draws sit between the workbench updates —
+            // painting inside an update would double-lease the workbench.
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("discard-armed").visible(),
+                "the armed discard renders its strip"
+            );
+            // Second Esc: the form closes and the arm stands down — and the
+            // strip goes with it.
+            wb.update(cx, |this, cx| {
+                assert!(this.close_open_settings_form(cx));
+                assert!(this.models_form.is_none());
+                assert!(!this.settings_form_confirm_discard);
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("discard-armed").is_none(),
+                "the strip left with the form"
+            );
+        })
+        .unwrap();
+    }
+
+    /// Overlay-level closes ride the same rung (the form contract: leaving a
+    /// dirty form asks, wherever the leave comes from). "Back to workspace"
+    /// first arms, then closes the form, and only the third press leaves the
+    /// overlay — one action never skips a level.
+    #[gpui_kit::test]
+    fn overlay_closes_wait_for_a_dirty_form(cx: &mut TestAppContext) {
+        use protocol::config_decode::{ModelRef, ModelsBlock, ModelsPayload};
+
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.models_page = Some(crate::runtime::ModelsPageView {
+            supported: Some(true),
+            loading: false,
+            error: None,
+            models: Some(ModelsPayload {
+                ok: Some(true),
+                models: Some(ModelsBlock {
+                    available: Some(vec![ModelRef {
+                        provider_id: Some("prov_1".to_string()),
+                        provider_name: Some("Provider One".to_string()),
+                        model_id: Some("model_1".to_string()),
+                    }]),
+                    providers: None,
+                    model_rules: None,
+                }),
+            }),
+            busy: false,
+        });
+
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            wb.update(cx, |wb, cx| {
+                wb.open_settings(
+                    crate::settings_overlay::SettingsSection::Models,
+                    cx,
+                )
+            });
+            let target = ModelRef {
+                provider_id: Some("prov_1".to_string()),
+                provider_name: Some("Provider One".to_string()),
+                model_id: Some("model_1".to_string()),
+            };
+            wb.update(cx, |this, cx| this.open_models_form(Some(target), window, cx));
+            wb.update(cx, |this, cx| {
+                if let Some(form) = &mut this.models_form {
+                    form.enabled = !form.enabled;
+                }
+                // First leave request: armed, everything stays open.
+                this.close_settings(cx);
+                assert!(this.settings.is_some(), "the armed discard keeps the overlay");
+                assert!(this.models_form.is_some());
+                assert!(this.settings_form_confirm_discard);
+                // Second: the form goes, the overlay stays.
+                this.close_settings(cx);
+                assert!(this.settings.is_some());
+                assert!(this.models_form.is_none());
+                assert!(!this.settings_form_confirm_discard);
+                // Third: the overlay itself finally closes.
+                this.close_settings(cx);
+                assert!(this.settings.is_none());
+            });
+        })
+        .unwrap();
+    }
+
+    /// Any edit stands the discard confirm down, not just typing: after the
+    /// first close arms, a level-chip toggle un-arms it and the next close
+    /// must ask again.
+    #[gpui_kit::test]
+    fn a_chip_toggle_stands_down_the_discard_confirm(cx: &mut TestAppContext) {
+        use protocol::config_decode::{ModelRef, ModelsBlock, ModelsPayload};
+
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.models_page = Some(crate::runtime::ModelsPageView {
+            supported: Some(true),
+            loading: false,
+            error: None,
+            models: Some(ModelsPayload {
+                ok: Some(true),
+                models: Some(ModelsBlock {
+                    available: Some(vec![ModelRef {
+                        provider_id: Some("prov_1".to_string()),
+                        provider_name: Some("Provider One".to_string()),
+                        model_id: Some("model_1".to_string()),
+                    }]),
+                    providers: None,
+                    model_rules: None,
+                }),
+            }),
+            busy: false,
+        });
+
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            let target = ModelRef {
+                provider_id: Some("prov_1".to_string()),
+                provider_name: Some("Provider One".to_string()),
+                model_id: Some("model_1".to_string()),
+            };
+            wb.update(cx, |this, cx| this.open_models_form(Some(target), window, cx));
+            wb.update(cx, |this, cx| {
+                if let Some(form) = &mut this.models_form {
+                    form.enabled = !form.enabled;
+                }
+                assert!(this.close_open_settings_form(cx));
+                assert!(this.settings_form_confirm_discard);
+                // The chip edit (a non-typing control) un-arms the confirm.
+                this.toggle_models_level("high", cx);
+                assert!(!this.settings_form_confirm_discard);
+                // So the next close asks again instead of discarding.
+                assert!(this.close_open_settings_form(cx));
+                assert!(this.models_form.is_some());
+                assert!(this.settings_form_confirm_discard);
+            });
         })
         .unwrap();
     }

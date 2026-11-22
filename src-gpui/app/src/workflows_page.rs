@@ -209,9 +209,39 @@ pub(crate) fn gate_position_label(pos: GatePosition) -> String {
 // The page frame + overview body
 // ---------------------------------------------------------------------------
 
-/// The Workflows page: one frame (back / title / refresh / notice), three
-/// layers (run > workflow > overview). The open forms replace the page
-/// while open — the workbench's render decides.
+/// The section's in-page crumb: (title, back) for the layer above the
+/// overview (run > workflow), `None` at the overview — there the overlay's
+/// top bar owns back (ADR-0014 §1). Shared by the breadcrumb bar and the
+/// Esc ladder, so a keystroke and a click unwind identically.
+pub(crate) fn workflows_crumb(page: &crate::runtime::WorkflowsPageView) -> Option<(String, UiCommand)> {
+    if let Some(run) = &page.run {
+        if let Some(viewer) = &run.artifact {
+            Some((
+                viewer
+                    .artifact
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| viewer.artifact.id.clone()),
+                UiCommand::WorkflowRunCloseArtifact,
+            ))
+        } else {
+            Some((
+                run.name
+                    .clone()
+                    .unwrap_or_else(|| t!("zconfig.workflows").into_owned()),
+                UiCommand::CloseWorkflowRun,
+            ))
+        }
+    } else {
+        page.detail
+            .as_ref()
+            .map(|d| (d.name.clone(), UiCommand::CloseWorkflowDetail))
+    }
+}
+
+/// The Workflows page: one frame (crumb bar / notice), three layers
+/// (run > workflow > overview). The open forms replace the page while
+/// open — the overlay's content switch decides.
 pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> AnyElement {
     let theme = cx.theme();
     let page = wb
@@ -221,32 +251,10 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
         .expect("render_workflows_page with no open page");
     let runtime = wb.runtime.clone();
 
-    // The header's back target follows the layer. With an artifact viewer
-    // open, back closes the viewer first (the TS back-gesture ladder:
-    // overlay, then page) and the title is the artifact's.
-    let (title, back): (String, UiCommand) = if let Some(run) = &page.run {
-        if let Some(viewer) = &run.artifact {
-            (
-                viewer
-                    .artifact
-                    .title
-                    .clone()
-                    .unwrap_or_else(|| viewer.artifact.id.clone()),
-                UiCommand::WorkflowRunCloseArtifact,
-            )
-        } else {
-            (
-                run.name
-                    .clone()
-                    .unwrap_or_else(|| t!("zconfig.workflows").into_owned()),
-                UiCommand::CloseWorkflowRun,
-            )
-        }
-    } else if let Some(d) = &page.detail {
-        (d.name.clone(), UiCommand::CloseWorkflowDetail)
-    } else {
-        (t!("zconfig.workflows").into_owned(), UiCommand::CloseWorkflows)
-    };
+    // The in-page breadcrumb bar (the crumb helper above): the section's
+    // own layers (run > workflow) own back here; at the OVERVIEW level the
+    // overlay's top bar already names the section and owns the way out.
+    let crumb = workflows_crumb(&page);
 
     let mut column = div()
         .id("workflows-page")
@@ -257,84 +265,47 @@ pub(crate) fn render_workflows_page(wb: &Workbench, cx: &Context<Workbench>) -> 
         .min_w_0()
         .overflow_x_hidden();
 
-    let runtime2 = runtime.clone();
-    column = column.child(
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .h_9()
-            .px_3()
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .child(
-                Button::new("workflows-back")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::ArrowLeft)
-                    .tooltip(t!("common.back"))
-                    .on_click(move |_, _, _| runtime.send(back.clone())),
-            )
-            .child(
-                div()
-                    .text_size(ui_text(13.))
-                    .text_color(theme.foreground)
-                    .truncate()
-                    .min_w_0()
-                    .child(title),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("workflows-refresh")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::RefreshCw)
-                    .tooltip(t!("common.reload"))
-                    .disabled(page.loading)
-                    .on_click(move |_, _, _| runtime2.send(UiCommand::RefreshWorkflows)),
-            ),
-    );
-
-    // The notice banner (write outcomes land here, like every config page).
-    if let Some(notice) = wb.snap.config_notice.as_deref() {
-        let runtime3 = wb.runtime.clone();
+    if let Some((title, back)) = crumb {
         column = column.child(
             div()
                 .flex()
                 .items_center()
-                .gap_2()
-                .mx_3()
-                .mt_2()
+                .gap_1()
+                .h_9()
                 .px_3()
-                .py_2()
                 .flex_none()
-                .rounded_md()
-                .bg(theme.secondary)
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.title_bar)
                 .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .text_size(ui_text(12.))
-                        .text_color(theme.foreground)
-                        .child(
-                            // A `notice.*` key resolves through the shared
-                            // catalog; plain failure text passes through.
-                            t!(notice).into_owned(),
-                        ),
-                )
-                .child(
-                    Button::new("workflows-notice-dismiss")
+                    Button::new("workflows-back")
                         .ghost()
                         .xsmall()
-                        .label("×")
-                        .tooltip(t!("common.dismiss"))
-                        .on_click(move |_, _, _| {
-                            runtime3.send(UiCommand::DismissConfigNotice)
-                        }),
-                ),
+                        .icon(IconName::ArrowLeft)
+                        .tooltip(t!("common.back"))
+                        .on_click(move |_, _, _| runtime.send(back.clone())),
+                )
+                .child(
+                    div()
+                        .text_size(ui_text(13.))
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .min_w_0()
+                        .child(title),
+                )
+                .child(div().flex_1()),
         );
+    }
+
+    // The notice banner (write outcomes land here, like every config page)
+    // — the one shared renderer (ADR-0014 §2).
+    if let Some(notice) = wb.snap.config_notice.as_ref() {
+        column = column.child(crate::config_notice::notice_banner(
+            theme,
+            notice,
+            &wb.runtime,
+            "workflows-notice-dismiss",
+        ));
     }
 
     let body = if let Some(run) = &page.run {

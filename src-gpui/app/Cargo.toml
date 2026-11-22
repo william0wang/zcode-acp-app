@@ -37,6 +37,7 @@ tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true
 rustls-native-certs.workspace = true
+pinyin = "0.10"
 
 [dev-dependencies]
 # UI integration tests (gpui-kit TESTING.md / website test guide): test-support

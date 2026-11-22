@@ -94,6 +94,18 @@ test("a skill path is encoded so slashes survive the route", async () => {
   );
 });
 
+test("the skill detail read reuses the delete route's path encoding", async () => {
+  responses.push(Response.json({ ok: true, skill: { name: "x" } }));
+  await client().skillDetail("/home/u/.zcode/skills/x/SKILL.md");
+  // Machine-level like the rest of the skills tree, whole absolute path in
+  // one segment — the bridge decodes one segment, so unencoded slashes would
+  // 404 as a multi-segment route.
+  expect(requested[0]).toMatchObject({
+    url: "http://hub/api/settings/skills/%2Fhome%2Fu%2F.zcode%2Fskills%2Fx%2FSKILL.md",
+    method: "GET",
+  });
+});
+
 test("a model upsert POSTs provider and model with only the set rule fields", async () => {
   responses.push(Response.json({ ok: true, effect: "immediate" }));
   await client().addModel({
@@ -155,6 +167,41 @@ test("a hook edit carries all three coordinates — two in the path, one in the 
   });
 });
 
+test("a hook add addresses the group by its matcher string", async () => {
+  responses.push(Response.json({ ok: true, effect: "needs-restart" }));
+  await client().addHook("PreToolUse", {
+    matcher: "Bash",
+    hook: { type: "command", command: "echo hi", timeout: 30 },
+  });
+  // The matcher STRING locates the group — an index would race a concurrent
+  // edit — and the entry itself rides under `hook`.
+  expect(requested[0]).toMatchObject({
+    url: "http://hub/api/settings/hooks/PreToolUse",
+    method: "POST",
+    body: {
+      matcher: "Bash",
+      hook: { type: "command", command: "echo hi", timeout: 30 },
+    },
+  });
+});
+
+test("a hook remove carries the command as the fingerprint", async () => {
+  responses.push(Response.json({ ok: true, effect: "needs-restart" }));
+  await client().removeHook("Stop", {
+    matcherIndex: 0,
+    hookIndex: 1,
+    command: "say done",
+  });
+  // The indexes address the entry, but `command` is the guard: a stale read
+  // whose entry changed is refused server-side instead of deleting the wrong
+  // hook.
+  expect(requested[0]).toMatchObject({
+    url: "http://hub/api/settings/hooks/Stop/remove",
+    method: "POST",
+    body: { matcherIndex: 0, hookIndex: 1, command: "say done" },
+  });
+});
+
 test("the MCP enable route wants `enabled`, not `enable`", async () => {
   responses.push(Response.json({ ok: true, effect: "needs-restart" }));
   await client().setMcpEnabled("ctx7", false);
@@ -163,6 +210,35 @@ test("the MCP enable route wants `enabled`, not `enable`", async () => {
     method: "POST",
     body: { name: "ctx7", enabled: false },
   });
+});
+
+test("the MCP status read rides the per-instance mount", async () => {
+  responses.push(
+    Response.json({
+      ok: true,
+      available: true,
+      statuses: { ctx7: { status: "connected", toolCount: 12 } },
+    }),
+  );
+  await client().mcpStatus("i 1");
+  // Per-instance on purpose — the machine-level mount has no backend to ask
+  // and answers 409 for this route, and the id rides the path encoded.
+  expect(requested[0]).toMatchObject({
+    url: "http://hub/api/instances/i%201/settings/mcp-status",
+    method: "GET",
+  });
+});
+
+test("an unavailable MCP status is a body, not an error", async () => {
+  responses.push(Response.json({ ok: true, available: false, statuses: {} }));
+  const body = (await client().mcpStatus("i1")) as {
+    available: boolean;
+    statuses: Record<string, unknown>;
+  };
+  // `available:false` (older bridge, timed-out RPC) must resolve Ok — the
+  // page renders "unknown", it does not fail.
+  expect(body.available).toBe(false);
+  expect(body.statuses).toEqual({});
 });
 
 test("a reset-card spend carries the nonce from the status read", async () => {
@@ -202,21 +278,6 @@ test("a reset-card spend carries the nonce from the status read", async () => {
       resetType: "FIVE_HOUR",
     },
   });
-});
-
-test("a denied opportunity is data, not a throw", async () => {
-  responses.push(
-    Response.json({
-      ok: true,
-      opportunity: { granted: false, nextTryAt: 1700000000000 },
-    }),
-  );
-  await expect(
-    client().requestResetOpportunity({
-      providerId: "account:bigmodel-individual-coding-plan",
-      idempotencyKey: "k-1",
-    }),
-  ).resolves.toMatchObject({ opportunity: { granted: false } });
 });
 
 test("the backend restart names an instance — the hub mount has no backend", async () => {

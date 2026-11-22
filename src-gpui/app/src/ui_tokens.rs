@@ -113,6 +113,19 @@ pub(crate) fn run_status_color(status: &str) -> Hsla {
     }
 }
 
+/// MCP server health dot colors (zconfig MCP rows, `mcp/list` mode:"status"
+/// vocabulary): connected emerald, failed red, untrusted amber, connecting
+/// sky, and the neutral grays for disabled/disconnected/unknown.
+pub(crate) fn mcp_health_color(status: &str) -> Hsla {
+    match status {
+        "connected" => rgb(0x10b981).into(),
+        "failed" => rgb(0xf87171).into(),
+        "untrusted" => rgb(0xfbbf24).into(),
+        "connecting" => rgb(0x38bdf8).into(),
+        _ => rgb(0x6b7280).into(),
+    }
+}
+
 /// The eight agent swatch colors the server's agent form offers
 /// (zconfig_pages `swatch_fill`); the TS picker paints the same tailwind
 /// values.
@@ -183,6 +196,15 @@ mod tests {
         assert_eq!(run_status_color("completed"), run_status_color("ok"));
         assert_eq!(run_status_color("failed"), run_status_color("errored"));
         assert_eq!(run_status_color("unknown-token"), run_status_color("x"));
+    }
+
+    #[test]
+    fn mcp_health_families() {
+        assert_eq!(mcp_health_color("connected"), mcp_health_color("connected"));
+        assert_ne!(mcp_health_color("connected"), mcp_health_color("failed"));
+        // disabled / disconnected / an unknown spelling share the neutral dot.
+        assert_eq!(mcp_health_color("disabled"), mcp_health_color("disconnected"));
+        assert_eq!(mcp_health_color("disabled"), mcp_health_color("never-heard-of"));
     }
 
     #[test]

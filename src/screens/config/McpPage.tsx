@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChevronRight, Plus } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
@@ -12,6 +12,7 @@ import {
   ConfigField,
   ConfigFormSheet,
   ConfigToggle,
+  FormDeleteButton,
   configInputClass,
   kvToLines,
   parseKvLines,
@@ -55,6 +56,57 @@ export function mcpServers(payload: unknown): McpServerRow[] {
 
 /** Transports the form offers; anything else an entry carries rides along. */
 const TYPES = ["stdio", "http", "sse"];
+
+/** One server's live health out of the mcp-status body. */
+export interface McpServerHealth {
+  status?: string;
+  toolCount?: number;
+  failureKind?: string;
+  authorizationUrl?: string;
+}
+
+/**
+ * The per-instance mcp-status body (the bridge's proxy of the backend
+ * `mcp/list` mode:"status" RPC). `available:false` is NOT an error — an
+ * older backend or a timed-out RPC means "status unknown", and the page
+ * renders that hint instead of failing. Exported so the response-shape test
+ * asserts the REAL decode.
+ */
+export function mcpStatuses(
+  payload: unknown,
+): { available: boolean; statuses: Record<string, McpServerHealth> } {
+  const body = payload as {
+    available?: boolean;
+    statuses?: Record<string, McpServerHealth>;
+  } | null;
+  return { available: body?.available === true, statuses: body?.statuses ?? {} };
+}
+
+/** Known backend verdicts localize; an unknown spelling renders verbatim. */
+const STATUS_LABEL_KEYS: Record<string, string> = {
+  connected: "zconfig.mcpStatusConnected",
+  connecting: "zconfig.mcpStatusConnecting",
+  disconnected: "zconfig.mcpStatusDisconnected",
+  disabled: "zconfig.disabled",
+  failed: "zconfig.mcpStatusFailed",
+  untrusted: "zconfig.mcpStatusUntrusted",
+};
+
+/** The dot's color family — the same tones the desktop row paints. */
+function statusTone(status: string): string {
+  switch (status) {
+    case "connected":
+      return "bg-success";
+    case "failed":
+      return "bg-danger";
+    case "untrusted":
+      return "bg-warning";
+    case "connecting":
+      return "bg-info";
+    default:
+      return "bg-faint";
+  }
+}
 
 /**
  * The PUT body for one server, built from the form's raw fields.
@@ -100,12 +152,21 @@ export function mcpUpsertBody(f: {
 export function McpPage() {
   const { t } = useTranslation();
   const mcp = useAppStore((s) => s.configMcp);
+  const mcpStatus = useAppStore((s) => s.configMcpStatus);
   const supported = useAppStore((s) => s.configSupported);
   const loading = useAppStore((s) => s.configLoading);
   const error = useAppStore((s) => s.configError);
   const loadConfigSection = useAppStore((s) => s.loadConfigSection);
+  const loadMcpStatus = useAppStore((s) => s.loadMcpStatus);
 
   const rows = mcpServers(mcp);
+  const { available, statuses } = mcpStatuses(mcpStatus);
+
+  // Best-effort dots: probed on every mount (and via the header refresh) so
+  // an enable flip's aftermath is visible without re-entering the page.
+  useEffect(() => {
+    void loadMcpStatus();
+  }, [loadMcpStatus]);
 
   const [editing, setEditing] = useState<McpServerRow | null>(null);
   const [adding, setAdding] = useState(false);
@@ -113,19 +174,28 @@ export function McpPage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.mcp")}
-      onBack={() => useAppStore.getState().openConfig(null)}
-      onRefresh={() => void loadConfigSection("mcp")}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
+      onRefresh={() => {
+        void loadConfigSection("mcp");
+        void loadMcpStatus();
+      }}
       refreshing={loading}
       unsupported={supported === false}
       error={error}
       hasLoaded={mcp !== null}
     >
+      {mcpStatus !== null && !available && (
+        <p className="px-4 pt-2 text-2xs text-faint">
+          {t("zconfig.mcpStatusUnavailable")}
+        </p>
+      )}
       {rows.length === 0 ? (
         <ConfigEmpty text={t("zconfig.mcpEmpty")} />
       ) : (
         <ConfigBlock>
           {rows.map((s) => {
             const name = s.name ?? "";
+            const health = statuses[name];
             return (
               <button
                 key={name}
@@ -139,6 +209,25 @@ export function McpPage() {
                       ? [s.command, ...(s.args ?? [])].join(" ")
                       : (s.url ?? s.type ?? "")}
                   </span>
+                  {health?.status && (
+                    <span className="mt-0.5 flex items-center gap-1.5 text-2xs text-faint">
+                      <span
+                        className={`size-1.5 shrink-0 rounded-full ${statusTone(health.status)}`}
+                      />
+                      <span>
+                        {STATUS_LABEL_KEYS[health.status]
+                          ? t(STATUS_LABEL_KEYS[health.status])
+                          : health.status}
+                      </span>
+                      {!!health.toolCount &&
+                        t("zconfig.mcpTools", { count: health.toolCount })}
+                      {health.failureKind && (
+                        <span className="truncate font-mono">
+                          {health.failureKind}
+                        </span>
+                      )}
+                    </span>
+                  )}
                   {s.enabled === false && (
                     <span className="block text-2xs text-faint">
                       {t("zconfig.disabled")}
@@ -193,25 +282,44 @@ function McpForm({
   const { t } = useTranslation();
   const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
   const upsertMcp = useAppStore((s) => s.upsertMcp);
+  const removeMcp = useAppStore((s) => s.removeMcp);
 
-  const [name, setName] = useState(target?.name ?? "");
   // An unknown transport type is kept verbatim (and shown as its own option
   // below) so the write never silently downgrades a server this build has not
   // heard of. Only the two remote transports are folded into the http branch.
   const initialType = target?.type ?? "stdio";
+  const initialCommand = target?.command ?? "";
+  const initialArgs = (target?.args ?? []).join("\n");
+  const initialEnv = kvToLines(target?.env);
+  const initialUrl = target?.url ?? "";
+  const initialHeaders = kvToLines(target?.headers);
+  const initialEnabled = target?.enabled !== false;
+
+  const [name, setName] = useState(target?.name ?? "");
   const [type, setType] = useState(initialType);
-  const [command, setCommand] = useState(target?.command ?? "");
-  const [argsText, setArgsText] = useState((target?.args ?? []).join("\n"));
-  const [envText, setEnvText] = useState(kvToLines(target?.env));
-  const [url, setUrl] = useState(target?.url ?? "");
-  const [headersText, setHeadersText] = useState(kvToLines(target?.headers));
-  const [enabled, setEnabled] = useState(target?.enabled !== false);
+  const [command, setCommand] = useState(initialCommand);
+  const [argsText, setArgsText] = useState(initialArgs);
+  const [envText, setEnvText] = useState(initialEnv);
+  const [url, setUrl] = useState(initialUrl);
+  const [headersText, setHeadersText] = useState(initialHeaders);
+  const [enabled, setEnabled] = useState(initialEnabled);
   const [busy, setBusy] = useState(false);
 
   const nameOk = name.trim() !== "" && !/[\\/]/.test(name.trim());
   const remote = type !== "stdio";
   const typeOk = remote ? url.trim() !== "" : command.trim() !== "";
   const canSubmit = nameOk && typeOk;
+  // The form contract's dirty gate: a create is dirty whenever valid; an
+  // edit compares every field against the opened values.
+  const dirty = !target
+    ? canSubmit
+    : type !== initialType ||
+      command.trim() !== initialCommand.trim() ||
+      argsText !== initialArgs ||
+      envText !== initialEnv ||
+      url.trim() !== initialUrl.trim() ||
+      headersText !== initialHeaders ||
+      enabled !== initialEnabled;
 
   async function submit() {
     setBusy(true);
@@ -237,11 +345,36 @@ function McpForm({
     if (ok) onClose();
   }
 
+  // The edit form's footer delete (the form contract) — the config entry is
+  // gone with no undo, so it stays two-tap.
+  async function remove() {
+    const name = target?.name;
+    if (!target || !name) return;
+    setBusy(true);
+    const ok = await applyConfigWrite(
+      "delete MCP server",
+      () => removeMcp(name),
+      ["mcp"],
+    );
+    setBusy(false);
+    if (ok) onClose();
+  }
+
   return (
     <ConfigFormSheet
       title={target ? t("zconfig.mcpEdit") : t("zconfig.mcpAdd")}
       busy={busy}
-      submitDisabled={!canSubmit}
+      submitDisabled={!canSubmit || !dirty}
+      dirty={dirty}
+      footerLeft={
+        target ? (
+          <FormDeleteButton
+            label={t("zconfig.mcpDelete")}
+            busy={busy}
+            onConfirm={() => void remove()}
+          />
+        ) : undefined
+      }
       onSubmit={() => void submit()}
       onClose={onClose}
     >
@@ -255,6 +388,7 @@ function McpForm({
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
+            autoFocus
             autoCapitalize="none"
             autoCorrect="off"
             spellCheck={false}
@@ -291,6 +425,7 @@ function McpForm({
             <input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
+              autoFocus={!!target}
               inputMode="url"
               autoCapitalize="none"
               autoCorrect="off"
@@ -320,6 +455,7 @@ function McpForm({
             <input
               value={command}
               onChange={(e) => setCommand(e.target.value)}
+              autoFocus={!!target}
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}

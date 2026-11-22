@@ -89,7 +89,7 @@ export function AppUpdatePage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.appUpdate")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       onRefresh={() => void loadConfigSection("appUpdate")}
       refreshing={loading}
       unsupported={supported === false}

@@ -178,7 +178,7 @@ export function QuotaPage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.quota")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       onRefresh={() => void refreshUsageStats()}
       unsupported={supported === false}
     >

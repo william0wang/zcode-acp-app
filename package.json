@@ -37,6 +37,7 @@
     "highlight.js": "^11.12.0",
     "i18next": "^26.3.6",
     "lucide-react": "^1.31.0",
+    "pinyin-pro": "^3.29.5",
     "react": "^19.2.8",
     "react-diff-viewer-continued": "^4.4.0",
     "react-dom": "^19.2.8",

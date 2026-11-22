@@ -1,24 +1,22 @@
 import { create } from "zustand";
 import { AcpConnection } from "../lib/acp";
 import { HubApiError, HubClient } from "../lib/hub";
+import { describeHubError, notConnectedMessage } from "../lib/errors";
 import { closeTerminal as dropTerminalLink } from "../lib/terminalSession";
 import { rememberLaunch } from "../lib/workflow-launches";
 import {
   defaultServerName,
   loadFontSize,
-  loadLang,
   loadPending,
   loadPinnedSessions,
   loadServerBook,
   loadUpdateChannel,
   newServerId,
   saveFontSize,
-  saveLang,
   savePending,
   savePinnedSessions,
   saveServerBook,
   type FontSize,
-  type Lang,
 } from "../lib/storage";
 import {
   configSliceState,
@@ -343,7 +341,6 @@ export interface AppState extends ConfigSlice {
   // `profile` mirrors the active entry (null when nothing is active).
   savedServers: SavedServer[];
   activeServerId: string | null;
-  lang: Lang;
   fontSize: FontSize;
   instances: HubInstance[];
   instancesError: string | null;
@@ -511,7 +508,9 @@ export interface AppState extends ConfigSlice {
     name?: string;
   }) => void;
   // Tears the connection down and clears the active selection; the saved
-  // server list itself is kept (the manager screen lists them).
+  // server list itself is kept (the manager screen lists them). No UI
+  // affordance calls it today — it stays as the ONE full-teardown primitive
+  // (the test suites' store reset).
   disconnectHub: () => void;
   // Switches the active server: full connection teardown, then fresh polling
   // against the target entry. No health gate — the hubOffline banner covers
@@ -541,7 +540,6 @@ export interface AppState extends ConfigSlice {
   fileBrowserTarget: string | null;
   openFileAt: (path: string) => void;
   clearFileBrowserTarget: () => void;
-  setLang: (lang: Lang) => void;
   setFontSize: (size: FontSize) => void;
   refreshInstances: (opts?: { probe?: boolean }) => Promise<void>;
   upgradeHub: () => Promise<HubUpgradeResult>;
@@ -1986,7 +1984,6 @@ export const useAppStore = create<AppState>((set, get) => {
     manageOpen: false,
     terminalTarget: null,
     fileBrowserTarget: null,
-    lang: "en",
     fontSize: "small" as FontSize,
     instances: [],
     instancesError: null,
@@ -2046,7 +2043,6 @@ export const useAppStore = create<AppState>((set, get) => {
         savedServers: book?.servers ?? [],
         activeServerId: book?.activeId ?? null,
         profile: book ? activeProfile(book.servers, book.activeId) : null,
-        lang: loadLang(),
         fontSize,
         updateChannel: channel,
       });
@@ -2201,11 +2197,6 @@ export const useAppStore = create<AppState>((set, get) => {
     openFileAt: (path) => set({ fileBrowserTarget: path }),
 
     clearFileBrowserTarget: () => set({ fileBrowserTarget: null }),
-
-    setLang: (lang) => {
-      saveLang(lang);
-      set({ lang });
-    },
 
     setFontSize: (size) => {
       saveFontSize(size);
@@ -3017,7 +3008,7 @@ export const useAppStore = create<AppState>((set, get) => {
         // to every client (editor included) — the store picks those up too.
       } catch (e) {
         if (!isTransientConnError(e))
-          set({ notice: `config change failed: ${(e as Error).message}` });
+          set({ notice: `config change failed: ${describeHubError(e)}` });
       }
     },
 
@@ -3513,14 +3504,15 @@ export const useAppStore = create<AppState>((set, get) => {
       const client = hub();
       const instanceId = iidOverride ?? get().instanceId;
       if (!client || !instanceId) {
-        if (!silent) get().notify(`${label} failed: not connected`);
-        onError?.("not connected");
+        const message = notConnectedMessage();
+        if (!silent) get().notify(`${label} failed: ${message}`);
+        onError?.(message);
         return null;
       }
       try {
         return await fn(client, instanceId);
       } catch (e) {
-        const message = e instanceof Error ? e.message : String(e);
+        const message = describeHubError(e);
         if (!silent) get().notify(`${label} failed: ${message}`);
         onError?.(message);
         return null;

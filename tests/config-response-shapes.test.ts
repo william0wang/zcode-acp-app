@@ -23,13 +23,14 @@ import {
   modelOptions,
   providerOptions,
 } from "../src/screens/config/ModelsPage";
-import { mcpServers, mcpUpsertBody } from "../src/screens/config/McpPage";
+import { mcpServers, mcpStatuses, mcpUpsertBody } from "../src/screens/config/McpPage";
 import {
   flattenHooks,
   hooksEnabled,
   timeoutMsOf,
 } from "../src/screens/config/HooksPage";
 import {
+  decodeSkillDetail,
   isUserTreeScope,
   type SkillScope,
 } from "../src/screens/config/SkillsPage";
@@ -87,6 +88,40 @@ describe("mcp payload", () => {
   it("returns an empty list rather than throwing on a missing section", () => {
     expect(mcpServers({ ok: true })).toEqual([]);
     expect(mcpServers(null)).toEqual([]);
+  });
+});
+
+// --- the per-instance health read behind the rows' status dots ---------------
+
+describe("mcp status decode", () => {
+  it("reads the per-server map and keeps the raw verdict vocabulary", () => {
+    const { available, statuses } = mcpStatuses({
+      ok: true,
+      available: true,
+      statuses: {
+        ctx7: { status: "connected", toolCount: 12 },
+        weird: { status: "never-heard-of", toolCount: 0, failureKind: "status_unavailable" },
+      },
+    });
+    expect(available).toBe(true);
+    // An unknown status spelling stays verbatim — the page renders it as-is
+    // rather than folding it into a default (the api_type rule).
+    expect(statuses["ctx7"]!.status).toBe("connected");
+    expect(statuses["weird"]!.status).toBe("never-heard-of");
+    expect(statuses["weird"]!.failureKind).toBe("status_unavailable");
+  });
+
+  it("treats `available:false` as unknown, not an error", () => {
+    // An older bridge or a timed-out RPC answers this BODY — the decode must
+    // succeed so the page can show its "unknown" hint instead of failing.
+    const body = mcpStatuses({ ok: true, available: false, statuses: {} });
+    expect(body.available).toBe(false);
+    expect(body.statuses).toEqual({});
+  });
+
+  it("degrades a missing or malformed body to unknown-and-empty", () => {
+    expect(mcpStatuses(null)).toEqual({ available: false, statuses: {} });
+    expect(mcpStatuses({ ok: true })).toEqual({ available: false, statuses: {} });
   });
 });
 
@@ -653,6 +688,50 @@ describe("skills payload", () => {
       true,
       true,
     ]);
+  });
+});
+
+// --- skill detail: `{ok, skill}` — the row → detail view -------------------
+
+describe("skill detail decode", () => {
+  const wire = {
+    ok: true,
+    skill: {
+      name: "pdf",
+      description: "PDF tools",
+      metadata: { name: "pdf", "allowed-tools": "Read, View" },
+      body: "# pdf\n",
+      path: "/h/.zcode/skills/pdf/SKILL.md",
+      dir: "/h/.zcode/skills/pdf",
+      scope: "user",
+      enabled: false,
+      deletable: true,
+    },
+  };
+
+  it("reads the skill whole — frontmatter keys as written, body included", () => {
+    // The detail's whole point is fidelity: every frontmatter key (hyphenated
+    // ones included) and the body after the block must survive the decode.
+    const skill = decodeSkillDetail(wire);
+    expect(skill?.name).toBe("pdf");
+    expect(skill?.metadata?.["allowed-tools"]).toBe("Read, View");
+    expect(skill?.body).toBe("# pdf\n");
+    expect(skill?.enabled).toBe(false);
+    expect(skill?.deletable).toBe(true);
+  });
+
+  it("reads a body without a skill object as null, never as an empty skill", () => {
+    // A malformed answer is a load failure in the view; inventing an empty
+    // skill would paint a blank detail over a file that exists.
+    expect(decodeSkillDetail({ ok: true })).toBeNull();
+    expect(decodeSkillDetail(null)).toBeNull();
+  });
+
+  it("keeps a skill with only required fields paintable", () => {
+    const skill = decodeSkillDetail({ ok: true, skill: { name: "bare" } });
+    expect(skill?.name).toBe("bare");
+    expect(skill?.metadata).toBeUndefined();
+    expect(skill?.body).toBeUndefined();
   });
 });
 

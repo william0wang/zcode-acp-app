@@ -140,13 +140,6 @@ fn emerald_check() -> Hsla {
 /// Kept as a local alias: the definition lives in ui_tokens (batch 2).
 pub(crate) use crate::ui_tokens::faint;
 
-/// The `notice.*` i18n keys the store surfaces, resolved through the shared
-/// catalog (`t!` falls back to its input — plain failure text passes
-/// through verbatim).
-fn notice_text(notice: &str) -> String {
-    t!(notice).into_owned()
-}
-
 // ---------------------------------------------------------------------------
 // Row primitives (QuotaRow / ConfigBlock / ConfigEmpty ports)
 // ---------------------------------------------------------------------------
@@ -265,37 +258,14 @@ fn config_empty(theme: &Theme, text: &str) -> AnyElement {
 
 /// The Effect Class outcome surface: the config pages replace the chat
 /// surface (the only other banner host), so the frame renders the banner
-/// itself (TS ConfigPageFrame's rationale).
-fn notice_banner(theme: &Theme, notice: &str, runtime: &ProtocolRuntime) -> AnyElement {
-    let runtime = runtime.clone();
-    div()
-        .mx(px(16.))
-        .mb(px(8.))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(8.))
-        .rounded_lg()
-        .bg(white().opacity(0.05))
-        .px(px(12.))
-        .py(px(8.))
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .text_size(ui_text(13.))
-                .text_color(theme.muted_foreground)
-                .child(notice_text(notice)),
-        )
-        .child(
-            Button::new("quota-notice-dismiss")
-                .ghost()
-                .xsmall()
-                .icon(IconName::CircleX)
-                .tooltip(t!("common.dismiss"))
-                .on_click(move |_, _, _| runtime.send(UiCommand::DismissConfigNotice)),
-        )
-        .into_any_element()
+/// itself (TS ConfigPageFrame's rationale). The banner is the one shared
+/// renderer (ADR-0014 §2).
+fn notice_banner(
+    theme: &Theme,
+    notice: &crate::config_notice::ConfigNotice,
+    runtime: &ProtocolRuntime,
+) -> AnyElement {
+    crate::config_notice::notice_banner(theme, notice, runtime, "quota-notice-dismiss")
 }
 
 /// The Backend Restart affordance (TS `RestartNote`), shown only while a
@@ -837,40 +807,8 @@ impl Workbench {
         let runtime = self.runtime.clone();
         let wb = cx.entity();
 
-        // Header: back, title, refresh.
-        let back_runtime = runtime.clone();
-        let refresh_runtime = runtime.clone();
-        let header = div()
-            .flex()
-            .items_center()
-            .gap(px(4.))
-            .px(px(8.))
-            .pb(px(8.))
-            .child(
-                Button::new("quota-back")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::ArrowLeft)
-                    .tooltip(t!("common.backToWorkbench"))
-                    .on_click(move |_, _, _| back_runtime.send(UiCommand::CloseQuota)),
-            )
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .truncate()
-                    .text_size(ui_text(14.))
-                    .text_color(theme.foreground)
-                    .child(t!("zconfig.quota").into_owned()),
-            )
-            .child(
-                Button::new("quota-page-refresh")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::RefreshCw)
-                    .tooltip(t!("quota.refreshHint"))
-                    .on_click(move |_, _, _| refresh_runtime.send(UiCommand::RefreshQuota)),
-            );
+        // The overlay's top bar carries the title, back, and refresh
+        // (ADR-0014 §1) — the page body starts at the notice banner.
 
         // ---- the allowance itself (GLM only — see the module doc) ----
         let allowance: Vec<AnyElement> = if page.quota_unavailable {
@@ -1055,8 +993,7 @@ impl Workbench {
             .min_h_0()
             .min_w_0()
             .pt(px(8.))
-            .child(header)
-            .when_some(self.snap.config_notice.as_deref(), |this, notice| {
+            .when_some(self.snap.config_notice.as_ref(), |this, notice| {
                 this.child(notice_banner(&theme, notice, &runtime))
             })
             .when(self.snap.pending_restart, |this| {
@@ -1080,8 +1017,7 @@ mod tests {
     // re-exports GPUI's `test` macro, which would shadow Rust's built-in
     // #[test] (the kit's own doc note).
     use super::{
-        fmt_percent, heat_rgb, is_team_plan, notice_text, provider_label,
-        window_used_percent, QuotaPageView,
+        fmt_percent, heat_rgb, is_team_plan, provider_label, window_used_percent, QuotaPageView,
     };
     use protocol::settings::ResetCardType;
 
@@ -1133,14 +1069,5 @@ mod tests {
         // An exhausted week must not let a 5-hour card skip its warning.
         assert_eq!(window_used_percent(&page, ResetCardType::FiveHour), 93.5);
         assert_eq!(window_used_percent(&page, ResetCardType::Week), 12.0);
-    }
-
-    #[test]
-    fn notices_resolve_the_catalog_keys_and_pass_text_through() {
-        assert_eq!(
-            notice_text("notice.configResetSpent"),
-            "Card spent — the window is reset"
-        );
-        assert_eq!(notice_text("plain failure text"), "plain failure text");
     }
 }

@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::settings::{HookEntryPatch, McpServerUpsert, ResetCardType};
+use crate::settings::{HookEntryPatch, HookUpsert, McpServerUpsert, ResetCardType};
 use crate::settings_client::encode_uri_component;
 
 // ─── models (ModelsPage.ts) ─────────────────────────────────────────────────
@@ -840,6 +840,21 @@ pub fn hook_edit_patch(row: &HookRow, command: &str, timeout_seconds: &str) -> H
         }
     }
     patch
+}
+
+/// The hook ADD form's entry (POST /settings/hooks/{event}): a command-type
+/// entry, its timeout in SECONDS — the unit a command entry spells on disk
+/// (the edit patch's "own unit" rule, creation edition) — only when the
+/// field is non-blank. Call only with a non-blank command and a
+/// [`hook_timeout_ok`] value.
+pub fn hook_add_body(command: &str, timeout_seconds: &str) -> HookUpsert {
+    let seconds = timeout_seconds.trim();
+    HookUpsert {
+        hook_type: "command".to_string(),
+        command: command.trim().to_string(),
+        timeout: (!seconds.is_empty())
+            .then(|| seconds.parse::<f64>().unwrap_or_default() as u64),
+    }
 }
 
 // ─── plan quota (QuotaPage.tsx) ─────────────────────────────────────────────
@@ -1744,6 +1759,22 @@ mod tests {
         assert_eq!(blank.timeout, None);
         assert_eq!(blank.timeout_ms, None);
         assert_eq!(blank.command.as_deref(), Some("echo"));
+    }
+
+    #[test]
+    fn hook_add_body_is_a_command_entry_with_seconds() {
+        // The add form's entry: command-type, trimmed command, and the
+        // timeout in SECONDS — the unit a command entry spells on disk —
+        // only when the field is non-blank.
+        let body = hook_add_body(" echo hi ", "30");
+        assert_eq!(body.hook_type, "command");
+        assert_eq!(body.command, "echo hi");
+        assert_eq!(body.timeout, Some(30));
+
+        // Blank timeout: no timeout key travels, so the entry runs on the
+        // schema's default.
+        let blank = hook_add_body("echo hi", "  ");
+        assert_eq!(blank.timeout, None);
     }
 
     // --- reset cards: the provider list is all four ids, not the account's -------

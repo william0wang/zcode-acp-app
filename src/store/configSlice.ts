@@ -4,6 +4,7 @@
 // the assembly site — this is a slice, not a separate store.
 import type { StoreApi } from "zustand";
 import { HubApiError, HubClient } from "../lib/hub";
+import { describeHubError, notConnectedMessage } from "../lib/errors";
 import { saveUpdateChannel, type UpdateChannel } from "../lib/storage";
 import type {
   AgentUpsert,
@@ -118,6 +119,18 @@ export interface ConfigSliceState {
   // reports no `enabled` field at all, so this is the only honest source for
   // "show the workflows entry". Null = not probed (reads as hidden).
   configWorkflowGate: SettingsAll["workflow"] | null;
+  // Per-server MCP health (`GET /settings/mcp-status`, per-instance): the
+  // status dots under the MCP rows. Null = not probed; a landed body with
+  // `available:false` means the bridge could not answer (older backend,
+  // timed-out RPC) and the page says "unknown" instead of failing.
+  configMcpStatus: unknown | null;
+  // The open skill detail (GET /settings/skills/{path}, machine-level): the
+  // path is also the stale-response guard's key — a late answer for another
+  // skill (or a closed view) must not repaint the screen. Null detail with a
+  // set path = loading; null path = the list.
+  configSkillDetailPath: string | null;
+  configSkillDetail: unknown | null;
+  configSkillDetailError: string | null;
   // ---- system status (bridge 0.62.0) ----
   //
   // The machine-level /api/system-stats snapshot the status page polls. Every
@@ -163,10 +176,6 @@ export interface ConfigSliceActions {
   // Thin wrappers over the hub routes so a screen never builds a HubClient or
   // a URL itself. Each returns the write's effect class; failures throw, and
   // `applyConfigWrite` turns them into a toast.
-  setProviderEnabled: (
-    providerId: string,
-    enabled: boolean,
-  ) => Promise<Effect | undefined>;
   setSkillEnabled: (
     path: string,
     enable: boolean,
@@ -175,20 +184,38 @@ export interface ConfigSliceActions {
   // POST /settings/models is an upsert: one route adds a model and edits its
   // rule (context window, reasoning levels), so one wrapper serves both forms.
   upsertModel: (body: ModelUpsert) => Promise<Effect | undefined>;
+  removeModel: (
+    providerId: string,
+    modelId: string,
+  ) => Promise<Effect | undefined>;
   setMcpEnabled: (name: string, enable: boolean) => Promise<Effect | undefined>;
   upsertMcp: (
     name: string,
     body: McpServerUpsert,
   ) => Promise<Effect | undefined>;
+  removeMcp: (name: string) => Promise<Effect | undefined>;
   setHooksEnabled: (enabled: boolean) => Promise<Effect | undefined>;
-  // Edits ONE existing hook entry in place; there is deliberately no add or
-  // remove through here (an insert shifts every later index and races a
-  // concurrent edit of the same event).
+  // Edits ONE existing hook entry in place (addressed by three indexes).
   updateHookEntry: (
     eventName: string,
     matcherIndex: number,
     hookIndex: number,
     body: HookEntryPatch,
+  ) => Promise<Effect | undefined>;
+  // Appends one hook entry under the matcher STRING's group (no index races;
+  // a missing group is created).
+  addHookEntry: (
+    eventName: string,
+    matcher: string,
+    hook: { type: string; command: string; timeout?: number },
+  ) => Promise<Effect | undefined>;
+  // Removes one hook entry; `command` is the fingerprint a stale read must
+  // match or the bridge refuses.
+  removeHookEntry: (
+    eventName: string,
+    matcherIndex: number,
+    hookIndex: number,
+    command: string,
   ) => Promise<Effect | undefined>;
   setAgentEnabled: (
     name: string,
@@ -197,6 +224,7 @@ export interface ConfigSliceActions {
   // A PUT on a missing personal agent creates it, so this one route serves
   // editing, creating, and the built-ins' model override.
   upsertAgent: (name: string, body: AgentUpsert) => Promise<Effect | undefined>;
+  deleteAgent: (name: string) => Promise<Effect | undefined>;
   restoreBackup: (file: string, path: string) => Promise<Effect | undefined>;
   // Reset cards: read the inventory, spend a card. Both actions take the
   // provider (and the spend its nonce) explicitly: reading the store at action
@@ -222,6 +250,14 @@ export interface ConfigSliceActions {
   // (the entry list's visibility source). A 404 marks the hub too old; any
   // other failure just leaves the gate unread — the entry stays hidden.
   loadWorkflowGate: () => Promise<void>;
+  // Loads the per-instance MCP health map (best-effort, silent on failure —
+  // the dots are decoration over the config list, which stays the truth).
+  loadMcpStatus: () => Promise<void>;
+  // Opens one skill's detail (the row → detail view): marks the asking path,
+  // then stores the body — or the failure — for that path only.
+  loadSkillDetail: (path: string) => Promise<void>;
+  // The detail view's back gesture: back to the skills list.
+  clearSkillDetail: () => void;
   // Writes the machine-level gate override (bridge ≥0.53 PUT
   // /settings/workflow-gate) and stores the returned verdict, so every
   // gate-driven surface (config entry, session-panel launcher) flips live.
@@ -262,6 +298,10 @@ export const configSliceState: ConfigSliceState = {
   configWorkflows: null,
   configWorkflowScope: "project",
   configWorkflowGate: null,
+  configMcpStatus: null,
+  configSkillDetailPath: null,
+  configSkillDetail: null,
+  configSkillDetailError: null,
   configSystemStats: null,
   configSystemStatsError: null,
   configSystemStatsSupported: true,
@@ -399,7 +439,7 @@ export function createConfigSlice(
           return;
         }
         set({
-          configError: e instanceof Error ? e.message : String(e),
+          configError: describeHubError(e),
           configLoading: false,
         });
       }
@@ -510,7 +550,7 @@ export function createConfigSlice(
           return;
         }
         set({
-          configError: e instanceof Error ? e.message : String(e),
+          configError: describeHubError(e),
           configLoading: false,
         });
       }
@@ -529,7 +569,7 @@ export function createConfigSlice(
         // Reporting that as success would show a toggle that moved on a machine
         // that never heard about it.
         if (effect === undefined) {
-          get().notify(`${label} failed: not connected`);
+          get().notify(`${label} failed: ${notConnectedMessage()}`);
           return false;
         }
         if (effect === "needs-restart") {
@@ -541,17 +581,10 @@ export function createConfigSlice(
         return true;
       } catch (e) {
         get().notify(
-          `${label} failed: ${e instanceof Error ? e.message : String(e)}`,
+          `${label} failed: ${describeHubError(e)}`,
         );
         return false;
       }
-    },
-
-    setProviderEnabled: async (providerId, enabled) => {
-      const client = hub();
-      if (!client) return undefined;
-      const res = await client.updateProvider(providerId, { enabled });
-      return res.effect;
     },
 
     setSkillEnabled: async (path, enable) => {
@@ -575,6 +608,13 @@ export function createConfigSlice(
       return res.effect;
     },
 
+    removeModel: async (providerId, modelId) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.removeModel(providerId, modelId);
+      return res.effect;
+    },
+
     setMcpEnabled: async (name, enable) => {
       const client = hub();
       if (!client) return undefined;
@@ -586,6 +626,13 @@ export function createConfigSlice(
       const client = hub();
       if (!client) return undefined;
       const res = await client.upsertMcpServer(name, body);
+      return res.effect;
+    },
+
+    removeMcp: async (name) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.removeMcpServer(name);
       return res.effect;
     },
 
@@ -608,6 +655,24 @@ export function createConfigSlice(
       return res.effect;
     },
 
+    addHookEntry: async (eventName, matcher, hook) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.addHook(eventName, { matcher, hook });
+      return res.effect;
+    },
+
+    removeHookEntry: async (eventName, matcherIndex, hookIndex, command) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.removeHook(eventName, {
+        matcherIndex,
+        hookIndex,
+        command,
+      });
+      return res.effect;
+    },
+
     setAgentEnabled: async (name, enable) => {
       const client = hub();
       if (!client) return undefined;
@@ -619,6 +684,13 @@ export function createConfigSlice(
       const client = hub();
       if (!client) return undefined;
       const res = await client.upsertAgent(name, body);
+      return res.effect;
+    },
+
+    deleteAgent: async (name) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.deleteAgent(name);
       return res.effect;
     },
 
@@ -670,7 +742,7 @@ export function createConfigSlice(
         if (get().resetProviderId !== providerId) return;
         set({ resetBusy: false });
         get().notify(
-          `reset card status failed: ${e instanceof Error ? e.message : String(e)}`,
+          `reset card status failed: ${describeHubError(e)}`,
         );
       }
     },
@@ -726,7 +798,7 @@ export function createConfigSlice(
           return false;
         }
         get().notify(
-          `reset card spend failed: ${e instanceof Error ? e.message : String(e)}`,
+          `reset card spend failed: ${describeHubError(e)}`,
         );
         return false;
       }
@@ -762,7 +834,7 @@ export function createConfigSlice(
         await get().pollAppUpdate();
       } catch (e) {
         get().notify(
-          `app update install failed: ${e instanceof Error ? e.message : String(e)}`,
+          `app update install failed: ${describeHubError(e)}`,
         );
       }
     },
@@ -800,6 +872,58 @@ export function createConfigSlice(
       }
     },
 
+    loadMcpStatus: async () => {
+      const client = hub();
+      const instanceId = get().instanceId;
+      if (!client || !instanceId) return;
+      try {
+        const payload = await client.mcpStatus(instanceId);
+        // Stale-response guard: a read from a pre-switch instance must not
+        // relabel the rows under the new one.
+        if (get().instanceId !== instanceId) return;
+        set({ configMcpStatus: payload });
+      } catch {
+        // Silent: the status dots are optional decoration; the config list
+        // below them is still the truth. `available:false` bodies land
+        // normally (they decode Ok and read as "unknown", not an error).
+      }
+    },
+
+    loadSkillDetail: async (path) => {
+      const client = hub();
+      if (!client) return;
+      // Marks the open detail; only a SKILL SWITCH blanks the view — a
+      // refresh over the same path keeps the painted body until the re-read
+      // lands.
+      const switching = get().configSkillDetailPath !== path;
+      set({
+        configSkillDetailPath: path,
+        ...(switching
+          ? { configSkillDetail: null, configSkillDetailError: null }
+          : {}),
+      });
+      try {
+        const payload = await client.skillDetail(path);
+        // Stale-response guard, path edition: a late answer for another row
+        // (or a closed view) must not repaint the screen.
+        if (get().configSkillDetailPath !== path) return;
+        set({ configSkillDetail: payload });
+      } catch (e) {
+        if (get().configSkillDetailPath !== path) return;
+        set({
+          configSkillDetailError: describeHubError(e),
+        });
+      }
+    },
+
+    clearSkillDetail: () => {
+      set({
+        configSkillDetailPath: null,
+        configSkillDetail: null,
+        configSkillDetailError: null,
+      });
+    },
+
     setWorkflowGate: async (mode) => {
       const res = await get().workflowAction("set workflow gate", (c, iid) =>
         c.workflowGateSet(iid, mode),
@@ -833,7 +957,7 @@ export function createConfigSlice(
         // its instances), so it lands as a retriable page error instead of
         // the permanent "unsupported" screen.
         set({
-          configError: e instanceof Error ? e.message : String(e),
+          configError: describeHubError(e),
           configLoading: false,
         });
       }
@@ -860,7 +984,7 @@ export function createConfigSlice(
         return res.cancelledTurns;
       } catch (e) {
         get().notify(
-          `backend restart failed: ${e instanceof Error ? e.message : String(e)}`,
+          `backend restart failed: ${describeHubError(e)}`,
         );
         return -1;
       }
@@ -889,7 +1013,7 @@ export function createConfigSlice(
         }
         const hadData = get().configSystemStats !== null;
         set({
-          ...(hadData ? {} : { configSystemStatsError: e instanceof Error ? e.message : String(e) }),
+          ...(hadData ? {} : { configSystemStatsError: describeHubError(e) }),
           configSystemStatsLoading: false,
         });
       }

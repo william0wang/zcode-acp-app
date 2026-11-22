@@ -135,13 +135,6 @@ fn workspace_leaf(workspace: &str) -> &str {
         .unwrap_or(workspace)
 }
 
-/// The `notice.*` i18n keys the store surfaces, resolved through the shared
-/// catalog (TS renders keys through `t()`; `t!` falls back to its input, so
-/// plain failure text passes through verbatim).
-fn notice_text(notice: &str) -> String {
-    t!(notice).into_owned()
-}
-
 /// pmset wording → the catalog's display forms (TS `battStatus` map; an
 /// unrecognized status passes through, a null one is nothing at all).
 fn battery_status(status: Option<&str>) -> Option<String> {
@@ -615,40 +608,13 @@ fn render_stats(theme: &Theme, stats: &SystemStatsResponse) -> AnyElement {
 /// The Effect Class outcome surface: every config page renders this frame,
 /// so an effect-class or reset-card notice raised inside a section is
 /// always on a banner somebody can see (TS ConfigPageFrame's rationale).
+/// The banner itself is the one shared renderer (ADR-0014 §2).
 fn render_notice_banner(
     theme: &Theme,
-    notice: &str,
+    notice: &crate::config_notice::ConfigNotice,
     runtime: &ProtocolRuntime,
 ) -> AnyElement {
-    let runtime = runtime.clone();
-    div()
-        .mx(px(16.))
-        .mb(px(8.))
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(px(8.))
-        .rounded_lg()
-        .bg(white().opacity(0.05))
-        .px(px(12.))
-        .py(px(8.))
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .text_size(ui_text(13.))
-                .text_color(theme.muted_foreground)
-                .child(notice_text(notice)),
-        )
-        .child(
-            Button::new("config-notice-dismiss")
-                .ghost()
-                .xsmall()
-                .icon(IconName::CircleX)
-                .tooltip(t!("common.dismiss"))
-                .on_click(move |_, _, _| runtime.send(UiCommand::DismissConfigNotice)),
-        )
-        .into_any_element()
+    crate::config_notice::notice_banner(theme, notice, runtime, "config-notice-dismiss")
 }
 
 /// The Backend Restart affordance, shown only while a needs-restart write
@@ -770,7 +736,7 @@ fn render_error(theme: &Theme, error: &str) -> AnyElement {
 /// chat surfaces.
 pub fn render_system_status_page(
     page: &SystemStatusPageView,
-    notice: Option<&str>,
+    notice: Option<&crate::config_notice::ConfigNotice>,
     pending_restart: bool,
     restart_available: bool,
     toast: Option<&str>,
@@ -778,42 +744,9 @@ pub fn render_system_status_page(
     cx: &App,
 ) -> AnyElement {
     let theme = cx.theme();
-    let back_runtime = runtime.clone();
-    let refresh_runtime = runtime.clone();
 
-    let header = div()
-        .flex()
-        .items_center()
-        .gap(px(4.))
-        .px(px(8.))
-        .pb(px(8.))
-        .child(
-            Button::new("system-back")
-                .ghost()
-                .xsmall()
-                .icon(IconName::ArrowLeft)
-                .tooltip(t!("common.back").into_owned())
-                .on_click(move |_, _, _| back_runtime.send(UiCommand::CloseSystemStatus)),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .truncate()
-                .text_size(ui_text(14.))
-                .text_color(theme.foreground)
-                .child(t!("system.title").into_owned()),
-        )
-        .child(
-            Button::new("system-refresh")
-                .ghost()
-                .xsmall()
-                .icon(IconName::RefreshCw)
-                .tooltip(t!("quota.refresh").into_owned())
-                // The spinner: a read is in flight (TS animate-spin).
-                .loading(page.loading)
-                .on_click(move |_, _, _| refresh_runtime.send(UiCommand::RefreshSystemStatus)),
-        );
+    // The overlay's top bar carries the title, back, and refresh
+    // (ADR-0014 §1) — the page body starts at the notice banner.
 
     // ConfigPageFrame state precedence: unsupported > error >
     // loading-without-payload > content.
@@ -856,7 +789,6 @@ pub fn render_system_status_page(
         .min_h_0()
         .min_w_0()
         .pt(px(8.))
-        .child(header)
         .when_some(notice, |this, notice| {
             this.child(render_notice_banner(&theme, notice, runtime))
         })
@@ -877,7 +809,7 @@ mod tests {
     // #[test] (the kit's own doc note).
     use super::{
         battery_status, fmt_bytes, fmt_minutes, fmt_rate, fmt_uptime, heat_rgb,
-        notice_text, workspace_leaf,
+        workspace_leaf,
     };
 
     #[test]
@@ -953,18 +885,5 @@ mod tests {
         // An unrecognized pmset wording passes through verbatim.
         assert_eq!(battery_status(Some("backup")).as_deref(), Some("backup"));
         assert_eq!(battery_status(None), None);
-    }
-
-    #[test]
-    fn notices_resolve_the_catalog_keys_and_pass_text_through() {
-        assert_eq!(
-            notice_text("notice.configNeedsRestart"),
-            "Saved — restart the backend to apply it"
-        );
-        assert_eq!(
-            notice_text("notice.configRestarted"),
-            "Backend restarted"
-        );
-        assert_eq!(notice_text("plain failure text"), "plain failure text");
     }
 }

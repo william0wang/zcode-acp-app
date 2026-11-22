@@ -2,6 +2,8 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { Activity, ChevronRight, Pencil, RefreshCw, X } from "lucide-react";
 import { useBackHandler } from "../lib/backNav";
+import { describeHubError } from "../lib/errors";
+import { saveLang } from "../lib/storage";
 import { useAppStore } from "../store/appStore";
 import { QuotaSection } from "./QuotaSection";
 
@@ -64,7 +66,6 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
   const savedServers = useAppStore((s) => s.savedServers);
   const activeServerId = useAppStore((s) => s.activeServerId);
   const openServerManager = useAppStore((s) => s.openServerManager);
-  const setLang = useAppStore((s) => s.setLang);
   const fontSize = useAppStore((s) => s.fontSize);
   const setFontSize = useAppStore((s) => s.setFontSize);
   const upgradeHub = useAppStore((s) => s.upgradeHub);
@@ -91,14 +92,16 @@ export function SettingsPanel({ onClose }: { onClose: () => void }) {
           : t("panel.upgradeLatest", { version: r.runningVersion }),
       );
     } catch (e) {
-      setUpgradeNote(e instanceof Error ? e.message : String(e));
+      setUpgradeNote(describeHubError(e));
     } finally {
       setUpgradeBusy(false);
     }
   }
 
   function switchLang(lang: "en" | "zh-CN") {
-    setLang(lang);
+    // i18n.language is the single source of truth; the store keeps no copy
+    // (settings-alignment P1-7). Persistence rides the storage helper.
+    saveLang(lang);
     void i18n.changeLanguage(lang);
   }
 

@@ -453,6 +453,19 @@ export class HubClient {
     return res.json();
   }
 
+  /**
+   * Per-server MCP health for the settings rows' status dots (the bridge's
+   * proxy of the backend `mcp/list` mode:"status" RPC). Per-instance ONLY:
+   * the machine-level mount has no backend to ask and answers 409 for this
+   * route — unlike the section reads above, this one cannot ride it.
+   */
+  async mcpStatus(instanceId: string): Promise<unknown> {
+    const res = await this.fetch(
+      `/api/instances/${encodeURIComponent(instanceId)}/settings/mcp-status`,
+    );
+    return res.json();
+  }
+
   async settingsHooks(): Promise<unknown> {
     const res = await this.fetch("/api/settings/hooks");
     return res.json();
@@ -483,11 +496,6 @@ export class HubClient {
     return res.json();
   }
 
-  async settingsQuota(): Promise<unknown> {
-    const res = await this.fetch("/api/settings/quota");
-    return res.json();
-  }
-
   /**
    * Reset-card inventory for one coding-plan provider. The `nonce` in the
    * answer is what `spendResetCard` must send back — a spend is tied to a
@@ -512,24 +520,6 @@ export class HubClient {
       input,
     );
     return res.json();
-  }
-
-  async requestResetOpportunity(input: {
-    providerId: string;
-    idempotencyKey: string;
-  }): Promise<{
-    ok: boolean;
-    opportunity?: { granted: boolean; nextTryAt: number | null };
-  }> {
-    const res = await this.fetch(
-      "/api/settings/reset-cards/opportunity",
-      "POST",
-      input,
-    );
-    return (await res.json()) as {
-      ok: boolean;
-      opportunity?: { granted: boolean; nextTryAt: number | null };
-    };
   }
 
   async markResetHistoryRead(providerId: string): Promise<void> {
@@ -620,6 +610,19 @@ export class HubClient {
     return (await res.json()) as WriteEffect;
   }
 
+  /**
+   * One skill's full detail (GET /settings/skills/{path} — the row → detail
+   * view). Machine-level like the rest of the skills tree, and the path
+   * encoding is deleteSkill's: the whole absolute SKILL.md path rides inside
+   * one encodeURIComponent segment.
+   */
+  async skillDetail(skillPath: string): Promise<unknown> {
+    const res = await this.fetch(
+      `/api/settings/skills/${encodeURIComponent(skillPath)}`,
+    );
+    return res.json();
+  }
+
   async upsertMcpServer(
     name: string,
     body: McpServerUpsert,
@@ -668,6 +671,43 @@ export class HubClient {
       `/api/settings/hooks/${encodeURIComponent(eventName)}/${matcherIndex}`,
       "PUT",
       { ...body, hookIndex },
+    );
+    return (await res.json()) as WriteEffect;
+  }
+
+  /**
+   * Append one hook entry (settings parity: hooks create). The matcher
+   * STRING names the target group — an index would race a concurrent edit —
+   * and an empty/absent matcher is the any-matcher group.
+   */
+  async addHook(
+    eventName: string,
+    body: {
+      matcher: string;
+      hook: { type: string; command: string; timeout?: number };
+    },
+  ): Promise<WriteEffect> {
+    const res = await this.fetch(
+      `/api/settings/hooks/${encodeURIComponent(eventName)}`,
+      "POST",
+      body,
+    );
+    return (await res.json()) as WriteEffect;
+  }
+
+  /**
+   * Remove one hook entry. The indexes address it, and `command` is the
+   * FINGERPRINT: if the entry at those indexes changed since the client read
+   * it, the bridge refuses rather than deleting the wrong hook.
+   */
+  async removeHook(
+    eventName: string,
+    body: { matcherIndex: number; hookIndex: number; command: string },
+  ): Promise<WriteEffect> {
+    const res = await this.fetch(
+      `/api/settings/hooks/${encodeURIComponent(eventName)}/remove`,
+      "POST",
+      body,
     );
     return (await res.json()) as WriteEffect;
   }

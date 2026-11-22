@@ -11,9 +11,14 @@ import {
   Package,
   Plug,
   RefreshCw,
+  Search,
   Sparkles,
   Workflow,
 } from "lucide-react";
+import {
+  filterConfigRows,
+  normalizeSearchText,
+} from "../lib/configSearch";
 import { useAppStore, type ConfigSection } from "../store/appStore";
 import { ConfigPageFrame } from "../components/config/ConfigPage";
 import { gatePosition, WorkflowGateSheet } from "../components/config/WorkflowGateSheet";
@@ -34,7 +39,7 @@ import { SystemStatusPage } from "./config/SystemStatusPage";
 // page. Reaches state that belongs to no session, so it works from the
 // settings panel (inside a session) and from the instance picker alike.
 export function ZCodeConfigScreen() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const section = useAppStore((s) => s.configSection);
   const supported = useAppStore((s) => s.configSupported);
   const workflowGate = useAppStore((s) => s.configWorkflowGate);
@@ -47,6 +52,11 @@ export function ZCodeConfigScreen() {
   const loadConfigSection = useAppStore((s) => s.loadConfigSection);
   const loadWorkflowGate = useAppStore((s) => s.loadWorkflowGate);
   const [gateSheetOpen, setGateSheetOpen] = useState(false);
+  // The list search (ADR-0014 §4): fixed rows only, filtered live. Both
+  // locales' labels are indexed (the other language is the alias source),
+  // so the translate closure resolves per locale rather than following the
+  // active one.
+  const [query, setQuery] = useState("");
 
   // The snapshot load resolves the machine-level `supported` verdict (and
   // caches the body other screens read), so it runs once when this screen
@@ -165,6 +175,18 @@ export function ZCodeConfigScreen() {
     off: "zconfig.workflowGateOff",
   }[gatePosition(workflowGate)];
 
+  // Filter while a query runs: the matcher owns the semantics, the screen
+  // only hides non-matching rows (the gated workflows entry stays out here —
+  // it was never in `entries` when the gate is off).
+  const searching = normalizeSearchText(query).length > 0;
+  const matchedIds = new Set(
+    filterConfigRows(query, (key, locale) => i18n.t(key, { lng: locale })).map(
+      (row) => row.id,
+    ),
+  );
+  const visibleEntries = entries.filter((e) => !searching || matchedIds.has(e.id));
+  const gateVisible = !searching || matchedIds.has("gate");
+
   return (
     <ConfigPageFrame
       title={t("zconfig.title")}
@@ -179,8 +201,20 @@ export function ZCodeConfigScreen() {
       <p className="px-4 pb-1 pt-1 text-2xs text-faint">
         {t("zconfig.scope")}
       </p>
+      <div className="mx-4 mb-1 flex items-center gap-2 rounded-xl bg-raised px-3 ring-1 ring-inset ring-hairline focus-within:ring-2 focus-within:ring-info/50">
+        <Search className="size-4 shrink-0 text-faint" />
+        <input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={t("settings.searchPlaceholder")}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          className="min-w-0 flex-1 bg-transparent py-2.5 text-sm text-ink placeholder:text-faint focus:outline-none"
+        />
+      </div>
       <div className="mt-1">
-        {entries.map(({ id, icon: Icon, title, hint }) => (
+        {visibleEntries.map(({ id, icon: Icon, title, hint }) => (
           <button
             key={id}
             onClick={() => openConfig(id)}
@@ -196,10 +230,12 @@ export function ZCodeConfigScreen() {
             <ChevronRight className="size-4 shrink-0 text-faint" />
           </button>
         ))}
-        {/* Machine-level workflow switch (bridge ≥0.53): ALWAYS visible —
-            with the remote verdict off this override is the only way in, so
-            unlike the gated workflows entry above it must not hide. On an
-            older bridge the write 404s into the standard failure toast. */}
+        {/* Machine-level workflow switch (bridge ≥0.53): visible with no
+            query — with the remote verdict off this override is the only
+            way in, so unlike the gated workflows entry above it must not
+            hide; while searching it rides the same filter as every row. On
+            an older bridge the write 404s into the standard failure toast. */}
+        {gateVisible && (
         <button
           onClick={() => setGateSheetOpen(true)}
           className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-hover active:bg-active"
@@ -215,6 +251,12 @@ export function ZCodeConfigScreen() {
           </span>
           <ChevronRight className="size-4 shrink-0 text-faint" />
         </button>
+        )}
+        {searching && visibleEntries.length === 0 && !gateVisible && (
+          <p className="px-4 py-8 text-center text-xs text-faint">
+            {t("settings.searchEmpty")}
+          </p>
+        )}
       </div>
 
       {gateSheetOpen && (

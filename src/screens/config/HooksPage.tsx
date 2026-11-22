@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { ChevronDown, ChevronRight, Plus } from "lucide-react";
 import { useAppStore } from "../../store/appStore";
 import {
   ConfigBlock,
@@ -10,16 +10,16 @@ import {
 import {
   ConfigField,
   ConfigFormSheet,
+  FormDeleteButton,
   configInputClass,
 } from "../../components/config/ConfigFormSheet";
 import type { HookEntryPatch } from "../../lib/types";
 
 // Hooks (ADR-0009): the seven event names, each with the entries the user
-// already configured. Adding an event or a matcher is deliberately not
-// offered — the bridge's write route only edits an EXISTING entry's command,
-// timeout and enabled flag, and a "new hook" button would produce a request
-// the API refuses. The edit covers the real remote use cases: temporarily
-// disable one hook, tweak its command, adjust its timeout.
+// already configured, plus full CRUD — the edit sheet tweaks an existing
+// entry's command, timeout and enabled flag; the add sheet appends a
+// command-type entry under a picked event and matcher; the edit sheet's
+// footer deletes (two taps, the form contract).
 //
 // The payload nests two levels: `hooks.events` is a Record keyed by event
 // name, whose value is a list of matcher GROUPS, and each group carries its
@@ -29,6 +29,18 @@ import type { HookEntryPatch } from "../../lib/types";
 //
 // Each entry expands in place rather than opening a third screen: the form is
 // three fields, and a drill-down for that is more navigation than content.
+
+/** The seven hook events the schema accepts, in its own order (server
+ * cli-config.ts HOOK_EVENT_NAMES) — the create sheet's picker vocabulary. */
+export const HOOK_EVENTS = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PermissionRequest",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "Stop",
+] as const;
 
 /** One flattened row: an event, its matcher group, and one hook inside it. */
 export interface HookRow {
@@ -56,9 +68,10 @@ export interface HookRow {
  * copied version that drifted is how this screen once showed an empty list on
  * a machine with hooks configured while every test passed.
  *
- * The nesting is `events[event]` → matcher groups → hook entries, so one event
- * can hold several matchers and each matcher several commands. The indexes
- * ride along because the edit route addresses an entry by all three.
+ * The nesting is `events[event]` → matcher groups → hook entries, so one
+ * event can hold several matchers and each matcher several commands. The
+ * indexes ride along because the edit and remove routes address an entry by
+ * all three.
  *
  * The two timeout spellings are kept RAW rather than normalized: the edit form
  * writes back in the unit the entry already uses, so editing never adds a
@@ -140,6 +153,7 @@ export function HooksPage() {
   const updateHookEntry = useAppStore((s) => s.updateHookEntry);
   const [open, setOpen] = useState<string | null>(null);
   const [editing, setEditing] = useState<HookRow | null>(null);
+  const [creating, setCreating] = useState(false);
 
   const payload = hooks as {
     ok?: boolean;
@@ -177,139 +191,151 @@ export function HooksPage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.hooks")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       onRefresh={() => void loadConfigSection("hooks")}
       refreshing={loading}
       unsupported={supported === false}
       error={error}
       hasLoaded={hooks !== null}
     >
-      {rows.length === 0 ? (
-        <ConfigEmpty text={t("zconfig.hooksEmpty")} />
-      ) : (
-        <>
-          {/* The whole tree's switch. One write, needs-restart — the bridge
-              re-reads hooks only when its backend respawns. */}
-          <div className="flex items-center gap-3 px-4 py-3">
-            <span className="flex-1 text-sm text-dim">
-              {t("zconfig.hooksAll")}
-            </span>
+      {rows.length === 0 && <ConfigEmpty text={t("zconfig.hooksEmpty")} />}
+
+      {/* The whole tree's switch. One write, needs-restart — the bridge
+          re-reads hooks only when its backend respawns. */}
+      <div className="flex items-center gap-3 px-4 py-3">
+        <span className="flex-1 text-sm text-dim">
+          {t("zconfig.hooksAll")}
+        </span>
+        <button
+          role="switch"
+          aria-checked={enabled}
+          aria-label={t("zconfig.hooksAll")}
+          onClick={() =>
+            void applyConfigWrite(
+              enabled ? "disable hooks" : "enable hooks",
+              () => setHooksEnabled(!enabled),
+              ["hooks"],
+            )
+          }
+          className={`h-6 w-10 shrink-0 rounded-full transition ${
+            enabled ? "bg-success/80" : "bg-active"
+          }`}
+        >
+          <span
+            className={`block size-5 rounded-full bg-white transition ${
+              enabled ? "translate-x-4.5" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
+
+      {/* The create control: appends a command-type entry under a picked
+          event and matcher. */}
+      <div className="px-4 pb-1 pt-1">
+        <button
+          onClick={() => setCreating(true)}
+          className="flex w-full items-center justify-center gap-1.5 rounded-xl bg-hover px-3 py-2.5 text-sm text-ink active:bg-active"
+        >
+          <Plus className="size-4" />
+          {t("zconfig.hookAdd")}
+        </button>
+      </div>
+
+      {[...byEvent].map(([event, entries]) => {
+        const isOpen = open === event;
+        return (
+          <ConfigBlock key={event} divided>
             <button
-              role="switch"
-              aria-checked={enabled}
-              aria-label={t("zconfig.hooksAll")}
-              onClick={() =>
-                void applyConfigWrite(
-                  enabled ? "disable hooks" : "enable hooks",
-                  () => setHooksEnabled(!enabled),
-                  ["hooks"],
-                )
-              }
-              className={`h-6 w-10 shrink-0 rounded-full transition ${
-                enabled ? "bg-success/80" : "bg-active"
-              }`}
+              onClick={() => setOpen(isOpen ? null : event)}
+              className="flex w-full items-center gap-2 px-4 py-3 text-left hover:bg-hover active:bg-active"
             >
-              <span
-                className={`block size-5 rounded-full bg-white transition ${
-                  enabled ? "translate-x-4.5" : "translate-x-0.5"
-                }`}
-              />
+              {isOpen ? (
+                <ChevronDown className="size-4 shrink-0 text-faint" />
+              ) : (
+                <ChevronRight className="size-4 shrink-0 text-faint" />
+              )}
+              <span className="min-w-0 flex-1">
+                <span className="block font-mono text-sm text-ink">
+                  {event}
+                </span>
+                <span className="block text-2xs text-faint">
+                  {t("zconfig.hooksEntryCount", { count: entries.length })}
+                </span>
+              </span>
             </button>
-          </div>
 
-          {[...byEvent].map(([event, entries]) => {
-            const isOpen = open === event;
-            return (
-              <ConfigBlock key={event} divided>
-                <button
-                  onClick={() => setOpen(isOpen ? null : event)}
-                  className="flex w-full items-center gap-2 px-4 py-3 text-left hover:bg-hover active:bg-active"
-                >
-                  {isOpen ? (
-                    <ChevronDown className="size-4 shrink-0 text-faint" />
-                  ) : (
-                    <ChevronRight className="size-4 shrink-0 text-faint" />
-                  )}
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-mono text-sm text-ink">
-                      {event}
-                    </span>
-                    <span className="block text-2xs text-faint">
-                      {t("zconfig.hooksEntryCount", { count: entries.length })}
-                    </span>
-                  </span>
-                </button>
-
-                {isOpen &&
-                  (entries.length === 0 ? (
-                    <p className="px-4 pb-3 text-xs text-faint">
-                      {t("zconfig.hooksNoEntries")}
-                    </p>
-                  ) : (
-                    <ul className="pb-2">
-                      {entries.map((h) => {
-                        const ms = timeoutMsOf(h);
-                        return (
-                          <li
-                            key={h.key}
-                            className="mx-4 mb-1.5 flex items-start gap-2 rounded-lg bg-hover py-2 pl-3 pr-2"
-                          >
-                            <button
-                              onClick={() => setEditing(h)}
-                              className="min-w-0 flex-1 text-left active:opacity-80"
-                            >
-                              <div className="flex items-baseline justify-between gap-2">
-                                <span className="font-mono text-2xs text-dim">
-                                  {h.matcher || t("zconfig.hooksAnyMatcher")}
-                                </span>
-                                <span
-                                  className={`shrink-0 text-2xs ${
-                                    h.enabled ? "text-faint" : "text-warning"
-                                  }`}
-                                >
-                                  {h.enabled
-                                    ? ms != null
-                                      ? `${ms}ms`
-                                      : ""
-                                    : t("zconfig.disabled")}
-                                </span>
-                              </div>
-                              <p className="pt-0.5 font-mono text-2xs break-all text-faint">
-                                {h.command}
-                              </p>
-                            </button>
-                            <button
-                              role="switch"
-                              aria-checked={h.enabled}
-                              aria-label={t("zconfig.hookEnabled")}
-                              onClick={() => void toggleHook(h, !h.enabled)}
-                              className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
-                                h.enabled
-                                  ? "bg-success/80"
-                                  : "bg-active"
+            {isOpen &&
+              (entries.length === 0 ? (
+                <p className="px-4 pb-3 text-xs text-faint">
+                  {t("zconfig.hooksNoEntries")}
+                </p>
+              ) : (
+                <ul className="pb-2">
+                  {entries.map((h) => {
+                    const ms = timeoutMsOf(h);
+                    return (
+                      <li
+                        key={h.key}
+                        className="mx-4 mb-1.5 flex items-start gap-2 rounded-lg bg-hover py-2 pl-3 pr-2"
+                      >
+                        <button
+                          onClick={() => setEditing(h)}
+                          className="min-w-0 flex-1 text-left active:opacity-80"
+                        >
+                          <div className="flex items-baseline justify-between gap-2">
+                            <span className="font-mono text-2xs text-dim">
+                              {h.matcher || t("zconfig.hooksAnyMatcher")}
+                            </span>
+                            <span
+                              className={`shrink-0 text-2xs ${
+                                h.enabled ? "text-faint" : "text-warning"
                               }`}
                             >
-                              <span
-                                className={`block size-5 rounded-full bg-white transition ${
-                                  h.enabled
-                                    ? "translate-x-4.5"
-                                    : "translate-x-0.5"
-                                }`}
-                              />
-                            </button>
-                          </li>
-                        );
-                      })}
-                    </ul>
-                  ))}
-              </ConfigBlock>
-            );
-          })}
+                              {h.enabled
+                                ? ms != null
+                                  ? `${ms}ms`
+                                  : ""
+                                : t("zconfig.disabled")}
+                            </span>
+                          </div>
+                          <p className="pt-0.5 font-mono text-2xs break-all text-faint">
+                            {h.command}
+                          </p>
+                        </button>
+                        <button
+                          role="switch"
+                          aria-checked={h.enabled}
+                          aria-label={t("zconfig.hookEnabled")}
+                          onClick={() => void toggleHook(h, !h.enabled)}
+                          className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
+                            h.enabled
+                              ? "bg-success/80"
+                              : "bg-active"
+                          }`}
+                        >
+                          <span
+                            className={`block size-5 rounded-full bg-white transition ${
+                              h.enabled
+                                ? "translate-x-4.5"
+                                : "translate-x-0.5"
+                            }`}
+                          />
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              ))}
+          </ConfigBlock>
+        );
+      })}
 
-          <p className="px-4 pt-3 text-center text-2xs text-faint">
-            {t("zconfig.hooksReadOnly", { count: rows.length })}
-          </p>
-        </>
+      <p className="px-4 pt-3 text-center text-2xs text-faint">
+        {t("zconfig.hooksNote")}
+      </p>
+
+      {creating && (
+        <HookCreateSheet key="hook-create" onClose={() => setCreating(false)} />
       )}
 
       {editing && (
@@ -324,11 +350,122 @@ export function HooksPage() {
 }
 
 /**
- * Edit sheet for ONE existing hook entry.
+ * Create sheet for one NEW hook entry: the event picker, the matcher (blank =
+ * the any-matcher group), the command, and a seconds timeout. The matcher
+ * STRING names the target group — the route appends to it (creating it when
+ * missing), so no index races an edit of the existing entries.
  *
- * The bridge deliberately offers no add/remove (an insert shifts every later
- * index and races a concurrent edit of the same event), so the sheet edits
- * what the entry already carries: its command and its timeout.
+ * The add form's timeout is SECONDS — the unit a command entry spells on
+ * disk. Blank adds no timeout key, so the entry runs on the schema's default.
+ */
+function HookCreateSheet({ onClose }: { onClose: () => void }) {
+  const { t } = useTranslation();
+  const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
+  const addHookEntry = useAppStore((s) => s.addHookEntry);
+
+  const [event, setEvent] = useState<string>(HOOK_EVENTS[0]);
+  const [matcher, setMatcher] = useState("");
+  const [command, setCommand] = useState("");
+  const [timeoutText, setTimeoutText] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  // Same validation as the edit sheet: a non-empty command and a blank or
+  // positive-numeric timeout. A create form has no baseline — any valid
+  // content is a change — so dirty is always true.
+  const seconds = timeoutText.trim();
+  const timeoutOk =
+    seconds === "" || (Number(seconds) > 0 && Number.isFinite(Number(seconds)));
+  const canSubmit = command.trim() !== "" && timeoutOk;
+
+  async function submit() {
+    setBusy(true);
+    const ok = await applyConfigWrite(
+      "add hook",
+      () =>
+        addHookEntry(event, matcher.trim(), {
+          type: "command",
+          command: command.trim(),
+          ...(seconds !== "" ? { timeout: Number(seconds) } : {}),
+        }),
+      ["hooks"],
+    );
+    setBusy(false);
+    if (ok) onClose();
+  }
+
+  return (
+    <ConfigFormSheet
+      title={t("zconfig.hookAdd")}
+      busy={busy}
+      submitDisabled={!canSubmit}
+      dirty
+      onSubmit={() => void submit()}
+      onClose={onClose}
+    >
+      <ConfigField label={t("zconfig.hookEvent")}>
+        <select
+          value={event}
+          onChange={(e) => setEvent(e.target.value)}
+          className={configInputClass}
+        >
+          {HOOK_EVENTS.map((v) => (
+            <option key={v} value={v}>
+              {v}
+            </option>
+          ))}
+        </select>
+      </ConfigField>
+
+      <ConfigField
+        label={t("zconfig.hookMatcher")}
+        hint={t("zconfig.hookMatcherHint")}
+      >
+        <input
+          value={matcher}
+          onChange={(e) => setMatcher(e.target.value)}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="Bash"
+          className={configInputClass}
+        />
+      </ConfigField>
+
+      <ConfigField label={t("zconfig.hookCommand")}>
+        <input
+          value={command}
+          onChange={(e) => setCommand(e.target.value)}
+          autoFocus
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          className={configInputClass}
+        />
+      </ConfigField>
+
+      <ConfigField
+        label={t("zconfig.hookTimeout")}
+        hint={t("zconfig.hookTimeoutHintAdd")}
+      >
+        <input
+          value={timeoutText}
+          onChange={(e) => setTimeoutText(e.target.value)}
+          inputMode="decimal"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          placeholder="60"
+          className={configInputClass}
+        />
+      </ConfigField>
+    </ConfigFormSheet>
+  );
+}
+
+/**
+ * Edit sheet for ONE existing hook entry: its command and its timeout, with
+ * the entry's own delete in the footer (two taps, the form contract — the
+ * remove write is fingerprint-guarded but still undoless from here).
  *
  * The timeout field works in SECONDS — the desktop form's unit — and writes
  * back in the unit the entry already spells, so editing never adds a second
@@ -346,12 +483,15 @@ function HookForm({
   const { t } = useTranslation();
   const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
   const updateHookEntry = useAppStore((s) => s.updateHookEntry);
+  const removeHookEntry = useAppStore((s) => s.removeHookEntry);
 
-  const [command, setCommand] = useState(target.command);
-  const [timeoutText, setTimeoutText] = useState(() => {
+  const initialTimeout = (() => {
     const ms = timeoutMsOf(target);
     return ms != null ? String(ms / 1000) : "";
-  });
+  })();
+
+  const [command, setCommand] = useState(target.command);
+  const [timeoutText, setTimeoutText] = useState(initialTimeout);
   const [busy, setBusy] = useState(false);
 
   // The server accepts any positive number in either unit, but not zero or a
@@ -360,6 +500,9 @@ function HookForm({
   const timeoutOk =
     seconds === "" || (Number(seconds) > 0 && Number.isFinite(Number(seconds)));
   const canSubmit = command.trim() !== "" && timeoutOk;
+  // The form contract's dirty gate: an untouched entry has nothing to save.
+  const dirty =
+    command.trim() !== target.command.trim() || seconds !== initialTimeout.trim();
 
   async function submit() {
     setBusy(true);
@@ -393,11 +536,38 @@ function HookForm({
     if (ok) onClose();
   }
 
+  async function remove() {
+    setBusy(true);
+    // The STORED command is the fingerprint — a draft edit in the command
+    // box must not change what the guard expects.
+    const ok = await applyConfigWrite(
+      "remove hook",
+      () =>
+        removeHookEntry(
+          target.event,
+          target.matcherIndex,
+          target.hookIndex,
+          target.command,
+        ),
+      ["hooks"],
+    );
+    setBusy(false);
+    if (ok) onClose();
+  }
+
   return (
     <ConfigFormSheet
       title={t("zconfig.hookEdit")}
       busy={busy}
-      submitDisabled={!canSubmit}
+      submitDisabled={!canSubmit || !dirty}
+      dirty={dirty}
+      footerLeft={
+        <FormDeleteButton
+          label={t("zconfig.hookDelete")}
+          busy={busy}
+          onConfirm={() => void remove()}
+        />
+      }
       onSubmit={() => void submit()}
       onClose={onClose}
     >
@@ -409,6 +579,7 @@ function HookForm({
         <input
           value={command}
           onChange={(e) => setCommand(e.target.value)}
+          autoFocus
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}

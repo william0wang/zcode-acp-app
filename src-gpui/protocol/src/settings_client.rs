@@ -27,10 +27,10 @@ use serde_json::Value;
 
 use crate::hub::{ConnectionProfile, HubUpgradeResult};
 use crate::settings::{
-    AgentUpsert, BackendRestartResult, ConnectivityResult, HookEntryPatch, McpServerUpsert,
-    ModelUpsert, PendingRestartStatus, ResetCardStatus, ResetOpportunityRequest,
-    ResetOpportunityResponse, SettingsAll, SpendResetCard, WorkflowGateModeSetting,
-    WorkflowGateSetResponse, WriteEffect,
+    AgentUpsert, BackendRestartResult, ConnectivityResult, HookEntryPatch, HookUpsert,
+    McpServerUpsert, McpStatusSnapshot, ModelUpsert, PendingRestartStatus, ResetCardStatus,
+    ResetOpportunityRequest, ResetOpportunityResponse, SettingsAll, SkillDetailSnapshot,
+    SpendResetCard, WorkflowGateModeSetting, WorkflowGateSetResponse, WriteEffect,
 };
 use crate::system_stats::SystemStatsResponse;
 use crate::workflow::{
@@ -437,6 +437,21 @@ impl<T: HttpTransport> HubHttpClient<T> {
             .await
     }
 
+    /// Per-server MCP health (GET /settings/mcp-status) — the settings rows'
+    /// status dots. Per-instance like pending-restart: the machine-level
+    /// mount has no backend to ask and answers 409.
+    pub async fn settings_mcp_status(
+        &self,
+        instance_id: &str,
+    ) -> Result<McpStatusSnapshot, HubApiError> {
+        let path = format!(
+            "/api/instances/{}/settings/mcp-status",
+            encode_uri_component(instance_id)
+        );
+        self.fetch_json(Method::Get, &path, None, FetchOptions::default())
+            .await
+    }
+
     pub async fn settings_app_update(&self, channel: Option<&str>) -> Result<Value, HubApiError> {
         let path = match channel {
             Some(channel) => format!(
@@ -563,6 +578,19 @@ impl<T: HttpTransport> HubHttpClient<T> {
             .await
     }
 
+    /// GET /settings/skills/{path} — one skill's full detail (the row →
+    /// detail view). Machine-level like the rest of the skills tree, and the
+    /// path encoding is [`Self::delete_skill`]'s: the whole absolute
+    /// SKILL.md path rides inside one segment.
+    pub async fn skill_detail(&self, skill_path: &str) -> Result<SkillDetailSnapshot, HubApiError> {
+        let path = format!(
+            "/api/settings/skills/{}",
+            encode_uri_component(skill_path)
+        );
+        self.fetch_json(Method::Get, &path, None, FetchOptions::default())
+            .await
+    }
+
     /// PUT /settings/mcp/{name} MERGES into the existing entry, so only the
     /// fields the form actually edits travel.
     pub async fn upsert_mcp_server(
@@ -596,8 +624,7 @@ impl<T: HttpTransport> HubHttpClient<T> {
 
     /// Edit one existing hook entry. The entry is addressed by THREE
     /// coordinates: event + matcher index in the path, hook index in the
-    /// body (the route only takes two path segments). There is no way to
-    /// add or remove an entry through here.
+    /// body (the route only takes two path segments).
     pub async fn update_hook(
         &self,
         event_name: &str,
@@ -614,6 +641,56 @@ impl<T: HttpTransport> HubHttpClient<T> {
             .map_err(|e| HubApiError::Unexpected(format!("serialize hook patch: {e}")))?;
         value["hookIndex"] = serde_json::json!(hook_index);
         self.fetch_json(Method::Put, &path, Some(value), FetchOptions::default())
+            .await
+    }
+
+    /// POST /settings/hooks/{event} — append one hook entry (settings
+    /// parity: hooks create). The matcher STRING names the target group (no
+    /// index races; an empty or absent matcher is the any-matcher group, and
+    /// a group that does not exist yet is appended).
+    pub async fn add_hook(
+        &self,
+        event_name: &str,
+        matcher: &str,
+        hook: HookUpsert,
+    ) -> Result<WriteEffect, HubApiError> {
+        let path = format!(
+            "/api/settings/hooks/{}",
+            encode_uri_component(event_name)
+        );
+        let hook_value = serde_json::to_value(&hook)
+            .map_err(|e| HubApiError::Unexpected(format!("serialize hook entry: {e}")))?;
+        let value = serde_json::json!({
+            // The empty-string matcher and an absent one are the same group
+            // server-side; sending the string is the honest spelling.
+            "matcher": matcher,
+            "hook": hook_value,
+        });
+        self.fetch_json(Method::Post, &path, Some(value), FetchOptions::default())
+            .await
+    }
+
+    /// POST /settings/hooks/{event}/remove — remove one entry. The indexes
+    /// address it, and the body's `command` is the FINGERPRINT: if the entry
+    /// at those indexes changed since the client read it, the bridge refuses
+    /// rather than deleting the wrong hook.
+    pub async fn remove_hook(
+        &self,
+        event_name: &str,
+        matcher_index: usize,
+        hook_index: usize,
+        command: &str,
+    ) -> Result<WriteEffect, HubApiError> {
+        let path = format!(
+            "/api/settings/hooks/{}/remove",
+            encode_uri_component(event_name)
+        );
+        let value = serde_json::json!({
+            "matcherIndex": matcher_index,
+            "hookIndex": hook_index,
+            "command": command,
+        });
+        self.fetch_json(Method::Post, &path, Some(value), FetchOptions::default())
             .await
     }
 
@@ -1511,6 +1588,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_skill_detail_read_encodes_the_whole_path_and_decodes_the_body() {
+        let t = transport();
+        t.push(ok_json(json!({
+            "ok": true,
+            "skill": {
+                "name": "pdf",
+                "description": "PDF tools",
+                "metadata": { "name": "pdf", "allowed-tools": "Read" },
+                "body": "# pdf\n",
+                "path": "/home/u/.zcode/skills/pdf/SKILL.md",
+                "dir": "/home/u/.zcode/skills/pdf",
+                "scope": "user",
+                "enabled": false,
+                "deletable": true
+            }
+        })));
+        let snapshot = client(&t)
+            .skill_detail("/home/u/.zcode/skills/pdf/SKILL.md")
+            .await
+            .unwrap();
+        assert_eq!(
+            t.urls()[0],
+            "http://hub/api/settings/skills/%2Fhome%2Fu%2F.zcode%2Fskills%2Fpdf%2FSKILL.md"
+        );
+        let skill = snapshot.skill.expect("skill present");
+        assert_eq!(skill.name, "pdf");
+        assert_eq!(skill.metadata.get("allowed-tools").map(String::as_str), Some("Read"));
+        assert!(!skill.enabled);
+        assert!(skill.deletable);
+    }
+
+    #[tokio::test]
+    async fn a_skill_detail_body_without_a_skill_decodes_rather_than_erroring() {
+        let t = transport();
+        t.push(ok_json(json!({ "ok": true })));
+        let snapshot = client(&t).skill_detail("/x/SKILL.md").await.unwrap();
+        assert!(snapshot.skill.is_none());
+    }
+
+    #[tokio::test]
     async fn a_model_upsert_posts_provider_and_model_with_only_the_set_rule_fields() {
         let t = transport();
         t.push(ok_json(json!({ "ok": true, "effect": "immediate" })));
@@ -1605,6 +1722,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hook_add_addresses_the_group_by_its_matcher_string() {
+        let t = transport();
+        t.push(ok_json(json!({ "ok": true, "effect": "needs-restart" })));
+        client(&t)
+            .add_hook(
+                "PreToolUse",
+                "Bash",
+                HookUpsert {
+                    hook_type: "command".into(),
+                    command: "echo hi".into(),
+                    timeout: Some(30),
+                },
+            )
+            .await
+            .unwrap();
+        // The matcher STRING locates the group — an index would race a
+        // concurrent edit — and the entry itself rides under `hook`. The
+        // timeout is seconds: the unit a command entry spells on disk.
+        let req = &t.requested()[0];
+        assert_eq!(req.url, "http://hub/api/settings/hooks/PreToolUse");
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(
+            t.body(0),
+            json!({
+                "matcher": "Bash",
+                "hook": { "type": "command", "command": "echo hi", "timeout": 30 },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_remove_carries_the_command_as_the_fingerprint() {
+        let t = transport();
+        t.push(ok_json(json!({ "ok": true, "effect": "needs-restart" })));
+        client(&t)
+            .remove_hook("Stop", 0, 1, "say done")
+            .await
+            .unwrap();
+        // The indexes address the entry, but `command` is the guard: a stale
+        // read whose entry changed is refused server-side instead of
+        // deleting the wrong hook.
+        let req = &t.requested()[0];
+        assert_eq!(req.url, "http://hub/api/settings/hooks/Stop/remove");
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(
+            t.body(0),
+            json!({
+                "matcherIndex": 0,
+                "hookIndex": 1,
+                "command": "say done",
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn the_mcp_enable_route_wants_enabled_not_enable() {
         let t = transport();
         t.push(ok_json(json!({ "ok": true, "effect": "needs-restart" })));
@@ -1613,6 +1785,43 @@ mod tests {
         assert_eq!(req.url, "http://hub/api/settings/mcp/enable");
         assert_eq!(req.method, Method::Post);
         assert_eq!(t.body(0), json!({ "name": "ctx7", "enabled": false }));
+    }
+
+    #[tokio::test]
+    async fn the_mcp_status_read_rides_the_instance_mount() {
+        let t = transport();
+        t.push(ok_json(json!({
+            "ok": true,
+            "available": true,
+            "statuses": {
+                "ctx7": {
+                    "status": "connected",
+                    "toolCount": 12,
+                    "failureKind": "tool_list_failed"
+                }
+            }
+        })));
+        let snap = client(&t).settings_mcp_status("i 1").await.unwrap();
+        // Per-instance on purpose — the machine-level mount answers 409
+        // (no backend to ask), and the id rides the path encoded.
+        let req = &t.requested()[0];
+        assert_eq!(req.url, "http://hub/api/instances/i%201/settings/mcp-status");
+        assert_eq!(req.method, Method::Get);
+        let health = snap.statuses.get("ctx7").unwrap();
+        assert_eq!(health.status, "connected");
+        assert_eq!(health.tool_count, 12);
+        assert_eq!(health.failure_kind.as_deref(), Some("tool_list_failed"));
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_mcp_status_is_a_body_not_an_error() {
+        let t = transport();
+        t.push(ok_json(json!({ "ok": true, "available": false, "statuses": {} })));
+        let snap = client(&t).settings_mcp_status("i1").await.unwrap();
+        // `available: false` (older backend, timed-out RPC) must decode Ok —
+        // the page renders "unknown", it does not fail.
+        assert!(!snap.available);
+        assert!(snap.statuses.is_empty());
     }
 
     #[tokio::test]

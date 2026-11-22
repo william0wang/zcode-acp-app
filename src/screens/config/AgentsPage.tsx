@@ -11,6 +11,7 @@ import {
 import {
   ConfigField,
   ConfigFormSheet,
+  FormDeleteButton,
   configInputClass,
 } from "../../components/config/ConfigFormSheet";
 import {
@@ -134,7 +135,7 @@ export function AgentsPage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.agents")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       onRefresh={() => void loadConfigSection("agents")}
       refreshing={loading}
       unsupported={supported === false}
@@ -287,12 +288,20 @@ function BuiltInAgentForm({
   const available = payload?.models?.available ?? [];
   const rules = payload?.models?.modelRules ?? [];
 
-  const [providerId, setProviderId] = useState(override?.providerId ?? "");
-  const [modelId, setModelId] = useState(override?.modelId ?? "");
-  const [reasoningLevel, setReasoningLevel] = useState(
-    override?.thoughtLevel ?? "",
-  );
+  const initialProvider = override?.providerId ?? "";
+  const initialModel = override?.modelId ?? "";
+  const initialLevel = override?.thoughtLevel ?? "";
+
+  const [providerId, setProviderId] = useState(initialProvider);
+  const [modelId, setModelId] = useState(initialModel);
+  const [reasoningLevel, setReasoningLevel] = useState(initialLevel);
   const [busy, setBusy] = useState(false);
+  // The form contract's dirty gate — an untouched override has nothing to
+  // save.
+  const dirty =
+    providerId !== initialProvider ||
+    modelId !== initialModel ||
+    reasoningLevel.trim() !== initialLevel;
 
   const modelIds = [
     ...new Set(
@@ -345,7 +354,8 @@ function BuiltInAgentForm({
     <ConfigFormSheet
       title={`${t("zconfig.agentEdit")} · ${name}`}
       busy={busy}
-      submitDisabled={providerId === "" || modelId === ""}
+      submitDisabled={providerId === "" || modelId === "" || !dirty}
+      dirty={dirty}
       onSubmit={() => void submit()}
       onClose={onClose}
     >
@@ -467,6 +477,7 @@ function PersonalAgentForm({
   const loadConfigSection = useAppStore((s) => s.loadConfigSection);
   const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
   const upsertAgent = useAppStore((s) => s.upsertAgent);
+  const deleteAgent = useAppStore((s) => s.deleteAgent);
 
   // The picker's data source; the entry screen's snapshot carries it, but a
   // screen opened straight to an agent does not.
@@ -496,13 +507,13 @@ function PersonalAgentForm({
   const [description, setDescription] = useState(
     target.frontmatter?.description ?? "",
   );
-  const [color, setColor] = useState(
-    (AGENT_COLORS as readonly string[]).includes(
-      target.frontmatter?.color ?? "",
-    )
-      ? target.frontmatter!.color!
-      : "",
-  );
+  const initialColor = (AGENT_COLORS as readonly string[]).includes(
+    target.frontmatter?.color ?? "",
+  )
+    ? target.frontmatter!.color!
+    : "";
+  const initialDescription = target.frontmatter?.description ?? "";
+  const [color, setColor] = useState(initialColor);
   // Seeded once, when the picker's options first exist: before that the state
   // is unknown, not empty (see the doc comment).
   const [model, setModel] = useState<string | undefined>(undefined);
@@ -546,6 +557,15 @@ function PersonalAgentForm({
   }
 
   const canSubmit = description.trim() !== "";
+  // The form contract's dirty gate: a picked model is a change by itself;
+  // everything else compares against the opened values. The level term treats
+  // `undefined` (not seeded yet — picker data pending, or the stored model is
+  // unmappable) as the baseline, not as a change to "".
+  const dirty =
+    modelTouched ||
+    description.trim() !== initialDescription.trim() ||
+    color !== initialColor ||
+    (thoughtLevel ?? thoughtWas ?? "") !== (thoughtWas ?? "");
 
   async function submit() {
     const body: AgentUpsert = { description: description.trim() };
@@ -573,11 +593,32 @@ function PersonalAgentForm({
     if (ok) onClose();
   }
 
+  // The edit form's footer delete (the form contract): removes the markdown
+  // file — the prompt body included — with no undo, so it stays two-tap.
+  async function remove() {
+    setBusy(true);
+    const ok = await applyConfigWrite(
+      "delete subagent",
+      () => deleteAgent(name),
+      ["agents"],
+    );
+    setBusy(false);
+    if (ok) onClose();
+  }
+
   return (
     <ConfigFormSheet
       title={`${t("zconfig.agentEdit")} · ${name}`}
       busy={busy}
-      submitDisabled={!canSubmit}
+      submitDisabled={!canSubmit || !dirty}
+      dirty={dirty}
+      footerLeft={
+        <FormDeleteButton
+          label={t("zconfig.agentDelete")}
+          busy={busy}
+          onConfirm={() => void remove()}
+        />
+      }
       onSubmit={() => void submit()}
       onClose={onClose}
     >
@@ -586,6 +627,7 @@ function PersonalAgentForm({
           value={description}
           onChange={(e) => setDescription(e.target.value)}
           rows={3}
+          autoFocus
           className={configInputClass}
         />
       </ConfigField>
@@ -613,7 +655,12 @@ function PersonalAgentForm({
             setModelTouched(true);
             setThoughtLevel("");
           }}
-          onThoughtLevelChange={setThoughtLevel}
+          onThoughtLevelChange={(next) => {
+            // A level pick edits the model block too: the submit carries the
+            // level only when the block is touched (see `modelTouched` there).
+            setThoughtLevel(next);
+            setModelTouched(true);
+          }}
         />
       )}
     </ConfigFormSheet>
@@ -646,6 +693,8 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
 
   const canSubmit = isValidAgentName(name.trim()) && description.trim() !== "";
+  // The form contract's dirty gate: a valid create has content by definition.
+  const dirty = canSubmit;
 
   // The levels a picker choice carries come with the option, so the level
   // field can only offer values the chosen model actually supports.
@@ -673,7 +722,8 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
     <ConfigFormSheet
       title={t("zconfig.agentsAdd")}
       busy={busy}
-      submitDisabled={!canSubmit}
+      submitDisabled={!canSubmit || !dirty}
+      dirty={dirty}
       onSubmit={() => void submit()}
       onClose={onClose}
     >
@@ -684,6 +734,7 @@ function NewAgentForm({ onClose }: { onClose: () => void }) {
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
+          autoFocus
           autoCapitalize="none"
           autoCorrect="off"
           spellCheck={false}

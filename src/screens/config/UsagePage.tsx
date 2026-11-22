@@ -40,7 +40,7 @@ export function UsagePage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.usage")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       unsupported={supported === false}
       hasLoaded={hasLoaded}
     >

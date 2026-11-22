@@ -69,7 +69,7 @@ export function BackupsPage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.backups")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       onRefresh={() => void loadConfigSection("backups")}
       refreshing={loading}
       unsupported={supported === false}

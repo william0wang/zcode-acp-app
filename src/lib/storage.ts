@@ -121,6 +121,10 @@ export function saveServerBook(book: ServerBook): void {
 }
 
 export function loadLang(): Lang {
+  // The i18n module reads this at load, and stores import it transitively
+  // (lib/errors) — in storage-less environments (node tests) the fallback
+  // language is the answer, not a crash.
+  if (typeof localStorage === "undefined") return "en";
   return localStorage.getItem(LANG_KEY) === "zh-CN" ? "zh-CN" : "en";
 }
 

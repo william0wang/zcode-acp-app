@@ -12,6 +12,7 @@ import {
   ConfigField,
   ConfigFormSheet,
   ConfigToggle,
+  FormDeleteButton,
   configInputClass,
 } from "../../components/config/ConfigFormSheet";
 
@@ -298,7 +299,7 @@ export function ModelsPage() {
   return (
     <ConfigPageFrame
       title={t("zconfig.models")}
-      onBack={() => useAppStore.getState().openConfig(null)}
+      onBack={() => useAppStore.getState().backFromConfigSection()}
       onRefresh={() => void loadConfigSection("models")}
       refreshing={loading}
       unsupported={supported === false}
@@ -393,20 +394,21 @@ function ModelForm({
   const { t } = useTranslation();
   const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
   const upsertModel = useAppStore((s) => s.upsertModel);
+  const removeModel = useAppStore((s) => s.removeModel);
 
   const providers = providerOptions(payload);
   const rules = payload?.models?.modelRules ?? [];
   const rule = target ? ruleFor(target, rules) : undefined;
 
+  const initialWindow = rule?.contextWindow ? String(rule.contextWindow) : "";
+  const initialLevels = rule?.reasoningLevels ?? [];
+  const initialEnabled = rule?.enabled !== false;
+
   const [providerId, setProviderId] = useState(target?.providerId ?? "");
   const [modelId, setModelId] = useState(target?.modelId ?? "");
-  const [contextWindow, setContextWindow] = useState(
-    rule?.contextWindow ? String(rule.contextWindow) : "",
-  );
-  const [levels, setLevels] = useState<string[]>(
-    () => rule?.reasoningLevels ?? [],
-  );
-  const [enabled, setEnabled] = useState(rule?.enabled !== false);
+  const [contextWindow, setContextWindow] = useState(initialWindow);
+  const [levels, setLevels] = useState<string[]>(() => initialLevels);
+  const [enabled, setEnabled] = useState(initialEnabled);
   const [busy, setBusy] = useState(false);
 
   // Every level any rule declares, plus the ones this model already carries —
@@ -422,6 +424,13 @@ function ModelForm({
     providerId.trim() !== "" &&
     modelId.trim() !== "" &&
     contextWindowOk(contextWindow);
+  // The form contract's dirty gate: a create is dirty whenever it is valid
+  // (a valid create has content); an edit compares against the opened values.
+  const dirty = !target
+    ? canSubmit
+    : contextWindow.trim() !== initialWindow.trim() ||
+      levels.join("\n") !== initialLevels.join("\n") ||
+      enabled !== initialEnabled;
 
   async function submit() {
     const window = contextWindow.trim();
@@ -446,11 +455,37 @@ function ModelForm({
     if (ok) onClose();
   }
 
+  // The edit form's footer delete (the form contract): removes the rule —
+  // the model stops being offered anywhere — so it stays two-tap.
+  async function remove() {
+    const providerId = target?.providerId;
+    const modelId = target?.modelId;
+    if (!target || !providerId || !modelId) return;
+    setBusy(true);
+    const ok = await applyConfigWrite(
+      "delete model",
+      () => removeModel(providerId, modelId),
+      ["models"],
+    );
+    setBusy(false);
+    if (ok) onClose();
+  }
+
   return (
     <ConfigFormSheet
       title={target ? t("zconfig.modelsEdit") : t("zconfig.modelsAdd")}
       busy={busy}
-      submitDisabled={!canSubmit}
+      submitDisabled={!canSubmit || !dirty}
+      dirty={dirty}
+      footerLeft={
+        target ? (
+          <FormDeleteButton
+            label={t("zconfig.modelDelete")}
+            busy={busy}
+            onConfirm={() => void remove()}
+          />
+        ) : undefined
+      }
       onSubmit={() => void submit()}
       onClose={onClose}
     >
@@ -478,6 +513,7 @@ function ModelForm({
             <input
               value={modelId}
               onChange={(e) => setModelId(e.target.value)}
+              autoFocus
               autoCapitalize="none"
               autoCorrect="off"
               spellCheck={false}
@@ -495,6 +531,7 @@ function ModelForm({
         <input
           value={contextWindow}
           onChange={(e) => setContextWindow(e.target.value)}
+          autoFocus={!!target}
           inputMode="numeric"
           autoCapitalize="none"
           placeholder="200000"

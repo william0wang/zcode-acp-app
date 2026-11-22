@@ -115,6 +115,20 @@ pub struct HookEntryPatch {
     pub timeout: Option<u64>,
 }
 
+/// The `hook` object of `POST /settings/hooks/{event}` (settings parity:
+/// hooks create). The form's add sheet always writes a `command`-type entry;
+/// the timeout is SECONDS, the unit a command entry spells on disk (the
+/// edit patch's "own unit" rule, creation edition).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookUpsert {
+    #[serde(rename = "type")]
+    pub hook_type: String,
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+}
+
 /// Three-state optional: `T | null` with the key itself optional — `None`
 /// omits the key (via the field's `skip_serializing_if`), `Some(None)` sends
 /// JSON null (the documented "clear" spelling), `Some(Some(v))` sends the
@@ -336,6 +350,83 @@ pub struct ResetOpportunityResponse {
 pub struct PendingRestartStatus {
     pub pending_restart: bool,
     pub writes: u64,
+}
+
+/// One server's health from `GET /api/instances/{id}/settings/mcp-status`
+/// (the bridge's proxy of the backend `mcp/list` mode:"status" RPC — the
+/// same data the `/mcp` slash card reads). `status` is the backend's
+/// vocabulary VERBATIM (connecting|connected|disabled|disconnected|failed|
+/// untrusted); an unknown spelling renders as-is rather than folding into a
+/// default — the api_type rule.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerHealth {
+    pub status: String,
+    #[serde(default)]
+    pub tool_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization_url: Option<String>,
+}
+
+/// The mcp-status route's body. `available: false` is NOT an error: an older
+/// backend or a timed-out RPC means "status unknown", and the page renders
+/// that instead of failing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpStatusSnapshot {
+    pub ok: bool,
+    pub available: bool,
+    #[serde(default)]
+    pub statuses: std::collections::BTreeMap<String, McpServerHealth>,
+}
+
+/// One skill's full detail (GET /settings/skills/{path}, server
+/// `readSkillDetail`): every frontmatter key as written plus the SKILL.md
+/// body after the block. Permissive decode — the bridge always sends the
+/// fields, and an unexpected body degrades to defaults instead of failing
+/// the view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetail {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Every frontmatter key as written (values are strings, as parsed).
+    #[serde(default)]
+    pub metadata: BTreeMap<String, String>,
+    /// The SKILL.md body after the frontmatter block; "" when none.
+    #[serde(default)]
+    pub body: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub dir: String,
+    #[serde(default)]
+    pub scope: String,
+    /// Absent means on — the same spelling as the list rows.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Plugin skills belong to the plugin install; the detail says so.
+    #[serde(default)]
+    pub deletable: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The detail route's body `{ok, skill}`. `skill: None` is a malformed body,
+/// which the view reads as a load failure — never a fake empty skill.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillDetailSnapshot {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub skill: Option<SkillDetail>,
 }
 
 /// `POST /api/instances/{id}/backend/restart` (server handleBackendRestart,

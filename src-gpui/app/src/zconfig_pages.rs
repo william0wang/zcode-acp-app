@@ -38,11 +38,12 @@ use gpui_kit::component::{
 use gpui_kit::{assets::IconName as KitIconName, *};
 use protocol::config_decode::{
     agent_rows, backup_lists, decode_subagent_model, encode_subagent_model, find_model_option,
-    flatten_hooks, hook_edit_patch, hook_timeout_ok, hooks_enabled, is_agent_read_only,
-    is_user_tree_scope, mcp_servers, mcp_upsert_body, model_options, skill_rows, timeout_ms_of,
-    AgentRow, HookRow, McpFormFields, McpServerRow, ModelOption, SkillRow,
+    flatten_hooks, hook_add_body, hook_edit_patch, hook_timeout_ok, hooks_enabled,
+    is_agent_read_only, is_user_tree_scope, mcp_servers, mcp_upsert_body, model_options,
+    skill_rows, timeout_ms_of, AgentRow, HookRow, McpFormFields, McpServerRow, ModelOption,
+    SkillRow,
 };
-use protocol::settings::{AgentUpsert, HookEntryPatch};
+use protocol::settings::{AgentUpsert, HookEntryPatch, McpServerHealth, SkillDetail};
 use rust_i18n::t;
 use serde_json::Value;
 
@@ -55,6 +56,18 @@ use crate::workbench::Workbench;
 /// the swatch fills are the tailwind values the TS picker paints.
 pub(crate) const AGENT_COLORS: [&str; 8] = [
     "red", "blue", "green", "yellow", "purple", "orange", "pink", "cyan",
+];
+
+/// The seven hook events the schema accepts, in its own order (server
+/// cli-config.ts `HOOK_EVENT_NAMES`) — the create form's picker vocabulary.
+pub(crate) const HOOK_EVENTS: [&str; 7] = [
+    "SessionStart",
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PermissionRequest",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
 ];
 
 fn swatch_fill(name: &str) -> Rgba {
@@ -91,14 +104,40 @@ pub(crate) struct McpFormState {
     url: Entity<InputState>,
     headers: Entity<TextareaState>,
     enabled: bool,
+    /// The opened values — the dirty gate's baseline.
+    orig: McpFormOrig,
 }
 
-/// The hook-entry edit form's state (the TS `HookForm`).
+/// The MCP form's opened values (the dirty gate's baseline).
+pub(crate) struct McpFormOrig {
+    server_type: String,
+    enabled: bool,
+    name: String,
+    command: String,
+    args: String,
+    env: String,
+    url: String,
+    headers: String,
+}
+
+/// The hook-entry form's state (the TS `HookForm`, plus its create branch).
 pub(crate) struct HookFormState {
-    target: HookRow,
+    /// The entry being edited; `None` = creating one — the event picker and
+    /// the matcher box exist only in this mode (on an existing entry they
+    /// ARE its identity, addressed by index in the route).
+    target: Option<HookRow>,
+    /// Create mode's event (one of [`HOOK_EVENTS`]; the picker guarantees
+    /// it). In edit mode a copy of the target's event, unused.
+    event: String,
+    /// Create mode's matcher; blank = the any-matcher group.
+    matcher: Entity<InputState>,
     command: Entity<InputState>,
-    /// Seconds, blank = keep the entry's current timeout.
+    /// Seconds, blank = keep the entry's current timeout (edit) / add none
+    /// (create).
     timeout: Entity<InputState>,
+    /// The opened values — the dirty gate's baseline (edit mode).
+    orig_command: String,
+    orig_timeout: String,
 }
 
 /// The personal-agent form's state (the TS `PersonalAgentForm`).
@@ -135,6 +174,24 @@ pub(crate) struct AgentFormState {
     stored_tools: Option<Vec<String>>,
     permission_mode: Option<String>,
     max_turns: Entity<InputState>,
+    inject_agents_md: bool,
+    background: bool,
+    /// The opened values — the dirty gate's baseline.
+    orig: AgentFormOrig,
+}
+
+/// The agent form's opened values (the dirty gate's baseline). `all_tools` +
+/// `tools` collapse into one effective Option, matching how the save decides
+/// whether the tool key changed.
+pub(crate) struct AgentFormOrig {
+    name: String,
+    description: String,
+    prompt: String,
+    max_turns: String,
+    color: Option<String>,
+    tools: Option<Vec<String>>,
+    permission_mode: Option<String>,
+    thought_level: Option<String>,
     inject_agents_md: bool,
     background: bool,
 }
@@ -244,13 +301,6 @@ const AGENT_PERMISSION_MODES: [&str; 6] = [
 // ---------------------------------------------------------------------------
 // The shared page shell
 // ---------------------------------------------------------------------------
-
-/// The config-screen notice (TS `notice`): a `notice.*` i18n key resolves
-/// through the shared catalog, anything else is plain failure text (t!
-/// falls back to its input when the key misses).
-fn notice_text(notice: &str) -> String {
-    t!(notice).into_owned()
-}
 
 /// The unsupported / error card (TS ConfigPageFrame's two states).
 fn state_card(title: &str, detail: &str, theme: &component::Theme) -> AnyElement {
@@ -386,7 +436,6 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
         .clone()
         .expect("render_config_section_page with no open section page");
     let key = page.kind.key();
-    let runtime = wb.runtime.clone();
     let mut column = div()
         .id(SharedString::from(format!("config-section-{key}")))
         .flex()
@@ -396,85 +445,18 @@ pub(crate) fn render_config_section_page(wb: &Workbench, cx: &Context<Workbench>
         .min_w_0()
         .overflow_x_hidden();
 
-    // Header: back, title, refresh.
-    let close_kind = page.kind;
-    let refresh_kind = page.kind;
-    let runtime2 = runtime.clone();
-    column = column.child(
-        div()
-            .flex()
-            .items_center()
-            .gap_1()
-            .h_9()
-            .px_3()
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.border)
-            .bg(theme.title_bar)
-            .child(
-                Button::new(SharedString::from(format!("{key}-back")))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::ArrowLeft)
-                    .tooltip(t!("common.backToWorkbench"))
-                    .on_click(move |_, _, _| {
-                        runtime.send(UiCommand::CloseConfigPage { page: close_kind })
-                    }),
-            )
-            .child(
-                div()
-                    .text_size(ui_text(13.))
-                    .text_color(theme.foreground)
-                    .child(t!(page.kind.title()).into_owned()),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new(SharedString::from(format!("{key}-refresh")))
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::RefreshCw)
-                    .tooltip(t!("zconfig.reloadSection"))
-                    .disabled(page.loading)
-                    .on_click(move |_, _, _| {
-                        runtime2.send(UiCommand::RefreshConfigPage { page: refresh_kind })
-                    }),
-            ),
-    );
+    // The overlay's top bar carries the title, back, and refresh
+    // (ADR-0014 §1) — the page body starts at the notice banner.
 
-    // The notice banner (write outcomes and effect classes land here).
-    if let Some(notice) = wb.snap.config_notice.as_deref() {
-        let runtime3 = wb.runtime.clone();
-        column = column.child(
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .mx_3()
-                .mt_2()
-                .px_3()
-                .py_2()
-                .flex_none()
-                .rounded_md()
-                .bg(theme.secondary)
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .text_size(ui_text(12.))
-                        .text_color(theme.foreground)
-                        .child(notice_text(notice)),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("{key}-notice-dismiss")))
-                        .ghost()
-                        .xsmall()
-                        .label("×")
-                        .tooltip(t!("common.dismiss"))
-                        .on_click(move |_, _, _| {
-                            runtime3.send(UiCommand::DismissConfigNotice)
-                        }),
-                ),
-        );
+    // The notice banner (write outcomes and effect classes land here) —
+    // the one shared renderer (ADR-0014 §2).
+    if let Some(notice) = wb.snap.config_notice.as_ref() {
+        column = column.child(crate::config_notice::notice_banner(
+            theme,
+            notice,
+            &wb.runtime,
+            format!("{key}-notice-dismiss"),
+        ));
     }
 
     // The three frame states, in the TS order: unsupported → error →
@@ -548,6 +530,11 @@ fn rows_card(theme: &component::Theme) -> gpui::Div {
 
 fn render_skills_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<Workbench>) -> AnyElement {
     let theme = cx.theme();
+    // The detail sub-view replaces the list in the same page frame (skills
+    // parity: row → detail); its back gesture returns here.
+    if page.skill_detail_path.is_some() {
+        return render_skill_detail(page, &wb.runtime, cx);
+    }
     let rows = skill_rows(page.payload.as_ref());
     let mut list = section_list("skills-list");
 
@@ -572,6 +559,209 @@ fn render_skills_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context
         ));
     }
     list.child(rows_card(theme).child(block))
+        .into_any_element()
+}
+
+/// One skill's detail sub-view (GET /settings/skills/{path}): the frontmatter
+/// as written plus the SKILL.md body, read-only — the enable/copy/delete
+/// controls stay on the list rows, where their effects already have their
+/// confirm flows.
+fn render_skill_detail(
+    page: &ConfigSectionPageView,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let runtime1 = runtime.clone();
+    let title = page
+        .skill_detail
+        .as_ref()
+        .map(|d| d.name.clone())
+        .filter(|n| !n.is_empty())
+        .or_else(|| page.skill_detail_path.clone())
+        .unwrap_or_default();
+    let column = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h_9()
+                .px_3()
+                .flex_none()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.title_bar)
+                .child(
+                    Button::new("skill-detail-back")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ArrowLeft)
+                        .tooltip(t!("zconfig.backToSkills"))
+                        .on_click(move |_, _, _| {
+                            runtime1.send(UiCommand::CloseSkillDetail);
+                        }),
+                )
+                .child(
+                    div()
+                        .text_size(ui_text(13.))
+                        .text_color(theme.foreground)
+                        .truncate()
+                        .min_w_0()
+                        .child(title),
+                ),
+        );
+
+    let body = if let Some(error) = &page.skill_detail_error {
+        state_card(&t!("zconfig.skillDetailLoadFailed"), error, theme)
+    } else if let Some(detail) = &page.skill_detail {
+        render_skill_detail_card(detail, theme)
+    } else {
+        // In flight: the list underneath is not painted, so the read says so.
+        div()
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .child(Spinner::new())
+            .into_any_element()
+    };
+    column.child(body).into_any_element()
+}
+
+/// Multi-line plain text as one child per line — this gpui-kit build has no
+/// pre-wrap, and per-line children keep the breaks (a blank line renders as a
+/// single space so it keeps its height).
+fn multiline_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| if l.is_empty() { " ".to_string() } else { l.to_string() })
+        .collect()
+}
+
+/// The detail's content card: name, scope + enabled line, description, the
+/// file path, every frontmatter key as written, then the SKILL.md body.
+fn render_skill_detail_card(detail: &SkillDetail, theme: &component::Theme) -> AnyElement {
+    let scope_key = format!("zconfig.scope{}", detail.scope);
+    let state_line = format!(
+        "{} · {}",
+        t!(scope_key.as_str()),
+        if detail.enabled {
+            t!("zconfig.skillOn")
+        } else {
+            t!("zconfig.skillOff")
+        },
+    );
+    let mut body = div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_4()
+        .child(
+            div()
+                .text_size(ui_text(14.))
+                .text_color(theme.foreground)
+                .child(detail.name.clone()),
+        )
+        .child(
+            div()
+                .text_size(ui_text(10.))
+                .text_color(theme.muted_foreground)
+                .child(state_line),
+        );
+    if !detail.description.is_empty() {
+        body = body.child(
+            div()
+                .text_size(ui_text(12.))
+                .text_color(theme.muted_foreground)
+                .child(detail.description.clone()),
+        );
+    }
+    body = body.child(
+        div()
+            .font_family(theme.mono_font_family.clone())
+            .text_size(ui_text(10.))
+            .text_color(theme.muted_foreground)
+            .truncate()
+            .child(detail.path.clone()),
+    );
+
+    if !detail.metadata.is_empty() {
+        let mut meta = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .pt_2()
+            .child(
+                div()
+                    .text_size(ui_text(10.))
+                    .text_color(theme.foreground)
+                    .child(t!("zconfig.skillDetailMetadata")),
+            );
+        for (key, value) in &detail.metadata {
+            meta = meta.child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w_32()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(ui_text(10.))
+                            .text_color(theme.muted_foreground)
+                            .truncate()
+                            .child(key.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(ui_text(10.))
+                            .text_color(theme.foreground)
+                            .flex()
+                            .flex_col()
+                            .children(multiline_lines(value)),
+                    ),
+            );
+        }
+        body = body.child(meta);
+    }
+
+    if !detail.body.is_empty() {
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .pt_2()
+                .child(
+                    div()
+                        .text_size(ui_text(10.))
+                        .text_color(theme.foreground)
+                        .child(t!("zconfig.skillDetailBody")),
+                )
+                .child(
+                    div()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(ui_text(12.))
+                        .text_color(theme.foreground)
+                        .flex()
+                        .flex_col()
+                        .children(multiline_lines(&detail.body)),
+                ),
+        );
+    }
+
+    section_list("skill-detail-scroll")
+        .child(rows_card(theme).child(body))
         .into_any_element()
 }
 
@@ -601,6 +791,11 @@ fn render_skill_row(
     let runtime1 = runtime.clone();
     let switch_path = id.clone();
     let enable = !skill.is_enabled();
+    // Opening the detail hides the rows, so an armed delete confirm must not
+    // survive the trip back to the list.
+    let open_wb = cx.entity();
+    let open_runtime = runtime.clone();
+    let open_path = id.clone();
     let mut row = div()
         .flex()
         .items_start()
@@ -609,6 +804,13 @@ fn render_skill_row(
         .py_3()
         .child(
             div()
+                .id(SharedString::from(format!("skill-open-{index}")))
+                .test_support()
+                .cursor_pointer()
+                .on_click(move |_, _, cx| {
+                    open_wb.update(cx, |this, _| this.skill_delete_confirm = None);
+                    open_runtime.send(UiCommand::OpenSkillDetail { path: open_path.clone() });
+                })
                 .flex_1()
                 .min_w_0()
                 .flex()
@@ -761,23 +963,30 @@ fn render_mcp_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<Wo
     let rows = mcp_servers(page.payload.as_ref());
     let mut list = section_list("mcp-list");
 
+    // The health read landed but could not answer (an older backend, a
+    // timed-out RPC): one page-level hint, not a row-level error — the
+    // config list below is still the truth it always was.
+    if page.mcp_status.as_ref().is_some_and(|s| !s.available) {
+        list = list.child(
+            div()
+                .px_4()
+                .py_2()
+                .text_size(ui_text(10.))
+                .text_color(crate::ui_tokens::faint(theme))
+                .child(t!("zconfig.mcpStatusUnavailable").into_owned()),
+        );
+    }
+
     if rows.is_empty() {
         list = list.child(empty_card(&t!("zconfig.mcpEmpty"), theme));
     } else {
         let mut block = div().flex().flex_col();
         for (index, server) in rows.iter().enumerate() {
-            // Resolved from `wb` (already borrowed) — never via
-            // `cx.entity().read_with(cx, ..)`, which double-leases the entity
-            // mid-render and panics (the 14:51 SIGABRT, 2026-10-21).
-            let armed = wb.mcp_delete_confirm.as_deref() == server.name.as_deref();
-            block = block.child(render_mcp_row(
-                index,
-                server,
-                page.busy,
-                armed,
-                wb,
-                cx,
-            ));
+            let health = page
+                .mcp_status
+                .as_ref()
+                .and_then(|s| server.name.as_ref().and_then(|n| s.statuses.get(n)));
+            block = block.child(render_mcp_row(index, server, health, page.busy, wb, cx));
         }
         list = list.child(rows_card(theme).child(block));
     }
@@ -800,11 +1009,81 @@ fn render_mcp_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<Wo
     list.into_any_element()
 }
 
+/// A backend status vocabulary word → its label. Known verdicts localize;
+/// an unknown spelling renders VERBATIM (the api_type rule — this build
+/// must never fold a verdict it has not heard of into a default).
+fn mcp_status_label(status: &str) -> String {
+    match status {
+        "connected" => t!("zconfig.mcpStatusConnected").into_owned(),
+        "connecting" => t!("zconfig.mcpStatusConnecting").into_owned(),
+        "disconnected" => t!("zconfig.mcpStatusDisconnected").into_owned(),
+        "disabled" => t!("zconfig.disabled").into_owned(),
+        "failed" => t!("zconfig.mcpStatusFailed").into_owned(),
+        "untrusted" => t!("zconfig.mcpStatusUntrusted").into_owned(),
+        other => other.to_string(),
+    }
+}
+
+/// The row's live health line (the per-instance probe): dot + verdict +
+/// tool count + the raw failure kind — the same parts the `/mcp` slash card
+/// prints, inline under the transport subtitle. A pending OAuth
+/// authorization shows its URL, the one action that unblocks the server.
+fn render_mcp_health_line(
+    row_id: &str,
+    health: &McpServerHealth,
+    theme: &component::Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let mut parts = vec![mcp_status_label(&health.status)];
+    if health.tool_count > 0 {
+        parts.push(t_count("zconfig.mcpTools", health.tool_count));
+    }
+    let mut line = div()
+        .id(SharedString::from(format!("mcp-health-{row_id}")))
+        .flex()
+        .items_center()
+        .gap_2()
+        .child(
+            div()
+                .size(px(6.))
+                .flex_none()
+                .rounded_full()
+                .bg(crate::ui_tokens::mcp_health_color(&health.status)),
+        )
+        .child(
+            div()
+                .text_size(ui_text(10.))
+                .text_color(theme.muted_foreground)
+                .child(parts.join(" · ")),
+        );
+    if let Some(kind) = health.failure_kind.as_deref() {
+        line = line.child(
+            div()
+                .font_family(theme.mono_font_family.clone())
+                .text_size(ui_text(10.))
+                .text_color(theme.muted_foreground)
+                .truncate()
+                .min_w_0()
+                .child(kind.to_string()),
+        );
+    }
+    if let Some(url) = health.authorization_url.as_deref() {
+        line = line.child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(ui_text(10.))
+                .text_color(crate::ui_tokens::info_text())
+                .child(url.to_string()),
+        );
+    }
+    line
+}
+
 fn render_mcp_row(
     index: usize,
     server: &McpServerRow,
+    health: Option<&McpServerHealth>,
     busy: bool,
-    armed: bool,
     wb_ref: &Workbench,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -824,11 +1103,10 @@ fn render_mcp_row(
     let disabled = server.enabled == Some(false);
     let wb = cx.entity();
     let target = server.clone();
-    let runtime = wb_ref.runtime.clone();
-    let runtime_switch = runtime.clone();
+    let runtime_switch = wb_ref.runtime.clone();
     let switch_name = name.clone();
+    let health_name = name.clone();
     let enable = !disabled;
-    let delete = render_mcp_delete(index, &name, busy, armed, &runtime, cx);
     div()
         .id(SharedString::from(format!("mcp-row-{index}-{name}")))
         .test_support()
@@ -862,6 +1140,11 @@ fn render_mcp_row(
                         .truncate()
                         .child(subtitle),
                 )
+                // The live health line (None = the probe never landed, or
+                // this server is absent from the backend's answer — no dot).
+                .when_some(health, |this, h| {
+                    this.child(render_mcp_health_line(&health_name, h, theme))
+                })
                 .when(disabled, |this| {
                     this.child(
                         div()
@@ -885,7 +1168,6 @@ fn render_mcp_row(
                     });
                 }),
         )
-        .child(delete)
         .child(
             div()
                 .size_3()
@@ -900,7 +1182,6 @@ fn render_mcp_row(
 /// first press arms it (Cancel / Delete swap in), the second removes the
 /// config entry — no undo from the app.
 fn render_mcp_delete(
-    index: usize,
     name: &str,
     busy: bool,
     armed: bool,
@@ -921,7 +1202,7 @@ fn render_mcp_delete(
             .gap_1()
             .flex_none()
             .child(
-                Button::new(SharedString::from(format!("mcp-delete-cancel-{index}")))
+                Button::new("mcp-delete-cancel")
                     .ghost()
                     .xsmall()
                     .label(t!("common.cancel").into_owned())
@@ -933,7 +1214,7 @@ fn render_mcp_delete(
                     }),
             )
             .child(
-                Button::new(SharedString::from(format!("mcp-delete-confirm-{index}")))
+                Button::new("mcp-delete-confirm")
                     .primary()
                     .xsmall()
                     .label(t!("zconfig.mcpDelete").into_owned())
@@ -954,7 +1235,7 @@ fn render_mcp_delete(
 
     let wb_arm = wb;
     let arm_name = name.to_string();
-    Button::new(SharedString::from(format!("mcp-delete-{index}")))
+    Button::new("mcp-delete")
         .ghost()
         .xsmall()
         .icon(KitIconName::Trash)
@@ -990,7 +1271,6 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
 
     if rows.is_empty() {
         list = list.child(empty_card(&t!("zconfig.hooksEmpty"), theme));
-        return list.into_any_element();
     }
 
     // The whole tree's switch. One write, needs-restart — the bridge
@@ -1025,6 +1305,23 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
                         runtime.send(UiCommand::SetHooksEnabled { enabled: !enabled });
                     }),
             ),
+    );
+
+    // The create control (settings parity: hooks CRUD): appends a
+    // command-type entry under a picked event and matcher.
+    let wb_add = cx.entity();
+    list = list.child(
+        div().px_3().child(
+            Button::new("hooks-add")
+                .secondary()
+                .small()
+                .w_full()
+                .icon(IconName::Plus)
+                .label(t!("zconfig.hookAdd").into_owned())
+                .on_click(move |_, window, cx| {
+                    wb_add.update(cx, |this, cx| this.open_hook_form(None, window, cx));
+                }),
+        ),
     );
 
     // Group by event for the collapsible list, preserving the server's
@@ -1107,17 +1404,16 @@ fn render_hooks_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context<
         list = list.child(block);
     }
 
-    // The read-only footnote (the route offers no add/remove).
+    // The footnote: what a hook edit costs (every write on this page is
+    // needs-restart — the bridge re-reads hooks only when its backend
+    // respawns).
     list = list.child(
         div()
             .px_4()
             .pt_1()
             .text_size(ui_text(10.))
             .text_color(theme.muted_foreground)
-            .child(fill(
-                &t!("zconfig.hooksReadOnly"),
-                &[("count", &rows.len().to_string())],
-            )),
+            .child(t!("zconfig.hooksNote").into_owned()),
     );
     list.into_any_element()
 }
@@ -1158,7 +1454,9 @@ fn render_hook_entry(
                 .min_w_0()
                 .cursor_pointer()
                 .on_click(move |_, window, cx| {
-                    wb.update(cx, |this, cx| this.open_hook_form(target.clone(), window, cx));
+                    wb.update(cx, |this, cx| {
+                        this.open_hook_form(Some(target.clone()), window, cx)
+                    });
                 })
                 .child(
                     div()
@@ -1236,19 +1534,11 @@ fn render_agents_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context
     } else {
         let mut block = div().flex().flex_col();
         for (index, agent) in rows.iter().enumerate() {
-            // The delete key is the row's DISPLAY name (render_agent_row's
-            // `name`), so derive it the same way here. Resolved from `wb`
-            // (already borrowed) — never via `cx.entity().read_with(cx, ..)`,
-            // which double-leases the entity mid-render and panics (the
-            // 14:51 SIGABRT, 2026-10-21).
-            let row_name = agent.name.clone().unwrap_or_default();
-            let armed = wb.agent_delete_confirm.as_deref() == Some(row_name.as_str());
             block = block.child(render_agent_row(
                 index,
                 agent,
                 &options,
                 page.busy,
-                armed,
                 &wb.runtime,
                 cx,
             ));
@@ -1281,7 +1571,6 @@ fn render_agent_row(
     agent: &AgentRow,
     options: &[protocol::config_decode::ModelOption],
     busy: bool,
-    armed: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
 ) -> AnyElement {
@@ -1418,9 +1707,6 @@ fn render_agent_row(
                     });
                 }),
         );
-        row = row.child(render_agent_delete(
-            index, &name, busy, armed, runtime, cx,
-        ));
     } else {
         // A built-in has no file, but its MODEL is overridable — the server
         // keeps that in the agents state file. Without this control the only
@@ -1533,12 +1819,88 @@ fn render_builtin_model_control(
         .into_any_element()
 }
 
-/// A personal agent's delete control, two gestures like a backup restore: the
-/// first press arms it (the row swaps to Cancel / Delete), the second fires.
-/// Deleting removes the markdown file — the prompt body included — and the app
-/// has no undo, so one stray click must not do it.
+/// A personal agent's delete control, two gestures, in the edit form's footer
+/// (the form contract: delete lives in the edit form's footer, never on
+/// rows). Deleting removes the markdown file — the prompt body included — and
+/// the app has no undo, so one stray click must not do it.
+/// A hook entry's delete control (the edit form's footer, the form
+/// contract): two gestures — the first arms (Cancel / Delete), the second
+/// fires the remove write with the STORED command as the fingerprint (a
+/// draft edit in the command box must not change what the guard expects).
+fn render_hook_delete(
+    target: &HookRow,
+    busy: bool,
+    armed: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let wb = cx.entity();
+
+    if armed {
+        let wb_cancel = wb.clone();
+        let wb_confirm = wb.clone();
+        let runtime_fire = runtime.clone();
+        let fire = target.clone();
+        return div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .child(
+                Button::new("hook-delete-cancel")
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        wb_cancel.update(cx, |this, cx| {
+                            this.hook_delete_confirm = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new("hook-delete-confirm")
+                    .primary()
+                    .xsmall()
+                    .label(t!("zconfig.hookDelete").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        wb_confirm.update(cx, |this, cx| {
+                            this.hook_delete_confirm = None;
+                            cx.notify();
+                        });
+                        runtime_fire.send(UiCommand::RemoveHookEntry {
+                            event: fire.event.clone(),
+                            matcher_index: fire.matcher_index,
+                            hook_index: fire.hook_index,
+                            command: fire.command.clone(),
+                        });
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let wb_arm = wb;
+    let arm_key = target.key.clone();
+    Button::new("hook-delete")
+        .ghost()
+        .xsmall()
+        .icon(KitIconName::Trash)
+        .text_color(theme.muted_foreground)
+        .disabled(busy)
+        .on_click(move |_, _, cx| {
+            cx.stop_propagation();
+            let key = arm_key.clone();
+            wb_arm.update(cx, |this, cx| {
+                this.hook_delete_confirm = Some(key);
+                cx.notify();
+            });
+        })
+        .into_any_element()
+}
+
 fn render_agent_delete(
-    index: usize,
     name: &str,
     busy: bool,
     armed: bool,
@@ -1559,7 +1921,7 @@ fn render_agent_delete(
             .gap_1()
             .flex_none()
             .child(
-                Button::new(SharedString::from(format!("agent-delete-cancel-{index}")))
+                Button::new("agent-delete-cancel")
                     .ghost()
                     .xsmall()
                     .label(t!("common.cancel").into_owned())
@@ -1571,7 +1933,7 @@ fn render_agent_delete(
                     }),
             )
             .child(
-                Button::new(SharedString::from(format!("agent-delete-confirm-{index}")))
+                Button::new("agent-delete-confirm")
                     .primary()
                     .xsmall()
                     .label(t!("zconfig.agentDelete").into_owned())
@@ -1591,7 +1953,7 @@ fn render_agent_delete(
 
     let wb_arm = wb;
     let arm_name = name.to_string();
-    Button::new(SharedString::from(format!("agent-delete-{index}")))
+    Button::new("agent-delete")
         .ghost()
         .xsmall()
         .icon(KitIconName::Trash)
@@ -1861,20 +2223,62 @@ impl Workbench {
         }
 
         // Re-render per keystroke: canSubmit depends on the typed values.
+        // Typing also stands down the discard confirmation.
         let mut subs = Vec::new();
         for entity in [name.clone(), command.clone(), url.clone()] {
-            subs.push(cx.subscribe(&entity, |_, _, _: &InputEvent, cx| cx.notify()));
+            subs.push(cx.subscribe(&entity, |this, _, _: &InputEvent, cx| {
+                this.settings_form_confirm_discard = false;
+                cx.notify();
+            }));
         }
         for entity in [args.clone(), env.clone(), headers.clone()] {
-            subs.push(cx.subscribe(&entity, |_, _, _: &InputEvent, cx| cx.notify()));
+            subs.push(cx.subscribe(&entity, |this, _, _: &InputEvent, cx| {
+                this.settings_form_confirm_discard = false;
+                cx.notify();
+            }));
         }
 
-        self.zconfig_form = Some(ZConfigForm::Mcp(McpFormState {
-            server_type: target
+        let server_type = target
+            .as_ref()
+            .and_then(|t| t.server_type.clone())
+            .unwrap_or_else(|| "stdio".to_string());
+        let enabled = target.as_ref().map(|t| t.enabled != Some(false)).unwrap_or(true);
+        let orig = McpFormOrig {
+            server_type: server_type.clone(),
+            enabled,
+            name: target.as_ref().and_then(|t| t.name.clone()).unwrap_or_default(),
+            command: target.as_ref().and_then(|t| t.command.clone()).unwrap_or_default(),
+            args: target
                 .as_ref()
-                .and_then(|t| t.server_type.clone())
-                .unwrap_or_else(|| "stdio".to_string()),
-            enabled: target.as_ref().map(|t| t.enabled != Some(false)).unwrap_or(true),
+                .and_then(|t| t.args.clone())
+                .map(|l| l.join("\n"))
+                .unwrap_or_default(),
+            env: target
+                .as_ref()
+                .and_then(|t| t.env.clone())
+                .map(|m| kv_to_lines(&m))
+                .unwrap_or_default(),
+            url: target.as_ref().and_then(|t| t.url.clone()).unwrap_or_default(),
+            headers: target
+                .as_ref()
+                .and_then(|t| t.headers.clone())
+                .map(|m| kv_to_lines(&m))
+                .unwrap_or_default(),
+        };
+        // Focus the first input on open: the name in add mode, the active
+        // transport's first field in edit mode (the name input does not
+        // render there — its handle would focus nothing).
+        let adding = target.is_none();
+        let focus = if adding {
+            name.clone()
+        } else if server_type == "stdio" {
+            command.clone()
+        } else {
+            url.clone()
+        };
+        self.zconfig_form = Some(ZConfigForm::Mcp(McpFormState {
+            server_type,
+            enabled,
             target,
             name,
             command,
@@ -1882,18 +2286,34 @@ impl Workbench {
             env,
             url,
             headers,
+            orig,
         }));
         self.zconfig_form_subs = subs;
+        self.settings_form_confirm_discard = false;
+        window.defer(cx, move |window, cx| {
+            let handle = focus.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
         cx.notify();
     }
 
-    /// Opens the hook-entry edit form (command + timeout, TS `HookForm`).
-    pub fn open_hook_form(&mut self, target: HookRow, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens the hook-entry form (command + timeout; TS `HookForm`).
+    /// `target = None` is the create branch: the event picker and matcher
+    /// box are editable, and every field starts empty.
+    pub fn open_hook_form(
+        &mut self,
+        target: Option<HookRow>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let command = cx.new(|cx| InputState::new(window, cx).placeholder("echo done"));
-        prefill(&command, target.command.clone(), window, cx);
+        if let Some(t) = &target {
+            prefill(&command, t.command.clone(), window, cx);
+        }
         // Seconds (the desktop form's unit), blank = keep.
         let timeout = cx.new(|cx| InputState::new(window, cx).placeholder("60"));
-        if let Some(ms) = timeout_ms_of(&target) {
+        let mut orig_timeout = String::new();
+        if let Some(ms) = target.as_ref().and_then(timeout_ms_of) {
             // TS `String(ms / 1000)`: keep the fraction (3500ms is "3.5"),
             // whole seconds print bare.
             let secs = ms as f64 / 1000.0;
@@ -1902,16 +2322,46 @@ impl Workbench {
             } else {
                 secs.to_string()
             };
-            prefill(&timeout, text, window, cx);
+            prefill(&timeout, text.clone(), window, cx);
+            orig_timeout = text;
         }
-        let sub_c = cx.subscribe(&command, |_, _, _: &InputEvent, cx| cx.notify());
-        let sub_t = cx.subscribe(&timeout, |_, _, _: &InputEvent, cx| cx.notify());
+        let matcher = cx.new(|cx| InputState::new(window, cx).placeholder("Bash"));
+        let sub_c = cx.subscribe(&command, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_t = cx.subscribe(&timeout, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_m = cx.subscribe(&matcher, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let orig_command = target
+            .as_ref()
+            .map(|t| t.command.clone())
+            .unwrap_or_default();
+        let event = target
+            .as_ref()
+            .map(|t| t.event.clone())
+            .unwrap_or_else(|| HOOK_EVENTS[0].to_string());
+        let focus = command.clone();
         self.zconfig_form = Some(ZConfigForm::Hook(HookFormState {
             target,
+            event,
+            matcher,
             command,
             timeout,
+            orig_command,
+            orig_timeout,
         }));
-        self.zconfig_form_subs = vec![sub_c, sub_t];
+        self.zconfig_form_subs = vec![sub_c, sub_t, sub_m];
+        self.settings_form_confirm_discard = false;
+        window.defer(cx, move |window, cx| {
+            let handle = focus.read(cx).focus_handle(cx);
+            window.focus(&handle, cx);
+        });
         cx.notify();
     }
 
@@ -1995,9 +2445,47 @@ impl Workbench {
         let stored_tools = fm.tools.clone().filter(|t| !t.is_empty());
         let all_tools = stored_tools.is_none();
         let tools = stored_tools.clone().unwrap_or_default();
-        let sub = cx.subscribe(&description, |_, _, _: &InputEvent, cx| cx.notify());
-        let sub_prompt = cx.subscribe(&system_prompt, |_, _, _: &InputEvent, cx| cx.notify());
-        let sub_name = cx.subscribe(&name, |_, _, _: &InputEvent, cx| cx.notify());
+        let sub = cx.subscribe(&description, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_prompt = cx.subscribe(&system_prompt, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_name = cx.subscribe(&name, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let sub_max = cx.subscribe(&max_turns, |this, _, _: &InputEvent, cx| {
+            this.settings_form_confirm_discard = false;
+            cx.notify();
+        });
+        let orig = AgentFormOrig {
+            name: target
+                .as_ref()
+                .and_then(|t| t.name.clone())
+                .unwrap_or_default(),
+            description: fm.description.clone().unwrap_or_default(),
+            prompt: target
+                .as_ref()
+                .and_then(|t| t.system_prompt.clone())
+                .unwrap_or_default(),
+            max_turns: fm.max_turns.map(|n| n.to_string()).unwrap_or_default(),
+            color: color.clone(),
+            tools: if all_tools { None } else { Some(tools.clone()) },
+            permission_mode: fm.permission_mode.clone().filter(|v| !v.is_empty()),
+            thought_level: fm.thought_level.clone().filter(|l| !l.is_empty()),
+            inject_agents_md: fm.inject_agents_md.unwrap_or(true),
+            background: fm.background.unwrap_or(false),
+        };
+        // Focus the first input on open: the name when creating, the
+        // description when editing (the name is the file path, shown fixed).
+        // The two are different state types, so the pick happens INSIDE the
+        // deferred closure.
+        let focus_name = name.clone();
+        let focus_desc = description.clone();
+        let editing = target.is_some();
         self.zconfig_form = Some(ZConfigForm::Agent(AgentFormState {
             target,
             name,
@@ -2018,8 +2506,18 @@ impl Workbench {
             max_turns,
             inject_agents_md: fm.inject_agents_md.unwrap_or(true),
             background: fm.background.unwrap_or(false),
+            orig,
         }));
-        self.zconfig_form_subs = vec![sub, sub_prompt, sub_name];
+        self.zconfig_form_subs = vec![sub, sub_prompt, sub_name, sub_max];
+        self.settings_form_confirm_discard = false;
+        window.defer(cx, move |window, cx| {
+            let handle = if editing {
+                focus_desc.read(cx).focus_handle(cx).clone()
+            } else {
+                focus_name.read(cx).focus_handle(cx).clone()
+            };
+            window.focus(&handle, cx);
+        });
         cx.notify();
     }
 
@@ -2027,7 +2525,66 @@ impl Workbench {
     pub(crate) fn close_zconfig_form(&mut self, cx: &mut Context<Self>) {
         self.zconfig_form = None;
         self.zconfig_form_subs.clear();
+        self.settings_form_confirm_discard = false;
+        // A footer delete left armed must not survive into the next form —
+        // reopening the same entry would render it already-confirmed-away.
+        self.mcp_delete_confirm = None;
+        self.agent_delete_confirm = None;
+        self.hook_delete_confirm = None;
         cx.notify();
+    }
+
+    /// The open zconfig form's dirty gate. Add/create forms count as dirty
+    /// whenever valid (a valid create has content by definition); edit forms
+    /// compare every field against the opened values.
+    pub(crate) fn zconfig_form_dirty(&self, cx: &Context<Self>) -> bool {
+        match &self.zconfig_form {
+            None => false,
+            Some(ZConfigForm::Mcp(form)) => {
+                if form.target.is_none() {
+                    return true;
+                }
+                form.server_type != form.orig.server_type
+                    || form.enabled != form.orig.enabled
+                    || form.name.read(cx).value().trim() != form.orig.name.trim()
+                    || form.command.read(cx).value().trim() != form.orig.command.trim()
+                    || form.args.read(cx).value() != form.orig.args
+                    || form.env.read(cx).value() != form.orig.env
+                    || form.url.read(cx).value().trim() != form.orig.url.trim()
+                    || form.headers.read(cx).value() != form.orig.headers
+            }
+            Some(ZConfigForm::Hook(form)) => {
+                // A create form has no baseline — any valid content is a
+                // change (the agent form's create branch).
+                if form.target.is_none() {
+                    return true;
+                }
+                form.command.read(cx).value().trim() != form.orig_command.trim()
+                    || form.timeout.read(cx).value().trim() != form.orig_timeout.trim()
+            }
+            Some(ZConfigForm::Agent(form)) => {
+                if form.target.is_none() {
+                    return true;
+                }
+                // A model PICK is a change by itself, whatever it changed to.
+                form.model_touched
+                    || form.name.read(cx).value().trim() != form.orig.name.trim()
+                    || form.description.read(cx).value().trim()
+                        != form.orig.description.trim()
+                    || form.system_prompt.read(cx).value() != form.orig.prompt
+                    || form.max_turns.read(cx).value().trim() != form.orig.max_turns.trim()
+                    || form.color != form.orig.color
+                    || (if form.all_tools {
+                        None
+                    } else {
+                        Some(form.tools.clone())
+                    }) != form.orig.tools
+                    || form.permission_mode != form.orig.permission_mode
+                    || form.thought_level != form.orig.thought_level
+                    || form.inject_agents_md != form.orig.inject_agents_md
+                    || form.background != form.orig.background
+            }
+        }
     }
 
     // ---- validation ----
@@ -2091,7 +2648,6 @@ impl Workbench {
         let Some(ZConfigForm::Mcp(form)) = &self.zconfig_form else {
             return;
         };
-        let adding = form.target.is_none();
         let name = match &form.target {
             Some(t) => t.name.clone().unwrap_or_default(),
             None => form.name.read(cx).value().trim().to_string(),
@@ -2106,29 +2662,43 @@ impl Workbench {
             args_text: &form.args.read(cx).value(),
             env_text: &form.env.read(cx).value(),
         });
-        self.runtime
-            .send(UiCommand::UpsertMcpServer { adding, name, body });
+        self.runtime.send(UiCommand::UpsertMcpServer { name, body });
         cx.notify();
     }
 
-    /// The hook form's Save: the patch carries the trimmed command and the
-    /// timeout only when the field is non-blank (config_decode's
-    /// `hook_edit_patch` writes back in the entry's own unit).
+    /// The hook form's Save: an edit patches the entry (`hook_edit_patch`
+    /// writes back in the entry's own unit); a create appends a command-type
+    /// entry under the picked event and matcher string (`hook_add_body`).
     fn submit_hook_form(&mut self, cx: &mut Context<Self>) {
         let Some(ZConfigForm::Hook(form)) = &self.zconfig_form else {
             return;
         };
-        let patch = hook_edit_patch(
-            &form.target,
-            &form.command.read(cx).value(),
-            &form.timeout.read(cx).value(),
-        );
-        self.runtime.send(UiCommand::UpdateHookEntry {
-            event: form.target.event.clone(),
-            matcher_index: form.target.matcher_index,
-            hook_index: form.target.hook_index,
-            patch,
-        });
+        match &form.target {
+            Some(target) => {
+                let patch = hook_edit_patch(
+                    target,
+                    &form.command.read(cx).value(),
+                    &form.timeout.read(cx).value(),
+                );
+                self.runtime.send(UiCommand::UpdateHookEntry {
+                    event: target.event.clone(),
+                    matcher_index: target.matcher_index,
+                    hook_index: target.hook_index,
+                    patch,
+                });
+            }
+            None => {
+                let body = hook_add_body(
+                    &form.command.read(cx).value(),
+                    &form.timeout.read(cx).value(),
+                );
+                self.runtime.send(UiCommand::AddHookEntry {
+                    event: form.event.clone(),
+                    matcher: form.matcher.read(cx).value().trim().to_string(),
+                    body,
+                });
+            }
+        }
         cx.notify();
     }
 
@@ -2286,16 +2856,22 @@ impl Workbench {
                     self.mcp_form_can_submit(cx),
                     Self::submit_mcp_form,
                 ),
-                Some(ZConfigForm::Hook(_)) => (
-                    t!("zconfig.hookEdit").into_owned(),
+                Some(ZConfigForm::Hook(form)) => (
+                    if form.target.is_some() {
+                        t!("zconfig.hookEdit").into_owned()
+                    } else {
+                        t!("zconfig.hookAdd").into_owned()
+                    },
                     self.hook_form_can_submit(cx),
                     Self::submit_hook_form,
                 ),
                 Some(ZConfigForm::Agent(form)) => {
+                    // Breadcrumb: the section names the file (the upstream
+                    // form-header pattern) — "Subagents › name".
                     let title = match &form.target {
                         Some(target) => format!(
-                            "{} · {}",
-                            t!("zconfig.agentEdit"),
+                            "{} › {}",
+                            t!("zconfig.agents"),
                             target.name.clone().unwrap_or_default()
                         ),
                         None => t!("zconfig.agentsAdd").into_owned(),
@@ -2304,6 +2880,7 @@ impl Workbench {
                 }
                 None => return div().into_any_element(),
             };
+        let dirty = self.zconfig_form_dirty(cx);
 
         let mut column = div().flex().flex_col().flex_1().min_h_0().min_w_0();
         let wb = cx.entity();
@@ -2325,7 +2902,7 @@ impl Workbench {
                         .icon(IconName::ArrowLeft)
                         .tooltip(t!("zconfig.backToSections"))
                         .on_click(move |_, _, cx| {
-                            wb.update(cx, |this, cx| this.close_zconfig_form(cx));
+                            wb.update(cx, |this, cx| this.request_close_settings_form(cx));
                         }),
                 )
                 .child(
@@ -2337,6 +2914,9 @@ impl Workbench {
                         .child(title),
                 ),
         );
+        if let Some(strip) = self.discard_armed_strip(&theme, cx) {
+            column = column.child(strip);
+        }
 
         let body = match &self.zconfig_form {
             Some(ZConfigForm::Mcp(form)) => self.render_mcp_form(form, theme, cx),
@@ -2345,7 +2925,71 @@ impl Workbench {
             None => div().into_any_element(),
         };
 
+        // Footer (the form contract): Delete LEFT in an edit form's footer —
+        // never on rows — and Save disabled while busy, invalid, or CLEAN
+        // (valid AND dirty).
         let wb2 = cx.entity();
+        let save = Button::new("zconfig-form-save")
+            .primary()
+            .label(if busy {
+                t!("zconfig.saving").into_owned()
+            } else {
+                t!("common.save").into_owned()
+            })
+            .disabled(busy || !can_submit || !dirty)
+            .on_click(move |_, _, cx| {
+                wb2.update(cx, |this, cx| submit(this, cx));
+            });
+        let delete: Option<AnyElement> = match &self.zconfig_form {
+            Some(ZConfigForm::Mcp(form)) => form.target.as_ref().map(|t| {
+                let name = t.name.clone().unwrap_or_default();
+                render_mcp_delete(
+                    &name,
+                    busy,
+                    self.mcp_delete_confirm.as_deref() == Some(name.as_str()),
+                    &self.runtime,
+                    cx,
+                )
+            }),
+            Some(ZConfigForm::Hook(form)) => form.target.as_ref().map(|t| {
+                render_hook_delete(
+                    t,
+                    busy,
+                    self.hook_delete_confirm.as_deref() == Some(t.key.as_str()),
+                    &self.runtime,
+                    cx,
+                )
+            }),
+            Some(ZConfigForm::Agent(form)) => form.target.as_ref().map(|t| {
+                let name = t.name.clone().unwrap_or_default();
+                let editable = !is_agent_read_only(t.read_only);
+                if !editable {
+                    None
+                } else {
+                    Some(render_agent_delete(
+                        &name,
+                        busy,
+                        self.agent_delete_confirm.as_deref() == Some(name.as_str()),
+                        &self.runtime,
+                        cx,
+                    ))
+                }
+                .unwrap_or_else(|| div().into_any_element())
+            }),
+            _ => None,
+        };
+        let footer = match delete {
+            Some(delete) => div()
+                .p_4()
+                .max_w(rems(46.))
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(delete)
+                .child(div().flex_1())
+                .child(save),
+            None => div().p_4().max_w(rems(46.)).child(save.w_full()),
+        };
         column
             .child(
                 div()
@@ -2354,22 +2998,7 @@ impl Workbench {
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(body)
-                    .child(
-                        div().p_4().max_w(rems(46.)).child(
-                            Button::new("zconfig-form-save")
-                                .primary()
-                                .w_full()
-                                .label(if busy {
-                                    t!("zconfig.saving").into_owned()
-                                } else {
-                                    t!("common.save").into_owned()
-                                })
-                                .disabled(busy || !can_submit)
-                                .on_click(move |_, _, cx| {
-                                    wb2.update(cx, |this, cx| submit(this, cx));
-                                }),
-                        ),
-                    ),
+                    .child(footer),
             )
             .into_any_element()
     }
@@ -2427,6 +3056,7 @@ impl Workbench {
                                 let ty = ty.clone();
                                 move |_, _, cx| {
                                     wb.update(cx, |this, cx| {
+                                        this.settings_form_confirm_discard = false;
                                         if let Some(ZConfigForm::Mcp(form)) =
                                             &mut this.zconfig_form
                                         {
@@ -2499,6 +3129,7 @@ impl Workbench {
                     Switch::new("mcp-enabled").checked(form.enabled).on_click(
                         move |checked: &bool, _, cx| {
                             wb3.update(cx, |this, cx| {
+                                this.settings_form_confirm_discard = false;
                                 if let Some(ZConfigForm::Mcp(form)) = &mut this.zconfig_form {
                                     form.enabled = *checked;
                                 }
@@ -2517,30 +3148,88 @@ impl Workbench {
         &self,
         form: &HookFormState,
         theme: &component::Theme,
-        _cx: &Context<Workbench>,
+        cx: &Context<Workbench>,
     ) -> AnyElement {
-        let matcher = if form.target.matcher.is_empty() {
-            t!("zconfig.hooksAnyMatcher").into_owned()
+        let mut body = div().flex().flex_col().gap_2().p_4();
+
+        match &form.target {
+            Some(target) => {
+                let matcher = if target.matcher.is_empty() {
+                    t!("zconfig.hooksAnyMatcher").into_owned()
+                } else {
+                    target.matcher.clone()
+                };
+                // The entry's identity (it travels in the route's path) —
+                // shown, never edited.
+                body = body.child(
+                    div()
+                        .font_family(theme.mono_font_family.clone())
+                        .text_size(ui_text(12.))
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{} · {}", target.event, matcher)),
+                );
+            }
+            None => {
+                // The event picker (the schema's seven, in its own order).
+                let wb = cx.entity();
+                let form_event = form.event.clone();
+                body = body
+                    .child(field_label(&t!("zconfig.hookEvent"), None, theme))
+                    .child(div().max_w(rems(46.)).child(
+                        Button::new("hook-event")
+                            .secondary()
+                            .small()
+                            .w_full()
+                            .font_family(theme.mono_font_family.clone())
+                            .label(form.event.clone())
+                            .dropdown_menu(move |menu, _, _| {
+                                let mut m = menu;
+                                for event in HOOK_EVENTS {
+                                    let wb = wb.clone();
+                                    let value = event.to_string();
+                                    let active = form_event == value;
+                                    m = m.item(
+                                        PopupMenuItem::new(value.clone())
+                                            .checked(active)
+                                            .on_click(move |_, _, cx| {
+                                                let value = value.clone();
+                                                wb.update(cx, |this, cx| {
+                                                    this.settings_form_confirm_discard = false;
+                                                    if let Some(ZConfigForm::Hook(form)) =
+                                                        &mut this.zconfig_form
+                                                    {
+                                                        form.event = value.clone();
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            }),
+                                    );
+                                }
+                                m
+                            }),
+                    ))
+                    .child(field_label(
+                        &t!("zconfig.hookMatcher"),
+                        Some(&t!("zconfig.hookMatcherHint")),
+                        theme,
+                    ))
+                    .child(div().max_w(rems(46.)).child(Input::new(&form.matcher)));
+            }
+        }
+
+        // Blank means "keep the current timeout" on an edit and "add no
+        // timeout" on a create — the hint names the mode's own reading.
+        let timeout_hint = if form.target.is_some() {
+            t!("zconfig.hookTimeoutHint")
         } else {
-            form.target.matcher.clone()
+            t!("zconfig.hookTimeoutHintAdd")
         };
-        div()
-            .flex()
-            .flex_col()
-            .gap_2()
-            .p_4()
-            .child(
-                div()
-                    .font_family(theme.mono_font_family.clone())
-                    .text_size(ui_text(12.))
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{} · {}", form.target.event, matcher)),
-            )
+        body
             .child(field_label(&t!("zconfig.hookCommand"), None, theme))
             .child(div().max_w(rems(46.)).child(Input::new(&form.command)))
             .child(field_label(
                 &t!("zconfig.hookTimeout"),
-                Some(&t!("zconfig.hookTimeoutHint")),
+                Some(&timeout_hint),
                 theme,
             ))
             .child(div().max_w(rems(46.)).child(Input::new(&form.timeout)))
@@ -2608,6 +3297,7 @@ impl Workbench {
                     .cursor_pointer()
                     .on_click(move |_, _, cx| {
                         wb.update(cx, |this, cx| {
+                            this.settings_form_confirm_discard = false;
                             if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                                 form.color = Some(color.to_string());
                             }
@@ -2626,6 +3316,7 @@ impl Workbench {
                 .selected(form.color.is_none())
                 .on_click(move |_, _, cx| {
                     wb_none.update(cx, |this, cx| {
+                        this.settings_form_confirm_discard = false;
                         if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                             form.color = None;
                         }
@@ -2735,6 +3426,7 @@ impl Workbench {
                                         PopupMenuItem::new(label).checked(active).on_click(
                                             move |_, _, cx| {
                                                 wb.update(cx, |this, cx| {
+                                                    this.settings_form_confirm_discard = false;
                                                     if let Some(ZConfigForm::Agent(form)) =
                                                         &mut this.zconfig_form
                                                     {
@@ -2789,10 +3481,16 @@ impl Workbench {
                         .when(!on, |b| b.secondary().outline())
                         .on_click(move |_, _, cx| {
                             wb.update(cx, |this, cx| {
+                                this.settings_form_confirm_discard = false;
                                 if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                                     // Tapping the active chip = inherit.
                                     form.thought_level =
                                         if on { None } else { Some(level.clone()) };
+                                    // A level pick edits the model block: the
+                                    // submit only carries the level when the
+                                    // block is touched, and the dirty gate
+                                    // already counts the pick as a change.
+                                    form.model_touched = true;
                                 }
                                 cx.notify();
                             });
@@ -2826,6 +3524,7 @@ impl Workbench {
                         .selected(form.all_tools)
                         .on_click(move |_, _, cx| {
                             wb_all.update(cx, |this, cx| {
+                                this.settings_form_confirm_discard = false;
                                 if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                                     form.all_tools = true;
                                 }
@@ -2844,6 +3543,7 @@ impl Workbench {
                             .label(t!("zconfig.agentToolsCustom").into_owned())
                             .on_click(move |_, _, cx| {
                                 wb_custom.update(cx, |this, cx| {
+                                    this.settings_form_confirm_discard = false;
                                     if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                                         form.all_tools = false;
                                     }
@@ -2880,6 +3580,7 @@ impl Workbench {
                         .when(!on, |b| b.secondary().outline())
                         .on_click(move |_, _, cx| {
                             wb.update(cx, |this, cx| {
+                                this.settings_form_confirm_discard = false;
                                 if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                                     if on {
                                         form.tools.retain(|t| t != &label);
@@ -2920,6 +3621,7 @@ impl Workbench {
                                 let wb = wb_perm.clone();
                                 move |_, _, cx| {
                                     wb.update(cx, |this, cx| {
+                                        this.settings_form_confirm_discard = false;
                                         if let Some(ZConfigForm::Agent(form)) =
                                             &mut this.zconfig_form
                                         {
@@ -2940,6 +3642,7 @@ impl Workbench {
                                     .on_click(move |_, _, cx| {
                                         let value = value.clone();
                                         wb.update(cx, |this, cx| {
+                                            this.settings_form_confirm_discard = false;
                                             if let Some(ZConfigForm::Agent(form)) =
                                                 &mut this.zconfig_form
                                             {
@@ -2997,6 +3700,7 @@ impl Workbench {
                         .on_click(move |checked: &bool, _, cx| {
                             let checked = *checked;
                             wb_inject.update(cx, |this, cx| {
+                                this.settings_form_confirm_discard = false;
                                 if let Some(ZConfigForm::Agent(form)) = &mut this.zconfig_form {
                                     form.inject_agents_md = checked;
                                 }
@@ -3041,6 +3745,7 @@ impl Workbench {
                             .on_click(move |checked: &bool, _, cx| {
                                 let checked = *checked;
                                 wb_bg.update(cx, |this, cx| {
+                                    this.settings_form_confirm_discard = false;
                                     if let Some(ZConfigForm::Agent(form)) =
                                         &mut this.zconfig_form
                                     {

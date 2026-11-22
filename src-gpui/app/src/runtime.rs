@@ -37,6 +37,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config_notice::{classify_failure, ConfigNotice, NoticeKind};
 use crate::remote_terminal;
 use crate::terminal_panel;
 
@@ -61,9 +62,10 @@ use protocol::config_store::{
 };
 use protocol::quota::{AccountUsageStats, QuotaItem};
 use protocol::settings::{
-    AgentUpsert, Effect, HookEntryPatch, McpServerUpsert, ModelUpsert, PendingRestartStatus,
-    ResetCardInventory, ResetCardStatus, ResetCardType, SettingsAll, SettingsPlatformUsage,
-    SettingsUsage, SpendResetCard, WriteEffect, WorkflowGateBlock, WorkflowGateModeSetting,
+    AgentUpsert, Effect, HookEntryPatch, HookUpsert, McpServerUpsert, McpStatusSnapshot,
+    ModelUpsert, PendingRestartStatus, ResetCardInventory, ResetCardStatus, ResetCardType,
+    SettingsAll, SettingsPlatformUsage, SettingsUsage, SkillDetail, SkillDetailSnapshot,
+    SpendResetCard, WriteEffect, WorkflowGateBlock, WorkflowGateModeSetting,
     WorkflowGateSetResponse,
 };
 use protocol::hub::{
@@ -194,6 +196,9 @@ const QUOTA_DOCK_POLL_MS: u64 = 60_000;
 /// How long the hub-upgrade verdict note stays (TS SidePanel's 5s
 /// `setTimeout(() => setUpgradeNote(null))`).
 const HUB_UPGRADE_NOTE_MS: u64 = 5_000;
+/// A Saved notice's on-screen window (ADR-0014 §2: immediate writes
+/// confirm briefly; the deadline is checked on tick, like the toast).
+const NOTICE_SAVED_MS: u64 = 3_000;
 
 /// Env-gated stderr trace for the driver lifecycle — the slice's connection
 /// story, observable without a debugger. Rides the product family's one debug
@@ -432,10 +437,7 @@ pub enum UiCommand {
     RefreshModels,
     /// The add/edit form's Save: POST /settings/models — an UPSERT — through
     /// the applyConfigWrite path (effect class surfaced, section reloaded).
-    /// `adding` only names the failure label (TS `target ? "update model" :
-    /// "add model"`).
     UpsertModel {
-        adding: bool,
         body: ModelUpsert,
     },
     /// DELETE /settings/models/{providerId}/{modelId} — removes the model's
@@ -523,11 +525,15 @@ pub enum UiCommand {
     /// directory; the view confirms first (unrecoverable). Only rows the
     /// server marks `deletable` offer the control.
     DeleteSkill { path: String },
+    /// GET /settings/skills/{path} — open one skill's detail view (the row →
+    /// detail; skills parity). The load replaces the list in the same page.
+    OpenSkillDetail { path: String },
+    /// The skill detail view's back gesture — return to the skills list.
+    CloseSkillDetail,
     /// PUT /settings/mcp/{name} (TS `upsertMcp`): add or edit one server;
     /// the body carries only its transport's fields (config_decode's
-    /// `mcp_upsert_body`). `adding` names the failure label only.
+    /// `mcp_upsert_body`).
     UpsertMcpServer {
-        adding: bool,
         name: String,
         body: McpServerUpsert,
     },
@@ -541,12 +547,28 @@ pub enum UiCommand {
     /// tree's switch.
     SetHooksEnabled { enabled: bool },
     /// PUT /settings/hooks/{event}/{matcherIndex} + body `hookIndex`
-    /// (TS `updateHookEntry`) — edit ONE existing entry; no add, no remove.
+    /// (TS `updateHookEntry`) — edit ONE existing entry.
     UpdateHookEntry {
         event: String,
         matcher_index: usize,
         hook_index: usize,
         patch: HookEntryPatch,
+    },
+    /// POST /settings/hooks/{event} — append one hook entry. The matcher
+    /// STRING names the target group (append-only, so concurrent edits of
+    /// existing entries by index stay valid).
+    AddHookEntry {
+        event: String,
+        matcher: String,
+        body: HookUpsert,
+    },
+    /// POST /settings/hooks/{event}/remove — remove one entry; `command` is
+    /// the fingerprint a stale read must match or the bridge refuses.
+    RemoveHookEntry {
+        event: String,
+        matcher_index: usize,
+        hook_index: usize,
+        command: String,
     },
     /// POST /settings/agents/{name}/enable (TS `setAgentEnabled`).
     SetAgentEnabled { name: String, enable: bool },
@@ -1286,6 +1308,15 @@ pub struct ConfigSectionPageView {
     /// progress poll adopts; `None` until a poll carries one or an install
     /// POST fails.
     pub install: Option<Value>,
+    /// MCP only: the per-instance health read behind the rows' status dots.
+    /// `None` = not fetched; `available: false` inside means "unknown".
+    pub mcp_status: Option<McpStatusSnapshot>,
+    /// Skills only: the open detail's path (`None` = the list). The detail
+    /// body / its load error ride along; both are meaningful only while the
+    /// path is set.
+    pub skill_detail_path: Option<String>,
+    pub skill_detail: Option<SkillDetail>,
+    pub skill_detail_error: Option<String>,
 }
 
 /// The Workflows page (batch J): the hub's machine-level overview rendered
@@ -1476,9 +1507,10 @@ pub struct WorkbenchSnapshot {
     /// status bar's global `hub {version}` chip. `None` hides it (no read
     /// yet, or a hub predating the route).
     pub hub_version: Option<String>,
-    /// Config-screen notice (TS `notice`): a `notice.*` i18n key or plain
-    /// failure text, rendered by every config page's frame.
-    pub config_notice: Option<String>,
+    /// Config-screen notice (TS `notice`, ADR-0014 §2): typed and
+    /// localized — rendered by every config page's frame through the one
+    /// shared banner.
+    pub config_notice: Option<ConfigNotice>,
     /// A needs-restart write has not been applied yet (TS `pendingRestart`)
     /// — drives the Backend Restart affordance on the config pages.
     pub pending_restart: bool,
@@ -1730,7 +1762,6 @@ enum LoopEvent {
     ModelsLoaded(Result<Value, SettingsApiError>),
     /// POST /settings/models settled (the applyConfigWrite outcome).
     ModelUpsert {
-        adding: bool,
         result: Result<WriteEffect, SettingsApiError>,
     },
     /// GET /settings/all settled for the Usage page (the loadConfigAll
@@ -1810,13 +1841,25 @@ enum LoopEvent {
         result: Result<Value, SettingsApiError>,
     },
     /// One config-section write settled (the applyConfigWrite outcome):
-    /// `label` names the failure, `reload` the sections the write's success
-    /// must re-read.
+    /// `reload` names the sections the write's success must re-read.
     ConfigWriteSettled {
         page: ConfigPageKind,
-        label: &'static str,
         reload: &'static [ConfigPageKind],
         result: Result<WriteEffect, SettingsApiError>,
+    },
+    /// GET /api/instances/{id}/settings/mcp-status settled — the MCP rows'
+    /// status dots. Failure keeps the previous snapshot (dots degrade
+    /// gracefully; an error card would crowd the section's own story).
+    McpStatusLoaded {
+        instance_id: String,
+        result: Result<McpStatusSnapshot, SettingsApiError>,
+    },
+    /// GET /api/settings/skills/{path} settled — the skills page's detail
+    /// view. The event carries its asking path; a late answer for a
+    /// different (or closed) detail must not repaint the view.
+    SkillDetailLoaded {
+        path: String,
+        result: Result<SkillDetailSnapshot, SettingsApiError>,
     },
     /// GET /api/instances/{id}/settings/pending-restart settled — a
     /// cross-client needs-restart the driver never saw (another client's
@@ -2458,6 +2501,21 @@ struct ConfigSectionPanel {
     /// block. Wins over the payload's in-flight `install` block while set;
     /// cleared when a new install starts so the poll's progress shows.
     install: Option<Value>,
+    /// MCP only: the per-instance health read (`GET /settings/mcp-status`)
+    /// behind the rows' status dots. `None` = not fetched; a landed body with
+    /// `available: false` means "unknown" (older backend / timed-out RPC).
+    mcp_status: Option<McpStatusSnapshot>,
+    /// The instance the in-flight (or landed) status read belongs to — an
+    /// answer from a pre-switch instance must not relabel the rows (the
+    /// gate-probe guard, same doctrine).
+    mcp_status_instance: Option<String>,
+    /// Skills only: the detail sub-view (`GET /settings/skills/{path}`).
+    /// `Some` replaces the list in the page body; the trio clears together
+    /// (open/close/reopen), and a reopen of the page always re-enters the
+    /// list.
+    skill_detail_path: Option<String>,
+    skill_detail: Option<SkillDetail>,
+    skill_detail_error: Option<String>,
 }
 
 impl ConfigSectionPanel {
@@ -2471,6 +2529,11 @@ impl ConfigSectionPanel {
         self.payload = None;
         self.busy = false;
         self.install = None;
+        self.mcp_status = None;
+        self.mcp_status_instance = None;
+        self.skill_detail_path = None;
+        self.skill_detail = None;
+        self.skill_detail_error = None;
     }
 }
 
@@ -2858,8 +2921,14 @@ struct Driver {
     next_app_update_poll_at: u64,
     /// The Workflows page + gate (batch J, see [`WorkflowsPanel`]).
     workflows: WorkflowsPanel,
-    /// Config-screen notice (TS `notice`): `notice.*` i18n key or plain text.
-    config_notice: Option<String>,
+    /// Config-screen notice (ADR-0014 §2 — see [`ConfigNotice`]).
+    config_notice: Option<ConfigNotice>,
+    /// The next notice's monotonic id (the auto-expire guard's token).
+    notice_seq: u64,
+    /// A Saved notice's expiry: (its id, deadline epoch-ms), checked on
+    /// tick. Only a notice whose id still matches clears — a replaced
+    /// banner survives its predecessor's timer.
+    notice_deadline: Option<(u64, u64)>,
     /// A needs-restart write is pending on the connected bridge — drives the
     /// Backend Restart affordance (armed by config writes; M3 pages).
     pending_restart: bool,
@@ -2966,6 +3035,8 @@ impl Driver {
             next_app_update_poll_at: 0,
             workflows: WorkflowsPanel::default(),
             config_notice: None,
+            notice_seq: 0,
+            notice_deadline: None,
             pending_restart: false,
             model_tests: std::collections::HashMap::new(),
             model_test_pending: None,
@@ -3963,6 +4034,69 @@ impl Driver {
         });
     }
 
+    // ---- config notices (ADR-0014 §2) ----
+
+    /// Post a notice; the id it returns is the auto-expire token.
+    fn post_notice(
+        &mut self,
+        kind: NoticeKind,
+        key: &'static str,
+        detail: Option<String>,
+    ) -> u64 {
+        self.notice_seq += 1;
+        let id = self.notice_seq;
+        // Only a Saved notice carries a deadline; every other kind clears
+        // by dismissal, replacement, or a hub switch.
+        self.notice_deadline = match kind {
+            NoticeKind::Saved => Some((id, self.clock.now_ms() + NOTICE_SAVED_MS)),
+            _ => None,
+        };
+        self.config_notice = Some(ConfigNotice { id, kind, key, detail });
+        id
+    }
+
+    /// An immediate write landed — the short "Saved" confirmation.
+    fn notice_saved(&mut self, key: &'static str) {
+        self.post_notice(NoticeKind::Saved, key, None);
+    }
+
+    /// A needs-restart write armed the restart affordance; the notice
+    /// stays until a restart (or hub switch) retires the pair.
+    fn notice_needs_restart(&mut self) {
+        self.pending_restart = true;
+        self.post_notice(NoticeKind::NeedsRestart, NOTICE_NEEDS_RESTART, None);
+    }
+
+    /// A write/load failure, classified before render (ADR-0014 §2):
+    /// [`classify_failure`] picks the i18n key by kind and the server's
+    /// own message rides as the detail line under it.
+    fn notice_failed(&mut self, err: &SettingsApiError, load: bool) {
+        let (key, detail) = classify_failure(err, load);
+        self.post_notice(NoticeKind::Error, key, detail);
+    }
+
+    /// [`Self::notice_failed`] with a caller-supplied context prefix on
+    /// the detail line (the workflow's name, a run id — data the generic
+    /// key cannot know).
+    fn notice_failed_ctx(&mut self, err: &SettingsApiError, load: bool, ctx: &str) {
+        let (key, detail) = classify_failure(err, load);
+        let detail = Some(match detail {
+            Some(detail) => format!("{ctx} — {detail}"),
+            None => ctx.to_string(),
+        });
+        self.post_notice(NoticeKind::Error, key, detail);
+    }
+
+    /// A refused write that still answered 2xx (`ok: false` + the body's
+    /// reason) — the detail IS the message the user can act on.
+    fn notice_refused(&mut self, error: Option<String>) {
+        self.post_notice(
+            NoticeKind::Error,
+            "notice.writeFailed",
+            Some(error.unwrap_or_else(|| "refused".to_string())),
+        );
+    }
+
     /// The restart settled. `closed: false` means the old subprocess
     /// survived — the writes this restart existed to apply did NOT take
     /// effect, so the pending flag stays armed (the affordance remains).
@@ -3970,14 +4104,14 @@ impl Driver {
         match result {
             Ok(res) if res.closed => {
                 self.pending_restart = false;
-                self.config_notice = Some(NOTICE_RESTARTED.to_string());
+                self.notice_saved(NOTICE_RESTARTED);
             }
             Ok(_) => {
-                self.config_notice = Some(NOTICE_RESTART_FAILED.to_string());
+                self.post_notice(NoticeKind::Error, NOTICE_RESTART_FAILED, None);
             }
             Err(e) => {
-                // TS `notify` — plain text (not an i18n key) in the banner.
-                self.config_notice = Some(format!("backend restart failed: {e}"));
+                let (key, detail) = crate::config_notice::classify_hub_failure(&e);
+                self.post_notice(NoticeKind::Error, key, detail);
             }
         }
     }
@@ -4078,13 +4212,13 @@ impl Driver {
     /// `immediate` is applied, `needs-restart` ARMS the Backend Restart
     /// affordance with its notice (never auto-restarted; CONTEXT.md) — and
     /// the models section reloads either way.
-    fn spawn_model_upsert(&mut self, adding: bool, body: ModelUpsert) {
+    fn spawn_model_upsert(&mut self, body: ModelUpsert) {
         self.models.busy = true;
         let hub = self.settings_client();
         let tx = self.loop_tx.clone();
         tokio::spawn(async move {
             let result = hub.add_model(body).await;
-            let _ = tx.send(LoopEvent::ModelUpsert { adding, result });
+            let _ = tx.send(LoopEvent::ModelUpsert { result });
         });
     }
 
@@ -4092,31 +4226,28 @@ impl Driver {
     /// ok reloads the section and closes the form; a needs-restart effect
     /// arms the restart affordance; a refusal surfaces its BODY (the reason
     /// the user can act on), never a bare status.
-    fn on_model_upsert(&mut self, adding: bool, result: Result<WriteEffect, SettingsApiError>) {
+    fn on_model_upsert(&mut self, result: Result<WriteEffect, SettingsApiError>) {
         self.models.busy = false;
-        let label = if adding { "add model" } else { "update model" };
         let ok = match result {
             Ok(w) if w.ok => {
                 // The Effect Class (CONTEXT.md): the models route is
-                // `immediate` (the backend polls the provider table), but
-                // the outcome is surfaced, not assumed — a needs-restart
+                // `immediate` (the backend polls the provider table), but the
+                // outcome is surfaced, not assumed — a needs-restart
                 // answer arms the affordance.
                 if w.effect == Some(Effect::NeedsRestart) {
-                    self.pending_restart = true;
-                    self.config_notice = Some(NOTICE_NEEDS_RESTART.to_string());
+                    self.notice_needs_restart();
+                } else {
+                    self.notice_saved("notice.saved");
                 }
                 self.spawn_models_load();
                 true
             }
             Ok(w) => {
-                self.config_notice = Some(format!(
-                    "{label} failed: {}",
-                    w.error.unwrap_or_else(|| "refused".to_string())
-                ));
+                self.notice_refused(w.error);
                 false
             }
             Err(e) => {
-                self.config_notice = Some(format!("{label} failed: {e}"));
+                self.notice_failed(&e, false);
                 false
             }
         };
@@ -4171,6 +4302,98 @@ impl Driver {
             };
             let _ = tx.send(LoopEvent::ConfigSectionLoaded { page, result });
         });
+    }
+
+    /// The MCP page's health read (GET /settings/mcp-status on the active
+    /// tab's instance — the machine-level mount has no backend and answers
+    /// 409). Best-effort: with no instance the rows simply render without
+    /// dots, and a landed `available: false` reads as "unknown".
+    fn spawn_mcp_status_load(&mut self) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let Some(instance_id) = self.active_instance_id() else {
+            return;
+        };
+        self.sections[ConfigPageKind::Mcp.index()].mcp_status_instance = Some(instance_id.clone());
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.settings_mcp_status(&instance_id).await;
+            let _ = tx.send(LoopEvent::McpStatusLoaded { instance_id, result });
+        });
+    }
+
+    /// The health read settled: guarded by the asking instance (an in-flight
+    /// read from a pre-switch instance drops). Success replaces the snapshot
+    /// — including `available: false` bodies, which are the honest "unknown"
+    /// — a failure keeps the previous dots rather than blanking them.
+    fn on_mcp_status_loaded(
+        &mut self,
+        instance_id: &str,
+        result: Result<McpStatusSnapshot, SettingsApiError>,
+    ) {
+        let panel = &mut self.sections[ConfigPageKind::Mcp.index()];
+        if panel.mcp_status_instance.as_deref() != Some(instance_id) {
+            return;
+        }
+        if let Ok(snapshot) = result {
+            panel.mcp_status = Some(snapshot);
+        }
+    }
+
+    /// The skills page's detail read (GET /settings/skills/{path} —
+    /// machine-level like the list). Records the asking path so a late
+    /// answer for another skill (or a closed view) cannot repaint the page.
+    fn spawn_skill_detail_load(&mut self, path: String) {
+        if !matches!(
+            self.phase,
+            Phase::Discovering | Phase::Connected | Phase::Reconnecting
+        ) {
+            return;
+        }
+        let panel = &mut self.sections[ConfigPageKind::Skills.index()];
+        // Only a SKILL SWITCH blanks the view; a refresh over the same path
+        // keeps the painted body until the re-read lands.
+        let switching = panel.skill_detail_path.as_deref() != Some(path.as_str());
+        panel.skill_detail_path = Some(path.clone());
+        if switching {
+            panel.skill_detail = None;
+            panel.skill_detail_error = None;
+        }
+        let hub = self.settings_client();
+        let tx = self.loop_tx.clone();
+        tokio::spawn(async move {
+            let result = hub.skill_detail(&path).await;
+            let _ = tx.send(LoopEvent::SkillDetailLoaded { path, result });
+        });
+    }
+
+    /// The detail read settled: guarded by the asking path. Success paints
+    /// the body; a body without a `skill` object is a malformed answer and
+    /// reads as a load failure — the view must not invent an empty skill.
+    fn on_skill_detail_loaded(
+        &mut self,
+        path: &str,
+        result: Result<SkillDetailSnapshot, SettingsApiError>,
+    ) {
+        let panel = &mut self.sections[ConfigPageKind::Skills.index()];
+        if panel.skill_detail_path.as_deref() != Some(path) {
+            return;
+        }
+        match result {
+            Ok(snapshot) => match snapshot.skill {
+                Some(detail) => panel.skill_detail = Some(detail),
+                None => {
+                    panel.skill_detail_error =
+                        Some(t!("zconfig.skillDetailLoadFailed").into_owned())
+                }
+            },
+            Err(e) => panel.skill_detail_error = Some(e.to_string()),
+        }
     }
 
     /// The section probe settled — same verdict handling as
@@ -4315,13 +4538,12 @@ impl Driver {
             .insert((provider_id, model_id), verdict);
     }
 
-    /// One write through the applyConfigWrite path (label, write, reload):
-    /// the future is boxed by the spawn because each route returns its own
+    /// One write through the applyConfigWrite path (write, reload): the
+    /// future is boxed by the spawn because each route returns its own
     /// concrete future type.
     fn spawn_config_write<F>(
         &mut self,
         page: ConfigPageKind,
-        label: &'static str,
         reload: &'static [ConfigPageKind],
         fut: F,
     ) where
@@ -4333,7 +4555,6 @@ impl Driver {
             let result = fut.await;
             let _ = tx.send(LoopEvent::ConfigWriteSettled {
                 page,
-                label,
                 reload,
                 result,
             });
@@ -4367,7 +4588,6 @@ impl Driver {
     fn on_config_write_settled(
         &mut self,
         page: ConfigPageKind,
-        label: &'static str,
         reload: &[ConfigPageKind],
         result: Result<WriteEffect, SettingsApiError>,
     ) {
@@ -4375,11 +4595,18 @@ impl Driver {
         let ok = match result {
             Ok(w) if w.ok => {
                 if w.effect == Some(Effect::NeedsRestart) {
-                    self.pending_restart = true;
-                    self.config_notice = Some(NOTICE_NEEDS_RESTART.to_string());
+                    self.notice_needs_restart();
+                } else {
+                    self.notice_saved("notice.saved");
                 }
                 for r in reload {
                     self.spawn_config_section_load(*r);
+                }
+                // An MCP write changes what the health route would say (an
+                // enable flip at least flips its own dot after the backend
+                // catches up) — re-read the dots with the section.
+                if reload.contains(&ConfigPageKind::Mcp) {
+                    self.spawn_mcp_status_load();
                 }
                 // A restore rewrites the WHOLE config document, so the
                 // models page's snapshot is stale too (TS BackupsPage
@@ -4390,14 +4617,11 @@ impl Driver {
                 true
             }
             Ok(w) => {
-                self.config_notice = Some(format!(
-                    "{label} failed: {}",
-                    w.error.unwrap_or_else(|| "refused".to_string())
-                ));
+                self.notice_refused(w.error);
                 false
             }
             Err(e) => {
-                self.config_notice = Some(format!("{label} failed: {e}"));
+                self.notice_failed(&e, false);
                 false
             }
         };
@@ -4635,13 +4859,13 @@ impl Driver {
         match result {
             Ok(res) if res.ok => {
                 self.workflows.gate = Some(res.gate);
-                self.config_notice = Some("workflow switch updated".to_string());
+                self.notice_saved("notice.saved");
             }
             Ok(_) => {
-                self.config_notice = Some("workflow gate write failed: refused".to_string());
+                self.notice_refused(None);
             }
             Err(e) => {
-                self.config_notice = Some(format!("workflow gate write failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -4825,8 +5049,7 @@ impl Driver {
                 self.open_session_by_id(res.acp_session_id, instance_id);
             }
             Err(e) => {
-                self.config_notice =
-                    Some(format!("start workflow \"{name}\" ({scope:?}) failed: {e}"));
+                self.notice_failed_ctx(&e, false, &format!("\"{name}\" ({scope:?})"));
             }
         }
     }
@@ -4847,9 +5070,12 @@ impl Driver {
         }
         d.busy = false;
         match result {
-            Ok(_) => self.spawn_workflow_detail_loads(),
+            Ok(_) => {
+                self.notice_saved("notice.saved");
+                self.spawn_workflow_detail_loads();
+            }
             Err(e) => {
-                self.config_notice = Some(format!("save description failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -4864,12 +5090,13 @@ impl Driver {
             Ok(_) if self.workflows.detail.as_ref().is_some_and(|d| d.seq == seq) => {
                 self.workflows.detail = None;
                 self.workflows.workflow_seq += 1;
+                self.notice_saved("notice.saved");
                 let now = self.clock.now_ms();
                 self.spawn_workflow_overview(now);
             }
             Ok(_) => {}
             Err(e) => {
-                self.config_notice = Some(format!("move workflow failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -4883,12 +5110,13 @@ impl Driver {
             Ok(_) if self.workflows.detail.as_ref().is_some_and(|d| d.seq == seq) => {
                 self.workflows.detail = None;
                 self.workflows.workflow_seq += 1;
+                self.notice_saved("notice.saved");
                 let now = self.clock.now_ms();
                 self.spawn_workflow_overview(now);
             }
             Ok(_) => {}
             Err(e) => {
-                self.config_notice = Some(format!("delete workflow failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -4917,7 +5145,7 @@ impl Driver {
                 }));
             }
             Err(e) => {
-                self.config_notice = Some(format!("load create prompt failed: {e}"));
+                self.notice_failed(&e, true);
             }
         }
     }
@@ -4945,7 +5173,7 @@ impl Driver {
                 self.open_session_by_id(session_id, instance_id);
             }
             Err(e) => {
-                self.config_notice = Some(format!("resume workflow run failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -4955,7 +5183,7 @@ impl Driver {
     fn on_workflow_run_stopped(&mut self, result: Result<Value, SettingsApiError>) {
         self.workflows.busy = false;
         if let Err(e) = result {
-            self.config_notice = Some(format!("stop workflow run failed: {e}"));
+            self.notice_failed(&e, false);
         }
         self.spawn_workflow_run_reads(true);
     }
@@ -4969,7 +5197,7 @@ impl Driver {
     ) {
         self.workflows.busy = false;
         if let Err(e) = result {
-            self.config_notice = Some(format!("dismiss run {run_id} failed: {e}"));
+            self.notice_failed_ctx(&e, false, &run_id);
         }
         if self.workflows.open {
             let now = self.clock.now_ms();
@@ -4986,7 +5214,7 @@ impl Driver {
     fn on_workflow_runs_dismissed(&mut self, result: Result<DismissRunsResponse, SettingsApiError>) {
         self.workflows.busy = false;
         if let Err(e) = result {
-            self.config_notice = Some(format!("clear finished runs failed: {e}"));
+            self.notice_failed(&e, false);
         }
         if self.workflows.detail.is_some() {
             self.spawn_workflow_runs_load();
@@ -5180,18 +5408,22 @@ impl Driver {
                     }
                     self.workflows.workflow_seq += 1;
                 }
-                self.config_notice = Some(if repointed {
-                    "run settings updated — the amendment superseded the run; the view re-pointed to the new run".to_string()
-                } else {
-                    "run settings updated".to_string()
-                });
+                self.post_notice(
+                    NoticeKind::Saved,
+                    if repointed {
+                        "notice.runSettingsRepointed"
+                    } else {
+                        "notice.runSettingsUpdated"
+                    },
+                    None,
+                );
                 self.spawn_workflow_run_reads(true);
             }
             Err(e) => {
                 if let Some(r) = &mut self.workflows.run {
                     r.amend_busy = false;
                 }
-                self.config_notice = Some(format!("amend run settings failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -5278,7 +5510,7 @@ impl Driver {
                 );
             }
             Err(e) => {
-                self.config_notice = Some(format!("load artifacts failed: {e}"));
+                self.notice_failed(&e, true);
             }
         }
     }
@@ -5298,7 +5530,7 @@ impl Driver {
         match result {
             Ok(res) => r.nodes = Some(res.nodes),
             Err(e) => {
-                self.config_notice = Some(format!("load workspace failed: {e}"));
+                self.notice_failed(&e, true);
             }
         }
     }
@@ -5356,7 +5588,7 @@ impl Driver {
                 });
             }
             Err(e) => {
-                self.config_notice = Some(format!("load node result failed: {e}"));
+                self.notice_failed(&e, true);
             }
         }
     }
@@ -5455,7 +5687,7 @@ impl Driver {
         let res = match result {
             Ok(res) => res,
             Err(e) => {
-                self.config_notice = Some(format!("read artifact failed: {e}"));
+                self.notice_failed(&e, true);
                 return;
             }
         };
@@ -5534,7 +5766,7 @@ impl Driver {
         let res = match result {
             Ok(res) => res,
             Err(e) => {
-                self.config_notice = Some(format!("load artifact items failed: {e}"));
+                self.notice_failed(&e, true);
                 return;
             }
         };
@@ -6373,7 +6605,7 @@ impl Driver {
                 }
             }
             Err(e) => {
-                self.config_notice = Some(format!("reset card status failed: {e}"));
+                self.notice_failed(&e, true);
             }
         }
     }
@@ -6442,14 +6674,11 @@ impl Driver {
         match result {
             Ok(res) => {
                 let used = res.get("used").and_then(Value::as_bool) != Some(false);
-                self.config_notice = Some(
-                    if used {
-                        NOTICE_RESET_SPENT
-                    } else {
-                        NOTICE_RESET_SPEND_FAILED
-                    }
-                    .to_string(),
-                );
+                if used {
+                    self.notice_saved(NOTICE_RESET_SPENT);
+                } else {
+                    self.post_notice(NoticeKind::Error, NOTICE_RESET_SPEND_FAILED, None);
+                }
                 // Refresh both surfaces: the card list (one fewer card — and
                 // the next nonce) and the quota (the window it cleared). A
                 // spend that shows no result reads as a failure even when it
@@ -6469,10 +6698,10 @@ impl Driver {
                 if let Some(provider_id) = provider_id {
                     self.spawn_quota_cards(provider_id);
                 }
-                self.config_notice = Some(NOTICE_RESET_STALE.to_string());
+                self.post_notice(NoticeKind::Error, NOTICE_RESET_STALE, None);
             }
             Err(e) => {
-                self.config_notice = Some(format!("reset card spend failed: {e}"));
+                self.notice_failed(&e, false);
             }
         }
     }
@@ -6499,6 +6728,19 @@ impl Driver {
         // The hub-upgrade note's 5s timer (TS SidePanel's effect).
         if self.hub_upgrade_note.is_some() && now >= self.hub_upgrade_note_until {
             self.hub_upgrade_note = None;
+        }
+        // A Saved notice's 3s window (ADR-0014 §2): the deadline names its
+        // notice, so a replaced banner survives its predecessor's timer.
+        if let Some((id, at)) = self.notice_deadline {
+            if now >= at
+                && self
+                    .config_notice
+                    .as_ref()
+                    .is_some_and(|n| n.id == id && n.kind == NoticeKind::Saved)
+            {
+                self.config_notice = None;
+                self.notice_deadline = None;
+            }
         }
         // The status bar's quota dock line keeps itself fresh while the app
         // sits idle: turn-end refreshes only cover usage movement, so without
@@ -7417,7 +7659,7 @@ impl Driver {
             LoopEvent::BackendRestart(result) => self.on_backend_restart(result),
             LoopEvent::ConfigProbe(result) => self.on_config_probe(result),
             LoopEvent::ModelsLoaded(result) => self.on_models_loaded(result),
-            LoopEvent::ModelUpsert { adding, result } => self.on_model_upsert(adding, result),
+            LoopEvent::ModelUpsert { result } => self.on_model_upsert(result),
             LoopEvent::UsageAll(result) => self.on_usage_all(result),
             LoopEvent::UsageSection {
                 platform,
@@ -7463,18 +7705,22 @@ impl Driver {
             }
             LoopEvent::ConfigWriteSettled {
                 page,
-                label,
                 reload,
                 result,
-            } => self.on_config_write_settled(page, label, reload, result),
+            } => self.on_config_write_settled(page, reload, result),
+            LoopEvent::McpStatusLoaded { instance_id, result } => {
+                self.on_mcp_status_loaded(&instance_id, result);
+            }
+            LoopEvent::SkillDetailLoaded { path, result } => {
+                self.on_skill_detail_loaded(&path, result);
+            }
             LoopEvent::PendingRestartChecked(result) => {
                 // A silent arm by design: the banner it raises IS the
                 // notice. A failure is dropped the same way — the next
                 // config entry re-probes.
                 if let Ok(status) = result {
                     if status.pending_restart && !self.pending_restart {
-                        self.pending_restart = true;
-                        self.config_notice = Some(NOTICE_NEEDS_RESTART.to_string());
+                        self.notice_needs_restart();
                     }
                 }
             }
@@ -8237,6 +8483,9 @@ impl Driver {
                 // effect — not only the first): a reopened page refreshes
                 // over its surviving snapshot.
                 self.spawn_system_stats(now);
+                // Cross-client pending-restart probe (see
+                // maybe_spawn_pending_restart_check).
+                self.maybe_spawn_pending_restart_check();
             }
             UiCommand::CloseSystemStatus => {
                 self.system.open = false;
@@ -8246,6 +8495,7 @@ impl Driver {
             }
             UiCommand::DismissConfigNotice => {
                 self.config_notice = None;
+                self.notice_deadline = None;
             }
             UiCommand::RestartBackend => {
                 self.spawn_backend_restart();
@@ -8269,11 +8519,11 @@ impl Driver {
             UiCommand::RefreshModels => {
                 self.spawn_models_load();
             }
-            UiCommand::UpsertModel { adding, body } => {
+            UiCommand::UpsertModel { body } => {
                 // One write at a time (the form's Save disables while busy;
                 // this is the same guard on the driver side).
                 if !self.models.busy {
-                    self.spawn_model_upsert(adding, body);
+                    self.spawn_model_upsert(body);
                 }
             }
             UiCommand::RemoveModel {
@@ -8286,10 +8536,7 @@ impl Driver {
                     let tx = self.loop_tx.clone();
                     tokio::spawn(async move {
                         let result = hub.remove_model(&provider_id, &model_id).await;
-                        let _ = tx.send(LoopEvent::ModelUpsert {
-                            adding: false,
-                            result,
-                        });
+                        let _ = tx.send(LoopEvent::ModelUpsert { result });
                     });
                 }
             }
@@ -8325,10 +8572,7 @@ impl Driver {
                         let result = hub
                             .update_provider(&provider_id, serde_json::Value::Object(body))
                             .await;
-                        let _ = tx.send(LoopEvent::ModelUpsert {
-                            adding: false,
-                            result,
-                        });
+                        let _ = tx.send(LoopEvent::ModelUpsert { result });
                     });
                 }
             }
@@ -8339,6 +8583,9 @@ impl Driver {
                 self.usage.open = true;
                 self.usage.tab = UsageTab::Platform;
                 self.spawn_usage_loads();
+                // Cross-client pending-restart probe (see
+                // maybe_spawn_pending_restart_check).
+                self.maybe_spawn_pending_restart_check();
             }
             UiCommand::CloseUsage => {
                 self.usage.open = false;
@@ -8370,6 +8617,9 @@ impl Driver {
                 // surviving payloads.
                 self.spawn_quota_settings_all();
                 self.spawn_quota_usage();
+                // Cross-client pending-restart probe (see
+                // maybe_spawn_pending_restart_check).
+                self.maybe_spawn_pending_restart_check();
             }
             UiCommand::CloseQuota => {
                 self.quota.open = false;
@@ -8421,12 +8671,25 @@ impl Driver {
             // ---- ZCode config sections (batch I) ----
             UiCommand::OpenConfigPage { page } => {
                 self.sections[page.index()].open = true;
+                // Reopening the skills page always re-enters the list — a
+                // detail left open by the last visit would paint stale data.
+                if page == ConfigPageKind::Skills {
+                    let panel = &mut self.sections[page.index()];
+                    panel.skill_detail_path = None;
+                    panel.skill_detail = None;
+                    panel.skill_detail_error = None;
+                }
                 // The TS mount pair, on EVERY open (not only the first): a
                 // reopened page refreshes over its surviving payload.
                 if self.sections[page.index()].supported.is_none() {
                     self.spawn_config_section_probe(page);
                 }
                 self.spawn_config_section_load(page);
+                // The MCP page's status dots read the per-instance health
+                // route (best-effort — no instance, no dots).
+                if page == ConfigPageKind::Mcp {
+                    self.spawn_mcp_status_load();
+                }
                 // The Agents page's picker reads the models section (TS
                 // AgentsPage's `loadConfigSection("models")` effect); the
                 // entry screen's snapshot may not have carried it.
@@ -8442,17 +8705,25 @@ impl Driver {
             }
             UiCommand::RefreshConfigPage { page } => {
                 self.spawn_config_section_load(page);
+                if page == ConfigPageKind::Mcp {
+                    self.spawn_mcp_status_load();
+                }
+                // A refresh while the detail is open re-reads it too — the
+                // body it paints is as stale as the list otherwise.
+                if page == ConfigPageKind::Skills {
+                    let path = self.sections[page.index()].skill_detail_path.clone();
+                    if let Some(path) = path {
+                        self.spawn_skill_detail_load(path);
+                    }
+                }
             }
             UiCommand::SetSkillEnabled { path, enable } => {
                 // One write at a time per page (the switches disable while
                 // busy; this is the same guard on the driver side).
                 if !self.sections[ConfigPageKind::Skills.index()].busy {
                     let hub = self.settings_client();
-                    let label: &'static str =
-                        if enable { "enable skill" } else { "disable skill" };
                     self.spawn_config_write(
                         ConfigPageKind::Skills,
-                        label,
                         &[ConfigPageKind::Skills],
                         async move { hub.set_skill_enabled(&path, enable).await },
                     );
@@ -8463,7 +8734,6 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Skills,
-                        "copy skill",
                         &[ConfigPageKind::Skills],
                         async move { hub.copy_skill_to_user(&path).await },
                     );
@@ -8474,20 +8744,25 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Skills,
-                        "delete skill",
                         &[ConfigPageKind::Skills],
                         async move { hub.delete_skill(&path).await },
                     );
                 }
             }
-            UiCommand::UpsertMcpServer { adding, name, body } => {
+            UiCommand::OpenSkillDetail { path } => {
+                self.spawn_skill_detail_load(path);
+            }
+            UiCommand::CloseSkillDetail => {
+                let panel = &mut self.sections[ConfigPageKind::Skills.index()];
+                panel.skill_detail_path = None;
+                panel.skill_detail = None;
+                panel.skill_detail_error = None;
+            }
+            UiCommand::UpsertMcpServer { name, body } => {
                 if !self.sections[ConfigPageKind::Mcp.index()].busy {
                     let hub = self.settings_client();
-                    let label: &'static str =
-                        if adding { "add MCP server" } else { "update MCP server" };
                     self.spawn_config_write(
                         ConfigPageKind::Mcp,
-                        label,
                         &[ConfigPageKind::Mcp],
                         async move { hub.upsert_mcp_server(&name, body).await },
                     );
@@ -8496,11 +8771,8 @@ impl Driver {
             UiCommand::SetMcpEnabled { name, enable } => {
                 if !self.sections[ConfigPageKind::Mcp.index()].busy {
                     let hub = self.settings_client();
-                    let label: &'static str =
-                        if enable { "enable MCP server" } else { "disable MCP server" };
                     self.spawn_config_write(
                         ConfigPageKind::Mcp,
-                        label,
                         &[ConfigPageKind::Mcp],
                         async move { hub.set_mcp_enabled(&name, enable).await },
                     );
@@ -8511,7 +8783,6 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Mcp,
-                        "delete MCP server",
                         &[ConfigPageKind::Mcp],
                         async move { hub.remove_mcp_server(&name).await },
                     );
@@ -8520,11 +8791,8 @@ impl Driver {
             UiCommand::SetHooksEnabled { enabled } => {
                 if !self.sections[ConfigPageKind::Hooks.index()].busy {
                     let hub = self.settings_client();
-                    let label: &'static str =
-                        if enabled { "enable hooks" } else { "disable hooks" };
                     self.spawn_config_write(
                         ConfigPageKind::Hooks,
-                        label,
                         &[ConfigPageKind::Hooks],
                         async move { hub.set_hooks_enabled(enabled).await },
                     );
@@ -8540,7 +8808,6 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Hooks,
-                        "update hook",
                         &[ConfigPageKind::Hooks],
                         async move {
                             hub.update_hook(&event, matcher_index, hook_index, patch)
@@ -8549,14 +8816,43 @@ impl Driver {
                     );
                 }
             }
+            UiCommand::AddHookEntry {
+                event,
+                matcher,
+                body,
+            } => {
+                if !self.sections[ConfigPageKind::Hooks.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Hooks,
+                        &[ConfigPageKind::Hooks],
+                        async move { hub.add_hook(&event, &matcher, body).await },
+                    );
+                }
+            }
+            UiCommand::RemoveHookEntry {
+                event,
+                matcher_index,
+                hook_index,
+                command,
+            } => {
+                if !self.sections[ConfigPageKind::Hooks.index()].busy {
+                    let hub = self.settings_client();
+                    self.spawn_config_write(
+                        ConfigPageKind::Hooks,
+                        &[ConfigPageKind::Hooks],
+                        async move {
+                            hub.remove_hook(&event, matcher_index, hook_index, &command)
+                                .await
+                        },
+                    );
+                }
+            }
             UiCommand::SetAgentEnabled { name, enable } => {
                 if !self.sections[ConfigPageKind::Agents.index()].busy {
                     let hub = self.settings_client();
-                    let label: &'static str =
-                        if enable { "enable subagent" } else { "disable subagent" };
                     self.spawn_config_write(
                         ConfigPageKind::Agents,
-                        label,
                         &[ConfigPageKind::Agents],
                         async move { hub.set_agent_enabled(&name, enable).await },
                     );
@@ -8567,7 +8863,6 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Agents,
-                        "update subagent",
                         &[ConfigPageKind::Agents],
                         async move { hub.upsert_agent(&name, body).await },
                     );
@@ -8578,7 +8873,6 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Agents,
-                        "delete subagent",
                         &[ConfigPageKind::Agents],
                         async move { hub.delete_agent(&name).await },
                     );
@@ -8605,7 +8899,6 @@ impl Driver {
                     };
                     self.spawn_config_write(
                         ConfigPageKind::Agents,
-                        "set built-in agent model",
                         &[ConfigPageKind::Agents],
                         async move { hub.upsert_agent(&name, body).await },
                     );
@@ -8632,7 +8925,6 @@ impl Driver {
                     let hub = self.settings_client();
                     self.spawn_config_write(
                         ConfigPageKind::Backups,
-                        "restore backup",
                         &[
                             ConfigPageKind::Skills,
                             ConfigPageKind::Mcp,
@@ -8654,6 +8946,9 @@ impl Driver {
                 if self.workflows.gate.is_none() {
                     self.spawn_workflow_gate_probe();
                 }
+                // Cross-client pending-restart probe (see
+                // maybe_spawn_pending_restart_check).
+                self.maybe_spawn_pending_restart_check();
             }
             UiCommand::CloseWorkflows => {
                 self.workflows.open = false;
@@ -9453,7 +9748,7 @@ impl Driver {
         mix(
             self.config_notice
                 .as_ref()
-                .map(|n| n.len() as u64)
+                .map(|n| fold_str(&format!("{:?}|{}|{}", n.kind, n.key, n.detail.as_deref().unwrap_or(""))))
                 .unwrap_or(u64::MAX),
             &mut sig,
         );
@@ -10089,6 +10384,18 @@ impl Driver {
                             .flatten(),
                         update_channel: self.update_channel.clone(),
                         install: panel.install.clone(),
+                        mcp_status: (*page == ConfigPageKind::Mcp)
+                            .then(|| panel.mcp_status.clone())
+                            .flatten(),
+                        skill_detail_path: (*page == ConfigPageKind::Skills)
+                            .then(|| panel.skill_detail_path.clone())
+                            .flatten(),
+                        skill_detail: (*page == ConfigPageKind::Skills)
+                            .then(|| panel.skill_detail.clone())
+                            .flatten(),
+                        skill_detail_error: (*page == ConfigPageKind::Skills)
+                            .then(|| panel.skill_detail_error.clone())
+                            .flatten(),
                     }
                 }),
             hub_upgrade_busy: self.hub_upgrade_busy,
@@ -10504,6 +10811,7 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
         d.seen_at.clear();
         d.discovery_baselined = false;
         d.config_notice = None;
+        d.notice_deadline = None;
         d.pending_restart = false;
         d.emit_if_changed();
 
@@ -10846,6 +11154,53 @@ mod tests {
         // discovery-quiet rule the attach amends only on the boot snapshot).
         d.cold_attach_done = true;
         d
+    }
+
+    /// ADR-0014 §2 lifecycle: a Saved notice lives exactly its 3s window,
+    /// and a banner that REPLACED a Saved one survives the old deadline —
+    /// the deadline names the notice, not the slot.
+    #[tokio::test]
+    async fn saved_notice_expires_on_tick_and_a_replaced_banner_survives() {
+        let mut d = driver();
+        d.notice_saved("notice.saved");
+        let at = d.notice_deadline.expect("a Saved notice carries a deadline").1;
+        d.tick(at - 1);
+        assert!(d.config_notice.is_some(), "the window has not closed yet");
+        d.tick(at);
+        assert!(d.config_notice.is_none(), "the window closed");
+
+        d.notice_saved("notice.saved");
+        d.notice_failed(
+            &protocol::settings_client::HubApiError::Http {
+                status: 409,
+                message: "nonce is stale".into(),
+            },
+            false,
+        );
+        assert_eq!(d.notice_deadline, None, "an Error notice carries no deadline");
+        // Far future, but below every `now + interval` tick computes.
+        d.tick(1_000_000_000_000);
+        assert!(
+            d.config_notice.is_some(),
+            "an Error notice waits for the dismiss click, not a timer"
+        );
+    }
+
+    /// The needs-restart pair: the notice arms `pending_restart` and both
+    /// stay armed across ticks — only a restart (or hub switch) retires
+    /// them.
+    #[tokio::test]
+    async fn needs_restart_notice_arms_the_flag_and_survives_ticks() {
+        let mut d = driver();
+        d.notice_needs_restart();
+        assert!(d.pending_restart);
+        assert!(matches!(
+            d.config_notice.as_ref().map(|n| n.kind),
+            Some(super::NoticeKind::NeedsRestart)
+        ));
+        d.tick(1_000_000_000_000);
+        assert!(d.config_notice.is_some());
+        assert!(d.pending_restart);
     }
 
     /// A serve bridge self-exits (~1.5s) once its LAST advertised session is
