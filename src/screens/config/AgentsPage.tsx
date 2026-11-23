@@ -114,6 +114,10 @@ export function AgentsPage() {
   const payload = agents as { ok?: boolean; agents?: AgentEntryView[] } | null;
 
   const rows = payload?.agents ?? [];
+  // Grouped like upstream: editable personal first, read-only built-ins
+  // below (relative order preserved inside each group).
+  const personal = rows.filter((a) => !isAgentReadOnly(a.readOnly));
+  const builtin = rows.filter((a) => isAgentReadOnly(a.readOnly));
   // For the rows' model labels only; the payload may not be loaded yet, in
   // which case the label degrades to the bare model id.
   const pickerOptions = modelOptions(configModels as ModelsPayload | null);
@@ -146,80 +150,93 @@ export function AgentsPage() {
         <ConfigEmpty text={t("zconfig.agentsEmpty")} />
       ) : (
         <ConfigBlock>
-          {rows.map((a) => {
-            const name = a.name ?? "";
-            // `readOnly` is the server's verdict (a built-in has no file to
-            // edit or delete). Trusting it — rather than guessing from the
-            // name — is what keeps the enable control off agents the API
-            // would refuse anyway.
-            const readOnly = isAgentReadOnly(a.readOnly);
-            const description = a.frontmatter?.description;
-            // `modelSelection` is the built-ins' override; a personal agent's
-            // model lives in its own frontmatter. Both render as the picker
-            // label — never the raw `custom:…` spelling the file carries.
-            const stored = decodeSubagentModel(a.frontmatter?.model);
-            const model =
-              a.modelSelection?.modelId ??
-              (stored
-                ? (findModelOption(
-                    pickerOptions,
-                    stored.providerId,
-                    stored.modelId,
-                  )?.label ?? stored.modelId)
-                : a.frontmatter?.model);
-            const thoughtLevel =
-              a.modelSelection?.thoughtLevel ?? a.frontmatter?.thoughtLevel;
-            return (
-              <div key={name} className="flex items-start gap-3 px-4 py-3">
-                <button
-                  onClick={() => setEditing(a)}
-                  className="min-w-0 flex-1 text-left active:opacity-80"
-                >
-                  <span className="block text-sm text-ink">{name}</span>
-                  {description && (
-                    <span className="block truncate text-2xs text-faint">
-                      {description}
-                    </span>
-                  )}
-                  {model && (
-                    <span className="block truncate text-2xs text-faint">
-                      {model}
-                      {thoughtLevel ? ` · ${thoughtLevel}` : ""}
-                    </span>
-                  )}
-                  {readOnly && (
-                    <span className="block text-2xs text-faint">
-                      {t("zconfig.agentBuiltIn")}
-                    </span>
-                  )}
-                </button>
-                {/* Immediate identity: the switch only exists where the API
-                    accepts it — a built-in cannot be disabled. */}
-                {!readOnly && (
-                  <button
-                    role="switch"
-                    aria-checked={a.enabled !== false}
-                    aria-label={t("zconfig.agentEnabled")}
-                    onClick={() => void toggle(name, a.enabled === false)}
-                    className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
-                      a.enabled !== false
-                        ? "bg-success/80"
-                        : "bg-active"
-                    }`}
-                  >
-                    <span
-                      className={`block size-5 rounded-full bg-white transition ${
-                        a.enabled !== false
-                          ? "translate-x-4.5"
-                          : "translate-x-0.5"
-                      }`}
-                    />
-                  </button>
-                )}
-                <ChevronRight className="mt-1 size-4 shrink-0 text-faint" />
+          {/* Grouped like upstream's SubagentsSection: the editable personal
+              agents first, the read-only built-ins below; an empty group
+              renders nothing, and the group header carries the count. */}
+          {(
+            [
+              [t("zconfig.agentsGroupPersonal"), personal],
+              [t("zconfig.agentsGroupBuiltin"), builtin],
+            ] as const
+          ).map(([label, group]) =>
+            group.length > 0 ? (
+              <div key={label}>
+                <h2 className="px-4 pb-1 pt-3 text-2xs font-medium uppercase tracking-wide text-faint">
+                  {label} · {group.length}
+                </h2>
+                {group.map((a) => {
+                  const name = a.name ?? "";
+                  // `readOnly` is the server's verdict (a built-in has no file
+                  // to edit or delete). Trusting it — rather than guessing
+                  // from the name — is what keeps the enable control off
+                  // agents the API would refuse anyway.
+                  const readOnly = isAgentReadOnly(a.readOnly);
+                  const description = a.frontmatter?.description;
+                  // `modelSelection` is the built-ins' override; a personal
+                  // agent's model lives in its own frontmatter. Both render
+                  // as the picker label — never the raw `custom:…` spelling
+                  // the file carries.
+                  const stored = decodeSubagentModel(a.frontmatter?.model);
+                  const model =
+                    a.modelSelection?.modelId ??
+                    (stored
+                      ? (findModelOption(
+                          pickerOptions,
+                          stored.providerId,
+                          stored.modelId,
+                        )?.label ?? stored.modelId)
+                      : a.frontmatter?.model);
+                  const thoughtLevel =
+                    a.modelSelection?.thoughtLevel ?? a.frontmatter?.thoughtLevel;
+                  return (
+                    <div key={name} className="flex items-start gap-3 px-4 py-3">
+                      <button
+                        onClick={() => setEditing(a)}
+                        className="min-w-0 flex-1 text-left active:opacity-80"
+                      >
+                        <span className="block text-sm text-ink">{name}</span>
+                        {description && (
+                          <span className="block truncate text-2xs text-faint">
+                            {description}
+                          </span>
+                        )}
+                        {model && (
+                          <span className="block truncate text-2xs text-faint">
+                            {model}
+                            {thoughtLevel ? ` · ${thoughtLevel}` : ""}
+                          </span>
+                        )}
+                      </button>
+                      {/* Immediate identity: the switch only exists where the
+                          API accepts it — a built-in cannot be disabled. */}
+                      {!readOnly && (
+                        <button
+                          role="switch"
+                          aria-checked={a.enabled !== false}
+                          aria-label={t("zconfig.agentEnabled")}
+                          onClick={() => void toggle(name, a.enabled === false)}
+                          className={`mt-0.5 h-6 w-10 shrink-0 rounded-full transition ${
+                            a.enabled !== false
+                              ? "bg-success/80"
+                              : "bg-active"
+                          }`}
+                        >
+                          <span
+                            className={`block size-5 rounded-full bg-white transition ${
+                              a.enabled !== false
+                                ? "translate-x-4.5"
+                                : "translate-x-0.5"
+                            }`}
+                          />
+                        </button>
+                      )}
+                      <ChevronRight className="mt-1 size-4 shrink-0 text-faint" />
+                    </div>
+                  );
+                })}
               </div>
-            );
-          })}
+            ) : null,
+          )}
         </ConfigBlock>
       )}
 

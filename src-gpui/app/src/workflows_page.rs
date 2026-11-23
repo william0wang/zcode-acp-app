@@ -3565,6 +3565,9 @@ pub(crate) struct WorkflowStartForm {
     /// free-form fallback.
     pub(crate) fields: Vec<WorkflowStartField>,
     pub(crate) free_json: Option<Entity<TextareaState>>,
+    /// Each boolean field's opening value (the dirty gate's baseline — the
+    /// typed inputs and the JSON textarea start empty, booleans do not).
+    pub(crate) orig_bools: Vec<bool>,
 }
 
 impl WorkflowStartForm {
@@ -3605,6 +3608,9 @@ pub(crate) struct WorkflowMetaForm {
     pub(crate) instance_id: String,
     pub(crate) description: Entity<TextareaState>,
     pub(crate) when_to_use: Entity<TextareaState>,
+    /// The opened values (the dirty gate's baseline).
+    pub(crate) orig_description: String,
+    pub(crate) orig_when_to_use: String,
 }
 
 impl Workbench {
@@ -3630,6 +3636,7 @@ impl Workbench {
         let decls = args_declaration(meta.as_ref());
 
         let mut subs = Vec::new();
+        let mut orig_bools = Vec::new();
         let (fields, free_json) = if let Some(decls) = &decls {
             let initial = args_initial_values(decls);
             let mut fields = Vec::new();
@@ -3649,11 +3656,17 @@ impl Workbench {
                         .then(|| cx.new(|cx| TextareaState::new(window, cx)));
                 let bool_value = initial.get(fname) == Some(&serde_json::Value::Bool(true));
                 if let Some(entity) = &input {
-                    let sub = cx.subscribe(entity, |_, _, _: &InputEvent, cx| cx.notify());
+                    let sub = cx.subscribe(entity, |this, _, _: &InputEvent, cx| {
+                        this.settings_form_confirm_discard = false;
+                        cx.notify();
+                    });
                     subs.push(sub);
                 }
                 if let Some(entity) = &area {
-                    let sub = cx.subscribe(entity, |_, _, _: &InputEvent, cx| cx.notify());
+                    let sub = cx.subscribe(entity, |this, _, _: &InputEvent, cx| {
+                        this.settings_form_confirm_discard = false;
+                        cx.notify();
+                    });
                     subs.push(sub);
                 }
                 fields.push(WorkflowStartField {
@@ -3663,13 +3676,17 @@ impl Workbench {
                     area,
                     bool_value,
                 });
+                orig_bools.push(bool_value);
             }
             (fields, None)
         } else {
             let area = cx.new(|cx| {
                 TextareaState::new(window, cx).placeholder("{\"target\": \"src/\"}")
             });
-            subs.push(cx.subscribe(&area, |_, _, _: &InputEvent, cx| cx.notify()));
+            subs.push(cx.subscribe(&area, |this, _, _: &InputEvent, cx| {
+                this.settings_form_confirm_discard = false;
+                cx.notify();
+            }));
             (Vec::new(), Some(area))
         };
 
@@ -3679,6 +3696,7 @@ impl Workbench {
             instance_id: instance_id.to_string(),
             fields,
             free_json,
+            orig_bools,
         });
         self.workflow_form_subs = subs;
         cx.notify();
@@ -3709,6 +3727,7 @@ impl Workbench {
                     form.clear_model = false;
                 }
             }
+            wb.settings_form_confirm_discard = false;
             cx.notify();
         });
         let sub_c = cx.subscribe(&concurrency, |wb, entity, _: &InputEvent, cx| {
@@ -3718,6 +3737,7 @@ impl Workbench {
                     form.clear_concurrency = false;
                 }
             }
+            wb.settings_form_confirm_discard = false;
             cx.notify();
         });
         self.workflow_amend_form = Some(WorkflowAmendForm {
@@ -3753,6 +3773,10 @@ impl Workbench {
             ),
             None => (String::new(), String::new()),
         };
+        // Cloned BEFORE the set_value closures move the texts — the dirty
+        // gate's baseline rides alongside the form.
+        let (orig_description, orig_when_to_use) =
+            (description_text.clone(), when_to_use_text.clone());
         let description = cx.new(|cx| {
             let mut state = TextareaState::new(window, cx);
             state.set_value(description_text, window, cx);
@@ -3765,7 +3789,10 @@ impl Workbench {
         });
         let mut subs = Vec::new();
         for entity in [&description, &when_to_use] {
-            subs.push(cx.subscribe(entity, |_, _, _: &InputEvent, cx| cx.notify()));
+            subs.push(cx.subscribe(entity, |this, _, _: &InputEvent, cx| {
+                this.settings_form_confirm_discard = false;
+                cx.notify();
+            }));
         }
         self.workflow_meta_form = Some(WorkflowMetaForm {
             scope,
@@ -3773,6 +3800,8 @@ impl Workbench {
             instance_id,
             description,
             when_to_use,
+            orig_description,
+            orig_when_to_use,
         });
         self.workflow_form_subs = subs;
         cx.notify();
@@ -3842,6 +3871,7 @@ impl Workbench {
             .min_w_0()
             .overflow_x_hidden();
         column = column.child(form_header(
+            self,
             &t!("zconfig.workflowEditDescription").into_owned(),
             "workflow-form-back",
             theme,
@@ -3885,7 +3915,9 @@ impl Workbench {
                     .primary()
                     .w_full()
                     .label(t!("common.save").into_owned())
-                    .disabled(!can_submit)
+                    // The form contract: valid AND dirty (an untouched edit
+                    // has nothing to save).
+                    .disabled(!can_submit || !self.workflow_form_dirty(cx))
                     .on_click(move |_, _, cx| {
                         wb.update(cx, |this, cx| this.submit_workflow_meta_form(cx));
                     }),
@@ -3927,6 +3959,9 @@ impl Workbench {
         self.workflow_amend_form = None;
         self.workflow_meta_form = None;
         self.workflow_form_subs.clear();
+        // Same rule as close_zconfig_form: an armed discard must not survive
+        // into the next form.
+        self.settings_form_confirm_discard = false;
         cx.notify();
     }
 
@@ -4005,6 +4040,7 @@ impl Workbench {
                 }
             }
         }
+        self.settings_form_confirm_discard = false;
         cx.notify();
     }
 
@@ -4130,6 +4166,46 @@ impl Workbench {
         !empty && !invalid
     }
 
+    /// The open workflow form's dirty verdict (the form contract, ADR-0014
+    /// §3 — these sheets ride the same discard gate as the settings forms):
+    /// the start sheet deviates from its declaration's opening values (typed
+    /// inputs and the JSON textarea start empty; booleans from their
+    /// defaults), the amend sheet contributes any change, and the meta
+    /// sheet differs from the loaded prose.
+    pub(crate) fn workflow_form_dirty(&self, cx: &Context<Self>) -> bool {
+        if let Some(form) = &self.workflow_start_form {
+            // orig_bools is index-parallel to fields (built in the same loop).
+            let typed = form.fields.iter().zip(&form.orig_bools).any(|(f, orig)| {
+                f.input
+                    .as_ref()
+                    .is_some_and(|i| !i.read(cx).value().trim().is_empty())
+                    || f.area
+                        .as_ref()
+                        .is_some_and(|a| !a.read(cx).value().trim().is_empty())
+                    || f.bool_value != *orig
+            });
+            if typed {
+                return true;
+            }
+            return form
+                .free_json
+                .as_ref()
+                .is_some_and(|a| !a.read(cx).value().trim().is_empty());
+        }
+        if let Some(form) = &self.workflow_amend_form {
+            let (model, concurrency, _) = self.workflow_amend_state(cx);
+            return !(model.is_none()
+                && concurrency.is_none()
+                && !form.clear_concurrency
+                && !form.clear_model);
+        }
+        if let Some(form) = &self.workflow_meta_form {
+            return form.description.read(cx).value() != form.orig_description
+                || form.when_to_use.read(cx).value() != form.orig_when_to_use;
+        }
+        false
+    }
+
     /// The amend form's submit: build the three-state body (the key's
     /// PRESENCE is the wire discriminator) and dispatch.
     fn submit_workflow_amend_form(&mut self, cx: &mut Context<Self>) {
@@ -4179,6 +4255,7 @@ impl Workbench {
             .min_w_0()
             .overflow_x_hidden();
         column = column.child(form_header(
+            self,
             &form.name,
             "workflow-form-back",
             theme,
@@ -4266,6 +4343,7 @@ impl Workbench {
             .min_w_0()
             .overflow_x_hidden();
         column = column.child(form_header(
+            self,
             &t!("zconfig.workflowConfigure").into_owned(),
             "workflow-form-back",
             theme,
@@ -4318,6 +4396,7 @@ impl Workbench {
                                                 });
                                             }
                                         }
+                                        this.settings_form_confirm_discard = false;
                                         cx.notify();
                                     });
                                 },
@@ -4369,6 +4448,7 @@ impl Workbench {
                                                 });
                                             }
                                         }
+                                        this.settings_form_confirm_discard = false;
                                         cx.notify();
                                     });
                                 }),
@@ -4607,15 +4687,21 @@ impl Workbench {
     }
 }
 
-/// The shared form header (back + title) — the TS sheets' frame top.
+/// The shared form header (back + title) — the TS sheets' frame top. The
+/// back gesture rides the form-contract rung (a dirty sheet asks before it
+/// discards, ADR-0014 §3), and the armed discard renders its strip under
+/// the bar. `wb_ref` is the already-borrowed workbench (resolving it via
+/// `cx.entity().read_with` mid-render double-leases and panics).
 fn form_header(
+    wb_ref: &Workbench,
     title: &str,
     back_id: &'static str,
     theme: &component::Theme,
     cx: &Context<Workbench>,
-) -> gpui::Div {
+) -> AnyElement {
     let wb = cx.entity();
-    div()
+    let mut column = div().flex().flex_col().flex_none().overflow_x_hidden();
+    let bar = div()
         .flex()
         .items_center()
         .gap_1()
@@ -4632,7 +4718,9 @@ fn form_header(
                 .icon(IconName::ArrowLeft)
                 .tooltip(t!("common.back"))
                 .on_click(move |_, _, cx| {
-                    wb.update(cx, |this, cx| this.close_workflow_form(cx));
+                    wb.update(cx, |this, cx| {
+                        let _ = this.close_open_settings_form(cx);
+                    });
                 }),
         )
         .child(
@@ -4642,7 +4730,12 @@ fn form_header(
                 .truncate()
                 .min_w_0()
                 .child(title.to_string()),
-        )
+        );
+    column = column.child(bar);
+    if let Some(strip) = wb_ref.discard_armed_strip(theme, cx) {
+        column = column.child(strip);
+    }
+    column.into_any_element()
 }
 
 /// One typed start-form field (TS WorkflowArgsForm's rows): label + required

@@ -188,6 +188,20 @@ export interface ConfigSliceActions {
     providerId: string,
     modelId: string,
   ) => Promise<Effect | undefined>;
+  // Provider create/delete/reorder (settings parity): the id is derived
+  // server-side from the name on create; the section reload lands the row.
+  createProviderEntry: (body: {
+    providerName: string;
+    apiType?: string;
+    baseUrl?: string;
+    apiKey?: string;
+  }) => Promise<Effect | undefined>;
+  updateProviderEntry: (
+    providerId: string,
+    body: Record<string, unknown>,
+  ) => Promise<Effect | undefined>;
+  removeProviderEntry: (providerId: string) => Promise<Effect | undefined>;
+  reorderProviderEntries: (providerIds: string[]) => Promise<Effect | undefined>;
   setMcpEnabled: (name: string, enable: boolean) => Promise<Effect | undefined>;
   upsertMcp: (
     name: string,
@@ -612,6 +626,36 @@ export function createConfigSlice(
       const client = hub();
       if (!client) return undefined;
       const res = await client.removeModel(providerId, modelId);
+      return res.effect;
+    },
+
+    // Provider create/delete/reorder (settings parity). The create's id is
+    // derived server-side from the name; the section reload lands the row.
+    createProviderEntry: async (body) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.createProvider(body);
+      return res.effect;
+    },
+
+    updateProviderEntry: async (providerId, body) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.updateProvider(providerId, body);
+      return res.effect;
+    },
+
+    removeProviderEntry: async (providerId) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.removeProvider(providerId);
+      return res.effect;
+    },
+
+    reorderProviderEntries: async (providerIds) => {
+      const client = hub();
+      if (!client) return undefined;
+      const res = await client.reorderProviders(providerIds);
       return res.effect;
     },
 

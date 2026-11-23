@@ -287,6 +287,9 @@ pub struct Workbench {
     /// files and never open together.
     pub(crate) provider_form: Option<crate::models_page::ProviderFormState>,
     pub(crate) provider_form_subs: Vec<Subscription>,
+    /// The provider edit form's armed delete (the form contract's two-tap
+    /// footer control), keyed by provider id.
+    pub(crate) provider_delete_confirm: Option<String>,
     /// The open ZCode-config section form (batch I: MCP / hook / agent);
     /// `None` = closed. Rendered instead of the section page while open,
     /// like `models_form`.
@@ -1602,6 +1605,7 @@ impl Workbench {
             models_form: None,
             models_form_subs: Vec::new(),
             provider_form: None,
+            provider_delete_confirm: None,
             provider_form_subs: Vec::new(),
             zconfig_form: None,
             zconfig_form_subs: Vec::new(),
@@ -2094,10 +2098,12 @@ impl Workbench {
     }
 
     /// Any open settings form's dirty verdict (the discard gate's question).
+    /// The workflow sheets ride the same contract (ADR-0014 §3).
     fn settings_form_dirty(&self, cx: &Context<Self>) -> bool {
         self.provider_form_dirty(cx)
             || self.models_form_dirty(cx)
             || self.zconfig_form_dirty(cx)
+            || self.workflow_form_dirty(cx)
     }
 
     /// Close the open settings form — or, when it is DIRTY, ask first: the
@@ -2112,10 +2118,13 @@ impl Workbench {
     /// level. A DIRTY form answers the first Esc by arming the discard
     /// confirm instead of closing; the second Esc closes. True when a form
     /// was open (the rung fired).
-    fn close_open_settings_form(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn close_open_settings_form(&mut self, cx: &mut Context<Self>) -> bool {
         let form_open = self.provider_form.is_some()
             || self.models_form.is_some()
-            || self.zconfig_form.is_some();
+            || self.zconfig_form.is_some()
+            || self.workflow_start_form.is_some()
+            || self.workflow_amend_form.is_some()
+            || self.workflow_meta_form.is_some();
         if form_open && self.settings_form_dirty(cx) && !self.settings_form_confirm_discard {
             self.settings_form_confirm_discard = true;
             cx.notify();
@@ -2147,7 +2156,10 @@ impl Workbench {
     pub(crate) fn settings_form_rung(&mut self, cx: &mut Context<Self>) -> bool {
         let settings_form_open = self.provider_form.is_some()
             || self.models_form.is_some()
-            || self.zconfig_form.is_some();
+            || self.zconfig_form.is_some()
+            || self.workflow_start_form.is_some()
+            || self.workflow_amend_form.is_some()
+            || self.workflow_meta_form.is_some();
         settings_form_open && self.close_open_settings_form(cx)
     }
 
@@ -2548,10 +2560,16 @@ impl Workbench {
                 }
                 // The form lives only inside the page (TS ConfigFormSheet
                 // unmounts with it); a page closed under an open form drops
-                // it so a reopen starts clean.
+                // it so a reopen starts clean. The provider form follows the
+                // same contract, its armed delete included.
                 if self.snap.models_page.is_none() && self.models_form.is_some() {
                     self.models_form = None;
                     self.models_form_subs.clear();
+                }
+                if self.snap.models_page.is_none() && self.provider_form.is_some() {
+                    self.provider_form = None;
+                    self.provider_form_subs.clear();
+                    self.provider_delete_confirm = None;
                 }
                 if self.snap.config_section_page.is_none() {
                     // Same contract for the section form, plus the page-local
@@ -10807,6 +10825,7 @@ mod ui_tests {
                     }]),
                     providers: None,
                     model_rules: None,
+                    provider_order: None,
                 }),
             }),
             busy: false,
@@ -10873,6 +10892,7 @@ mod ui_tests {
                     }]),
                     providers: None,
                     model_rules: None,
+                    provider_order: None,
                 }),
             }),
             busy: false,
@@ -10939,14 +10959,14 @@ mod ui_tests {
         cx.update_window(handle.into(), |_, window, cx| {
             wb.update(cx, |this, cx| {
                 this.open_provider_form(
-                    ProviderRef {
+                    Some(ProviderRef {
                         provider_id: Some("prov_1".to_string()),
                         provider_name: Some("Provider One".to_string()),
                         base_url: Some(String::new()),
                         api_type: Some("weird-vendor".to_string()),
                         has_api_key: false,
                         ..Default::default()
-                    },
+                    }),
                     window,
                     cx,
                 );
@@ -11014,6 +11034,7 @@ mod ui_tests {
                     }]),
                     providers: None,
                     model_rules: None,
+                    provider_order: None,
                 }),
             }),
             busy: false,
@@ -11101,6 +11122,7 @@ mod ui_tests {
                     }]),
                     providers: None,
                     model_rules: None,
+                    provider_order: None,
                 }),
             }),
             busy: false,
@@ -11142,6 +11164,169 @@ mod ui_tests {
         .unwrap();
     }
 
+    /// The workflow sheets ride the same form contract (ADR-0014 §3): a
+    /// dirty start sheet (free-JSON branch — no declaration on the detail)
+    /// answers the first leave request by arming the discard confirm, the
+    /// strip renders, and the second closes it.
+    #[gpui_kit::test]
+    fn a_dirty_workflow_form_asks_before_discarding(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.workflows_page = Some(crate::runtime::WorkflowsPageView {
+            loading: false,
+            error: None,
+            overview: None,
+            detail: Some(crate::runtime::WorkflowDetailView {
+                scope: protocol::workflow::WorkflowScope::Global,
+                name: "wf".to_string(),
+                instance_id: "i1".to_string(),
+                loading: false,
+                detail: None,
+                runs: None,
+                summaries: std::collections::HashMap::new(),
+            }),
+            run: None,
+            busy: false,
+            action_instance: None,
+            launches: std::collections::HashMap::new(),
+            session_runs: std::collections::HashMap::new(),
+        });
+
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            wb.update(cx, |wb, cx| {
+                wb.open_settings(
+                    crate::settings_overlay::SettingsSection::Workflows,
+                    cx,
+                )
+            });
+            wb.update(cx, |this, cx| {
+                this.open_workflow_start_form(
+                    protocol::workflow::WorkflowScope::Global,
+                    "wf",
+                    "i1",
+                    window,
+                    cx,
+                );
+                assert!(!this.workflow_form_dirty(cx), "an untouched sheet is clean");
+            });
+            // Type into the free-form JSON area — the sheet goes dirty.
+            wb.update(cx, |this, cx| {
+                if let Some(form) = &this.workflow_start_form {
+                    if let Some(area) = &form.free_json {
+                        area.update(cx, |s, cx| {
+                            s.set_value("{\"target\": \"src/\"}".to_string(), window, cx)
+                        });
+                    }
+                }
+                assert!(this.workflow_form_dirty(cx));
+                // First leave: the discard confirm arms, the sheet stays.
+                assert!(this.close_open_settings_form(cx));
+                assert!(
+                    this.workflow_start_form.is_some(),
+                    "the armed discard keeps the sheet"
+                );
+                assert!(this.settings_form_confirm_discard);
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("discard-armed").visible(),
+                "the workflow sheet renders the same strip"
+            );
+            // Second leave: the sheet closes, the arm and strip go with it.
+            wb.update(cx, |this, cx| {
+                assert!(this.close_open_settings_form(cx));
+                assert!(this.workflow_start_form.is_none());
+                assert!(!this.settings_form_confirm_discard);
+            });
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("discard-armed").is_none(),
+                "the strip left with the sheet"
+            );
+        })
+        .unwrap();
+    }
+
+    /// An overlay-level close waits for a dirty workflow sheet too — one
+    /// action never skips a level, whatever surface the form lives on.
+    #[gpui_kit::test]
+    fn overlay_close_waits_for_a_dirty_workflow_form(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+
+        let mut snap = connected_snapshot();
+        snap.workflows_page = Some(crate::runtime::WorkflowsPageView {
+            loading: false,
+            error: None,
+            overview: None,
+            detail: Some(crate::runtime::WorkflowDetailView {
+                scope: protocol::workflow::WorkflowScope::Global,
+                name: "wf".to_string(),
+                instance_id: "i1".to_string(),
+                loading: false,
+                detail: None,
+                runs: None,
+                summaries: std::collections::HashMap::new(),
+            }),
+            run: None,
+            busy: false,
+            action_instance: None,
+            launches: std::collections::HashMap::new(),
+            session_runs: std::collections::HashMap::new(),
+        });
+
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            wb.update(cx, |wb, cx| {
+                wb.open_settings(
+                    crate::settings_overlay::SettingsSection::Workflows,
+                    cx,
+                )
+            });
+            wb.update(cx, |this, cx| {
+                this.open_workflow_start_form(
+                    protocol::workflow::WorkflowScope::Global,
+                    "wf",
+                    "i1",
+                    window,
+                    cx,
+                );
+            });
+            // Dirty the sheet, then leave at the overlay level.
+            wb.update(cx, |this, cx| {
+                if let Some(form) = &this.workflow_start_form {
+                    if let Some(area) = &form.free_json {
+                        area.update(cx, |s, cx| {
+                            s.set_value("{\"target\": \"src/\"}".to_string(), window, cx)
+                        });
+                    }
+                }
+                this.close_settings(cx);
+                assert!(
+                    this.settings.is_some(),
+                    "the armed discard keeps the overlay"
+                );
+                assert!(this.workflow_start_form.is_some());
+                // Second: the sheet goes, the overlay stays; third closes it.
+                this.close_settings(cx);
+                assert!(this.settings.is_some());
+                assert!(this.workflow_start_form.is_none());
+                this.close_settings(cx);
+                assert!(this.settings.is_none());
+            });
+        })
+        .unwrap();
+    }
+
     /// Any edit stands the discard confirm down, not just typing: after the
     /// first close arms, a level-chip toggle un-arms it and the next close
     /// must ask again.
@@ -11170,6 +11355,7 @@ mod ui_tests {
                     }]),
                     providers: None,
                     model_rules: None,
+                    provider_order: None,
                 }),
             }),
             busy: false,

@@ -1532,16 +1532,56 @@ fn render_agents_body(wb: &Workbench, page: &ConfigSectionPageView, cx: &Context
     if rows.is_empty() {
         list = list.child(empty_card(&t!("zconfig.agentsEmpty"), theme));
     } else {
+        // Grouped like upstream's SubagentsSection: the editable personal
+        // agents first, the read-only built-ins below — group headers carry
+        // the count, and an empty group renders nothing.
+        let mut personal: Vec<(usize, &AgentRow)> = Vec::new();
+        let mut builtin: Vec<(usize, &AgentRow)> = Vec::new();
+        for pair in rows.iter().enumerate() {
+            if is_agent_read_only(pair.1.read_only) {
+                builtin.push(pair);
+            } else {
+                personal.push(pair);
+            }
+        }
         let mut block = div().flex().flex_col();
-        for (index, agent) in rows.iter().enumerate() {
-            block = block.child(render_agent_row(
-                index,
-                agent,
-                &options,
-                page.busy,
-                &wb.runtime,
-                cx,
-            ));
+        for (group, key) in [(personal.as_slice(), "zconfig.agentsGroupPersonal"), (builtin.as_slice(), "zconfig.agentsGroupBuiltin")] {
+            if group.is_empty() {
+                continue;
+            }
+            block = block.child(
+                div()
+                    .id(SharedString::from(key))
+                    .test_support()
+                    .flex()
+                    .items_baseline()
+                    .gap_2()
+                    .px_4()
+                    .pt_3()
+                    .pb_1()
+                    .child(
+                        div()
+                            .text_size(ui_text(10.))
+                            .text_color(theme.muted_foreground)
+                            .child(t!(key).into_owned()),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui_text(10.))
+                            .text_color(crate::ui_tokens::faint(theme))
+                            .child(group.len().to_string()),
+                    ),
+            );
+            for (index, agent) in group {
+                block = block.child(render_agent_row(
+                    *index,
+                    agent,
+                    &options,
+                    page.busy,
+                    &wb.runtime,
+                    cx,
+                ));
+            }
         }
         list = list.child(rows_card(theme).child(block));
     }
@@ -1644,22 +1684,8 @@ fn render_agent_row(
                             .truncate()
                             .child(name.clone()),
                     )
-                    .when(read_only, |this| {
-                        // The built-in badge — the server's own verdict.
-                        this.child(
-                            div()
-                                .id(SharedString::from(format!("agent-builtin-{index}")))
-                                .test_support()
-                                .flex_none()
-                                .px(px(6.))
-                                .py(px(1.))
-                                .rounded_md()
-                                .bg(theme.secondary)
-                                .text_size(ui_text(10.))
-                                .text_color(theme.muted_foreground)
-                                .child(t!("zconfig.agentBuiltIn").into_owned()),
-                        )
-                    }),
+                    // No per-row built-in badge: the group header already
+                    // says it (the upstream grouping).
             )
             .when(description.is_some(), |this| {
                 this.child(

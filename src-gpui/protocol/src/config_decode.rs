@@ -94,8 +94,45 @@ pub struct ModelsBlock {
     pub available: Option<Vec<ModelRef>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub providers: Option<Vec<ProviderRef>>,
+    /// The display order the settings surfaces sort the providers block by
+    /// (absent = the block's own order; the reorder write keeps it total).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_order: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_rules: Option<Vec<ModelRule>>,
+}
+
+/// The providers block in its display order: `provider_order` names the
+/// sequence, ids the block carries but the order does not mention keep their
+/// file order after the mentioned ones (the reorder write's own normalize
+/// rule — the read side mirrors it so both clients agree).
+pub fn ordered_provider_refs(block: Option<&ModelsBlock>) -> Vec<ProviderRef> {
+    let Some(block) = block else {
+        return Vec::new();
+    };
+    let providers = block.providers.as_deref().unwrap_or(&[]);
+    let Some(order) = block.provider_order.as_deref() else {
+        return providers.to_vec();
+    };
+    let mut out: Vec<ProviderRef> = Vec::with_capacity(providers.len());
+    let mut taken = vec![false; providers.len()];
+    for id in order {
+        if let Some(at) = providers
+            .iter()
+            .position(|p| p.provider_id.as_deref() == Some(id.as_str()))
+        {
+            if !taken[at] {
+                taken[at] = true;
+                out.push(providers[at].clone());
+            }
+        }
+    }
+    for (at, p) in providers.iter().enumerate() {
+        if !taken[at] {
+            out.push(p.clone());
+        }
+    }
+    out
 }
 
 /// One picker row of the model list.
@@ -914,6 +951,46 @@ mod tests {
 
     fn models(payload: Value) -> ModelsPayload {
         serde_json::from_value(payload).unwrap()
+    }
+
+    #[test]
+    fn provider_order_names_the_sequence_and_unmentioned_ids_keep_file_order() {
+        // The reorder write's normalize rule, mirrored on the read side:
+        // the order array leads, ids it does not mention follow in file
+        // order, and a missing order falls back to the block's own order.
+        let payload = json!({
+            "ok": true,
+            "models": {
+                "available": [],
+                "providerOrder": ["beta", "ghost"],
+                "providers": [
+                    { "providerId": "alpha", "providerName": "Alpha" },
+                    { "providerId": "beta", "providerName": "Beta" },
+                    { "providerId": "gamma", "providerName": "Gamma" }
+                ],
+                "modelRules": []
+            }
+        });
+        let ordered = ordered_provider_refs(models(payload).models.as_ref());
+        let ids: Vec<&str> = ordered
+            .iter()
+            .map(|p| p.provider_id.as_deref().unwrap_or_default())
+            .collect();
+        assert_eq!(ids, ["beta", "alpha", "gamma"]);
+
+        // No order on the wire → the block's own order, untouched.
+        let no_order = json!({
+            "ok": true,
+            "models": {
+                "providers": [
+                    { "providerId": "alpha" },
+                    { "providerId": "beta" }
+                ]
+            }
+        });
+        let ordered = ordered_provider_refs(models(no_order).models.as_ref());
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].provider_id.as_deref(), Some("alpha"));
     }
 
     // --- mcp: wrapped in `{ok, mcp:{servers}}`, like models and usage -------

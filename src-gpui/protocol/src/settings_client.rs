@@ -28,9 +28,10 @@ use serde_json::Value;
 use crate::hub::{ConnectionProfile, HubUpgradeResult};
 use crate::settings::{
     AgentUpsert, BackendRestartResult, ConnectivityResult, HookEntryPatch, HookUpsert,
-    McpServerUpsert, McpStatusSnapshot, ModelUpsert, PendingRestartStatus, ResetCardStatus,
-    ResetOpportunityRequest, ResetOpportunityResponse, SettingsAll, SkillDetailSnapshot,
-    SpendResetCard, WorkflowGateModeSetting, WorkflowGateSetResponse, WriteEffect,
+    McpServerUpsert, McpStatusSnapshot, ModelUpsert, PendingRestartStatus, ProviderCreated,
+    ResetCardStatus, ResetOpportunityRequest, ResetOpportunityResponse, SettingsAll,
+    SkillDetailSnapshot, SpendResetCard, WorkflowGateModeSetting, WorkflowGateSetResponse,
+    WriteEffect,
 };
 use crate::system_stats::SystemStatsResponse;
 use crate::workflow::{
@@ -504,6 +505,67 @@ impl<T: HttpTransport> HubHttpClient<T> {
         );
         self.fetch_json(Method::Put, &path, Some(body), FetchOptions::default())
             .await
+    }
+
+    /// POST /settings/providers (settings parity: provider create). The id is
+    /// derived from the name SERVER-side and returned — the response carries
+    /// it, the request never does.
+    pub async fn create_provider(
+        &self,
+        provider_name: &str,
+        api_type: Option<&str>,
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+    ) -> Result<ProviderCreated, HubApiError> {
+        let mut body = serde_json::Map::new();
+        body.insert("providerName".into(), serde_json::json!(provider_name));
+        if let Some(v) = api_type {
+            body.insert("apiType".into(), serde_json::json!(v));
+        }
+        if let Some(v) = base_url {
+            body.insert("baseUrl".into(), serde_json::json!(v));
+        }
+        if let Some(v) = api_key {
+            body.insert("apiKey".into(), serde_json::json!(v));
+        }
+        self.fetch_json(
+            Method::Post,
+            "/api/settings/providers",
+            Some(Value::Object(body)),
+            FetchOptions::default(),
+        )
+        .await
+    }
+
+    /// DELETE /settings/providers/{id} — only a rule this file declares can
+    /// go; the provider's model rules and order entry go with it.
+    pub async fn remove_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<WriteEffect, HubApiError> {
+        let path = format!(
+            "/api/settings/providers/{}",
+            encode_uri_component(provider_id)
+        );
+        self.fetch_json(Method::Delete, &path, None, FetchOptions::default())
+            .await
+    }
+
+    /// POST /settings/providers/reorder — the desired order for the declared
+    /// rules; unknown ids are ignored and unmentioned ones keep their file
+    /// order after the mentioned ones (the server normalizes the same way).
+    pub async fn reorder_providers(
+        &self,
+        provider_ids: &[String],
+    ) -> Result<WriteEffect, HubApiError> {
+        let body = serde_json::json!({ "providerIds": provider_ids });
+        self.fetch_json(
+            Method::Post,
+            "/api/settings/providers/reorder",
+            Some(body),
+            FetchOptions::default(),
+        )
+        .await
     }
 
     /// POST /settings/models is an upsert: one route adds a model to a
@@ -1656,6 +1718,66 @@ mod tests {
                 "reasoningLevels": ["high", "low"],
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_provider_create_posts_the_name_and_reads_the_derived_id_back() {
+        let t = transport();
+        t.push(ok_json(json!({
+            "ok": true,
+            "providerId": "my-api",
+            "effect": "immediate"
+        })));
+        let created = client(&t)
+            .create_provider(
+                "My API",
+                Some("openai-chat-completions"),
+                Some("https://api.example.com/v1"),
+                Some("sk-new"),
+            )
+            .await
+            .unwrap();
+        // The request carries only the fields the form filled — the id is
+        // DERIVED server-side, so the response is where it first appears.
+        let req = &t.requested()[0];
+        assert_eq!(req.url, "http://hub/api/settings/providers");
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(
+            t.body(0),
+            json!({
+                "providerName": "My API",
+                "apiType": "openai-chat-completions",
+                "baseUrl": "https://api.example.com/v1",
+                "apiKey": "sk-new",
+            })
+        );
+        assert_eq!(created.provider_id.as_deref(), Some("my-api"));
+
+        // The optional fields are OMITTED when absent, not sent empty.
+        let t2 = transport();
+        t2.push(ok_json(json!({ "ok": true, "providerId": "bare" })));
+        client(&t2).create_provider("Bare", None, None, None).await.unwrap();
+        assert_eq!(t2.body(0), json!({ "providerName": "Bare" }));
+    }
+
+    #[tokio::test]
+    async fn a_provider_remove_deletes_and_a_reorder_posts_the_whole_sequence() {
+        let t = transport();
+        t.push(ok_json(json!({ "ok": true, "effect": "immediate" })));
+        client(&t).remove_provider("my api").await.unwrap();
+        let req = &t.requested()[0];
+        assert_eq!(req.url, "http://hub/api/settings/providers/my%20api");
+        assert_eq!(req.method, Method::Delete);
+
+        t.push(ok_json(json!({ "ok": true, "effect": "immediate" })));
+        client(&t)
+            .reorder_providers(&["beta".into(), "alpha".into()])
+            .await
+            .unwrap();
+        let req = &t.requested()[1];
+        assert_eq!(req.url, "http://hub/api/settings/providers/reorder");
+        assert_eq!(req.method, Method::Post);
+        assert_eq!(t.body(1), json!({ "providerIds": ["beta", "alpha"] }));
     }
 
     #[tokio::test]

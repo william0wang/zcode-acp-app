@@ -35,7 +35,8 @@ use gpui_kit::component::{
 use gpui_kit::assets::IconName as KitIconName;
 use gpui_kit::*;
 use protocol::config_decode::{
-    context_window_for, provider_options, rule_for, ModelRef, ProviderOption,
+    context_window_for, ordered_provider_refs, provider_options, rule_for, ModelRef,
+    ProviderOption,
 };
 use protocol::settings::ModelUpsert;
 use rust_i18n::t;
@@ -85,8 +86,13 @@ pub(crate) struct ModelFormOrig {
 /// `config.api` / `config.access`. One Save spanning both would have two
 /// independent failure modes.
 pub struct ProviderFormState {
+    /// The row being edited; `None` = creating one (the name box exists only
+    /// in that mode — on an existing provider the name is display-only).
+    target: Option<protocol::config_decode::ProviderRef>,
     provider_id: String,
     provider_name: String,
+    /// Create mode's name box (edit mode shows the fixed name instead).
+    name_input: Option<Entity<InputState>>,
     pub(crate) base_url: Entity<InputState>,
     /// The key box. The current key is never shown — the server does not send
     /// it — so a blank box means "keep the stored key", not "clear it".
@@ -217,55 +223,86 @@ impl Workbench {
     /// The key box starts EMPTY even when a key is stored: the server never
     /// sends the secret back, so there is nothing to prefill. A blank submit
     /// therefore keeps the stored key (see `submit_provider_form`).
+    /// `target == None` is the create branch: the name box is the one extra
+    /// field, and the id is derived server-side from it on submit.
     pub fn open_provider_form(
         &mut self,
-        provider: protocol::config_decode::ProviderRef,
+        provider: Option<protocol::config_decode::ProviderRef>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(provider_id) = provider.provider_id.clone() else {
-            return;
+        // Edit mode addresses the row by its id (a row without one cannot be
+        // addressed); create mode has none — the server derives it.
+        let provider_id = match provider.as_ref().and_then(|p| p.provider_id.clone()) {
+            Some(id) => id,
+            None if provider.is_none() => String::new(),
+            None => return,
         };
         let base_url = cx.new(|cx| InputState::new(window, cx));
         prefill(
             &base_url,
-            provider.base_url.clone().unwrap_or_default(),
+            provider
+                .as_ref()
+                .and_then(|p| p.base_url.clone())
+                .unwrap_or_default(),
             window,
             cx,
         );
+        let has_api_key = provider.as_ref().map(|p| p.has_api_key).unwrap_or(false);
         let api_key = cx.new(|cx| {
             InputState::new(window, cx).placeholder(
-                if provider.has_api_key {
+                if has_api_key {
                     t!("zconfig.providerKeyKeep").into_owned()
                 } else {
                     String::new()
                 },
             )
         });
-        let sub_url = cx.subscribe(&base_url, |this, _, _: &InputEvent, cx| {
+        let mut subs = Vec::new();
+        let name_input = (provider.is_none()).then(|| {
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("My API"));
+            subs.push(cx.subscribe(&input, |this, _, _: &InputEvent, cx| {
+                this.settings_form_confirm_discard = false;
+                cx.notify();
+            }));
+            input
+        });
+        subs.push(cx.subscribe(&base_url, |this, _, _: &InputEvent, cx| {
             this.settings_form_confirm_discard = false;
             cx.notify();
-        });
-        let sub_key = cx.subscribe(&api_key, |this, _, _: &InputEvent, cx| {
+        }));
+        subs.push(cx.subscribe(&api_key, |this, _, _: &InputEvent, cx| {
             this.settings_form_confirm_discard = false;
             cx.notify();
-        });
-        let opened_url = provider.base_url.clone().unwrap_or_default();
-        let api_type = provider.api_type.clone();
+        }));
+        let opened_url = provider
+            .as_ref()
+            .and_then(|p| p.base_url.clone())
+            .unwrap_or_default();
+        let api_type = provider.as_ref().and_then(|p| p.api_type.clone());
         self.provider_form = Some(ProviderFormState {
+            target: provider.clone(),
             provider_id,
-            provider_name: provider.provider_name.clone().unwrap_or_default(),
+            provider_name: provider
+                .as_ref()
+                .and_then(|p| p.provider_name.clone())
+                .unwrap_or_default(),
+            name_input,
             base_url,
             api_key,
-            has_api_key: provider.has_api_key,
+            has_api_key,
             api_type: api_type.clone(),
             orig_url: opened_url,
             orig_api_type: api_type,
         });
-        self.provider_form_subs = vec![sub_url, sub_key];
+        self.provider_form_subs = subs;
         self.settings_form_confirm_discard = false;
-        // Focus the first input on open.
-        let focus = self.provider_form.as_ref().unwrap().base_url.clone();
+        // Focus the first input on open: the name box when creating, the
+        // base URL when editing (the name is fixed above it).
+        let focus = match self.provider_form.as_ref().unwrap().name_input.clone() {
+            Some(name) => name,
+            None => self.provider_form.as_ref().unwrap().base_url.clone(),
+        };
         window.defer(cx, move |window, cx| {
             let handle = focus.read(cx).focus_handle(cx);
             window.focus(&handle, cx);
@@ -277,6 +314,9 @@ impl Workbench {
         self.provider_form = None;
         self.provider_form_subs.clear();
         self.settings_form_confirm_discard = false;
+        // Same rule as close_zconfig_form: an armed delete must not survive
+        // into the next form.
+        self.provider_delete_confirm = None;
         cx.notify();
     }
 
@@ -297,11 +337,21 @@ impl Workbench {
 
     /// The provider form's dirty gate: any field diverged from the opened
     /// values (a typed key is always a change — the box starts empty because
-    /// the secret never comes back).
+    /// the secret never comes back). A CREATE has no baseline — any content
+    /// is a change (the create-form rule, ADR-0014 §3).
     pub(crate) fn provider_form_dirty(&self, cx: &Context<Self>) -> bool {
         let Some(form) = &self.provider_form else {
             return false;
         };
+        if form.target.is_none() {
+            return form
+                .name_input
+                .as_ref()
+                .is_some_and(|n| !n.read(cx).value().trim().is_empty())
+                || !form.base_url.read(cx).value().trim().is_empty()
+                || !form.api_key.read(cx).value().trim().is_empty()
+                || form.api_type.is_some();
+        }
         form.base_url.read(cx).value().trim() != form.orig_url.trim()
             || !form.api_key.read(cx).value().trim().is_empty()
             || form.api_type != form.orig_api_type
@@ -311,6 +361,8 @@ impl Workbench {
     /// a blank box means "keep the stored key", because the value was never
     /// shown to be retyped. The api type travels as the form holds it — an
     /// absent or unknown spelling is sent back untouched (None = keep).
+    /// A CREATE posts the name (the id is derived server-side) and only the
+    /// optional fields the form actually filled.
     pub(crate) fn submit_provider_form(&mut self, cx: &mut Context<Self>) {
         let Some(form) = &self.provider_form else {
             return;
@@ -318,20 +370,24 @@ impl Workbench {
         let base_url = form.base_url.read(cx).value().trim().to_string();
         let api_key = form.api_key.read(cx).value().trim().to_string();
         let api_type = form.api_type.clone();
-        let command = UiCommand::UpdateProvider {
-            provider_id: form.provider_id.clone(),
-            enabled: None,
-            provider_name: if form.provider_name.is_empty() {
-                None
-            } else {
-                Some(form.provider_name.clone())
+        let command = match (&form.target, &form.name_input) {
+            (None, Some(name)) => UiCommand::CreateProvider {
+                provider_name: name.read(cx).value().trim().to_string(),
+                api_type,
+                base_url: (!base_url.is_empty()).then_some(base_url),
+                api_key: (!api_key.is_empty()).then_some(api_key),
             },
-            base_url: Some(base_url),
-            api_type,
-            api_key: if api_key.is_empty() {
-                None
-            } else {
-                Some(api_key)
+            _ => UiCommand::UpdateProvider {
+                provider_id: form.provider_id.clone(),
+                enabled: None,
+                provider_name: if form.provider_name.is_empty() {
+                    None
+                } else {
+                    Some(form.provider_name.clone())
+                },
+                base_url: Some(base_url),
+                api_type,
+                api_key: (!api_key.is_empty()).then_some(api_key),
             },
         };
         self.runtime.send(command);
@@ -506,11 +562,14 @@ impl Workbench {
         // The providers block: every provider this machine declares, with its
         // endpoint and enable switch. It leads because an endpoint problem
         // breaks every model under it, and that is invisible in a flat model
-        // list.
-        let providers = block
-            .and_then(|b| b.providers.as_deref())
-            .unwrap_or(&[]);
-        if !providers.is_empty() {
+        // list. The rows render in the payload's display order
+        // (`providerOrder`, the reorder write's own sequence).
+        let ordered = ordered_provider_refs(block);
+        if !ordered.is_empty() {
+            let ordered_ids: Vec<String> = ordered
+                .iter()
+                .filter_map(|p| p.provider_id.clone())
+                .collect();
             list = list.child(
                 div()
                     .px_4()
@@ -520,9 +579,14 @@ impl Workbench {
                     .child(t!("zconfig.providersTitle").into_owned()),
             );
             let mut provider_rows = div().flex().flex_col();
-            for (index, p) in providers.iter().enumerate() {
+            for (index, p) in ordered.iter().enumerate() {
                 provider_rows = provider_rows.child(render_provider_row(
-                    index, p, page.busy, &self.runtime, cx,
+                    index,
+                    p,
+                    &ordered_ids,
+                    page.busy,
+                    &self.runtime,
+                    cx,
                 ));
             }
             list = list.child(
@@ -534,6 +598,25 @@ impl Workbench {
                     .border_color(theme.border)
                     .overflow_hidden()
                     .child(provider_rows),
+            );
+            // The create control (settings parity: provider create) — the id
+            // is derived from the typed name on submit.
+            let wb_add = cx.entity();
+            list = list.child(
+                div().px_3().child(
+                    Button::new("provider-add")
+                        .secondary()
+                        .small()
+                        .w_full()
+                        .icon(IconName::Plus)
+                        .label(t!("zconfig.providerAdd").into_owned())
+                        .disabled(page.busy)
+                        .on_click(move |_, window, cx| {
+                            wb_add.update(cx, |this, cx| {
+                                this.open_provider_form(None, window, cx)
+                            });
+                        }),
+                ),
             );
         }
 
@@ -773,6 +856,13 @@ impl Workbench {
         let wb_save = cx.entity();
         let url_text = form.base_url.read(cx).value().to_string();
         let url_ok = Self::provider_url_ok(&url_text);
+        // A create may leave the URL empty (the field travels only when
+        // filled); an edit keeps the stricter always-valid rule.
+        let url_valid = if form.target.is_none() {
+            url_text.trim().is_empty() || url_ok
+        } else {
+            url_ok
+        };
         let dirty = self.provider_form_dirty(cx);
         column = column.child(
             div()
@@ -800,11 +890,13 @@ impl Workbench {
                     div()
                         .text_size(ui_text(13.))
                         .text_color(theme.foreground)
-                        .child(format!(
-                            "{} · {}",
-                            t!("zconfig.providerEdit"),
-                            form.provider_name
-                        )),
+                        .truncate()
+                        .min_w_0()
+                        .child(if form.target.is_some() {
+                            format!("{} · {}", t!("zconfig.providerEdit"), form.provider_name)
+                        } else {
+                            t!("zconfig.providerAdd").into_owned()
+                        }),
                 )
                 .child(div().flex_1())
                 .child(
@@ -815,7 +907,7 @@ impl Workbench {
                         // Valid AND dirty: an untouched form has nothing to
                         // save, an invalid URL would only toast after the
                         // fact (the form contract).
-                        .disabled(busy || !url_ok || !dirty)
+                        .disabled(busy || !url_valid || !dirty)
                         .on_click(move |_, _, cx| {
                             wb_save.update(cx, |this, cx| this.submit_provider_form(cx));
                         }),
@@ -835,6 +927,12 @@ impl Workbench {
             .overflow_y_scroll()
             .flex_1()
             .min_h_0();
+        // Create mode's name box — the id is derived from it server-side.
+        if let Some(name) = &form.name_input {
+            body = body
+                .child(field_label(&t!("zconfig.providerName"), None, &theme))
+                .child(div().max_w(rems(46.)).child(Input::new(name)));
+        }
         body = body
             .child(field_label(&t!("zconfig.providerBaseUrl"), None, &theme))
             .child(div().max_w(rems(46.)).child(Input::new(&form.base_url)));
@@ -861,7 +959,24 @@ impl Workbench {
                 &theme,
             ))
             .child(div().max_w(rems(46.)).child(Input::new(&form.api_key)));
-        column.child(body).into_any_element()
+        // The edit form's footer (the form contract): Delete LEFT of the
+        // scroll body's end, two gestures — removing a provider takes its
+        // model rules and order entry with it, and there is no undo.
+        let mut column = column.child(body);
+        if let Some(target) = &form.target {
+            let id = target.provider_id.clone().unwrap_or_default();
+            let editable = !id.starts_with("account:");
+            if editable {
+                column = column.child(render_provider_delete(
+                    &id,
+                    busy,
+                    self.provider_delete_confirm.as_deref() == Some(id.as_str()),
+                    &self.runtime,
+                    cx,
+                ));
+            }
+        }
+        column.into_any_element()
     }
 
     /// The add/edit form (TS `ConfigFormSheet`: a full screen of its own —
@@ -1248,6 +1363,7 @@ fn render_model_test_button(
 fn render_provider_row(
     index: usize,
     p: &protocol::config_decode::ProviderRef,
+    ordered_ids: &[String],
     busy: bool,
     runtime: &crate::runtime::ProtocolRuntime,
     cx: &Context<Workbench>,
@@ -1322,6 +1438,44 @@ fn render_provider_row(
         );
 
     if editable {
+        // The reorder pair: a whole-sequence write per move (the route takes
+        // the desired order, not an index swap), the edge buttons disabled.
+        let runtime_up = runtime.clone();
+        let runtime_down = runtime.clone();
+        let mut up_ids = ordered_ids.to_vec();
+        let mut down_ids = ordered_ids.to_vec();
+        let can_up = index > 0 && ordered_ids.len() > 1;
+        let can_down = index + 1 < ordered_ids.len();
+        if can_up {
+            up_ids.swap(index, index - 1);
+        }
+        if can_down {
+            down_ids.swap(index, index + 1);
+        }
+        row = row.child(
+            Button::new(SharedString::from(format!("provider-up-{index}")))
+                .ghost()
+                .xsmall()
+                .icon(IconName::ChevronUp)
+                .tooltip(t!("zconfig.providerMoveUp"))
+                .disabled(busy || !can_up)
+                .on_click(move |_, _, _| {
+                    runtime_up.send(UiCommand::ReorderProviders { provider_ids: up_ids.clone() });
+                }),
+        );
+        row = row.child(
+            Button::new(SharedString::from(format!("provider-down-{index}")))
+                .ghost()
+                .xsmall()
+                .icon(IconName::ChevronDown)
+                .tooltip(t!("zconfig.providerMoveDown"))
+                .disabled(busy || !can_down)
+                .on_click(move |_, _, _| {
+                    runtime_down.send(UiCommand::ReorderProviders {
+                        provider_ids: down_ids.clone(),
+                    });
+                }),
+        );
         let wb = cx.entity();
         let owned = p.clone();
         row = row.child(
@@ -1333,7 +1487,7 @@ fn render_provider_row(
                 .disabled(busy)
                 .on_click(move |_, window, cx| {
                     let p = owned.clone();
-                    wb.update(cx, |this, cx| this.open_provider_form(p, window, cx));
+                    wb.update(cx, |this, cx| this.open_provider_form(Some(p), window, cx));
                 }),
         );
         let runtime1 = runtime.clone();
@@ -1356,6 +1510,85 @@ fn render_provider_row(
         );
     }
     row.into_any_element()
+}
+
+/// The edit form's delete control (the form contract): two gestures — the
+/// first arms (Cancel / Delete swap in), the second fires the remove write.
+/// Deleting takes the provider's model rules and order entry with it, and
+/// the app has no undo, so one stray click must not do it.
+fn render_provider_delete(
+    id: &str,
+    busy: bool,
+    armed: bool,
+    runtime: &crate::runtime::ProtocolRuntime,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let theme = cx.theme();
+    let wb = cx.entity();
+
+    if armed {
+        let wb_cancel = wb.clone();
+        let wb_confirm = wb.clone();
+        let runtime_fire = runtime.clone();
+        let fire_id = id.to_string();
+        return div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .flex_none()
+            .child(
+                Button::new("provider-delete-cancel")
+                    .ghost()
+                    .xsmall()
+                    .label(t!("common.cancel").into_owned())
+                    .on_click(move |_, _, cx| {
+                        wb_cancel.update(cx, |this, cx| {
+                            this.provider_delete_confirm = None;
+                            cx.notify();
+                        });
+                    }),
+            )
+            .child(
+                Button::new("provider-delete-confirm")
+                    .primary()
+                    .xsmall()
+                    .label(t!("zconfig.providerDelete").into_owned())
+                    .disabled(busy)
+                    .on_click(move |_, _, cx| {
+                        wb_confirm.update(cx, |this, cx| {
+                            this.provider_delete_confirm = None;
+                            cx.notify();
+                        });
+                        runtime_fire.send(UiCommand::RemoveProvider {
+                            provider_id: fire_id.clone(),
+                        });
+                    }),
+            )
+            .into_any_element();
+    }
+
+    let wb_arm = wb;
+    let arm_id = id.to_string();
+    div()
+        .p_4()
+        .max_w(rems(46.))
+        .child(
+            Button::new("provider-delete")
+                .ghost()
+                .xsmall()
+                .icon(KitIconName::Trash)
+                .label(t!("zconfig.providerDelete").into_owned())
+                .text_color(theme.danger_foreground)
+                .disabled(busy)
+                .on_click(move |_, _, cx| {
+                    let id = arm_id.clone();
+                    wb_arm.update(cx, |this, cx| {
+                        this.provider_delete_confirm = Some(id);
+                        cx.notify();
+                    });
+                }),
+        )
+        .into_any_element()
 }
 
 /// The provider form's API-protocol dropdown. Each option is one wire format;

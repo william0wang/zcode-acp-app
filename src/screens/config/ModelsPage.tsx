@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ChevronRight, Plus } from "lucide-react";
+import { ChevronDown, ChevronRight, ChevronUp, Plus } from "lucide-react";
 import { matchProviderId } from "../../lib/modelValue";
 import { useAppStore } from "../../store/appStore";
 import {
@@ -48,9 +48,69 @@ export interface ModelsPayload {
   ok?: boolean;
   models?: {
     available?: ModelRef[];
-    providers?: Array<{ providerId?: string; providerName?: string }>;
+    providers?: Array<{
+      providerId?: string;
+      providerName?: string;
+      enabled?: boolean;
+      baseUrl?: string;
+      apiType?: string;
+      hasApiKey?: boolean;
+    }>;
+    providerOrder?: string[];
     modelRules?: ModelRule[];
   };
+}
+
+/** One provider rule row, as the settings payload reports it (the endpoint
+ * fields exist only for providers this machine's provider_config.json
+ * declares — a bundled or account-managed one carries no baseUrl). */
+export interface ProviderRow {
+  providerId: string;
+  providerName: string;
+  enabled: boolean;
+  baseUrl?: string;
+  apiType?: string;
+  hasApiKey: boolean;
+}
+
+/**
+ * The providers block in its display order (the reorder write's own
+ * normalize rule, mirrored on the read side): `providerOrder` names the
+ * sequence, ids the block carries but the order does not mention keep their
+ * file order after the mentioned ones, and a missing order falls back to the
+ * block's own order. Exported so the response-shape test pins it.
+ */
+export function orderedProviders(
+  payload: ModelsPayload | null,
+): ProviderRow[] {
+  const block = payload?.models;
+  const byId = new Map<string, ProviderRow>();
+  for (const p of block?.providers ?? []) {
+    if (!p.providerId) continue;
+    byId.set(p.providerId, {
+      providerId: p.providerId,
+      providerName: p.providerName ?? p.providerId,
+      enabled: p.enabled !== false,
+      baseUrl: p.baseUrl,
+      apiType: p.apiType,
+      hasApiKey: Boolean(p.hasApiKey),
+    });
+  }
+  const order = block?.providerOrder;
+  if (!order) return [...byId.values()];
+  const out: ProviderRow[] = [];
+  const seen = new Set<string>();
+  for (const id of order) {
+    const row = byId.get(id);
+    if (row && !seen.has(id)) {
+      seen.add(id);
+      out.push(row);
+    }
+  }
+  for (const row of byId.values()) {
+    if (!seen.has(row.providerId)) out.push(row);
+  }
+  return out;
 }
 
 /**
@@ -288,13 +348,37 @@ export function ModelsPage() {
   const loading = useAppStore((s) => s.configLoading);
   const error = useAppStore((s) => s.configError);
   const loadConfigSection = useAppStore((s) => s.loadConfigSection);
+  const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
+  const reorderProviderEntries = useAppStore(
+    (s) => s.reorderProviderEntries,
+  );
 
   const payload = models as ModelsPayload | null;
   const available = payload?.models?.available ?? [];
   const rules = payload?.models?.modelRules ?? [];
+  // The providers block renders in the payload's display order
+  // (`providerOrder` — the reorder write's own sequence).
+  const providers = orderedProviders(payload);
+  const providerIds = providers.map((p) => p.providerId);
 
   const [editing, setEditing] = useState<ModelRef | null>(null);
   const [adding, setAdding] = useState(false);
+  const [editingProvider, setEditingProvider] = useState<ProviderRow | null>(
+    null,
+  );
+  const [addingProvider, setAddingProvider] = useState(false);
+
+  // A move swaps two neighbors and posts the WHOLE sequence (the route takes
+  // the desired order, not an index swap).
+  async function moveProvider(index: number, delta: -1 | 1) {
+    const next = [...providerIds];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target]!, next[index]!];
+    await applyConfigWrite("reorder providers", () =>
+      reorderProviderEntries(next),
+    ["models"]);
+  }
 
   return (
     <ConfigPageFrame
@@ -306,6 +390,62 @@ export function ModelsPage() {
       error={error}
       hasLoaded={models !== null}
     >
+      {/* The providers block: every provider this machine declares, with its
+          endpoint form, reorder pair, and create entry. It leads because an
+          endpoint problem breaks every model under it. */}
+      {providers.length > 0 && (
+        <>
+          <h2 className="px-4 pb-1 pt-2 text-2xs font-medium uppercase tracking-wide text-faint">
+            {t("zconfig.providersTitle")}
+          </h2>
+          <ConfigBlock>
+            {providers.map((p, index) => (
+              <div
+                key={p.providerId}
+                className="flex items-center gap-2 px-4 py-3"
+              >
+                <button
+                  onClick={() => setEditingProvider(p)}
+                  className="min-w-0 flex-1 text-left active:opacity-80"
+                >
+                  <span className="block text-sm text-ink">{p.providerName}</span>
+                  <span className="block truncate text-2xs text-faint">
+                    {[p.baseUrl ?? "—", p.apiType, p.hasApiKey ? t("zconfig.providerKeySet") : t("zconfig.providerKeyMissing")]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </span>
+                </button>
+                <button
+                  onClick={() => void moveProvider(index, -1)}
+                  disabled={loading || index === 0}
+                  aria-label={t("zconfig.providerMoveUp")}
+                  className="flex size-8 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active disabled:opacity-40"
+                >
+                  <ChevronUp className="size-4" />
+                </button>
+                <button
+                  onClick={() => void moveProvider(index, 1)}
+                  disabled={loading || index + 1 >= providers.length}
+                  aria-label={t("zconfig.providerMoveDown")}
+                  className="flex size-8 shrink-0 items-center justify-center rounded-full text-dim hover:bg-hover active:bg-active disabled:opacity-40"
+                >
+                  <ChevronDown className="size-4" />
+                </button>
+              </div>
+            ))}
+          </ConfigBlock>
+          <div className="px-4">
+            <button
+              onClick={() => setAddingProvider(true)}
+              className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-raised px-3 py-2.5 text-sm text-dim hover:bg-hover active:bg-active"
+            >
+              <Plus className="size-4" />
+              {t("zconfig.providerAdd")}
+            </button>
+          </div>
+        </>
+      )}
+
       {available.length === 0 ? (
         <ConfigEmpty text={t("zconfig.modelsEmpty")} />
       ) : (
@@ -364,7 +504,188 @@ export function ModelsPage() {
           onClose={() => setAdding(false)}
         />
       )}
+      {editingProvider && (
+        <ProviderForm
+          key={editingProvider.providerId}
+          target={editingProvider}
+          onClose={() => setEditingProvider(null)}
+        />
+      )}
+      {addingProvider && (
+        <ProviderForm key="provider-add" target={null} onClose={() => setAddingProvider(false)} />
+      )}
     </ConfigPageFrame>
+  );
+}
+
+/**
+ * Add/edit form for one provider rule (settings parity: provider CRUD).
+ *
+ * Create posts the name (the id is DERIVED server-side) plus only the
+ * optional fields actually filled; edit PUTs the endpoint fields, with the
+ * key box starting EMPTY — the server never sends the secret back, so a
+ * blank submit keeps the stored key. The edit form's footer deletes
+ * (two taps, the form contract): removing a provider takes its model rules
+ * and order entry with it.
+ */
+function ProviderForm({
+  target,
+  onClose,
+}: {
+  // Null = creating one; the name box exists only in that mode.
+  target: ProviderRow | null;
+  onClose: () => void;
+}) {
+  const { t } = useTranslation();
+  const applyConfigWrite = useAppStore((s) => s.applyConfigWrite);
+  const createProviderEntry = useAppStore((s) => s.createProviderEntry);
+  const removeProviderEntry = useAppStore((s) => s.removeProviderEntry);
+  const updateProviderEntry = useAppStore((s) => s.updateProviderEntry);
+
+  const initialUrl = target?.baseUrl ?? "";
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState(initialUrl);
+  const [apiKey, setApiKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  // The wire formats the runtime understands; "" means "not set" (create)
+  // or "keep absent" (edit — the value rides only when changed).
+  const [apiType, setApiType] = useState(target?.apiType ?? "");
+  const knownTypes = [
+    "anthropic-messages",
+    "openai-chat-completions",
+    "openai-responses",
+  ];
+  const typeOptions =
+    apiType && !knownTypes.includes(apiType)
+      ? [...knownTypes, apiType]
+      : knownTypes;
+
+  const urlOk = url.trim() === "" || /^[a-z][a-z0-9+.-]*:\/\/\S+$/i.test(url.trim());
+  const canSubmit = (!target ? name.trim() !== "" : true) && urlOk;
+  // The form contract's dirty gate: a create is dirty whenever valid; an
+  // edit compares against the opened values (a typed key is always a change
+  // — the box starts empty because the secret never comes back).
+  const dirty = !target
+    ? canSubmit
+    : url.trim() !== initialUrl.trim() ||
+      apiKey.trim() !== "" ||
+      apiType !== (target.apiType ?? "");
+
+  async function submit() {
+    setBusy(true);
+    const ok = target
+      ? await applyConfigWrite("update provider", () =>
+          updateProviderEntry(target.providerId, {
+            ...(url.trim() !== initialUrl.trim() ? { baseUrl: url.trim() } : {}),
+            ...(apiType !== (target.apiType ?? "") ? { apiType: apiType || null } : {}),
+            ...(apiKey.trim() !== "" ? { apiKey: apiKey.trim() } : {}),
+          }),
+        ["models"])
+      : await applyConfigWrite("add provider", () =>
+          createProviderEntry({
+            providerName: name.trim(),
+            ...(apiType ? { apiType } : {}),
+            ...(url.trim() ? { baseUrl: url.trim() } : {}),
+            ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
+          }),
+        ["models"]);
+    setBusy(false);
+    if (ok) onClose();
+  }
+
+  async function remove() {
+    if (!target) return;
+    setBusy(true);
+    const ok = await applyConfigWrite(
+      "delete provider",
+      () => removeProviderEntry(target.providerId),
+      ["models"],
+    );
+    setBusy(false);
+    if (ok) onClose();
+  }
+
+  return (
+    <ConfigFormSheet
+      title={target ? t("zconfig.providerEdit") : t("zconfig.providerAdd")}
+      busy={busy}
+      submitDisabled={!canSubmit || !dirty}
+      dirty={dirty}
+      footerLeft={
+        target && !isAccountProvider(target.providerId) ? (
+          <FormDeleteButton
+            label={t("zconfig.providerDelete")}
+            busy={busy}
+            onConfirm={() => void remove()}
+          />
+        ) : undefined
+      }
+      onSubmit={() => void submit()}
+      onClose={onClose}
+    >
+      {target && (
+        <p className="mt-3 font-mono text-2xs text-faint">
+          {target.providerName} · {target.providerId}
+        </p>
+      )}
+      {!target && (
+        <ConfigField label={t("zconfig.providerName")}>
+          <input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoFocus
+            autoCapitalize="none"
+            autoCorrect="off"
+            spellCheck={false}
+            placeholder="My API"
+            className={configInputClass}
+          />
+        </ConfigField>
+      )}
+      <ConfigField label={t("zconfig.providerBaseUrl")}>
+        <input
+          value={url}
+          onChange={(e) => setUrl(e.target.value)}
+          autoFocus={!!target}
+          inputMode="url"
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          className={configInputClass}
+        />
+      </ConfigField>
+      <ConfigField label={t("zconfig.providerApiType")}>
+        <select
+          value={apiType}
+          onChange={(e) => setApiType(e.target.value)}
+          className={configInputClass}
+        >
+          <option value="">{t("zconfig.providerApiTypeDefault")}</option>
+          {typeOptions.map((v) => (
+            <option key={v} value={v}>
+              {v}
+            </option>
+          ))}
+        </select>
+      </ConfigField>
+      <ConfigField
+        label={t("zconfig.providerApiKey")}
+        hint={
+          target?.hasApiKey
+            ? t("zconfig.providerKeyKeepHint")
+            : t("zconfig.providerKeyHint")
+        }
+      >
+        <input
+          value={apiKey}
+          onChange={(e) => setApiKey(e.target.value)}
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          className={configInputClass}
+        />
+      </ConfigField>
+    </ConfigFormSheet>
   );
 }
 

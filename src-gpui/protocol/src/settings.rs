@@ -38,6 +38,21 @@ pub struct WriteEffect {
     pub error: Option<String>,
 }
 
+/// The answer to `POST /settings/providers` (settings parity: provider
+/// create). The id is DERIVED server-side from the provider name — two
+/// clients racing a hand-picked id would silently merge into one rule — so
+/// it rides the response, not the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCreated {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<Effect>,
+}
+
 /// The answer to `POST /settings/models/test` (server
 /// `settings/model-connectivity.ts` `ConnectivityResult`).
 ///

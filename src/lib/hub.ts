@@ -560,6 +560,46 @@ export class HubClient {
   // (a refused write says WHY — a non-coding-plan provider, a stale nonce)
   // reach the caller instead of collapsing into a bare status code.
 
+  /**
+   * Create a personal provider rule (settings parity: provider create). The
+   * id is DERIVED from the name server-side — the response carries it, the
+   * request never does.
+   */
+  async createProvider(body: {
+    providerName: string;
+    apiType?: string;
+    baseUrl?: string;
+    apiKey?: string;
+  }): Promise<WriteEffect & { providerId?: string }> {
+    const res = await this.fetch("/api/settings/providers", "POST", body);
+    return (await res.json()) as WriteEffect & { providerId?: string };
+  }
+
+  /**
+   * Delete a provider rule this machine declares; its model rules and order
+   * entry go with it (only provider_config.json rules can go — the route
+   * refuses anything else).
+   */
+  async removeProvider(providerId: string): Promise<WriteEffect> {
+    const res = await this.fetch(
+      `/api/settings/providers/${encodeURIComponent(providerId)}`,
+      "DELETE",
+    );
+    return (await res.json()) as WriteEffect;
+  }
+
+  /**
+   * Rewrite the provider display order: the desired sequence for the
+   * declared rules; unknown ids are ignored and unmentioned ones keep their
+   * file order after the mentioned ones (the server normalizes the same way).
+   */
+  async reorderProviders(providerIds: string[]): Promise<WriteEffect> {
+    const res = await this.fetch("/api/settings/providers/reorder", "POST", {
+      providerIds,
+    });
+    return (await res.json()) as WriteEffect;
+  }
+
   async updateProvider(
     providerId: string,
     body: Record<string, unknown>,

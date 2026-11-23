@@ -21,6 +21,7 @@ import {
   findModelOption,
   matchProviderId,
   modelOptions,
+  orderedProviders,
   providerOptions,
 } from "../src/screens/config/ModelsPage";
 import { mcpServers, mcpStatuses, mcpUpsertBody } from "../src/screens/config/McpPage";
@@ -376,6 +377,45 @@ describe("models payload", () => {
 // desktop keep the registry's `account:` spelling. Raw-string comparison never
 // matches the two — every agent's model read as unmappable and the picker
 // could not prefill.
+
+describe("provider order decode", () => {
+  it("orders by providerOrder, unmentioned ids keep file order", () => {
+    // The reorder write's normalize rule, mirrored on the read side.
+    const rows = orderedProviders({
+      ok: true,
+      models: {
+        providers: [
+          { providerId: "alpha", providerName: "Alpha" },
+          {
+            providerId: "beta",
+            providerName: "Beta",
+            baseUrl: "https://b.example",
+            apiType: "openai-chat-completions",
+            hasApiKey: true,
+          },
+          { providerId: "gamma" },
+        ],
+        providerOrder: ["beta", "ghost", "alpha"],
+      },
+    });
+    expect(rows.map((r) => r.providerId)).toEqual(["beta", "alpha", "gamma"]);
+    // The endpoint fields ride through for the form's prefill.
+    expect(rows[0]).toMatchObject({
+      providerName: "Beta",
+      baseUrl: "https://b.example",
+      apiType: "openai-chat-completions",
+      hasApiKey: true,
+    });
+  });
+
+  it("falls back to the block's own order when providerOrder is absent", () => {
+    const rows = orderedProviders({
+      ok: true,
+      models: { providers: [{ providerId: "a" }, { providerId: "b" }] },
+    });
+    expect(rows.map((r) => r.providerId)).toEqual(["a", "b"]);
+  });
+});
 
 describe("provider spelling normalization", () => {
   const planPayload = {

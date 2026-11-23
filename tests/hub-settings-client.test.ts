@@ -202,6 +202,46 @@ test("a hook remove carries the command as the fingerprint", async () => {
   });
 });
 
+test("a provider create posts the name only — the id comes back", async () => {
+  responses.push(
+    Response.json({ ok: true, providerId: "my-api", effect: "immediate" }),
+  );
+  const created = await client().createProvider({
+    providerName: "My API",
+    apiType: "openai-chat-completions",
+    baseUrl: "https://api.example.com/v1",
+  });
+  // The id is DERIVED server-side from the name; the response is where it
+  // first appears, never the request.
+  expect(requested[0]).toMatchObject({
+    url: "http://hub/api/settings/providers",
+    method: "POST",
+    body: {
+      providerName: "My API",
+      apiType: "openai-chat-completions",
+      baseUrl: "https://api.example.com/v1",
+    },
+  });
+  expect(created.providerId).toBe("my-api");
+});
+
+test("a provider remove deletes by encoded id, a reorder posts the sequence", async () => {
+  responses.push(Response.json({ ok: true, effect: "immediate" }));
+  await client().removeProvider("my api");
+  expect(requested[0]).toMatchObject({
+    url: "http://hub/api/settings/providers/my%20api",
+    method: "DELETE",
+  });
+
+  responses.push(Response.json({ ok: true, effect: "immediate" }));
+  await client().reorderProviders(["beta", "alpha"]);
+  expect(requested[1]).toMatchObject({
+    url: "http://hub/api/settings/providers/reorder",
+    method: "POST",
+    body: { providerIds: ["beta", "alpha"] },
+  });
+});
+
 test("the MCP enable route wants `enabled`, not `enable`", async () => {
   responses.push(Response.json({ ok: true, effect: "needs-restart" }));
   await client().setMcpEnabled("ctx7", false);

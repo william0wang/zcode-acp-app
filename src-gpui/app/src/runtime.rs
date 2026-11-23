@@ -458,6 +458,26 @@ pub enum UiCommand {
         api_type: Option<String>,
         api_key: Option<String>,
     },
+    /// POST /settings/providers (settings parity: provider create). The id
+    /// is DERIVED server-side from the name and returned — the section
+    /// reload lands the new row.
+    CreateProvider {
+        provider_name: String,
+        api_type: Option<String>,
+        base_url: Option<String>,
+        api_key: Option<String>,
+    },
+    /// DELETE /settings/providers/{id} — only a rule this machine's
+    /// provider_config.json declares; the provider's model rules and order
+    /// entry go with it. Two-gesture confirmed in the edit form's footer.
+    RemoveProvider {
+        provider_id: String,
+    },
+    /// POST /settings/providers/reorder — the desired sequence; the server
+    /// normalizes (unknown ids ignored, unmentioned ones keep file order).
+    ReorderProviders {
+        provider_ids: Vec<String>,
+    },
     /// Open the Usage config page. Every open is a fresh mount
     /// (UsagePage.tsx): the platform tab first — the account-level view the
     /// page leads with — then the mount loads (capability probe once, the
@@ -8524,6 +8544,58 @@ impl Driver {
                 // this is the same guard on the driver side).
                 if !self.models.busy {
                     self.spawn_model_upsert(body);
+                }
+            }
+            UiCommand::CreateProvider {
+                provider_name,
+                api_type,
+                base_url,
+                api_key,
+            } => {
+                if !self.models.busy {
+                    self.models.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub
+                            .create_provider(
+                                &provider_name,
+                                api_type.as_deref(),
+                                base_url.as_deref(),
+                                api_key.as_deref(),
+                            )
+                            .await
+                            // The created id rides the response, not the UI —
+                            // the section reload lands the new row either way.
+                            .map(|c| WriteEffect {
+                                ok: c.ok,
+                                effect: c.effect,
+                                error: None,
+                            });
+                        let _ = tx.send(LoopEvent::ModelUpsert { result });
+                    });
+                }
+            }
+            UiCommand::RemoveProvider { provider_id } => {
+                if !self.models.busy {
+                    self.models.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.remove_provider(&provider_id).await;
+                        let _ = tx.send(LoopEvent::ModelUpsert { result });
+                    });
+                }
+            }
+            UiCommand::ReorderProviders { provider_ids } => {
+                if !self.models.busy {
+                    self.models.busy = true;
+                    let hub = self.settings_client();
+                    let tx = self.loop_tx.clone();
+                    tokio::spawn(async move {
+                        let result = hub.reorder_providers(&provider_ids).await;
+                        let _ = tx.send(LoopEvent::ModelUpsert { result });
+                    });
                 }
             }
             UiCommand::RemoveModel {
