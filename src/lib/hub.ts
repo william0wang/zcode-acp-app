@@ -119,17 +119,26 @@ export class HubClient {
       // user with "HTTP 409" and no way forward, so the body becomes the
       // message whenever it says something. The workflow routes carry BOTH a
       // short reason token (`error`) and the human detail (`message`, e.g.
-      // compile diagnostics) — prefer the detail when present.
-      const detail = await res
-        .json()
-        .then((b: unknown) => {
-          const body = b as { error?: unknown; message?: unknown } | null;
-          if (typeof body?.message === "string" && body.message)
-            return body.message;
+      // compile diagnostics) — prefer the detail when present. Non-JSON
+      // bodies say their reason too (the hub's plain-text 502/403/404
+      // one-liners, e.g. the instance-incubation failures).
+      const text = await res.text();
+      let detail: string | null = null;
+      try {
+        const body = JSON.parse(text) as {
+          error?: unknown;
+          message?: unknown;
+        } | null;
+        if (typeof body?.message === "string" && body.message)
+          detail = body.message;
+        else {
           const err = body?.error;
-          return typeof err === "string" && err ? err : null;
-        })
-        .catch(() => null);
+          if (typeof err === "string" && err) detail = err;
+        }
+      } catch {
+        const trimmed = text.trim();
+        if (trimmed) detail = trimmed;
+      }
       throw new HubApiError(detail ?? `HTTP ${res.status}`, res.status);
     }
     return res;

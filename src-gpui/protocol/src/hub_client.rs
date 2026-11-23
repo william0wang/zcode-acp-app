@@ -211,7 +211,11 @@ impl HubClient {
                 if !(200..300).contains(&res.status) {
                     // A refused write answers with a REASON; the workflow
                     // routes carry `message` (detail) next to `error`
-                    // (token) — prefer the detail when present.
+                    // (token) — prefer the detail when present. Plain-text
+                    // bodies (the hub's 502/403/404 one-liners, e.g. the
+                    // instance-incubation failures) say their reason the
+                    // same way — dropping them leaves "HTTP 502" and no
+                    // way forward.
                     let detail = res.json().ok().and_then(|b| {
                         let pick = |key: &str| {
                             b.get(key)
@@ -221,8 +225,12 @@ impl HubClient {
                         };
                         pick("message").or_else(|| pick("error"))
                     });
+                    let text = detail.or_else(|| {
+                        let body = res.body.trim();
+                        (!body.is_empty()).then(|| body.to_string())
+                    });
                     return Err(HubApiError::msg(
-                        detail.unwrap_or_else(|| format!("HTTP {}", res.status)),
+                        text.unwrap_or_else(|| format!("HTTP {}", res.status)),
                         Some(res.status),
                     ));
                 }

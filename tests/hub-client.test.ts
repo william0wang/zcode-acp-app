@@ -60,7 +60,7 @@ test("quotaDock returns the formatted line; null hides the dock", async () => {
   await expect(client().quotaDock()).resolves.toBeNull();
 });
 
-test("401 keeps its status; other HTTP errors surface as 'HTTP <code>'", async () => {
+test("401 keeps its status; plain-text error bodies ARE the message", async () => {
   responses.push(new Response("no", { status: 401 }));
   const err = await client()
     .health()
@@ -71,10 +71,20 @@ test("401 keeps its status; other HTTP errors surface as 'HTTP <code>'", async (
     message: "unauthorized: check token",
   });
 
-  responses.push(new Response("boom", { status: 502 }));
+  // The hub's plain-text 502 one-liners (instance-incubation failures)
+  // become the message; only a truly empty body degrades to "HTTP <code>".
+  responses.push(
+    new Response("serve bridge exited during startup", { status: 502 }),
+  );
   await expect(client().health()).rejects.toMatchObject({
     status: 502,
-    message: "HTTP 502",
+    message: "serve bridge exited during startup",
+  });
+
+  responses.push(new Response("", { status: 503 }));
+  await expect(client().health()).rejects.toMatchObject({
+    status: 503,
+    message: "HTTP 503",
   });
 });
 

@@ -9,6 +9,7 @@ interface FakeResponse {
   ok: boolean;
   status: number;
   json: () => Promise<unknown>;
+  text: () => Promise<string>;
 }
 
 let requested: Array<{ url: string; method: string; body?: unknown }> = [];
@@ -71,12 +72,14 @@ const ok = (body: unknown): FakeResponse => ({
   ok: true,
   status: 200,
   json: async () => body,
+  text: async () => JSON.stringify(body),
 });
 
 const refused = (status: number, body: unknown): FakeResponse => ({
   ok: false,
   status,
   json: async () => body,
+  text: async () => JSON.stringify(body),
 });
 
 const delayed = (res: FakeResponse, ms: number) => ({
@@ -85,6 +88,10 @@ const delayed = (res: FakeResponse, ms: number) => ({
   json: async () => {
     await new Promise((r) => setTimeout(r, ms));
     return (await res.json()) as unknown;
+  },
+  text: async () => {
+    await new Promise((r) => setTimeout(r, ms));
+    return res.text();
   },
 });
 

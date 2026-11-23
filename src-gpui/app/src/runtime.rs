@@ -2184,7 +2184,10 @@ struct Tab {
 
 /// The sidebar's history browser state (driver-owned — all wire I/O lives
 /// here; `seq` invalidates in-flight listing responses across open/back,
-/// the ProjectHistoryDialog `listSeq` port).
+/// the ProjectHistoryDialog `listSeq` port). The cached project list
+/// survives a close for instant paint, but EVERY open re-reads it, and the
+/// selected project's page dies with the close (the TS dialog unmounts) —
+/// history rows churn, and a stale row is exactly the un-resumable click.
 #[derive(Default)]
 struct HistoryPanel {
     open: bool,
@@ -7480,8 +7483,16 @@ impl Driver {
                         self.spawn_discovery(false);
                     }
                     Err(e) => {
-                        if let Some(err) = resuming {
-                            *err = Some(describe_history_error(&e));
+                        // The page's error slot while its project view is
+                        // still open; when the panel closed mid-incubation
+                        // (a ~12-20s wait) the toast carries the failure —
+                        // otherwise the click just silently never lands.
+                        let msg = describe_resume_error(&e);
+                        match resuming {
+                            Some(err) => *err = Some(msg),
+                            None => {
+                                self.toast.notify(now, &msg);
+                            }
                         }
                     }
                 }
@@ -8337,15 +8348,18 @@ impl Driver {
             UiCommand::NewSessionToggle => {
                 self.new_session.open = !self.new_session.open;
                 if self.new_session.open {
-                    // Paint the cached list at once; the fetch below
-                    // refreshes it (the TS dialog's cached-then-fetch pair).
-                    if self.new_session.projects.is_none() {
-                        self.spawn_new_session_projects();
-                    }
+                    // Cached-then-fetch (the TS dialog's pair): the cached
+                    // list paints at once and EVERY open re-reads it — the
+                    // known list moves between visits (tombstones, new
+                    // projects), and a create aimed at a stale row is the
+                    // hub's 502/403.
+                    self.spawn_new_session_projects();
                 } else {
-                    // In-flight reads belong to the closed sheet.
+                    // In-flight reads belong to the closed sheet; the browse
+                    // sub-view dies with it (the TS dialog unmounts).
                     self.new_session.seq += 1;
                     self.new_session.creating = None;
+                    self.new_session.browse = None;
                 }
             }
             UiCommand::NewSessionBrowse { path } => {
@@ -8379,13 +8393,18 @@ impl Driver {
             UiCommand::HistoryToggle => {
                 self.history.open = !self.history.open;
                 if self.history.open {
-                    if self.history.projects.is_none() {
-                        self.spawn_history_projects();
-                    }
+                    // Cached-then-fetch (the TS dialog's pair): the cached
+                    // chooser paints at once and EVERY open re-reads it —
+                    // the known list moves between visits.
+                    self.spawn_history_projects();
                 } else {
                     // A load-more still in flight belongs to the view we are
-                    // leaving (the TS back() invalidation).
+                    // leaving (the TS back() invalidation), and the open
+                    // project's page dies with the dialog (the TS unmount):
+                    // a reopen starts at the chooser, never at a session
+                    // list whose rows may no longer resume.
                     self.history.seq += 1;
+                    self.history.selected = None;
                 }
             }
             UiCommand::HistoryOpenProject { workspace_path } => {
@@ -10568,6 +10587,20 @@ fn describe_history_error(e: &HubApiError) -> String {
     format!("history: {e}")
 }
 
+/// The resume POST's error story (TS `resumeSession`): the listing's 404
+/// mapping does NOT apply here — on a resume that 404 is the hub's
+/// "session deleted" tombstone (a stale cached row), not an old bridge's
+/// missing route. 403 keeps the shared dropped-project wording.
+fn describe_resume_error(e: &HubApiError) -> String {
+    if e.status == Some(403) {
+        return "project unknown to the hub — refresh and re-pick".to_string();
+    }
+    if e.status == Some(404) {
+        return "session deleted — the listing is stale, reopen the project".to_string();
+    }
+    format!("resume session failed: {e}")
+}
+
 /// The files panel's error story: a dead bridge is the one failure with an
 /// action behind it (the hub revives the instance on its next use, then a
 /// retry works); everything else is the plain wire error.
@@ -11228,6 +11261,44 @@ mod tests {
         d
     }
 
+    /// A driver whose loop channel is readable — spawned reads settle into
+    /// `loop_rx` as their terminal events (the empty default hub URL fails
+    /// the fetch in-line, no network involved). Poll until a matching event
+    /// arrives, skipping unrelated ones; `None` = timed out.
+    async fn driver_with_loop()
+        -> (super::Driver, tokio::sync::mpsc::UnboundedReceiver<LoopEvent>) {
+        let (loop_tx, loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, _ev_rx) = unbounded_channel();
+        let mut d = super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        d.cold_attach_done = true;
+        (d, loop_rx)
+    }
+
+    async fn await_loop_event(
+        loop_rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoopEvent>,
+        mut pred: impl FnMut(&LoopEvent) -> bool,
+    ) -> Option<LoopEvent> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            while let Ok(ev) = loop_rx.try_recv() {
+                if pred(&ev) {
+                    return Some(ev);
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
     /// ADR-0014 §2 lifecycle: a Saved notice lives exactly its 3s window,
     /// and a banner that REPLACED a Saved one survives the old deadline —
     /// the deadline names the notice, not the slot.
@@ -11645,6 +11716,218 @@ mod tests {
         assert!(!d
             .closed_sessions
             .contains_key(&("i-dead".to_string(), "sess_2".to_string())));
+    }
+
+    /// The history browser's cache contract (the reported stale-click bug):
+    /// the cached chooser paints instantly but EVERY open re-reads the list,
+    /// and the selected project's page dies with the close — a reopen starts
+    /// at the chooser, never at rows whose sessions may no longer resume.
+    #[tokio::test]
+    async fn history_reopen_refreshes_the_list_and_drops_the_stale_page() {
+        let (mut d, mut loop_rx) = driver_with_loop().await;
+
+        // First open: the projects read goes out even with no cache.
+        d.handle_cmd(super::UiCommand::HistoryToggle, 0);
+        assert!(
+            await_loop_event(&mut loop_rx, |ev| matches!(ev, LoopEvent::HistoryProjects { .. }))
+                .await
+                .is_some(),
+            "the first open reads the project list"
+        );
+        // The read failed (no hub); paint a cached list as if it had landed.
+        d.handle_loop_event(
+            LoopEvent::HistoryProjects {
+                seq: d.history.seq,
+                result: Ok(vec![protocol::hub::HubProject {
+                    workspace_path: "/w".to_string(),
+                    sessions: 2,
+                    last_active: 1_000,
+                }]),
+            },
+            0,
+        );
+        assert!(d.history.projects.as_ref().is_some_and(|l| l.len() == 1));
+
+        // Open the project, land its first page.
+        d.handle_cmd(
+            super::UiCommand::HistoryOpenProject {
+                workspace_path: "/w".to_string(),
+            },
+            0,
+        );
+        d.handle_loop_event(
+            LoopEvent::HistoryPage {
+                seq: d.history.seq,
+                more: false,
+                result: Ok(protocol::hub::HubHistoryPage {
+                    workspace_path: "/w".to_string(),
+                    instance: protocol::hub::HubHistoryInstance {
+                        id: "i1".to_string(),
+                        origin: None,
+                    },
+                    sessions: vec![protocol::hub::HubHistorySession {
+                        session_id: "s1".to_string(),
+                        title: None,
+                        cwd: None,
+                        updated_at: None,
+                        live: None,
+                        running: None,
+                        workflow_activity: None,
+                        extra: Default::default(),
+                    }],
+                    next_cursor: None,
+                }),
+            },
+            0,
+        );
+        assert!(d
+            .history
+            .selected
+            .as_ref()
+            .is_some_and(|sel| sel.rows.len() == 1 && sel.instance_id == "i1" && !sel.loading_page));
+
+        // Close: the page dies with the view; the cached chooser survives.
+        let stale_page_seq = d.history.seq;
+        d.handle_cmd(super::UiCommand::HistoryToggle, 0);
+        assert!(
+            d.history.selected.is_none(),
+            "the stale page must not survive the close"
+        );
+        assert!(d.history.projects.is_some(), "the cached chooser still paints");
+
+        // Reopen WITH the cache present: a refresh read must still go out,
+        // a pre-close page response must not land, and the refresh result
+        // replaces the cached list.
+        d.handle_cmd(super::UiCommand::HistoryToggle, 0);
+        assert!(
+            await_loop_event(&mut loop_rx, |ev| matches!(ev, LoopEvent::HistoryProjects { .. }))
+                .await
+                .is_some(),
+            "a reopen with a cached list still refreshes it"
+        );
+        d.handle_loop_event(
+            LoopEvent::HistoryPage {
+                seq: stale_page_seq,
+                more: false,
+                result: Ok(protocol::hub::HubHistoryPage {
+                    workspace_path: "/w".to_string(),
+                    instance: protocol::hub::HubHistoryInstance {
+                        id: "i1".to_string(),
+                        origin: None,
+                    },
+                    sessions: vec![],
+                    next_cursor: None,
+                }),
+            },
+            0,
+        );
+        assert!(
+            d.history.selected.is_none(),
+            "the pre-close page's late response is stale twice over"
+        );
+        d.handle_loop_event(
+            LoopEvent::HistoryProjects {
+                seq: d.history.seq,
+                result: Ok(vec![]),
+            },
+            0,
+        );
+        assert!(d.history.projects.as_ref().is_some_and(|l| l.is_empty()));
+    }
+
+    /// The new-session chooser's cache contract: the cached list paints but
+    /// every open re-reads it (a create aimed at a stale project row is the
+    /// hub's 502/403), and the browse sub-view dies with the close (the TS
+    /// dialog unmounts).
+    #[tokio::test]
+    async fn new_session_reopen_refreshes_the_list_and_drops_browse() {
+        let (mut d, mut loop_rx) = driver_with_loop().await;
+
+        d.handle_cmd(super::UiCommand::NewSessionToggle, 0);
+        assert!(
+            await_loop_event(&mut loop_rx, |ev| matches!(ev, LoopEvent::NewSessionProjects { .. }))
+                .await
+                .is_some(),
+            "the first open reads the project list"
+        );
+        // Paint a cached list, enter browse mode, then close the sheet.
+        d.handle_loop_event(
+            LoopEvent::NewSessionProjects {
+                seq: d.new_session.seq,
+                result: Ok(vec![protocol::hub::HubProject {
+                    workspace_path: "/w".to_string(),
+                    sessions: 1,
+                    last_active: 1_000,
+                }]),
+            },
+            0,
+        );
+        d.new_session.browse = Some(super::FsBrowseView::default());
+        d.handle_cmd(super::UiCommand::NewSessionToggle, 0);
+        assert!(d.new_session.browse.is_none(), "the browse sub-view dies with the sheet");
+        assert!(d.new_session.projects.is_some(), "the cached list still paints");
+
+        // Reopen WITH the cache present: the refresh read must still go out.
+        d.handle_cmd(super::UiCommand::NewSessionToggle, 0);
+        assert!(
+            await_loop_event(&mut loop_rx, |ev| matches!(ev, LoopEvent::NewSessionProjects { .. }))
+                .await
+                .is_some(),
+            "a reopen with a cached list still refreshes it"
+        );
+    }
+
+    /// Resume failures carry their OWN error story: a 404 is the hub's
+    /// "session deleted" tombstone (a stale cached row), NOT the listing's
+    /// bridge-too-old text — and when the panel closed mid-incubation the
+    /// failure toasts instead of silently vanishing with the view.
+    #[test]
+    fn resume_failures_map_their_own_errors_and_toast_when_the_page_is_gone() {
+        let mut d = driver();
+        let refused = |status: u16, msg: &str| HubApiError {
+            message: msg.to_string(),
+            status: Some(status),
+            network: false,
+            instance_dead: false,
+        };
+
+        // Page open: the 404 lands in the row's error slot.
+        d.history.selected = Some(super::HistorySelectedInner {
+            workspace_path: "/w".to_string(),
+            resuming: Some("s1".to_string()),
+            ..Default::default()
+        });
+        d.handle_loop_event(
+            LoopEvent::ResumeReady {
+                workspace_path: "/w".to_string(),
+                session_id: "s1".to_string(),
+                result: Err(refused(404, "HTTP 404")),
+            },
+            0,
+        );
+        let sel = d.history.selected.as_ref().expect("the page stays open");
+        assert_eq!(sel.resuming, None, "the row's wait ends");
+        assert_eq!(
+            sel.error.as_deref(),
+            Some("session deleted — the listing is stale, reopen the project"),
+            "a resume 404 is the delete tombstone, not the too-old bridge"
+        );
+
+        // Panel closed mid-incubation: the 502 toasts (the click must not
+        // silently never land) with the plain wire text.
+        d.history.selected = None;
+        d.handle_loop_event(
+            LoopEvent::ResumeReady {
+                workspace_path: "/w".to_string(),
+                session_id: "s1".to_string(),
+                result: Err(refused(502, "HTTP 502")),
+            },
+            0,
+        );
+        assert_eq!(
+            d.toast.current().map(|t| t.text.as_str()),
+            Some("resume session failed: HTTP 502")
+        );
     }
 
     /// The reconnect re-attach of a remotely closed conversation (ADR-0006

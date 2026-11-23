@@ -184,10 +184,18 @@ async fn http_401_keeps_its_status_and_other_errors_surface_as_http_code() {
     assert_eq!(err.message, "unauthorized: check token");
     assert!(!err.network);
 
-    http.push(res_text(502, "boom", &[]));
-    let err = client(http, clock).health().await.unwrap_err();
+    // A plain-text body IS the reason (the hub's 502 one-liners) — it
+    // becomes the message instead of the bare status line.
+    http.push(res_text(502, "serve bridge exited during startup", &[]));
+    let err = client(http.clone(), clock.clone()).health().await.unwrap_err();
     assert_eq!(err.status, Some(502));
-    assert_eq!(err.message, "HTTP 502");
+    assert_eq!(err.message, "serve bridge exited during startup");
+
+    // A truly empty body falls back to the bare status line.
+    http.push(res_text(503, "", &[]));
+    let err = client(http, clock).health().await.unwrap_err();
+    assert_eq!(err.status, Some(503));
+    assert_eq!(err.message, "HTTP 503");
 }
 
 #[tokio::test]
