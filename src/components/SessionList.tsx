@@ -242,8 +242,6 @@ export function SessionList({
   const [draftTitle, setDraftTitle] = useState("");
   const closeRemoteSession = useAppStore((s) => s.closeRemoteSession);
   const renameSession = useAppStore((s) => s.renameSession);
-  const shutdownInstance = useAppStore((s) => s.shutdownInstance);
-  const openTerminal = useAppStore((s) => s.openTerminal);
   const pinnedSessions = useAppStore((s) => s.pinnedSessions);
   const toggleSessionPin = useAppStore((s) => s.toggleSessionPin);
   const unreadBySession = useAppStore((s) => s.unreadBySession);
@@ -394,12 +392,6 @@ export function SessionList({
                 >
                   {t("chat.save")}
                 </button>
-                <button
-                  onClick={() => setActionTarget(null)}
-                  className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
-                >
-                  {t("common.cancel")}
-                </button>
               </div>
             ) : (
               <div className="flex flex-col gap-2 px-4 pb-4 pt-3">
@@ -432,35 +424,13 @@ export function SessionList({
                     {t("chat.renameSession")}
                   </button>
                 )}
-                {/* Remote Terminal (ADR-0011 + mirror): list-first — the
-                    desktop pane mirror opens, the v1 session terminal sits
-                    behind the session affordance / a remote-pane tap. Live
-                    rows only — a history row's session may not be held by
-                    any bridge, and the workbench answers unknown_session
-                    anyway. */}
-                {!readOnly && (
-                  <button
-                    onClick={() => {
-                      setActionTarget(null);
-                      openTerminal();
-                    }}
-                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
-                  >
-                    {t("remoteTerminal.openAction")}
-                  </button>
-                )}
                 {/* The close is a SESSION close for every origin: the bridge
                     retires the conversation, broadcasts session_closed (the
                     desktop drops its tab and tombstones it), the hub
                     tombstones it, and a serve bridge exits by itself once its
-                    LAST conversation closes. The whole-bridge kill below is
-                    not a close: a headless serve bridge hosts EVERY session of
-                    its project (Desktop Presence), and the kill skips all of
-                    that — no retirement, no broadcast, no tombstone — so other
-                    clients read it as a crash and re-incubate the bridge (the
-                    desktop's "closed tab came back", 2026-10-28). Delete
-                    (when offered) is a separate, always-available tombstone —
-                    it hides the conversation everywhere. */}
+                    LAST conversation closes — no whole-bridge kill here.
+                    Delete (when offered) is a separate, always-available
+                    tombstone — it hides the conversation everywhere. */}
                 {!readOnly && (
                   <button
                     onClick={() => {
@@ -471,18 +441,6 @@ export function SessionList({
                     className="rounded-xl bg-danger-wash px-4 py-3 text-sm font-medium text-danger ring-1 ring-inset ring-danger/40 active:brightness-125"
                   >
                     {t("chat.closeSession")}
-                  </button>
-                )}
-                {!readOnly && actionTarget.origin === "serve" && (
-                  <button
-                    onClick={() => {
-                      const { instanceId } = actionTarget;
-                      setActionTarget(null);
-                      void shutdownInstance(instanceId);
-                    }}
-                    className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
-                  >
-                    {t("chat.shutdownInstance")}
                   </button>
                 )}
                 {onDelete && (
@@ -497,12 +455,6 @@ export function SessionList({
                     {t("chat.deleteSession")}
                   </button>
                 )}
-                <button
-                  onClick={() => setActionTarget(null)}
-                  className="rounded-xl bg-raised px-4 py-3 text-sm font-medium text-ink ring-1 ring-inset ring-hairline hover:bg-hover active:bg-active"
-                >
-                  {t("common.cancel")}
-                </button>
               </div>
             )}
           </div>
