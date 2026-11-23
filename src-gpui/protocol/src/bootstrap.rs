@@ -867,6 +867,8 @@ pub enum TokenPlanError {
     Generation(#[from] TokenGenError),
     #[error("token must be a non-empty string")]
     EmptyToken,
+    #[error("hub host and token must be non-empty strings")]
+    EmptyDialParams,
     #[error("cannot read config file {path}: {source}")]
     Read {
         path: PathBuf,
@@ -883,10 +885,10 @@ pub enum TokenPlanError {
     RemoteNotAnObject { path: PathBuf },
 }
 
-/// The exact write a confirmed guided setup would perform — a PREVIEW, not a
-/// write. `content` is the byte-exact file body (pretty JSON, trailing
-/// newline); the caller persists it only after showing the user the path and
-/// content (requirements §3.1).
+/// The exact write a confirmed guided setup or a local-hub edit would
+/// perform — a PREVIEW, not a write. `content` is the byte-exact file body
+/// (pretty JSON, trailing newline); the caller persists it only after
+/// showing the user the path and content (requirements §3.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenWritePlan {
     pub path: PathBuf,
@@ -900,17 +902,12 @@ pub struct TokenWritePlan {
     pub dir_exists: bool,
 }
 
-/// Plan enabling remote access with `token` at `config_path`: sets
-/// `remote.enabled = true` and `remote.token`, preserving every other
-/// section and field verbatim (insertion order kept — serde_json
-/// preserve_order, matching the TS app's key-order expectations). A missing
-/// file plans a fresh minimal document; a malformed file or non-object
-/// root/`remote` refuses rather than clobber user data.
-pub fn plan_token_write(config_path: &Path, token: &str) -> Result<TokenWritePlan, TokenPlanError> {
-    let token = token.trim();
-    if token.is_empty() {
-        return Err(TokenPlanError::EmptyToken);
-    }
+/// Read the config root for any planned write. A malformed file or non-object
+/// root refuses rather than clobber user data; a missing file reads as a fresh
+/// empty object. Returns `(file_exists, dir_exists, root)`.
+fn config_root_for_write(
+    config_path: &Path,
+) -> Result<(bool, bool, Map<String, Value>), TokenPlanError> {
     let dir_exists = config_path.parent().map(|p| p.is_dir()).unwrap_or(false);
     let (file_exists, root) = match std::fs::read_to_string(config_path) {
         Ok(text) => (
@@ -927,40 +924,102 @@ pub fn plan_token_write(config_path: &Path, token: &str) -> Result<TokenWritePla
             })
         }
     };
-    let mut root = match root {
-        Value::Object(map) => map,
-        _ => {
-            return Err(TokenPlanError::NotAnObject {
-                path: config_path.to_owned(),
-            })
-        }
-    };
-    let remote = match root.get_mut("remote") {
-        Some(Value::Object(map)) => map,
-        Some(_) => {
-            return Err(TokenPlanError::RemoteNotAnObject {
-                path: config_path.to_owned(),
-            })
-        }
-        None => {
-            root.insert("remote".to_owned(), Value::Object(Map::new()));
-            root.get_mut("remote")
-                .and_then(Value::as_object_mut)
-                .expect("just inserted an object")
-        }
-    };
+    match root {
+        Value::Object(map) => Ok((file_exists, dir_exists, map)),
+        _ => Err(TokenPlanError::NotAnObject {
+            path: config_path.to_owned(),
+        }),
+    }
+}
+
+/// Get-or-insert the `remote` object of a config root.
+fn remote_object_for_write<'a>(
+    root: &'a mut Map<String, Value>,
+    config_path: &Path,
+) -> Result<&'a mut Map<String, Value>, TokenPlanError> {
+    if !root.contains_key("remote") {
+        root.insert("remote".to_owned(), Value::Object(Map::new()));
+    }
+    match root.get_mut("remote") {
+        Some(Value::Object(map)) => Ok(map),
+        _ => Err(TokenPlanError::RemoteNotAnObject {
+            path: config_path.to_owned(),
+        }),
+    }
+}
+
+fn serialize_plan(
+    config_path: &Path,
+    root: Map<String, Value>,
+    token: String,
+    file_exists: bool,
+    dir_exists: bool,
+) -> TokenWritePlan {
+    let content = serde_json::to_string_pretty(&Value::Object(root)).expect("Value is valid JSON");
+    TokenWritePlan {
+        path: config_path.to_owned(),
+        content: format!("{content}\n"),
+        token,
+        file_exists,
+        dir_exists,
+    }
+}
+
+/// Plan enabling remote access with `token` at `config_path`: sets
+/// `remote.enabled = true` and `remote.token`, preserving every other
+/// section and field verbatim (insertion order kept — serde_json
+/// preserve_order, matching the TS app's key-order expectations). A missing
+/// file plans a fresh minimal document; a malformed file or non-object
+/// root/`remote` refuses rather than clobber user data.
+pub fn plan_token_write(config_path: &Path, token: &str) -> Result<TokenWritePlan, TokenPlanError> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(TokenPlanError::EmptyToken);
+    }
+    let (file_exists, dir_exists, mut root) = config_root_for_write(config_path)?;
+    let remote = remote_object_for_write(&mut root, config_path)?;
     // `enabled: true` is part of the guided flow's promise: the plan enables
     // remote access, not just the token (requirements §3.1).
     remote.insert("enabled".to_owned(), Value::Bool(true));
     remote.insert("token".to_owned(), Value::String(token.to_owned()));
-    let content = serde_json::to_string_pretty(&Value::Object(root)).expect("Value is valid JSON");
-    Ok(TokenWritePlan {
-        path: config_path.to_owned(),
-        content: format!("{content}\n"),
-        token: token.to_owned(),
+    Ok(serialize_plan(
+        config_path,
+        root,
+        token.to_owned(),
         file_exists,
         dir_exists,
-    })
+    ))
+}
+
+/// Plan an EDIT of the local hub's dial parameters: sets `remote.hubHost`,
+/// `remote.hubPort` and `remote.token` and NOTHING else — `remote.enabled`
+/// and every other section/field keep their current values (forcing
+/// `enabled: true` is the guided flow's promise, not the editor's). Same
+/// refuse-don't-clobber posture and same preview-then-write contract as
+/// [`plan_token_write`].
+pub fn plan_remote_edit(
+    config_path: &Path,
+    hub_host: &str,
+    hub_port: u16,
+    token: &str,
+) -> Result<TokenWritePlan, TokenPlanError> {
+    let host = hub_host.trim();
+    let token = token.trim();
+    if host.is_empty() || token.is_empty() {
+        return Err(TokenPlanError::EmptyDialParams);
+    }
+    let (file_exists, dir_exists, mut root) = config_root_for_write(config_path)?;
+    let remote = remote_object_for_write(&mut root, config_path)?;
+    remote.insert("hubHost".to_owned(), Value::String(host.to_owned()));
+    remote.insert("hubPort".to_owned(), Value::Number(hub_port.into()));
+    remote.insert("token".to_owned(), Value::String(token.to_owned()));
+    Ok(serialize_plan(
+        config_path,
+        root,
+        token.to_owned(),
+        file_exists,
+        dir_exists,
+    ))
 }
 
 /// One-shot guided setup at the env's config path: generate a fresh token
@@ -1775,5 +1834,66 @@ mod tests {
         let value: Value = serde_json::from_str(&plan.content).unwrap();
         assert_eq!(value["remote"]["token"], serde_json::json!(token));
         assert_eq!(value["remote"]["enabled"], serde_json::json!(true));
+    }
+
+    // ---- local-hub edit planning ----
+
+    #[test]
+    fn plan_remote_edit_updates_only_dial_fields() {
+        let home = TempDir::new("edit");
+        let path = write_config(
+            home.path(),
+            r#"{"quota": {"autoResume": false}, "remote": {"enabled": false, "hubPort": 9500, "hubHost": "0.0.0.0", "token": "oldtok"}}"#,
+        );
+        let before = std::fs::read_to_string(&path).unwrap();
+        let plan = plan_remote_edit(&path, " 192.168.1.9 ", 18377, " newtok ").unwrap();
+        assert_eq!(plan.token, "newtok");
+        let value: Value = serde_json::from_str(&plan.content).unwrap();
+        assert_eq!(value["quota"]["autoResume"], serde_json::json!(false));
+        // The editor never flips enabled — force-true is the guided flow's
+        // promise, not the editor's.
+        assert_eq!(value["remote"]["enabled"], serde_json::json!(false));
+        assert_eq!(value["remote"]["hubHost"], serde_json::json!("192.168.1.9"));
+        assert_eq!(value["remote"]["hubPort"], serde_json::json!(18377));
+        assert_eq!(value["remote"]["token"], serde_json::json!("newtok"));
+        assert!(plan.content.ends_with('\n'));
+        // Planning writes nothing.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn plan_remote_edit_fresh_file_and_refusals() {
+        // A missing file plans a fresh document carrying only the trio.
+        let home = TempDir::new("editfresh");
+        let path = home.path().join(".config/zcode-acp/config.json");
+        let plan = plan_remote_edit(&path, "127.0.0.1", 8377, "tok").unwrap();
+        assert!(!plan.file_exists && !plan.dir_exists);
+        let value: Value = serde_json::from_str(&plan.content).unwrap();
+        assert_eq!(
+            value["remote"],
+            serde_json::json!({"hubHost": "127.0.0.1", "hubPort": 8377, "token": "tok"})
+        );
+        // Empty host or token refuses before any read.
+        assert!(matches!(
+            plan_remote_edit(&path, "  ", 8377, "tok"),
+            Err(TokenPlanError::EmptyDialParams)
+        ));
+        assert!(matches!(
+            plan_remote_edit(&path, "127.0.0.1", 8377, ""),
+            Err(TokenPlanError::EmptyDialParams)
+        ));
+        // Same refusals as the guided writer: malformed body, non-object root,
+        // non-object remote.
+        let home = TempDir::new("editrefuse");
+        let path = write_config(home.path(), "{ not json");
+        assert!(matches!(
+            plan_remote_edit(&path, "h", 1, "t"),
+            Err(TokenPlanError::Malformed { .. })
+        ));
+        let path = write_config(home.path(), r#"{"remote": 7}"#);
+        assert!(matches!(
+            plan_remote_edit(&path, "h", 1, "t"),
+            Err(TokenPlanError::RemoteNotAnObject { .. })
+        ));
     }
 }

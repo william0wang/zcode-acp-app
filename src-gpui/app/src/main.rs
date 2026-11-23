@@ -25,6 +25,7 @@ mod diff_view;
 mod file_browser;
 mod http_transport;
 mod i18n;
+mod local_hub_form;
 mod local_time;
 mod models_page;
 mod pending_store;

@@ -32,6 +32,9 @@
     "regenerate": "Regenerate",
     "localHub": "Local hub",
     "localHubHint": "Spawned or discovered on this machine",
+    "editLocalHub": "Edit local hub",
+    "hubHost": "Host",
+    "hubPort": "Port",
     "switchLocalHub": "Switch to the local hub",
     "switchHub": "Switch to this hub",
     "confirmRemove": "Confirm remove"

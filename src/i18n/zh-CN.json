@@ -32,6 +32,9 @@
     "regenerate": "重新生成",
     "localHub": "本机 hub",
     "localHubHint": "在本机启动或自动发现",
+    "editLocalHub": "编辑本机 hub",
+    "hubHost": "监听地址",
+    "hubPort": "端口",
     "switchLocalHub": "切换到本机 hub",
     "switchHub": "切换到此 hub",
     "confirmRemove": "确认移除"

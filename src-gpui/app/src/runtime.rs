@@ -52,7 +52,9 @@ use protocol::acp_client::{
     ServerRequest, ServerResponder, SessionAttachInfo, TurnStateInfo,
 };
 use protocol::approval::{ApprovalCore, ElicitAnswers, IncomingAsk, PendingAsk};
-use protocol::bootstrap::{assess_local_hub, dial_host, ensure_hub, BootstrapEnv, EnsureOptions};
+use protocol::bootstrap::{
+    assess_local_hub, dial_host, ensure_hub, BootstrapEnv, EnsureOptions, LocalHubConfig,
+};
 use protocol::chat::{ChatMessage, PromptDraft};
 use protocol::clock::{Clock, TokioClock};
 use protocol::config_decode::ModelsPayload;
@@ -287,6 +289,15 @@ pub enum UiCommand {
         id: String,
         name: String,
         hub_url: String,
+        token: String,
+    },
+    /// Edit the LOCAL hub's dial parameters: writes `remote.hubHost` /
+    /// `hubPort` / `token` in `~/.config/zcode-acp/config.json` (preserving
+    /// everything else); restarting the dial when local is the active target
+    /// so the edit takes effect now.
+    UpdateLocalHub {
+        host: String,
+        port: u16,
         token: String,
     },
     /// The settings drawer's hub staleness check (TS SettingsPanel
@@ -1546,6 +1557,10 @@ pub struct WorkbenchSnapshot {
     /// active id; `None` active = the local hub (Hub Bootstrap path).
     pub servers: Vec<protocol::hub::SavedServer>,
     pub active_server_id: Option<String>,
+    /// The local hub's dial parameters as last bootstrapped — the local-row
+    /// Edit form's prefill. `None` while a remote profile is active (the
+    /// form then live-reads the config file).
+    pub local_hub: Option<LocalHubConfig>,
     /// The new-session chooser (TS ProjectCreateDialog); `None` = closed.
     pub new_session: Option<NewSessionView>,
     /// The Session Files browser (batch F). Always present — the dock
@@ -1602,6 +1617,7 @@ impl WorkbenchSnapshot {
             model_test_pending: None,
             servers: Vec::new(),
             active_server_id: None,
+            local_hub: None,
             new_session: None,
             files: FilesPanelView::default(),
             config_section_page: None,
@@ -2832,6 +2848,10 @@ struct Driver {
     /// steady-state supervisor re-spawn the hub — a remote hub is dialed,
     /// never spawned (CONTEXT.md).
     local_hub: bool,
+    /// The local dial parameters of the last local bootstrap (mirrored into
+    /// the snapshot for the local-row Edit form's prefill); `None` while a
+    /// remote profile is the target.
+    local_hub_config: Option<LocalHubConfig>,
     /// Consecutive discovery failures whose error is NETWORK-level (the hub
     /// answered nothing): the hub-dark signal the respawn supervisor counts.
     /// Any answered error or successful poll resets it — the hub is alive.
@@ -3007,6 +3027,7 @@ impl Driver {
             seen_at: HashMap::new(),
             discovery_baselined: false,
             local_hub: false,
+            local_hub_config: None,
             hub_down_streak: 0,
             hub_respawn_busy: false,
             hub_respawn_next_at: 0,
@@ -8100,6 +8121,42 @@ impl Driver {
                     }
                 }
             }
+            UiCommand::UpdateLocalHub {
+                host,
+                port,
+                token,
+            } => {
+                // The local-row Edit form's save. The file feeds only the
+                // LOCAL dial, so this is UpdateServer's was_active rule in
+                // its local edition: restart (re-run ensure_hub, which
+                // re-reads the file) only when local is the active target.
+                let env = BootstrapEnv::from_env();
+                match protocol::bootstrap::plan_remote_edit(
+                    &protocol::bootstrap::user_config_path(&env),
+                    &host,
+                    port,
+                    &token,
+                ) {
+                    Ok(plan) => match apply_token_write(&plan) {
+                        Ok(()) => {
+                            traceln!(
+                                "[driver] local hub config written to {}",
+                                plan.path.display()
+                            );
+                            if self.book.active_id.is_none() {
+                                self.pending.reset();
+                                return Flow::Restart;
+                            }
+                        }
+                        Err(e) => {
+                            traceln!("[driver] local hub config write failed: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        traceln!("[driver] local hub config plan failed: {e}");
+                    }
+                }
+            }
             UiCommand::UpgradeHub => {
                 if !self.hub_upgrade_busy
                     && matches!(
@@ -10349,6 +10406,7 @@ impl Driver {
             toast: self.toast.current().cloned(),
             servers: self.book.servers.clone(),
             active_server_id: self.book.active_id.clone(),
+            local_hub: self.local_hub_config.clone(),
             new_session,
             system_status: self.system.open.then(|| SystemStatusPageView {
                 stats: self.system.stats.clone(),
@@ -10929,6 +10987,7 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
             d.hub_url = server.hub_url.clone();
             d.token = server.token.clone();
             d.note = Some(format!("remote: {}", server.name));
+            d.local_hub_config = None;
             None
         } else {
             let env = BootstrapEnv::from_env();
@@ -11024,7 +11083,8 @@ async fn driver(cmd_rx: UnboundedReceiver<UiCommand>, ev_tx: UnboundedSender<Run
                 dial_host(&config.hub_host),
                 config.hub_port
             );
-            d.token = config.token.unwrap_or_default();
+            d.token = config.token.clone().unwrap_or_default();
+            d.local_hub_config = Some(config);
         }
         traceln!(
             "[driver] hub ready {} ({})",

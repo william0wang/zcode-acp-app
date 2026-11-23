@@ -74,6 +74,7 @@ use crate::runtime::{
     PaneFact,
     WorkbenchSnapshot,
 };
+use crate::local_hub_form::LocalHubForm;
 use crate::server_form::ServerForm;
 use crate::terminal_panel;
 use gpui_terminal::TerminalView;
@@ -4024,6 +4025,28 @@ impl Workbench {
                     .icon(KitIconName::Plug)
                     .tooltip(t!("connect.switchLocalHub"))
                     .on_click(move |_, _, _| runtime.send(UiCommand::SwitchProfile { id: None })),
+            );
+        }
+        // The local entry's Edit: unlike the book rows the target is the
+        // config FILE, not a saved record. Prefill comes from the snapshot's
+        // last local bootstrap; a remote-active run never dialed local, so
+        // fall back to a live read of the same file (the server's live-config
+        // doctrine).
+        {
+            let runtime = runtime.clone();
+            let prefill = self.snap.local_hub.clone().unwrap_or_else(|| {
+                protocol::bootstrap::assess_local_hub(&protocol::bootstrap::BootstrapEnv::from_env())
+                    .config
+            });
+            local_row = local_row.child(
+                Button::new("server-edit-local")
+                    .ghost()
+                    .xsmall()
+                    .icon(KitIconName::Pencil)
+                    .tooltip(t!("connect.editLocalHub"))
+                    .on_click(move |_, window, cx| {
+                        LocalHubForm::open(Some(&prefill), runtime.clone(), window, cx)
+                    }),
             );
         }
         column = column.child(local_row);
@@ -10562,6 +10585,53 @@ mod ui_tests {
             window.click("server-form-cancel", cx);
             window.draw(cx).clear(cx);
             assert!(window.try_find("server-form").is_none(), "Cancel closes");
+        })
+        .unwrap();
+    }
+
+    /// The local row's Edit opens the local-hub form prefilled from the
+    /// snapshot's bootstrap; Save dispatches `UpdateLocalHub` with those
+    /// values and closes.
+    #[gpui_kit::test]
+    fn local_hub_row_edits_via_dialog(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let mut snap = connected_snapshot();
+        snap.active_server_id = None;
+        snap.local_hub = Some(protocol::bootstrap::LocalHubConfig {
+            token: Some("tok".to_string()),
+            hub_port: 18377,
+            hub_host: "127.0.0.1".to_string(),
+        });
+        let (handle, _wb, runtime) = cx.update(|cx| open(cx, snap, 1000.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.click("dock-rail-settings", cx);
+            window.draw(cx).clear(cx);
+
+            window.click("server-edit-local", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.find("local-hub-form").visible(),
+                "Edit opens the dialog"
+            );
+            window.click("local-hub-form-save", cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                runtime.recorded_commands().iter().any(|c| matches!(
+                    c,
+                    UiCommand::UpdateLocalHub { host, port, token }
+                        if host == "127.0.0.1" && *port == 18377 && token == "tok"
+                )),
+                "Save dispatches the prefilled local config"
+            );
+            assert!(
+                window.try_find("local-hub-form").is_none(),
+                "Save closes the dialog"
+            );
         })
         .unwrap();
     }
