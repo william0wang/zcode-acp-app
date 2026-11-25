@@ -119,6 +119,17 @@ const IMAGE_EXT = new Set([
   "avif",
 ]);
 
+const VIDEO_EXT = new Set([
+  "mp4",
+  "m4v",
+  "webm",
+  "mov",
+  "mkv",
+  "3gp",
+  "3g2",
+  "ogv",
+]);
+
 const TEXT_EXT = new Set([
   "txt",
   "md",
@@ -195,10 +206,13 @@ const TEXT_NAMES = new Set([
   "notice",
 ]);
 
-export function fileKindOf(name: string): "image" | "text" | "binary" {
+export function fileKindOf(
+  name: string,
+): "image" | "video" | "text" | "binary" {
   const lower = name.toLowerCase();
   const ext = lower.includes(".") ? lower.split(".").pop()! : "";
   if (ext && IMAGE_EXT.has(ext)) return "image";
+  if (ext && VIDEO_EXT.has(ext)) return "video";
   if (ext && TEXT_EXT.has(ext)) return "text";
   if (!ext && TEXT_NAMES.has(lower)) return "text";
   return "binary";
@@ -519,6 +533,10 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
   // Markdown: which of preview (default) / source is shown.
   const [mdSource, setMdSource] = useState(false);
 
+  // Playback failed (codec unsupported, stream error): fall back to the
+  // binary download card instead of a dead black rectangle.
+  const [videoFailed, setVideoFailed] = useState(false);
+
   // Same as the back arrow: return to the directory the file was opened from.
   useBackHandler(() => {
     onClose();
@@ -526,7 +544,7 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
   });
   const markdown = isMarkdown(file.name);
   const baseKind = fileKindOf(file.name);
-  const kind: "image" | "text" | "binary" = forcedText
+  const kind: "image" | "video" | "text" | "binary" = forcedText
     ? "text"
     : baseKind === "text" && file.size > LARGE_TEXT_BYTES
       ? "binary"
@@ -734,6 +752,52 @@ export function FileViewer({ file, path, localPath, onClose, onExit }: FileViewe
           slides={[{ src: url }]}
           zoom={{ maxZoomPixelRatio: 5 }}
         />
+      )}
+
+      {kind === "video" && url && !videoFailed && (
+        <video
+          src={url}
+          controls
+          playsInline
+          // Loopback-only app: the hub stream is same-origin trust boundary.
+          crossOrigin="anonymous"
+          className="flex-1 bg-black object-contain"
+          onError={() => setVideoFailed(true)}
+        />
+      )}
+
+      {kind === "video" && (!url || videoFailed) && (
+        <div className="flex flex-1 flex-col items-center justify-center gap-3 px-6">
+          <FileText className="size-10 text-faint" />
+          <div className="text-sm text-dim">
+            {file.name} · {fmtSize(file.size)}
+          </div>
+          {url && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={downloadFile}
+                disabled={downloading}
+                className="flex items-center gap-1.5 rounded-full bg-ink px-4 py-2 text-sm text-canvas active:brightness-90 disabled:opacity-50"
+              >
+                {downloading ? (
+                  <Spinner className="size-4" />
+                ) : (
+                  <Download className="size-4" />
+                )}
+                {downloading && progress !== null
+                  ? t("viewer.downloadProgress", { pct: progress })
+                  : t("viewer.download")}
+              </button>
+              <button
+                onClick={copyLink}
+                className="flex items-center gap-1.5 rounded-full bg-hover px-4 py-2 text-sm text-dim active:bg-active"
+              >
+                <Link2 className="size-4" />
+                {t("viewer.copyLink")}
+              </button>
+            </div>
+          )}
+        </div>
       )}
 
       {kind === "text" &&
