@@ -47,3 +47,60 @@ _Avoid_: terminal sync, pane clone, remote desktop terminals
 One terminal pane's running signal — busy or idle, the current command line,
 and when it started; unknown when the pane's shell cannot report it.
 _Avoid_: running flag, process status
+
+## Session Re-entry
+
+**Session Re-entry**:
+Coming back to a conversation this client already showed — after the phone
+wakes, after the connection dropped, or after switching back from another
+conversation. The bridge answers with a Tail Replay; the client reconciles it
+with the Painted View instead of starting over.
+_Avoid_: reload, refresh, re-attach (as words for the user-facing behavior)
+
+**Painted View**:
+The conversation as this client last showed it: the messages on screen, or the
+snapshot kept when the user switched away. A Re-entry always starts from it.
+_Avoid_: cache, stale view
+
+**Settled View**:
+A Painted View captured between turns. It is complete by construction, so an
+unchanged conversation tail proves nothing was missed — a view captured
+mid-turn proves nothing and must be reconciled.
+_Avoid_: cached state, final view
+
+**Tail Replay**:
+The bridge re-sending a conversation's newest messages when a client attaches.
+It reaches back a bounded distance, and it is the only way a client learns
+what happened while it was away.
+_Avoid_: full replay, history load
+
+**Anchor**:
+A message the Painted View and the Tail Replay both carry under an identity
+they share: assistant text and thoughts keep the backend's message id from the
+live stream into replay, and a tool card keeps its call id. A prompt sent from
+this device never anchors — live it is the sender's own bubble, replayed it is
+a stored message.
+_Avoid_: matching message, common message
+
+**Seam**:
+The newest Anchor. Everything above it stays as painted; everything below it
+is replaced by the replay.
+_Avoid_: merge point, diff position
+
+**Far Behind**:
+A Painted View that shares no Anchor with the Tail Replay: more happened while
+away than one replay reaches back. Only a Far Behind view is reloaded from
+scratch — a reload is the exception, not the re-entry.
+_Avoid_: stale, out of date
+
+**In-flight Content**:
+The output of the turn that was still running when the client looked away. The
+backend records a step's text only once the step finishes, so no replay
+contains it yet.
+_Avoid_: partial message, streaming leftovers
+
+**Carry-over**:
+Keeping In-flight Content through a Re-entry while the turn is still running.
+It is only ever done mid-turn: once no turn is running, the replay is the
+whole truth.
+_Avoid_: preserving draft output, keeping stale messages

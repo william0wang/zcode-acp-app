@@ -383,9 +383,9 @@ test("a thought-tailed turn reconciles on the raw thought_ id; a local optimisti
     replayMeta: {
       cursor: "c",
       hasMore: false,
-      // The store's totalMessages (3, from the previous test's replay) is
-      // what the prompt-turn snapshot cached — equal counts, local tail.
-      totalMessages: 3,
+      // 2, the count the thought-turn reconcile above just refreshed: equal
+      // counts with a local tail id keep the snapshot — no replay.
+      totalMessages: 2,
       lastMessageId: "m_t1",
       turnActive: false,
     },

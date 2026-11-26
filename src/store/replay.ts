@@ -44,6 +44,10 @@ interface SessionSnapshot {
   // locally-run turn, while context (usage above) paints instantly.
   cacheHit: number | null;
   turnStats: TurnStats | null;
+  // Taken between turns. Only a settled snapshot may skip the reconcile on an
+  // equal tail: mid-turn the last message can still be growing under the
+  // same id, and an optimistic prompt may never have reached the bridge.
+  settled: boolean;
 }
 
 const SESSION_CACHE_LIMIT = 6;
@@ -571,4 +575,214 @@ export function applyOne(
   }
   // Unknown kinds (additive-only contract): ignore.
   return null;
+}
+
+// ---- session re-entry: merging a tail replay into the painted view ----
+
+// One session/update notification held back from the store while a tail
+// replay is captured (see loadSession).
+export interface CapturedUpdate {
+  u: SessionUpdate;
+  meta?: unknown;
+}
+
+/**
+ * Folds a captured run the way flushUpdateBatch applies a live batch, but
+ * builds messages only from `from` on. Session-level kinds are snapshots, so
+ * every item's counts; message kinds before `from` are not part of the batch.
+ */
+export function foldCapturedUpdates(
+  items: CapturedUpdate[],
+  from: number,
+): {
+  messages: ChatMessage[];
+  planEntries?: PlanEntry[] | null;
+  usage?: ContextUsage;
+  availableCommands?: SlashCommand[];
+} {
+  let messages: ChatMessage[] = [];
+  let planEntries: PlanEntry[] | null | undefined;
+  let usage: ContextUsage | undefined;
+  let availableCommands: SlashCommand[] | undefined;
+  items.forEach(({ u, meta }, i) => {
+    const r = applyOne(i >= from ? messages : [], u, meta);
+    if (!r) return;
+    if (i >= from && r.messages) messages = r.messages;
+    if (r.planEntries !== undefined) planEntries = r.planEntries;
+    if (r.usage) usage = r.usage;
+    if (r.availableCommands) availableCommands = r.availableCommands;
+  });
+  return {
+    messages,
+    ...(planEntries !== undefined ? { planEntries } : {}),
+    ...(usage ? { usage } : {}),
+    ...(availableCommands ? { availableCommands } : {}),
+  };
+}
+
+// Whether a message update's target is already among `messages`: the chunk's
+// message, or the tool call's card. Session-level kinds carry no target.
+export function updateOnScreen(
+  u: SessionUpdate,
+  messages: ChatMessage[],
+): boolean {
+  const kind = u.sessionUpdate;
+  if (kind === "tool_call" || kind === "tool_call_update") {
+    const id = String(u.toolCallId ?? "");
+    return id !== "" && findToolCallPart(messages, id) !== null;
+  }
+  const mid =
+    typeof u.messageId === "string" && u.messageId ? u.messageId : null;
+  return mid !== null && messages.some((m) => m.id === mid);
+}
+
+// The painted object when both spellings are the same message, else null.
+// createdAt is capture time, so it never decides. The rewind handle rides
+// replay only and is borrowed onto the painted object — which is kept, not
+// replaced: assistant-ui caches conversions per object, so a message the
+// replay confirms never re-renders.
+function keepPainted(a: ChatMessage, b: ChatMessage): ChatMessage | null {
+  if (a.id !== b.id || a.role !== b.role) return null;
+  if (JSON.stringify(a.parts) !== JSON.stringify(b.parts)) return null;
+  if ((a.collapsed ?? undefined) !== (b.collapsed ?? undefined)) return null;
+  return b.mid && a.mid !== b.mid ? { ...a, mid: b.mid } : a;
+}
+
+// A user prompt in its two spellings: the sender's own bubble (or the live
+// echo of another client's) and the stored message — same role, same text.
+function samePrompt(a: ChatMessage, b: ChatMessage): boolean {
+  if (a.id === b.id) return true;
+  if (a.role !== "user" || b.role !== "user") return false;
+  const text = (m: ChatMessage) =>
+    m.parts.reduce(
+      (t, p) => (p.type === "text" ? t + p.text : t),
+      "",
+    );
+  return text(a) === text(b);
+}
+
+/**
+ * Merges a captured tail replay into the painted messages — null when the
+ * view is Far Behind (no shared Anchor) or the two cannot be aligned, the
+ * caller's cue to reload.
+ *
+ * From the Seam on, the replay's spelling wins — except for messages both
+ * agree on (kept as painted) and, when `carryInFlight`, for output the
+ * journal has not taken yet. Above the Seam the painted messages stay.
+ */
+export function mergeTailReplay(
+  painted: ChatMessage[],
+  replay: ChatMessage[],
+  carryInFlight: boolean,
+): ChatMessage[] | null {
+  const replayIds = new Map<string, number>();
+  const replayTools = new Map<string, number>();
+  replay.forEach((r, j) => {
+    replayIds.set(r.id, j);
+    for (const p of r.parts)
+      if (p.type === "tool-call") replayTools.set(p.toolCallId, j);
+  });
+  // Assistant text and thoughts keep the backend's message id from the live
+  // stream into replay; a card keeps its call id. Local bubbles and prompt
+  // echoes carry neither, so they never anchor.
+  const counterpart = (m: ChatMessage): number => {
+    if (!isLocalMessageId(m.id) && replayIds.has(m.id))
+      return replayIds.get(m.id)!;
+    for (const p of m.parts)
+      if (p.type === "tool-call" && replayTools.has(p.toolCallId))
+        return replayTools.get(p.toolCallId)!;
+    return -1;
+  };
+  let k = -1;
+  let j = -1;
+  for (let i = painted.length - 1; i >= 0; i--) {
+    const c = counterpart(painted[i]);
+    if (c < 0) continue;
+    // The Seam is the earliest painted message mapping into the region the
+    // newer ones map into. One row sits at two places in the two spellings
+    // (a card split off its text live, a step's thought and text), so a
+    // painted message whose counterpart lies AFTER a newer one's is part of
+    // the replaced region, not a firm anchor.
+    if (k >= 0) {
+      if (c < j) break;
+    } else {
+      j = c;
+    }
+    k = i;
+  }
+  if (k < 0) return null;
+
+  const out = painted.slice(0, k);
+  // Above the Seam the replay only knows more about a card that changed
+  // state while we were away (a background call finishing): take its
+  // spelling of that card.
+  for (let a = 0; a < k; a++) {
+    const m = painted[a];
+    let parts: ChatPart[] | null = null;
+    m.parts.forEach((p, i) => {
+      if (p.type !== "tool-call") return;
+      const c = replayTools.get(p.toolCallId);
+      if (c === undefined) return;
+      const r = replay[c].parts.find(
+        (q): q is ToolCallPart =>
+          q.type === "tool-call" && q.toolCallId === p.toolCallId,
+      );
+      if (!r || r.status === p.status) return;
+      if (!parts) parts = [...m.parts];
+      parts[i] = r;
+    });
+    if (parts) out[a] = { ...m, parts };
+  }
+  // A prompt sent from here stays its own bubble, but it must become editable
+  // once its stored copy exists: lend the replay's rewind handle to the
+  // messages just above the Seam as long as the two keep pairing up.
+  for (
+    let a = k - 1, b = j - 1;
+    a >= 0 && b >= 0 && samePrompt(painted[a], replay[b]);
+    a--, b--
+  ) {
+    const mid = replay[b].mid;
+    if (mid && out[a].mid !== mid) out[a] = { ...out[a], mid };
+  }
+
+  let cut = k;
+  let r = j;
+  for (; cut < painted.length && r < replay.length; cut++, r++) {
+    const kept = keepPainted(painted[cut], replay[r]);
+    if (!kept) break;
+    out.push(kept);
+  }
+  out.push(...replay.slice(r));
+  // Leading same-role pairs of the two remainders are the same rows in both
+  // spellings (the prompt bubble and its stored copy) and are already in.
+  // What the painted view still has past that is newer than the journal —
+  // the step still streaming at the disconnect; the backend takes a step's
+  // text only once it finishes. It survives only mid-turn: with no turn
+  // running, the replay is the whole truth.
+  const tail = painted.slice(cut);
+  let p = 0;
+  while (
+    p < tail.length &&
+    r + p < replay.length &&
+    tail[p].role === replay[r + p].role
+  )
+    p++;
+  if (carryInFlight && r + p >= replay.length)
+    out.push(...tail.slice(p).filter((m) => counterpart(m) < 0));
+
+  // assistant-ui keys messages by id and throws on a repeated tool call id:
+  // an alignment that would repeat either is not an alignment.
+  const seen = new Set<string>();
+  for (const m of out) {
+    if (seen.has(`id:${m.id}`)) return null;
+    seen.add(`id:${m.id}`);
+    for (const q of m.parts) {
+      if (q.type !== "tool-call") continue;
+      if (seen.has(`tool:${q.toolCallId}`)) return null;
+      seen.add(`tool:${q.toolCallId}`);
+    }
+  }
+  return out.length === painted.length && out.every((m, i) => m === painted[i])
+    ? painted
+    : out;
 }
