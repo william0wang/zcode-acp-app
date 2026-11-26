@@ -2236,10 +2236,15 @@ export const useAppStore = create<AppState>((set, get) => {
     refreshInstances: async (opts?: { probe?: boolean }) => {
       const client = hub();
       if (!client) return;
-      const profile = get().profile;
+      // Compare by VALUE, not identity: every set() rebuilds the profile
+      // object, so a reference compare would discard probe answers whenever
+      // any await-spanning state write landed mid-flight — the manual
+      // refresh silently did nothing.
+      const { hubUrl, token } = get().profile!;
       try {
         const instances = await client.instances(opts?.probe === true);
-        if (get().profile !== profile) return; // hub changed mid-flight
+        const cur = get().profile;
+        if (!cur || cur.hubUrl !== hubUrl || cur.token !== token) return; // hub changed mid-flight
         discoveryFailures = 0;
         const next = filterClosedSessions(instances);
         set({ instancesLoaded: true });
@@ -2270,7 +2275,8 @@ export const useAppStore = create<AppState>((set, get) => {
           }
         }
       } catch (e) {
-        if (get().profile !== profile) return;
+        const cur = get().profile;
+        if (!cur || cur.hubUrl !== hubUrl || cur.token !== token) return;
         set({ instancesLoaded: true });
         if (e instanceof HubApiError && e.network) {
           // Hub unreachable is expected while no editor runs (bridges
