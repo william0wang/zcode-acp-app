@@ -201,6 +201,26 @@ const HUB_UPGRADE_NOTE_MS: u64 = 5_000;
 /// A Saved notice's on-screen window (ADR-0014 §2: immediate writes
 /// confirm briefly; the deadline is checked on tick, like the toast).
 const NOTICE_SAVED_MS: u64 = 3_000;
+/// A Connected tab silent past this gets a `$/zcode/ping` probe — a dead
+/// link (sleep, NAT expiry, network switch, wedged hub) delivers no WS
+/// event, so without the probe the tab sits deaf while the backend keeps
+/// running (mobile parity: appStore.ts `WIRE_ACTIVITY_FRESH_MS` plus the
+/// 20s visibility interval).
+const TAB_PROBE_AFTER_MS: u64 = 30_000;
+/// The probe's round-trip budget (mobile parity: `probeAlive`'s 5s). Any
+/// settle proves the pipe — the bridge's SDK answers unknown methods with
+/// an immediate -32601; only silence (or a locally-refused send) means
+/// zombie.
+const TAB_PROBE_TIMEOUT_MS: u64 = 5_000;
+/// Auto-retry a failed `session/load` after this delay: the failure leaves
+/// a cleared (or stale-snapshot) view and nothing else re-issues the load
+/// while the socket stays up — the user used to have to close and reopen
+/// the tab.
+const LOAD_RETRY_DELAY_MS: u64 = 2_000;
+/// How many times a load failure auto-retries before giving up; the next
+/// reconnect's auto-attach is the further catch-up (the budget resets on
+/// each successful connect).
+const LOAD_RETRY_MAX: u32 = 2;
 
 /// Env-gated stderr trace for the driver lifecycle — the slice's connection
 /// story, observable without a debugger. Rides the product family's one debug
@@ -1674,6 +1694,11 @@ enum LoopEvent {
     /// handshake failures also fire it (via close_core) but own their
     /// retry through [`LoopEvent::ConnectResult`].
     Closed { tab: u64 },
+    /// The tab liveness probe settled (`$/zcode/ping`): `alive=false` tears a
+    /// silent Connected tab down exactly like an unexpected close — a
+    /// half-open link never announces itself, so the probe is the only
+    /// thing that catches it (mobile parity: `wakeProbe`).
+    ProbeResult { tab: u64, alive: bool },
     NewSession { tab: u64, result: Result<SessionAttachInfo, String> },
     LoadResult {
         tab: u64,
@@ -2039,6 +2064,33 @@ enum LoopEvent {
     },
 }
 
+/// The tab a loop event belongs to, when it carries one. Wire-inbound
+/// events stamp the tab's `last_wire_activity` — the liveness probe's
+/// freshness signal. Hub-REST and UI events either carry no tab or prove
+/// nothing about the socket (a REST answer can arrive while the WS is
+/// dead), so they read as None.
+fn loop_event_tab(ev: &LoopEvent) -> Option<u64> {
+    match ev {
+        LoopEvent::ConnHandle { tab, .. }
+        | LoopEvent::ConnectResult { tab, .. }
+        | LoopEvent::Update { tab, .. }
+        | LoopEvent::TurnState { tab, .. }
+        | LoopEvent::Closed { tab }
+        | LoopEvent::ProbeResult { tab, .. }
+        | LoopEvent::NewSession { tab, .. }
+        | LoopEvent::LoadResult { tab, .. }
+        | LoopEvent::LoadEarlierResult { tab, .. }
+        | LoopEvent::PromptResult { tab, .. }
+        | LoopEvent::RewindResult { tab, .. }
+        | LoopEvent::SetConfigResult { tab, .. }
+        | LoopEvent::ServerRequest { tab, .. }
+        | LoopEvent::CancelRequest { tab, .. }
+        | LoopEvent::AskSettled { tab, .. }
+        | LoopEvent::SessionClosedRemotely { tab, .. } => Some(*tab),
+        _ => None,
+    }
+}
+
 /// `AcpHandlers` forwarding into the driver loop's channel, tagged with the
 /// tab — including the interaction requests the approval cards answer.
 struct DriverHandlers {
@@ -2196,6 +2248,19 @@ struct Tab {
     /// The rewind extensions capability on the last `initialize`
     /// (`_meta.zcode.rewind`, TS `rewindCapable`).
     rewind_capable: bool,
+    /// Epoch-ms of the last inbound wire event for this tab (stamped in
+    /// `handle_loop_event` for every tab-tagged event) — the freshness the
+    /// liveness probe reads.
+    last_wire_activity: u64,
+    /// A `$/zcode/ping` liveness probe is in flight (one at a time per tab).
+    probe_in_flight: bool,
+    /// The failed `session/load` awaiting its auto-retry: the request plus
+    /// the epoch-ms it fires at. Kept as one slot so the schedule and its
+    /// target never drift apart.
+    load_retry: Option<(protocol::session::LoadRequest, u64)>,
+    /// Retries this tab already spent on load failures; reset on a live
+    /// connect, bounded by [`LOAD_RETRY_MAX`].
+    load_retries: u32,
 }
 
 /// The sidebar's history browser state (driver-owned — all wire I/O lives
@@ -3152,6 +3217,12 @@ impl Driver {
             reincubated_at: None,
             fs_capable: false,
             rewind_capable: false,
+            // 0 is safe: the probe arms only while Connected, and reaching
+            // Connected means a loop event already stamped a real timestamp.
+            last_wire_activity: 0,
+            probe_in_flight: false,
+            load_retry: None,
+            load_retries: 0,
         });
         self.active_tab = Some(id);
         traceln!("[driver] tab {id} opened (instance {})", self.tabs.last().unwrap().instance_id);
@@ -6753,6 +6824,10 @@ impl Driver {
     // ---- tick ----
 
     fn tick(&mut self, now: u64) {
+        // Liveness probes to spawn after the loop: the spawn reads
+        // `self.loop_tx`, so the candidates (and their connections) are
+        // collected under the tabs borrow first.
+        let mut probes: Vec<(u64, AcpConnection)> = Vec::new();
         for tab in &mut self.tabs {
             tab.core.flush_update_batch(now);
             tab.core.flush_late_page(now);
@@ -6760,6 +6835,62 @@ impl Driver {
             // A force-send's cancelled turn that never settled: release the
             // queue here rather than leaving the button permanently inert.
             tab.core.poll_force_send_stall(now);
+            // A failed session/load retries on the live socket after its
+            // delay. A session the store has since switched away from (or a
+            // tab no longer Connected) drops the schedule — the reconnect's
+            // auto-attach owns the catch-up there.
+            if let Some((req, at)) = tab.load_retry.clone() {
+                if now >= at {
+                    tab.load_retry = None;
+                    if tab.state == TabPhase::Connected
+                        && tab.core.active_session_id.as_deref() == Some(req.session_id.as_str())
+                    {
+                        traceln!(
+                            "[driver] tab {} retrying session/load for {}",
+                            tab.id,
+                            req.session_id
+                        );
+                        tab.core.load_session_as(&req.session_id, req.intent);
+                    }
+                }
+            }
+            // Liveness probe arming: only a Connected tab with a live-silent
+            // window and no probe in flight. The ping itself rides the tab's
+            // own connection (see the spawn below).
+            if tab.state == TabPhase::Connected
+                && !tab.probe_in_flight
+                && tab.conn.is_some()
+                && now.saturating_sub(tab.last_wire_activity) > TAB_PROBE_AFTER_MS
+            {
+                tab.probe_in_flight = true;
+                traceln!(
+                    "[driver] tab {} silent {}ms; probing",
+                    tab.id,
+                    now.saturating_sub(tab.last_wire_activity)
+                );
+                probes.push((tab.id, tab.conn.clone().expect("conn checked above")));
+            }
+        }
+        for (tab_id, conn) in probes {
+            let tx = self.loop_tx.clone();
+            tokio::spawn(async move {
+                let alive = match tokio::time::timeout(
+                    std::time::Duration::from_millis(TAB_PROBE_TIMEOUT_MS),
+                    conn.request("$/zcode/ping", serde_json::json!({})),
+                )
+                .await
+                {
+                    // Any settle proves the round-trip — the bridge's SDK
+                    // answers unknown methods with an immediate -32601
+                    // (Sup::probe_alive semantics, reconnect.rs). A
+                    // locally-refused send, or silence past the budget,
+                    // means the socket is a zombie.
+                    Ok(Ok(_)) => true,
+                    Ok(Err(e)) => e.0 != "connection not open",
+                    Err(_) => false,
+                };
+                let _ = tx.send(LoopEvent::ProbeResult { tab: tab_id, alive });
+            });
         }
         // Remote Terminal (ADR-0011): dial the control link when dark, and
         // settle running turns whose OSC 641 marker fired.
@@ -7104,10 +7235,62 @@ impl Driver {
 
     // ---- event handling ----
 
+    /// A tab's live socket died — an unexpected close, or the liveness probe
+    /// answered silence. The pending asks died with the socket — their
+    /// responders point into the void and would silently swallow taps;
+    /// broadcast activity is equally untrustworthy now (appStore.ts
+    /// "closed": clear permissions/elicitations/sessionStates). Back into
+    /// the reconnect ladder. Only a live socket dying reconnects: a
+    /// handshake failure fires Closed too but retries through
+    /// ConnectResult, and the state guard is what keeps a probe failure
+    /// and the socket's own close from both tearing the tab down.
+    fn socket_lost(&mut self, tab: u64, now: u64) {
+        let Some(t) = self.tab_mut(tab) else {
+            return;
+        };
+        if t.state != TabPhase::Connected {
+            return;
+        }
+        // Kill the socket itself, not just the tab's bookkeeping. The
+        // Closed arm arrives with it already dead, but a probe verdict
+        // reaches this method with a zombie still open: left alone it
+        // lingers until TCP gives up on the probe's unanswered ping
+        // (minutes), then fires a second Closed that carries no connection
+        // identity and — the tab being Connected again by then — tears the
+        // healthy replacement down. It also pins its pending requests in
+        // memory and, on a false-negative verdict (a live-but-slow socket),
+        // would leave two connections pushing one tab. Closing now settles
+        // all three; closed-by-us keeps the corpse's own pump from emitting
+        // another Closed (acp_client.rs pump). Mobile's probeAlive does the
+        // same (`acp?.close()`).
+        if let Some(conn) = t.conn.clone() {
+            conn.close();
+        }
+        traceln!("[driver] tab {tab} socket closed; reconnecting");
+        let delay = reconnect_delay_ms(t.reconnect_attempts);
+        t.reconnect_attempts += 1;
+        t.state = TabPhase::Reconnecting;
+        t.retry_at = Some(now + delay);
+        t.core.conn_open = false;
+        t.probe_in_flight = false;
+        // The reconnect's auto-attach re-loads the session; a pending load
+        // retry here would double it (the retry budget itself persists —
+        // it resets on the next successful connect).
+        t.load_retry = None;
+    }
+
     fn handle_loop_event(&mut self, ev: LoopEvent, now: u64) {
         // Session switches also arrive as events (session/new, load results)
         // — keep the files browser honest about its owner here too.
         self.files_reconcile();
+        // Every inbound wire frame lands here as a tab-tagged event: stamp
+        // the freshness the liveness probe reads (a streaming turn keeps its
+        // tab probe-free; an idle tab asks the pipe directly).
+        if let Some(tab) = loop_event_tab(&ev) {
+            if let Some(t) = self.tab_mut(tab) {
+                t.last_wire_activity = now;
+            }
+        }
         match ev {
             LoopEvent::ConnHandle { tab, conn } => {
                 if self.tab(tab).is_some() && !self.closing.contains(&tab) {
@@ -7189,25 +7372,15 @@ impl Driver {
                 if self.tab(tab).is_none() {
                     return;
                 }
-                // Only a live socket dying reconnects; a handshake failure
-                // fires Closed too but retries through ConnectResult.
-                if let Some(t) = self.tab_mut(tab) {
-                    if t.state == TabPhase::Connected {
-                        traceln!("[driver] tab {tab} socket closed; reconnecting");
-                        // The pending asks died with the socket — their
-                        // responders point into the void and would silently
-                        // swallow taps; broadcast activity is equally
-                        // untrustworthy now (appStore.ts "closed": clear
-                        // permissions/elicitations/sessionStates).
-                        t.approvals.clear();
-                        t.responders.clear();
-                        t.core.session_states.clear();
-                        let delay = reconnect_delay_ms(t.reconnect_attempts);
-                        t.reconnect_attempts += 1;
-                        t.state = TabPhase::Reconnecting;
-                        t.retry_at = Some(now + delay);
-                        t.core.conn_open = false;
-                    }
+                self.socket_lost(tab, now);
+            }
+            LoopEvent::ProbeResult { tab, alive } => {
+                let Some(t) = self.tab_mut(tab) else {
+                    return;
+                };
+                t.probe_in_flight = false;
+                if !alive {
+                    self.socket_lost(tab, now);
                 }
             }
             LoopEvent::Update {
@@ -7282,8 +7455,33 @@ impl Driver {
                     }
                 } else if let Some(t) = self.tab_mut(tab) {
                     match result {
-                        Ok(value) => t.core.on_load_result(now, &req, &value),
-                        Err(_) => t.core.on_load_failed(&req),
+                        Ok(value) => {
+                            t.core.on_load_result(now, &req, &value);
+                            // A settled load makes any armed retry moot. Only
+                            // a FULL tail replay settling refills the budget:
+                            // a limit-0 reconcile success is not settlement —
+                            // when history moved it chains a full replay, and
+                            // a refill here would let a chain that keeps
+                            // failing re-arm the retry every cycle (a hot
+                            // load/replay loop). The next connect refills.
+                            t.load_retry = None;
+                            if req.limit == protocol::REPLAY_TAIL_LIMIT {
+                                t.load_retries = 0;
+                            }
+                        }
+                        Err(e) => {
+                            traceln!("[driver] tab {tab} session/load failed: {e}");
+                            t.core.on_load_failed(&req);
+                            // The failure left a cleared (or stale-snapshot)
+                            // view and nothing else re-issues the load while
+                            // the socket stays up — arm the bounded retry
+                            // (the tick fires it; a successful connect
+                            // refills the budget).
+                            if t.load_retries < LOAD_RETRY_MAX {
+                                t.load_retries += 1;
+                                t.load_retry = Some((req.clone(), now + LOAD_RETRY_DELAY_MS));
+                            }
+                        }
                     }
                 }
             }
@@ -7902,6 +8100,10 @@ impl Driver {
                     t.rewind_capable = init.rewind_capability();
                     t.core.conn_open = true;
                     t.reconnect_attempts = 0;
+                    // A fresh socket generation gets a fresh load-retry
+                    // budget (the previous socket's failures are behind it).
+                    t.load_retries = 0;
+                    t.load_retry = None;
                     // A fresh wire knows nothing until events arrive; the
                     // active session's activity is restored by the replay
                     // below (appStore.ts "open" resets sessionStates).
@@ -12047,6 +12249,355 @@ mod tests {
             2_000,
         );
         assert!(d.tabs.iter().any(|t| t.id == tab2), "a normal answer keeps the tab");
+    }
+
+    /// A Connected tab with a never-connected AcpConnection handle — the
+    /// shape the liveness probe and the load-retry paths act on.
+    /// `handle_loop_event` stamps `last_wire_activity`, so tests drive
+    /// freshness by event or by hand.
+    fn connected_tab(d: &mut super::Driver, instance: &str, sid: &str) -> u64 {
+        let tab = d.open_tab(instance.to_string(), Some(sid.to_string()), "/w".to_string());
+        let (conn, _fut) = protocol::acp_client::AcpConnection::start(
+            "http://127.0.0.1:1",
+            "t",
+            instance,
+            std::sync::Arc::new(super::DriverHandlers { tab, tx: d.loop_tx.clone() }),
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+        );
+        if let Some(t) = d.tab_mut(tab) {
+            t.conn = Some(conn);
+            t.state = super::TabPhase::Connected;
+            t.core.conn_open = true;
+            t.core.active_session_id = Some(sid.to_string());
+            t.last_wire_activity = 1_000;
+        }
+        tab
+    }
+
+    /// The probe's arming bookkeeping: only a Connected tab with a
+    /// live-silent window and no probe in flight arms one, and inbound
+    /// traffic defers the next one.
+    #[tokio::test]
+    async fn a_silent_connected_tab_arms_a_probe_and_traffic_defers_it() {
+        let mut d = driver();
+        let tab = connected_tab(&mut d, "i-serve", "sess_1");
+
+        // Silent past the threshold (stamped 1_000): the probe arms.
+        d.tick(super::TAB_PROBE_AFTER_MS + 2_000);
+        assert!(d.tab(tab).unwrap().probe_in_flight, "silence arms a probe");
+        assert_eq!(d.tab(tab).unwrap().state, super::TabPhase::Connected);
+
+        // One at a time: a second tick inside the flight keeps the slot
+        // taken instead of arming another probe.
+        d.tick(super::TAB_PROBE_AFTER_MS + 3_000);
+        assert!(d.tab(tab).unwrap().probe_in_flight);
+
+        // Fresh traffic defers the NEXT probe: inside the new window nothing
+        // arms even with the slot cleared.
+        d.tab_mut(tab).unwrap().probe_in_flight = false;
+        d.handle_loop_event(
+            LoopEvent::Update {
+                tab,
+                session_id: "sess_1".to_string(),
+                update: protocol::acp::SessionUpdate::new("usage_update"),
+                meta: None,
+            },
+            34_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().last_wire_activity, 34_000);
+        d.tick(63_000); // 29s after traffic — inside the window
+        assert!(
+            !d.tab(tab).unwrap().probe_in_flight,
+            "fresh traffic keeps the tab probe-free inside the window"
+        );
+        // Past the window it arms again.
+        d.tick(65_000); // 31s after traffic
+        assert!(d.tab(tab).unwrap().probe_in_flight);
+    }
+
+    /// A failed probe tears a silent Connected tab down exactly like an
+    /// unexpected close, and neither the socket's own close nor a second
+    /// failed probe double-fires the ladder.
+    #[tokio::test]
+    async fn a_failed_probe_tears_the_tab_down_like_a_closed_socket() {
+        let mut d = driver();
+        let tab = connected_tab(&mut d, "i-serve", "sess_1");
+
+        d.handle_loop_event(LoopEvent::ProbeResult { tab, alive: false }, 40_000);
+        let t = d.tab(tab).unwrap();
+        assert_eq!(t.state, super::TabPhase::Reconnecting, "silence tears the tab down");
+        assert!(t.retry_at.is_some(), "the reconnect ladder arms");
+        assert!(!t.core.conn_open);
+        assert!(!t.probe_in_flight);
+        let attempts = t.reconnect_attempts;
+
+        // The socket's own close lands after the probe verdict: no double
+        // tear-down.
+        d.handle_loop_event(LoopEvent::Closed { tab }, 41_000);
+        let t = d.tab(tab).unwrap();
+        assert_eq!(t.state, super::TabPhase::Reconnecting);
+        assert_eq!(t.reconnect_attempts, attempts);
+
+        // A second failed probe is equally inert.
+        d.handle_loop_event(LoopEvent::ProbeResult { tab, alive: false }, 42_000);
+        assert_eq!(d.tab(tab).unwrap().reconnect_attempts, attempts);
+    }
+
+    /// A settling ping keeps the tab exactly as it was — the probe is pure
+    /// bookkeeping on the healthy path.
+    #[tokio::test]
+    async fn a_settling_probe_keeps_the_tab_connected() {
+        let mut d = driver();
+        let tab = connected_tab(&mut d, "i-serve", "sess_1");
+        d.tab_mut(tab).unwrap().probe_in_flight = true;
+        d.handle_loop_event(LoopEvent::ProbeResult { tab, alive: true }, 40_000);
+        let t = d.tab(tab).unwrap();
+        assert_eq!(t.state, super::TabPhase::Connected);
+        assert!(!t.probe_in_flight, "the slot frees for the next probe");
+        assert!(t.retry_at.is_none());
+    }
+
+    /// A failed session/load arms a bounded retry that re-issues the same
+    /// (session, intent) on the live socket; success resets the budget, the
+    /// reconnect drops the schedule, and a session switch abandons it.
+    #[tokio::test]
+    async fn a_failed_session_load_retries_bounded_on_the_live_socket() {
+        let mut d = driver();
+        let tab = connected_tab(&mut d, "i-serve", "sess_1");
+        let req = |seq: u64| protocol::session::LoadRequest {
+            session_id: "sess_1".to_string(),
+            limit: protocol::REPLAY_TAIL_LIMIT,
+            seq,
+            intent: LoadIntent::User,
+        };
+
+        // First failure: the retry arms for LOAD_RETRY_DELAY_MS later.
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: req(1), result: Err("bridge busy".into()) },
+            10_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().load_retries, 1);
+        d.tick(10_000 + super::LOAD_RETRY_DELAY_MS);
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        assert!(
+            issued.iter().any(|w| matches!(w, super::WireRequest::Load(r)
+                if r.session_id == "sess_1" && r.intent == LoadIntent::User)),
+            "the retry re-issues the load with the same shape"
+        );
+        assert!(d.tab(tab).unwrap().load_retry.is_none());
+
+        // The second failure still retries; the third finds the budget spent.
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: req(2), result: Err("bridge busy".into()) },
+            20_000,
+        );
+        d.tick(20_000 + super::LOAD_RETRY_DELAY_MS);
+        let _ = d.tab_mut(tab).unwrap().core.take_wire();
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: req(3), result: Err("bridge busy".into()) },
+            30_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().load_retries, super::LOAD_RETRY_MAX);
+        assert!(d.tab(tab).unwrap().load_retry.is_none(), "the budget is spent");
+
+        // A success resets the budget.
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: req(4), result: Ok(serde_json::json!({})) },
+            40_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().load_retries, 0);
+
+        // An armed retry dies with the socket (the reconnect's auto-attach
+        // owns the catch-up).
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: req(5), result: Err("bridge busy".into()) },
+            50_000,
+        );
+        assert!(d.tab(tab).unwrap().load_retry.is_some());
+        d.handle_loop_event(LoopEvent::Closed { tab }, 51_000);
+        assert!(d.tab(tab).unwrap().load_retry.is_none());
+
+        // A session switch abandons the due retry: no load for the old sid.
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: req(6), result: Err("bridge busy".into()) },
+            60_000,
+        );
+        d.tab_mut(tab).unwrap().core.active_session_id = Some("sess_9".to_string());
+        d.tick(60_000 + super::LOAD_RETRY_DELAY_MS);
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        assert!(
+            !issued.iter().any(|w| matches!(w, super::WireRequest::Load(r)
+                if r.session_id == "sess_1")),
+            "a switched-away session's retry is dropped"
+        );
+    }
+
+    /// A limit-0 reconcile success is NOT settlement: refilling the budget
+    /// there would let a chained full replay that keeps failing re-arm the
+    /// retry forever (reconcile Ok refills → replay Err arms → a hot
+    /// load/replay loop every LOAD_RETRY_DELAY_MS). Only a full tail replay
+    /// settling refills.
+    #[tokio::test]
+    async fn a_reconcile_success_does_not_refill_the_load_retry_budget() {
+        let mut d = driver();
+        let tab = connected_tab(&mut d, "i-serve", "sess_1");
+        let tail_req = |seq: u64| protocol::session::LoadRequest {
+            session_id: "sess_1".to_string(),
+            limit: protocol::REPLAY_TAIL_LIMIT,
+            seq,
+            intent: LoadIntent::User,
+        };
+        let reconcile_req = |seq: u64| protocol::session::LoadRequest {
+            session_id: "sess_1".to_string(),
+            limit: 0,
+            seq,
+            intent: LoadIntent::User,
+        };
+
+        // Prime the replay cache with a real settled load — a hand-built Ok
+        // has no pending_load to match, so the load goes through the core.
+        // This is a full settlement: the budget legitimately refills here.
+        d.tab_mut(tab).unwrap().core.load_session_as("sess_1", LoadIntent::User);
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        let primed_seq = issued
+            .iter()
+            .find_map(|w| match w {
+                super::WireRequest::Load(r) if r.session_id == "sess_1" => Some(r.seq),
+                _ => None,
+            })
+            .expect("the priming load issues");
+        d.handle_loop_event(
+            LoopEvent::LoadResult {
+                tab,
+                req: tail_req(primed_seq),
+                result: Ok(serde_json::json!({
+                    "replayMeta": { "cursor": "c", "hasMore": false, "totalMessages": 2 },
+                })),
+            },
+            1_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().load_retries, 0);
+
+        // Failure #1 arms retry #1; the warm cache turns the retry into a
+        // limit-0 reconcile.
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: tail_req(2), result: Err("bridge busy".into()) },
+            10_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().load_retries, 1);
+        d.tick(10_000 + super::LOAD_RETRY_DELAY_MS);
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        let reconcile_seq = issued
+            .iter()
+            .find_map(|w| match w {
+                super::WireRequest::Load(r) if r.limit == 0 => Some(r.seq),
+                _ => None,
+            })
+            .expect("the warm retry issues a reconcile load");
+
+        // The reconcile succeeds but history MOVED: no settlement, no
+        // refill — the core chains a full tail replay instead.
+        d.handle_loop_event(
+            LoopEvent::LoadResult {
+                tab,
+                req: reconcile_req(reconcile_seq),
+                result: Ok(serde_json::json!({ "replayMeta": { "totalMessages": 3 } })),
+            },
+            11_000,
+        );
+        assert_eq!(
+            d.tab(tab).unwrap().load_retries,
+            1,
+            "a reconcile success is not settlement"
+        );
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        let chained_seq = issued
+            .iter()
+            .find_map(|w| match w {
+                super::WireRequest::Load(r) if r.limit == protocol::REPLAY_TAIL_LIMIT => {
+                    Some(r.seq)
+                }
+                _ => None,
+            })
+            .expect("moved history chains a full tail replay");
+
+        // The chained replay fails: the budget spends to its cap across one
+        // more full cycle and then the loop terminates.
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: tail_req(chained_seq), result: Err("bridge busy".into()) },
+            12_000,
+        );
+        assert_eq!(d.tab(tab).unwrap().load_retries, super::LOAD_RETRY_MAX);
+        d.tick(12_000 + super::LOAD_RETRY_DELAY_MS);
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        let reconcile_seq = issued
+            .iter()
+            .find_map(|w| match w {
+                super::WireRequest::Load(r) if r.limit == 0 => Some(r.seq),
+                _ => None,
+            })
+            .expect("retry #2 fires");
+        d.handle_loop_event(
+            LoopEvent::LoadResult {
+                tab,
+                req: reconcile_req(reconcile_seq),
+                result: Ok(serde_json::json!({ "replayMeta": { "totalMessages": 4 } })),
+            },
+            13_000,
+        );
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        let chained_seq = issued
+            .iter()
+            .find_map(|w| match w {
+                super::WireRequest::Load(r) if r.limit == protocol::REPLAY_TAIL_LIMIT => {
+                    Some(r.seq)
+                }
+                _ => None,
+            })
+            .expect("the second cycle chains again");
+        d.handle_loop_event(
+            LoopEvent::LoadResult { tab, req: tail_req(chained_seq), result: Err("bridge busy".into()) },
+            14_000,
+        );
+        let t = d.tab(tab).unwrap();
+        assert_eq!(t.load_retries, super::LOAD_RETRY_MAX, "the budget stays spent");
+        assert!(t.load_retry.is_none(), "no third cycle arms");
+
+        // And time proves it: nothing further fires.
+        d.tick(20_000);
+        let issued = d.tab_mut(tab).unwrap().core.take_wire();
+        assert!(
+            !issued.iter().any(|w| matches!(w, super::WireRequest::Load(_))),
+            "the reconcile/replay loop is over"
+        );
+    }
+
+    /// The spawned probe itself (not just its bookkeeping): a
+    /// locally-refused ping — "connection not open", the write never
+    /// reached a socket — classifies the tab dead, and the verdict drives
+    /// the same teardown as an unexpected close.
+    #[tokio::test]
+    async fn a_locally_refused_probe_reports_the_tab_dead() {
+        let (mut d, mut rx) = driver_with_loop().await;
+        let tab = connected_tab(&mut d, "i-serve", "sess_1");
+
+        d.tick(super::TAB_PROBE_AFTER_MS + 2_000);
+        assert!(d.tab(tab).unwrap().probe_in_flight, "silence arms a probe");
+
+        // The conn is a never-opened handle: the ping refuses at once and
+        // the spawned task maps that verdict to alive=false.
+        let ev = await_loop_event(&mut rx, |ev| {
+            matches!(ev, LoopEvent::ProbeResult { .. })
+        })
+        .await
+        .expect("the probe reports a verdict");
+        assert!(
+            matches!(ev, LoopEvent::ProbeResult { tab: t, alive: false } if t == tab),
+            "a refused send is not proof of life"
+        );
+        d.handle_loop_event(ev, super::TAB_PROBE_AFTER_MS + 2_001);
+        assert_eq!(d.tab(tab).unwrap().state, super::TabPhase::Reconnecting);
     }
 
     /// Remote-opened sessions pop a tab (2026-10-24, amending the
