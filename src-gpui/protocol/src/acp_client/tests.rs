@@ -285,11 +285,13 @@ async fn session_update_forwards_the_update_and_the_notification_level_meta() {
 async fn turn_state_routes_with_the_optional_turn_block() {
     let handlers = Arc::new(CaptureHandlers::default());
     let (_conn, _factory, clock, ws) = opened(handlers.clone()).await;
-    // END transition carrying usage + wall time.
+    // END transition carrying usage + wall time + the bridge-measured
+    // LLM-only time (the field must survive the router, or the tps readout
+    // silently falls back to the tool-diluted wall clock).
     ws.server(json!({
         "jsonrpc": "2.0",
         "method": "$/zcode/turnState",
-        "params": { "sessionId": "s", "running": false, "usage": { "inputTokens": 5 }, "turnMs": 2400 },
+        "params": { "sessionId": "s", "running": false, "usage": { "inputTokens": 5 }, "turnMs": 2400, "llmMs": 1000 },
     }));
     // START carries neither — no turn block.
     ws.server(json!({
@@ -305,6 +307,7 @@ async fn turn_state_routes_with_the_optional_turn_block() {
     let turn = turns[0].2.clone().expect("turn block on END");
     assert_eq!(turn.usage, Some(json!({ "inputTokens": 5 })));
     assert_eq!(turn.turn_ms, Some(2400.0));
+    assert_eq!(turn.llm_ms, Some(1000.0));
     assert!(turns[1].2.is_none());
 }
 

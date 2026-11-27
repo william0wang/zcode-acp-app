@@ -99,8 +99,10 @@ pub struct ChatMessage {
 }
 
 /// Last completed turn's speed readout (title bar): output tokens, wall
-/// seconds, and their ratio. Seeded only by a locally-run turn's prompt
-/// response; persisted in the session snapshot so switches/reconnects keep it.
+/// seconds, and tps = output tokens over the LLM-only seconds the bridge
+/// reports (`llmMs`; wall seconds on an older bridge). Seeded by a turn's
+/// prompt response or its turnState broadcast; persisted in the session
+/// snapshot so switches/reconnects keep it.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnStats {

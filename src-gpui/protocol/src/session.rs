@@ -538,8 +538,18 @@ impl SessionCore {
     /// broadcast a NEW bridge attaches for attach-only clients) into the
     /// title-bar readouts. Turns without cache numbers keep the previous
     /// rate; tps needs output tokens plus a wall time (absent on foreign
-    /// turns from an old bridge).
-    fn apply_turn_usage(&mut self, session_id: &str, usage: &Value, seconds: Option<f64>) {
+    /// turns from an old bridge). `llm_secs` — the bridge-measured LLM-only
+    /// clock (`llmMs`: wall time minus the union of tool-execution windows,
+    /// bridge ADR-0037) — is the preferred tps denominator when present, so
+    /// tool-heavy turns stop diluting the rate; `seconds` stays the wall
+    /// duration on the readout.
+    fn apply_turn_usage(
+        &mut self,
+        session_id: &str,
+        usage: &Value,
+        seconds: Option<f64>,
+        llm_secs: Option<f64>,
+    ) {
         let hit = cache_hit_rate(usage);
         let out_tok = usage
             .get("outputTokens")
@@ -555,11 +565,14 @@ impl SessionCore {
             self.cache_hit = Some(h);
         }
         if out_tok > 0.0 {
-            if let Some(secs) = seconds.filter(|s| *s > 0.0) {
+            let denom = llm_secs
+                .filter(|s| *s > 0.0)
+                .or_else(|| seconds.filter(|s| *s > 0.0));
+            if let Some(secs) = denom {
                 self.turn_stats = Some(TurnStats {
                     tps: (out_tok / secs).round(),
                     output_tokens: out_tok.round() as u64,
-                    seconds: (secs * 10.0).round() / 10.0,
+                    seconds: (seconds.unwrap_or(0.0) * 10.0).round() / 10.0,
                 });
             }
         }
@@ -584,6 +597,11 @@ impl SessionCore {
             .filter(|u| !u.is_null());
         let turn_ms = turn
             .and_then(|t| t.get("turnMs"))
+            .and_then(Value::as_f64);
+        // Bridge ADR-0037: LLM-only clock (wall minus tool windows) — the
+        // preferred tps denominator; absent on old bridges.
+        let llm_ms = turn
+            .and_then(|t| t.get("llmMs"))
             .and_then(Value::as_f64);
 
         // Session-list activity (awaiting > running > just finished > idle).
@@ -624,7 +642,8 @@ impl SessionCore {
         }
         if let Some(usage) = turn_usage {
             let seconds = turn_ms.map(|ms| (ms / 1000.0).max(0.1));
-            self.apply_turn_usage(session_id, usage, seconds);
+            let llm_secs = llm_ms.map(|ms| ms / 1000.0);
+            self.apply_turn_usage(session_id, usage, seconds, llm_secs);
         }
         if self.local_prompt_active {
             return;
@@ -776,7 +795,15 @@ impl SessionCore {
         self.disarm_force_send_stall();
         if let Some(usage) = result.get("usage").filter(|u| !u.is_null()) {
             let seconds = ((now_ms.saturating_sub(req.started_at_ms)) as f64 / 1000.0).max(0.1);
-            self.apply_turn_usage(&req.session_id, usage, Some(seconds));
+            // Bridge ADR-0037: the LLM-only clock rides _meta on new bridges.
+            let llm_secs = result
+                .get("_meta")
+                .and_then(|m| m.get("zcode"))
+                .and_then(|z| z.get("usage"))
+                .and_then(|u| u.get("llmMs"))
+                .and_then(Value::as_f64)
+                .map(|ms| ms / 1000.0);
+            self.apply_turn_usage(&req.session_id, usage, Some(seconds), llm_secs);
         }
         self.settle_prompt(now_ms);
     }
@@ -3023,6 +3050,70 @@ mod tests {
         assert_eq!(ts.output_tokens, 200);
         assert_eq!(ts.seconds, 4.0);
         assert!(!core.is_running);
+    }
+
+    // ADR-0037 (bridge): `llmMs` — the LLM-only clock (wall time minus the
+    // union of tool-execution windows) — replaces the wall clock as the tps
+    // denominator; `seconds` keeps showing the wall duration. Absent on old
+    // bridges → the wall fallback, byte-identical to the pre-ADR behavior.
+    #[test]
+    fn llm_ms_is_the_tps_denominator_and_seconds_stays_wall() {
+        let mut core = fresh_core_with_replay(json!({ "sessionId": "sess_1" }));
+
+        // Broadcast spelling: llmMs alongside turnMs on the END transition.
+        core.on_turn_state(2000, "sess_1", true, None);
+        core.on_turn_state(
+            2100,
+            "sess_1",
+            false,
+            Some(&json!({
+                "usage": {
+                    "totalTokens": 1200,
+                    "inputTokens": 1000,
+                    "outputTokens": 200
+                },
+                "turnMs": 4000, // wall would read 50 tok/s…
+                "llmMs": 1000   // …but only 1s was model time → 200 tok/s
+            })),
+        );
+        let ts = core.turn_stats.expect("turnStats set");
+        assert_eq!(ts.tps, 200.0);
+        assert_eq!(ts.seconds, 4.0); // wall duration kept
+        assert_eq!(ts.output_tokens, 200);
+
+        // Local prompt response spelling: _meta.zcode.usage.llmMs.
+        assert_eq!(core.send_prompt(2200, "fast", vec![]), SendOutcome::Ran);
+        let req = find_prompt(&mut core);
+        core.on_prompt_result(
+            2300,
+            &req,
+            &json!({
+                "stopReason": "end_turn",
+                "usage": usage_cached(),
+                "_meta": { "zcode": { "usage": { "llmMs": 2000 } } }
+            }),
+        );
+        let ts = core.turn_stats.expect("turnStats set");
+        assert_eq!(ts.tps, 250.0); // 500 tokens / 2s LLM clock
+        assert_eq!(ts.output_tokens, 500);
+        assert!(ts.seconds < 4.0); // wall stopwatch floor (~0.1s)
+
+        // Old bridge (no llmMs anywhere): wall-clock fallback as before.
+        core.on_turn_state(2400, "sess_1", true, None);
+        core.on_turn_state(
+            2500,
+            "sess_1",
+            false,
+            Some(&json!({
+                "usage": {
+                    "totalTokens": 1200,
+                    "inputTokens": 1000,
+                    "outputTokens": 200
+                },
+                "turnMs": 4000
+            })),
+        );
+        assert_eq!(core.turn_stats.expect("turnStats set").tps, 50.0);
     }
 
     // Port anchor: the TS appStore editUserMessage/retryTurn semantics —

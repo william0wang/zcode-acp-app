@@ -25,6 +25,8 @@ const USAGE_CACHED = {
 class FakeWebSocket {
   static OPEN = 1;
   static current: FakeWebSocket | null = null;
+  // Test override for the session/prompt reply (default: USAGE_CACHED).
+  static promptResult: Record<string, unknown> | null = null;
   readyState = FakeWebSocket.OPEN;
   onopen: (() => void) | null = null;
   onmessage: ((ev: { data: string }) => void) | null = null;
@@ -43,7 +45,10 @@ class FakeWebSocket {
     } else if (frame.method === "session/load") {
       this.reply(frame.id, { sessionId: frame.params?.sessionId });
     } else if (frame.method === "session/prompt") {
-      this.reply(frame.id, { stopReason: "end_turn", usage: USAGE_CACHED });
+      this.reply(
+        frame.id,
+        FakeWebSocket.promptResult ?? { stopReason: "end_turn", usage: USAGE_CACHED },
+      );
     }
   }
 
@@ -183,4 +188,70 @@ test("a foreign turn's end broadcast (usage + turnMs) feeds the readouts", async
     seconds: 4,
   });
   expect(store.getState().isRunning).toBe(false);
+});
+
+// ADR-0037 (bridge): llmMs — the LLM-only clock (wall time minus the union
+// of tool-execution windows) — replaces the wall clock as the tps
+// denominator; `seconds` keeps showing the wall duration.
+test("llmMs from the bridge is the tps denominator, seconds stays wall", async () => {
+  const { useAppStore } = await import("../src/store/appStore");
+  const store = useAppStore;
+  const ws = FakeWebSocket.current!;
+
+  // Broadcast spelling: llmMs alongside turnMs on the turn-end notification.
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/turnState",
+    params: { sessionId: "sess_1", running: true },
+  });
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/turnState",
+    params: {
+      sessionId: "sess_1",
+      running: false,
+      usage: { totalTokens: 1200, inputTokens: 1000, outputTokens: 200 },
+      turnMs: 4000, // wall would read 50 tok/s…
+      llmMs: 1000, // …but only 1s was model time → 200 tok/s
+    },
+  });
+  expect(store.getState().turnStats).toEqual({
+    tps: 200,
+    outputTokens: 200,
+    seconds: 4,
+  });
+
+  // Local prompt response spelling: _meta.zcode.usage.llmMs.
+  FakeWebSocket.promptResult = {
+    stopReason: "end_turn",
+    usage: USAGE_CACHED,
+    _meta: { zcode: { usage: { llmMs: 2000 } } },
+  };
+  try {
+    await store.getState().sendPrompt("fast");
+    const ts = store.getState().turnStats;
+    expect(ts?.outputTokens).toBe(500);
+    expect(ts?.tps).toBe(250); // 500 tokens / 2s LLM clock
+    expect(ts?.seconds).toBeLessThan(4); // wall stopwatch floor (~0.1s)
+  } finally {
+    FakeWebSocket.promptResult = null;
+  }
+
+  // Old bridge (no llmMs anywhere): wall-clock fallback, exactly as before.
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/turnState",
+    params: { sessionId: "sess_1", running: true },
+  });
+  ws.server({
+    jsonrpc: "2.0",
+    method: "$/zcode/turnState",
+    params: {
+      sessionId: "sess_1",
+      running: false,
+      usage: { totalTokens: 1200, inputTokens: 1000, outputTokens: 200 },
+      turnMs: 4000,
+    },
+  });
+  expect(store.getState().turnStats?.tps).toBe(50);
 });

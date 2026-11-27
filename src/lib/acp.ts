@@ -24,13 +24,15 @@ export interface AcpHandlers {
   onCancelRequest: (id: number) => void;
   // Bridge extension `$/zcode/turnState`: a turn started/ended somewhere the
   // client can't infer (another client's prompt, restored after re-attach).
-  // The END transition carries the turn's usage block + wall time (bridge
-  // emits them so attach-only clients can paint cache/speed readouts for
-  // turns driven from elsewhere); both are optional.
+  // The END transition carries the turn's usage block + wall time (`turnMs`,
+  // plus `llmMs` — the LLM-only clock, wall time minus the union of
+  // tool-execution windows, ADR-0037 in the bridge; the tps denominator).
+  // Bridge emits them so attach-only clients can paint cache/speed readouts
+  // for turns driven from elsewhere; all optional (absent on old bridges).
   onTurnState?: (
     sessionId: string,
     running: boolean,
-    turn?: { usage?: unknown; turnMs?: number },
+    turn?: { usage?: unknown; turnMs?: number; llmMs?: number },
   ) => void;
   // Bridge extension `$/zcode/workflowListChanged` (bridge 0.57.0): the
   // directory watch fired — a workflow was saved/deleted/moved by any means
@@ -226,6 +228,7 @@ export class AcpConnection {
               running?: boolean;
               usage?: unknown;
               turnMs?: unknown;
+              llmMs?: unknown;
             }
           | undefined;
         if (
@@ -238,6 +241,7 @@ export class AcpConnection {
               ? {
                   usage: p.usage,
                   turnMs: typeof p.turnMs === "number" ? p.turnMs : undefined,
+                  llmMs: typeof p.llmMs === "number" ? p.llmMs : undefined,
                 }
               : undefined;
           this.handlers.onTurnState?.(p.sessionId, p.running, turn);

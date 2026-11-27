@@ -1050,21 +1050,28 @@ export const useAppStore = create<AppState>((set, get) => {
   // NEW bridge attaches for attach-only clients) into the title-bar readouts.
   // Turns without cache numbers keep the previous rate; tps needs output
   // tokens plus a wall time (absent on foreign turns from an old bridge).
+  // `llmMs` — the bridge-measured LLM-only clock (wall time minus the union
+  // of tool-execution windows, bridge ADR-0037) — is the preferred tps
+  // denominator when present: tool-heavy turns stop diluting the rate.
+  // `seconds` stays the displayed wall duration.
   function applyTurnUsage(
     sessionId: string,
     usage: unknown,
     seconds?: number,
+    llmMs?: number,
   ): void {
     const hit = cacheHitRate(usage);
     const v = usage as { outputTokens?: unknown } | null;
     const outTok = typeof v?.outputTokens === "number" ? v.outputTokens : 0;
+    const llmSecs = llmMs != null && llmMs > 0 ? llmMs / 1000 : null;
+    const denom = llmSecs ?? (seconds != null && seconds > 0 ? seconds : null);
     const patch: Partial<AppState> = {};
     if (hit !== null) patch.cacheHit = hit;
-    if (outTok > 0 && seconds != null && seconds > 0) {
+    if (outTok > 0 && denom != null) {
       patch.turnStats = {
-        tps: Math.round(outTok / seconds),
+        tps: Math.round(outTok / denom),
         outputTokens: outTok,
-        seconds: Math.round(seconds * 10) / 10,
+        seconds: Math.round((seconds ?? 0) * 10) / 10,
       };
     }
     if (Object.keys(patch).length === 0) return;
@@ -1847,12 +1854,14 @@ export const useAppStore = create<AppState>((set, get) => {
         // Turn-end broadcast carries the turn's usage (new bridges): an
         // attach-only client learns cache/tps for turns driven from another
         // client (TUI, editor, phone) — the response path only reaches the
-        // prompt's sender.
+        // prompt's sender. llmMs rides alongside turnMs on the same
+        // bridges (ADR-0037).
         if (turn?.usage != null) {
           applyTurnUsage(
             sessionId,
             turn.usage,
             turn.turnMs != null ? Math.max(turn.turnMs / 1000, 0.1) : undefined,
+            turn.llmMs,
           );
         }
         // End-of-turn arrives BEFORE the prompt response for locally sent
@@ -3427,15 +3436,23 @@ export const useAppStore = create<AppState>((set, get) => {
               mimeType: img.mimeType,
             })),
           ],
-        })) as { usage?: unknown } | null;
+        })) as {
+          usage?: unknown;
+          _meta?: { zcode?: { usage?: { llmMs?: unknown } } };
+        } | null;
         // Per-turn usage rides the prompt response (UNSTABLE ACP field) AND,
         // on new bridges, the turn-end broadcast — both fold through the
         // same helper. Turns that report no cache numbers keep the previous
-        // rate. Wall time includes tool calls (there is no LLM-only clock).
+        // rate. The stopwatch is the fallback denominator; on new bridges
+        // the response's `_meta.zcode.usage.llmMs` (bridge ADR-0037) is the
+        // LLM-only clock and replaces it.
         applyTurnUsage(
           sessionId,
           result?.usage,
           Math.max((Date.now() - startedAt) / 1000, 0.1),
+          typeof result?._meta?.zcode?.usage?.llmMs === "number"
+            ? result._meta.zcode.usage.llmMs
+            : undefined,
         );
       } catch (e) {
         if (isTransientConnError(e)) {

@@ -56,6 +56,9 @@ pub struct ServerRequest {
 pub struct TurnStateInfo {
     pub usage: Option<Value>,
     pub turn_ms: Option<f64>,
+    /// Bridge-measured LLM-only turn time (tool windows excluded); absent on
+    /// older bridges, where the readout falls back to `turn_ms`.
+    pub llm_ms: Option<f64>,
 }
 
 /// Connection events, the TS `AcpHandlers` trait-for-trait.
@@ -529,10 +532,15 @@ fn route_message(core: &Arc<ConnCore>, data: &str) {
                     .filter(|u| !u.is_null())
                     .cloned();
                 let turn_ms = p.and_then(|p| p.get("turnMs")).and_then(Value::as_f64);
+                let llm_ms = p.and_then(|p| p.get("llmMs")).and_then(Value::as_f64);
                 // The turn block exists only when the END transition carries
                 // at least one of usage / turnMs.
                 let turn = if usage.is_some() || turn_ms.is_some() {
-                    Some(TurnStateInfo { usage, turn_ms })
+                    Some(TurnStateInfo {
+                        usage,
+                        turn_ms,
+                        llm_ms,
+                    })
                 } else {
                     None
                 };

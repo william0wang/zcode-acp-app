@@ -7400,11 +7400,12 @@ impl Driver {
                 turn,
             } => {
                 if let Some(t) = self.tab_mut(tab) {
-                    // SessionCore reads usage/turnMs off the raw turn block;
-                    // rebuild that shape.
+                    // SessionCore reads usage/turnMs/llmMs off the raw turn
+                    // block; rebuild that shape.
                     let turn_value = turn.map(|t| json!({
                         "usage": t.usage,
                         "turnMs": t.turn_ms,
+                        "llmMs": t.llm_ms,
                     }));
                     t.core
                         .on_turn_state(now, &session_id, running, turn_value.as_ref());
