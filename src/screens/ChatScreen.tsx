@@ -88,8 +88,10 @@ function PlanPanel({ entries }: { entries: PlanEntry[] }) {
 }
 
 // Context stats (requirements 1.6/1.7): the always-visible segment stays
-// minimal (percent + window); tps, cache and the quota dock fold into this
-// popover, which is where the ≥80% warning and the compact entry live.
+// minimal (percent + window); cache and the quota dock fold into this
+// popover, which is where the ≥80% warning and the compact entry live. The
+// last turn's rate keeps a row here (next to its duration) and is also an
+// always-visible title-bar segment — see the header in ChatScreen.
 function ContextStats({
   usage,
   cacheHit,
@@ -334,23 +336,37 @@ export function ChatScreen() {
         </button>
         <div className="min-w-0 flex-1">
           <div className="truncate text-base font-medium">{title}</div>
-          {workspace && (
+          {(workspace || turnStats) && (
             <div className="flex items-baseline text-2xs text-faint">
-              {/* Stats live in the title bar, TUI style: the context chip is
-                  the always-visible segment (`17.5%/1.0M`); cache, tok/s and
-                  the quota dock line (ADR-0021) fold into its popover, so
-                  nothing is container-gated away anymore (requirements 1.6).
-                  ≥80% turns the chip and the header bar warning (1.7). */}
-              <span className="min-w-0 truncate">{workspace}</span>
-              {usage != null && usage.size > 0 && (
+              {/* Stats live in the title bar, TUI style: the context chip
+                  (`17.5%/1.0M`) and the last turn's rate (`45 tok/s`, the
+                  desktop status bar's segment) are the always-visible
+                  segments; cache and the quota dock line (ADR-0021) fold
+                  into the chip's popover, so nothing is container-gated
+                  away anymore (requirements 1.6). ≥80% turns the chip and
+                  the header bar warning (1.7). */}
+              {workspace && (
                 <>
-                  <span className="shrink-0">{" · "}</span>
-                  <ContextStats
-                    usage={usage}
-                    cacheHit={cacheHit}
-                    turnStats={turnStats}
-                    quotaDock={quotaDock}
-                  />
+                  <span className="min-w-0 truncate">{workspace}</span>
+                  {usage != null && usage.size > 0 && (
+                    <>
+                      <span className="shrink-0">{" · "}</span>
+                      <ContextStats
+                        usage={usage}
+                        cacheHit={cacheHit}
+                        turnStats={turnStats}
+                        quotaDock={quotaDock}
+                      />
+                    </>
+                  )}
+                </>
+              )}
+              {turnStats && (
+                <>
+                  {workspace && <span className="shrink-0">{" · "}</span>}
+                  <span className="shrink-0 tabular-nums">
+                    {turnStats.tps} tok/s
+                  </span>
                 </>
               )}
             </div>
