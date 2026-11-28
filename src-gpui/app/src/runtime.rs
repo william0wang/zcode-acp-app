@@ -442,6 +442,9 @@ pub enum UiCommand {
     },
     /// Dismiss the ephemeral toast.
     DismissToast,
+    /// Dismiss the ACTIVE TAB's standing notice (a rejected prompt's
+    /// reason, [`TabNotice`]).
+    DismissNotice,
     /// Open the System Status config page. Seeds one read (the TS
     /// ZCodeConfigScreen mount effect: loadConfigSection("system") →
     /// loadSystemStats); the driver keeps polling every 5s while open.
@@ -1069,6 +1072,22 @@ pub struct FsBrowseView {
     pub error: Option<String>,
 }
 
+/// A tab's standing notice: why a server-rejected prompt never ran (the TS
+/// store's `notice` on that path — a banner, not a toast). It has NO timer:
+/// the user may not be looking when the rejection lands, so it stays until
+/// dismissed, replaced by a newer rejection, or retired by a later prompt
+/// going out for the same session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabNotice {
+    /// The session whose prompt was rejected. The banner paints only while
+    /// that session is the tab's active one, and comes back with it.
+    pub session_id: String,
+    /// The server's verbatim reason — the `{{reason}}` of
+    /// `notice.promptRejected`, resolved at paint so a locale switch
+    /// re-renders it.
+    pub reason: String,
+}
+
 /// The active tab's session state (the old M1 `SessionSnapshot`).
 #[derive(Debug, Clone)]
 pub struct TabView {
@@ -1119,6 +1138,9 @@ pub struct TabView {
     /// Slash commands from `available_commands_update` — the composer's "/"
     /// completion menu (ChatView.tsx `commands`).
     pub available_commands: Vec<protocol::acp::SlashCommand>,
+    /// The tab's standing notice (a rejected prompt's reason) while its
+    /// session is the active one — see [`TabNotice`].
+    pub notice: Option<TabNotice>,
 }
 
 /// One project row of the history chooser (`GET /api/projects`).
@@ -2261,6 +2283,35 @@ struct Tab {
     /// Retries this tab already spent on load failures; reset on a live
     /// connect, bounded by [`LOAD_RETRY_MAX`].
     load_retries: u32,
+    /// The tab's standing notice — a rejected prompt's reason. Unlike the
+    /// driver-level toast it never expires (see [`TabNotice`]).
+    notice: Option<TabNotice>,
+}
+
+impl Tab {
+    /// The notice the chat column paints, if any: only while the rejected
+    /// prompt's session is the tab's active one.
+    fn standing_notice(&self) -> Option<&TabNotice> {
+        self.notice
+            .as_ref()
+            .filter(|n| Some(n.session_id.as_str()) == self.core.active_session_id.as_deref())
+    }
+
+    /// A prompt leaving the tab retires its own session's standing notice:
+    /// the notice describes the session's LAST prompt attempt, and this one
+    /// supersedes it (a fresh rejection raises it again). Another session's
+    /// notice in the same tab is not touched.
+    fn retire_notice(&mut self, outbox: &[WireRequest]) {
+        let noticed = self.notice.as_ref().map(|n| n.session_id.as_str());
+        if let Some(sid) = noticed {
+            let resent = outbox.iter().any(|wire| {
+                matches!(wire, WireRequest::Prompt(req) if req.session_id == sid)
+            });
+            if resent {
+                self.notice = None;
+            }
+        }
+    }
 }
 
 /// The sidebar's history browser state (driver-owned — all wire I/O lives
@@ -3223,6 +3274,7 @@ impl Driver {
             probe_in_flight: false,
             load_retry: None,
             load_retries: 0,
+            notice: None,
         });
         self.active_tab = Some(id);
         traceln!("[driver] tab {id} opened (instance {})", self.tabs.last().unwrap().instance_id);
@@ -7085,6 +7137,10 @@ impl Driver {
             Some(tab) if tab.state == TabPhase::Connected => {
                 let conn = tab.conn.clone();
                 let outbox = tab.core.take_wire();
+                // Every prompt leaves the tab through this outbox: a resend
+                // (manual, force-send, or the settle's auto-flush) retires
+                // the standing notice the earlier rejection raised.
+                tab.retire_notice(&outbox);
                 match conn {
                     Some(conn) => (conn, outbox),
                     None => return,
@@ -7503,6 +7559,8 @@ impl Driver {
                 }
             }
             LoopEvent::PromptResult { tab, req, result } => {
+                let is_active_tab = self.active_tab == Some(tab);
+                let mut toast_text = None;
                 if let Some(t) = self.tab_mut(tab) {
                     match result {
                         Ok(value) => {
@@ -7515,22 +7573,37 @@ impl Driver {
                         }
                         Err(e) => {
                             // A server rejection retracts the bubble and parks
-                            // the draft back in the queue — say why (the TS
-                            // store's `notice`). Silent, it read as "the
+                            // the draft back in the queue — say why, as the
+                            // tab's STANDING notice. The toast was not enough:
+                            // its 4s window is gone before a user who looked
+                            // away comes back, and silent it read as "the
                             // session stopped and nothing recovers it"
-                            // (observed 2026-11-27). The reason can be long:
-                            // the strip wraps it instead of cutting the tail.
+                            // (observed 2026-11-27). A transport failure stays
+                            // quiet — the turn may have run, the reconnect
+                            // replay is the answer.
                             if t.core.on_prompt_failed(now, Some(&req), &e) {
-                                self.toast.notify(
-                                    now,
-                                    &crate::i18n::fill(
+                                t.notice = Some(TabNotice {
+                                    session_id: req.session_id.clone(),
+                                    reason: e.clone(),
+                                });
+                                // The banner paints only in its own tab: a
+                                // rejection landing in a BACKGROUND tab would
+                                // change nothing in view (its strip badge
+                                // reads like any queued draft), so that tab
+                                // keeps the toast as a heads-up — the same
+                                // gate as the approval arm below.
+                                if !is_active_tab {
+                                    toast_text = Some(crate::i18n::fill(
                                         &rust_i18n::t!("notice.promptRejected"),
                                         &[("reason", e.as_str())],
-                                    ),
-                                );
+                                    ));
+                                }
                             }
                         }
                     }
+                }
+                if let Some(text) = toast_text {
+                    self.toast.notify(now, &text);
                 }
             }
             LoopEvent::RewindResult { tab, kind, result } => {
@@ -8792,6 +8865,11 @@ impl Driver {
             UiCommand::DismissToast => {
                 self.toast.dismiss();
             }
+            UiCommand::DismissNotice => {
+                if let Some(t) = self.active_tab_mut() {
+                    t.notice = None;
+                }
+            }
             UiCommand::OpenSystemStatus => {
                 self.system.open = true;
                 // Seed a read on EVERY open (the TS ZCodeConfigScreen mount
@@ -9877,6 +9955,7 @@ impl Driver {
             rewind_mark: tab.core.rewind_mark,
             approval_queue: 0,
             available_commands: tab.core.available_commands.clone(),
+            notice: tab.standing_notice().cloned(),
         }
     }
 
@@ -10052,6 +10131,12 @@ impl Driver {
             } else {
                 mix(u64::MAX, &mut sig);
             }
+            // The chat column's standing notice: raised, replaced, retired,
+            // or hidden again by a session switch must all re-emit.
+            mix(
+                tab.standing_notice().map(|n| fold_str(&n.reason)).unwrap_or(u64::MAX),
+                &mut sig,
+            );
         }
         mix(self.toast.current().map(|t| t.id).unwrap_or(u64::MAX), &mut sig);
         mix(self.active_tab.unwrap_or(0), &mut sig);
@@ -11540,6 +11625,28 @@ mod tests {
         d
     }
 
+    /// A driver whose snapshot channel is readable — `emit_if_changed` is
+    /// the loop's job, so a test calls it by hand and reads what the chat
+    /// column would get.
+    fn driver_with_events()
+        -> (
+            super::Driver,
+            tokio::sync::mpsc::UnboundedReceiver<super::RuntimeEvent>,
+        ) {
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, ev_rx) = unbounded_channel();
+        let mut d = super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        d.cold_attach_done = true;
+        (d, ev_rx)
+    }
+
     /// A driver whose loop channel is readable — spawned reads settle into
     /// `loop_rx` as their terminal events (the empty default hub URL fails
     /// the fetch in-line, no network involved). Poll until a matching event
@@ -12979,27 +13086,17 @@ mod tests {
         assert_eq!(snap.running_session_count, 1, "the other client's turn still runs");
     }
 
-    /// A server-rejected prompt must not vanish silently. The bubble is
-    /// retracted and the draft goes back to the queue, and the driver toasts
-    /// the reason — the TS store's `notice` (appStore runPrompt catch), which
-    /// the desktop line had dropped: silent, six refused prompts in a row
-    /// read as "the session stopped and nothing recovers it" (observed
-    /// 2026-11-27). A transport failure stays quiet — the turn may have run,
-    /// the reconnect replay is the answer.
+    /// A server-rejected prompt must not vanish silently — nor vanish at all
+    /// before the user has seen it. The bubble is retracted and the draft
+    /// goes back to the queue, and the reason becomes the tab's STANDING
+    /// notice (the TS store's `notice`): no toast, no timer. Silent, six
+    /// refused prompts in a row read as "the session stopped and nothing
+    /// recovers it" (observed 2026-11-27), and a 4s toast is gone before a
+    /// user who looked away comes back. A transport failure stays quiet —
+    /// the turn may have run, the reconnect replay is the answer.
     #[tokio::test]
-    async fn a_rejected_prompt_toasts_its_reason_while_a_transport_failure_stays_quiet() {
-        // The toast wording resolves through the process-global locale.
-        let _locale = crate::i18n::locale_test_lock();
-        let (loop_tx, _loop_rx) = unbounded_channel();
-        let (_cmd_tx, cmd_rx) = unbounded_channel();
-        let (ev_tx, _ev_rx) = unbounded_channel();
-        let mut d = super::Driver::new(
-            cmd_rx,
-            ev_tx,
-            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
-            std::sync::Arc::new(protocol::clock::TokioClock),
-            loop_tx,
-        );
+    async fn a_rejected_prompt_raises_a_standing_notice_until_dismissed_or_replaced() {
+        let (mut d, mut ev_rx) = driver_with_events();
         let tab = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
         let t = d.tabs.iter_mut().find(|t| t.id == tab).unwrap();
         t.core.conn_open = true;
@@ -13039,27 +13136,139 @@ mod tests {
                 .map(|q| q.iter().map(|p| p.text.clone()).collect())
                 .unwrap_or_default()
         };
+        let reason = |d: &super::Driver| -> Option<String> {
+            d.tabs
+                .iter()
+                .find(|t| t.id == tab)
+                .unwrap()
+                .notice
+                .as_ref()
+                .map(|n| n.reason.clone())
+        };
+        let reject = |d: &mut super::Driver,
+                       req: protocol::session::PromptRequest,
+                       reason: &str| {
+            d.handle_loop_event(
+                LoopEvent::PromptResult {
+                    tab,
+                    req,
+                    result: Err(reason.to_string()),
+                },
+                0,
+            );
+        };
 
         // Transport failure: no server reason exists, and the draft is NOT
         // re-queued (a re-send could duplicate a turn that did run).
         let req = send(&mut d, "maybe ran");
-        d.handle_loop_event(
-            LoopEvent::PromptResult {
-                tab,
-                req,
-                result: Err("connection closed".to_string()),
-            },
-            0,
+        reject(&mut d, req, "connection closed");
+        assert_eq!(reason(&d), None, "a transport failure has nothing to announce");
+        assert!(queued(&d).is_empty(), "no re-queue on a transport failure");
+
+        // Server rejection: the reason stands on the tab and the draft
+        // survives — with no toast behind it to expire.
+        let req = send(&mut d, "继续");
+        reject(&mut d, req, "a prompt is already running for this session");
+        assert_eq!(
+            reason(&d),
+            Some("a prompt is already running for this session".to_string())
         );
         assert_eq!(
             d.toast.current(),
             None,
-            "a transport failure has nothing to announce"
+            "the banner is the surface, not the toast strip"
         );
-        assert!(queued(&d).is_empty(), "no re-queue on a transport failure");
+        assert_eq!(
+            queued(&d),
+            vec!["继续".to_string()],
+            "the rejected draft is back at the head of the queue"
+        );
 
-        // Server rejection: the reason is shown and the draft survives.
-        let req = send(&mut d, "继续");
+        // Far past the toast window: the notice has no timer.
+        d.tick(1_000_000_000_000);
+        assert!(reason(&d).is_some(), "a standing notice does not expire");
+
+        // What the chat column gets: the snapshot carries the standing
+        // notice, and an unchanged driver does not re-emit.
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("a standing notice re-emits the snapshot");
+        };
+        assert_eq!(
+            snap.active.and_then(|t| t.notice).map(|n| n.reason),
+            Some("a prompt is already running for this session".to_string()),
+            "the banner reads the emitted snapshot"
+        );
+        d.emit_if_changed();
+        assert!(
+            ev_rx.try_recv().is_err(),
+            "an unchanged notice does not re-emit"
+        );
+
+        // A second rejection REPLACES the reason — one banner, the latest.
+        let req = send(&mut d, "再来");
+        reject(&mut d, req, "auto-compact busy");
+        assert_eq!(reason(&d), Some("auto-compact busy".to_string()));
+
+        // The dismiss click clears the notice and leaves the queue alone.
+        d.handle_cmd(super::UiCommand::DismissNotice, 0);
+        assert_eq!(reason(&d), None, "dismiss clears the notice");
+        assert_eq!(
+            queued(&d),
+            vec!["再来".to_string(), "继续".to_string()],
+            "dismiss does not touch the queue"
+        );
+
+        // Dismiss changed nothing but the notice — and that alone re-emits,
+        // so the banner leaves the screen.
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("a dismissed notice re-emits the snapshot");
+        };
+        assert!(
+            snap.active.and_then(|t| t.notice).is_none(),
+            "the dismissed notice is gone from the snapshot"
+        );
+    }
+
+    /// The notice describes a session's LAST prompt attempt. A prompt going
+    /// out for that session retires it (`pump_tab` hands every outbox to
+    /// `retire_notice`), so a resend that lands leaves no stale "back in the
+    /// queue" behind; another session's resend does not touch it. And the
+    /// banner paints only while the rejected prompt's session is the tab's
+    /// active one — kept, not cleared, across a session switch.
+    #[tokio::test]
+    async fn a_resent_prompt_retires_its_sessions_standing_notice() {
+        let mut d = driver();
+        let tab = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let t = d.tab_mut(tab).unwrap();
+        t.core.conn_open = true;
+        t.core.active_session_id = Some("s1".to_string());
+        let prompt_for = |sid: &str| {
+            super::WireRequest::Prompt(protocol::session::PromptRequest {
+                session_id: sid.to_string(),
+                prompt: vec![],
+                started_at_ms: 0,
+                bubble_id: "b1".to_string(),
+            })
+        };
+        let shown = |d: &super::Driver| -> Option<super::TabNotice> {
+            super::Driver::tab_view(d.tab(tab).unwrap()).notice
+        };
+
+        // A rejected prompt raises the notice.
+        d.handle_cmd(
+            super::UiCommand::SendPrompt {
+                text: "继续".to_string(),
+                images: vec![],
+            },
+            0,
+        );
+        let super::WireRequest::Prompt(req) =
+            d.tab_mut(tab).unwrap().core.take_wire().pop().unwrap()
+        else {
+            panic!("expected the prompt wire request");
+        };
         d.handle_loop_event(
             LoopEvent::PromptResult {
                 tab,
@@ -13069,17 +13278,135 @@ mod tests {
             0,
         );
         assert_eq!(
-            d.toast.current().map(|t| t.text.as_str()),
-            Some(
-                "Message not sent — the server rejected it; the draft is back in the queue: \
-                 a prompt is already running for this session"
-            )
+            shown(&d).map(|n| n.reason),
+            Some("a prompt is already running for this session".to_string())
         );
+
+        // The tab switches to another session: the notice hides, and is
+        // still there when the tab comes back.
+        d.tab_mut(tab).unwrap().core.active_session_id = Some("s2".to_string());
         assert_eq!(
-            queued(&d),
-            vec!["继续".to_string()],
-            "the rejected draft is back at the head of the queue"
+            shown(&d),
+            None,
+            "another session's chat shows no foreign reason"
         );
+        d.tab_mut(tab).unwrap().core.active_session_id = Some("s1".to_string());
+        assert!(shown(&d).is_some(), "the reason comes back with its session");
+
+        // Another session's prompt leaving the tab leaves the notice alone.
+        d.tab_mut(tab).unwrap().retire_notice(&[prompt_for("s2")]);
+        assert!(shown(&d).is_some(), "another session's resend is not this one's");
+        // The session's own resend retires it.
+        d.tab_mut(tab).unwrap().retire_notice(&[prompt_for("s1")]);
+        assert_eq!(
+            shown(&d),
+            None,
+            "a prompt going out for the session retires the notice"
+        );
+    }
+
+    /// The banner paints only in its own tab. A rejection landing in a
+    /// BACKGROUND tab would change nothing in view — its strip badge reads
+    /// like any queued draft — so that tab keeps the toast as a heads-up
+    /// (the approval arm's gate); in the active tab the banner is the
+    /// surface and nothing toasts.
+    #[tokio::test]
+    async fn a_rejection_in_a_background_tab_also_toasts() {
+        let mut d = driver();
+        let background = connected_tab(&mut d, "i1", "s1");
+        let active = connected_tab(&mut d, "i2", "s2");
+        assert_eq!(d.active_tab, Some(active), "the last opened tab is active");
+        let reject = |d: &mut super::Driver, tab: u64, sid: &str, reason: &str| {
+            let t = d.tab_mut(tab).unwrap();
+            let _ = t.core.send_prompt(0, "继续", Vec::new());
+            let super::WireRequest::Prompt(req) = t.core.take_wire().pop().unwrap() else {
+                panic!("expected the prompt wire request");
+            };
+            assert_eq!(req.session_id, sid);
+            d.handle_loop_event(
+                LoopEvent::PromptResult {
+                    tab,
+                    req,
+                    result: Err(reason.to_string()),
+                },
+                0,
+            );
+        };
+
+        reject(&mut d, background, "s1", "background busy");
+        assert!(d.tab(background).unwrap().notice.is_some(), "its own banner");
+        let text = d
+            .toast
+            .current()
+            .map(|t| t.text.clone())
+            .expect("a background tab's rejection still toasts");
+        assert!(text.ends_with("background busy"), "the toast carries the reason: {text}");
+
+        d.toast.dismiss();
+        reject(&mut d, active, "s2", "active busy");
+        assert!(d.tab(active).unwrap().notice.is_some(), "its own banner");
+        assert_eq!(
+            d.toast.current(),
+            None,
+            "the active tab's banner is the surface"
+        );
+    }
+
+    /// The retire runs on the real send path: a resend that leaves through
+    /// `pump_tab` retires the notice, and the retire alone re-emits — the
+    /// banner leaves the screen with nothing else changing.
+    #[tokio::test]
+    async fn a_resend_through_pump_tab_retires_the_notice_and_re_emits() {
+        let (mut d, mut ev_rx) = driver_with_events();
+        let tab = connected_tab(&mut d, "i1", "s1");
+
+        // A rejected prompt raises the notice.
+        d.handle_cmd(
+            super::UiCommand::SendPrompt {
+                text: "first".to_string(),
+                images: vec![],
+            },
+            0,
+        );
+        let super::WireRequest::Prompt(req) =
+            d.tab_mut(tab).unwrap().core.take_wire().pop().unwrap()
+        else {
+            panic!("expected the prompt wire request");
+        };
+        d.handle_loop_event(
+            LoopEvent::PromptResult {
+                tab,
+                req,
+                result: Err("busy".to_string()),
+            },
+            0,
+        );
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("the raise re-emits");
+        };
+        assert!(snap.active.unwrap().notice.is_some());
+
+        // The resend leaves through the REAL pump.
+        d.handle_cmd(super::UiCommand::ForceSendPending, 0);
+        d.pump_all();
+        assert!(d.tab(tab).unwrap().notice.is_none(), "pump_tab retired it");
+        assert!(
+            d.tab_mut(tab).unwrap().core.take_wire().is_empty(),
+            "the prompt left the tab"
+        );
+        d.emit_if_changed();
+        let Ok(super::RuntimeEvent::Snapshot(snap)) = ev_rx.try_recv() else {
+            panic!("the retire re-emits");
+        };
+        assert!(
+            snap.active.unwrap().notice.is_none(),
+            "the banner is gone from the snapshot"
+        );
+
+        // Nothing changed since: no re-emit.
+        d.emit_if_changed();
+        assert!(ev_rx.try_recv().is_err(), "an idle driver does not re-emit");
     }
 
     /// A dead backend revives instead of retrying forever: once a tab has

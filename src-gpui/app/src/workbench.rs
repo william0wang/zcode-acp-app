@@ -59,7 +59,9 @@ use protocol::image::{
 use protocol::session::RewindKind;
 use rust_i18n::t;
 
-use crate::approval_card::{render_approval_card, render_toast_strip, ApprovalCard};
+use crate::approval_card::{
+    render_approval_card, render_notice_banner, render_toast_strip, ApprovalCard,
+};
 use crate::diff_view::{blocks_of, DiffBlock, DiffLine, DiffLineKind};
 use crate::file_browser::{
     absolute_dir, is_loopback_hub, render_file_viewer, render_files_header, render_files_panel,
@@ -3601,7 +3603,7 @@ impl Workbench {
     }
 
     /// The chat column both dock states share: tab strip, the scroller, the
-    /// ephemeral toast strip, and the composer.
+    /// tab's standing notice, the ephemeral toast strip, and the composer.
     fn render_chat_column(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let runtime = self.runtime.clone();
@@ -3617,9 +3619,21 @@ impl Workbench {
             return self.render_token_guide(path, preview, error.as_deref(), cx);
         }
         let toast = self.snap.toast.as_ref().map(|t| t.text.clone());
+        // The tab's standing notice (a rejected prompt's reason; TS `notice`
+        // on that path). Resolved at paint, so a locale switch repaints it.
+        let notice = self
+            .tab
+            .as_ref()
+            .and_then(|t| t.notice.as_ref())
+            .map(|n| {
+                crate::i18n::fill(
+                    &t!("notice.promptRejected"),
+                    &[("reason", n.reason.as_str())],
+                )
+            });
         // The chat stack (everything above the terminal dock): tab strip,
-        // plan bar, scroller, toast, composer — the v_resizable split's top
-        // panel while the terminal is open.
+        // plan bar, scroller, notice, toast, composer — the v_resizable
+        // split's top panel while the terminal is open.
         let chat_stack = div()
             .flex()
             .flex_col()
@@ -3642,6 +3656,11 @@ impl Workbench {
                 |this, entries| this.child(self.render_plan_bar(&entries, cx)),
             )
             .child(self.render_chat(cx))
+            // The tab's standing notice outlasts the toast below it: it
+            // stays until the dismiss click or a later prompt goes out.
+            .when_some(notice, |this, text| {
+                this.child(render_notice_banner(&runtime, &text, &theme))
+            })
             // The ephemeral toast strip (notify-toast semantics: approval
             // requested in a non-active session, attachment notices…).
             .when_some(toast, |this, text| {
@@ -10212,10 +10231,10 @@ mod ui_tests {
         .unwrap();
     }
 
-    /// A prompt rejection's reason is long — a provider refusal runs past 150
-    /// characters and puts its way out at the end — so the toast strip wraps
-    /// it: the old single truncated line cut off exactly that tail. The wrap
-    /// is capped, so a pathological message cannot eat the chat column.
+    /// A toast can carry the server's own error text — a failed rename puts
+    /// a long reason at the end — so the toast strip wraps it: a single
+    /// truncated line cut off exactly that tail. The wrap is capped, so a
+    /// pathological message cannot eat the chat column.
     #[gpui_kit::test]
     fn toast_strip_wraps_a_long_reason_and_caps_it(cx: &mut TestAppContext) {
         let _windows = super::window_test_lock();
@@ -10253,6 +10272,115 @@ mod ui_tests {
             );
         })
         .unwrap();
+    }
+
+    /// A rejected prompt's reason is a STANDING banner, not a toast: it is on
+    /// screen until the dismiss click, nothing expires it. The text wraps
+    /// past the toast's four-line cap — a provider refusal runs past 150
+    /// characters and puts its way out at the end — up to the banner's own
+    /// height cap, and the click is the active tab's `DismissNotice`.
+    #[gpui_kit::test]
+    fn a_rejected_prompt_shows_a_standing_banner_that_the_dismiss_click_clears(
+        cx: &mut TestAppContext,
+    ) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let with_notice = |reason: Option<&str>| {
+            let mut snap = connected_snapshot();
+            snap.active = Some(crate::runtime::TabView {
+                session_id: Some("sess_1".to_string()),
+                phase: TabPhase::Connected,
+                running: false,
+                loading_session: false,
+                messages: Vec::new(),
+                pending: Vec::new(),
+                has_more: false,
+                total_messages: None,
+                loading_earlier: false,
+                approval: None,
+                config_options: Vec::new(),
+                usage: None,
+                cache_hit: None,
+                turn_stats: None,
+                plan_entries: None,
+                fs_capable: false,
+                rewind_capable: false,
+                rewind_mark: None,
+                approval_queue: 0,
+                available_commands: Vec::new(),
+                notice: reason.map(|reason| crate::runtime::TabNotice {
+                    session_id: "sess_1".to_string(),
+                    reason: reason.to_string(),
+                }),
+            });
+            snap
+        };
+        let (handle, wb, rt) = cx.update(|cx| open(cx, with_notice(None), 600.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            assert!(
+                window.try_find("chat-notice-text").is_none(),
+                "no rejection, no banner"
+            );
+
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(
+                    RuntimeEvent::Snapshot(with_notice(Some("busy"))),
+                    cx,
+                )
+            });
+            window.draw(cx).clear(cx);
+            // The short reason already fills the toast's four lines here.
+            let short = window.find("chat-notice-text").bounds();
+
+            // Far more text than the column holds: the banner grows with the
+            // reason, then stops at its own height cap — the rest scrolls
+            // inside the block, so the composer and the dismiss control stay
+            // on screen whatever the reason's length.
+            let long = "系统检测到输入或生成内容可能包含不安全或敏感内容。".repeat(40);
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::Snapshot(with_notice(Some(&long))), cx)
+            });
+            window.draw(cx).clear(cx);
+            let wrapped = window.find("chat-notice-text").bounds();
+
+            let height = |b: Bounds<gpui_kit::Pixels>| f32::from(b.size.height);
+            let bottom =
+                |b: Bounds<gpui_kit::Pixels>| f32::from(b.origin.y) + f32::from(b.size.height);
+            assert!(
+                height(wrapped) > height(short),
+                "a long reason wraps past the toast's four-line cap (got {wrapped:?} vs {short:?})"
+            );
+            assert!(
+                height(wrapped) <= 160.5,
+                "and stops at the banner's own height cap (got {wrapped:?})"
+            );
+            let viewport = f32::from(window.viewport_size().height);
+            let composer = window.find("composer").bounds();
+            assert!(
+                bottom(composer) <= viewport,
+                "the composer stays on screen (got {composer:?}, viewport {viewport})"
+            );
+            let dismiss = window.find("chat-notice-dismiss").bounds();
+            assert!(
+                bottom(dismiss) <= viewport,
+                "so does the dismiss control (got {dismiss:?}, viewport {viewport})"
+            );
+
+            // The dismiss click is the active tab's DismissNotice.
+            window.click("chat-notice-dismiss", cx);
+        })
+        .unwrap();
+        assert!(
+            rt.recorded_commands()
+                .iter()
+                .any(|c| matches!(c, UiCommand::DismissNotice)),
+            "the banner's dismiss sends DismissNotice"
+        );
     }
 
     /// The settings overlay (ADR-0014 §1) replaces the chat surfaces with
@@ -10874,6 +11002,7 @@ mod ui_tests {
             rewind_mark: None,
             approval_queue: 0,
             available_commands: Vec::new(),
+            notice: None,
         };
         active.session_id = Some("sess_1".to_string());
         snap.active = Some(active);

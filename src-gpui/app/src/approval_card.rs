@@ -701,11 +701,11 @@ fn slug(text: &str) -> String {
         .collect()
 }
 
-/// The most wrapped lines a toast text may take. A prompt rejection carries
-/// the server's reason — a provider refusal runs past 150 characters and
-/// puts its way out at the end — which one truncated line cut off. The
-/// ellipsis matters: `line_clamp` alone drops the overflow silently, and a
-/// reason cut mid-sentence reads as the whole message.
+/// The most wrapped lines a toast text may take. A toast can carry the
+/// server's own error text — `rename session failed: …` puts a long reason
+/// at the end — which one truncated line cut off. The ellipsis matters:
+/// `line_clamp` alone drops the overflow silently, and a reason cut
+/// mid-sentence reads as the whole message.
 const TOAST_MAX_LINES: usize = 4;
 
 /// The ephemeral toast strip (notify-toast semantics live in the driver):
@@ -747,6 +747,58 @@ pub fn render_toast_strip(
                 .on_click({
                     let runtime = runtime.clone();
                     move |_, _, _| runtime.send(UiCommand::DismissToast)
+                }),
+        )
+        .into_any_element()
+}
+
+/// A tab's standing notice (`TabNotice`): why a server-rejected prompt never
+/// ran, plus the dismiss control. The toast strip's chrome with none of its
+/// ephemerality — the driver keeps the text until dismissed, and it wraps
+/// past the toast's four-line cap (a provider refusal puts its way out at
+/// the end) up to the block's own height cap; past that the text scrolls
+/// instead of being cut. The danger tint marks it as the problem it is.
+/// Rendered above the composer.
+pub fn render_notice_banner(
+    runtime: &ProtocolRuntime,
+    text: &str,
+    theme: &component::Theme,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .bg(theme.danger.opacity(0.10))
+        .child(
+            div()
+                .id("chat-notice-text")
+                .test_support()
+                .min_w_0()
+                .flex_1()
+                // The reason's length is the server's to pick (the bridge
+                // forwards upstream text verbatim): cap the block and let
+                // the rest scroll, so the composer and the dismiss button
+                // stay on screen.
+                .max_h(px(160.))
+                .overflow_y_scroll()
+                .text_size(ui_text(12.))
+                .text_color(theme.foreground)
+                .child(text.to_string()),
+        )
+        .child(
+            Button::new("chat-notice-dismiss")
+                .ghost()
+                .xsmall()
+                .label("×")
+                .tooltip(t!("common.dismiss"))
+                .on_click({
+                    let runtime = runtime.clone();
+                    move |_, _, _| runtime.send(UiCommand::DismissNotice)
                 }),
         )
         .into_any_element()
