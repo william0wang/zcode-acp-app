@@ -7513,7 +7513,23 @@ impl Driver {
                             // landed last.
                             self.record_readouts(&req.session_id);
                         }
-                        Err(e) => t.core.on_prompt_failed(now, Some(&req), &e),
+                        Err(e) => {
+                            // A server rejection retracts the bubble and parks
+                            // the draft back in the queue — say why (the TS
+                            // store's `notice`). Silent, it read as "the
+                            // session stopped and nothing recovers it"
+                            // (observed 2026-11-27). The reason can be long:
+                            // the strip wraps it instead of cutting the tail.
+                            if t.core.on_prompt_failed(now, Some(&req), &e) {
+                                self.toast.notify(
+                                    now,
+                                    &crate::i18n::fill(
+                                        &rust_i18n::t!("notice.promptRejected"),
+                                        &[("reason", e.as_str())],
+                                    ),
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -12961,6 +12977,109 @@ mod tests {
         };
         assert_eq!(snap.own_running_session_count, 0, "the settled turn is no longer ours");
         assert_eq!(snap.running_session_count, 1, "the other client's turn still runs");
+    }
+
+    /// A server-rejected prompt must not vanish silently. The bubble is
+    /// retracted and the draft goes back to the queue, and the driver toasts
+    /// the reason — the TS store's `notice` (appStore runPrompt catch), which
+    /// the desktop line had dropped: silent, six refused prompts in a row
+    /// read as "the session stopped and nothing recovers it" (observed
+    /// 2026-11-27). A transport failure stays quiet — the turn may have run,
+    /// the reconnect replay is the answer.
+    #[tokio::test]
+    async fn a_rejected_prompt_toasts_its_reason_while_a_transport_failure_stays_quiet() {
+        // The toast wording resolves through the process-global locale.
+        let _locale = crate::i18n::locale_test_lock();
+        let (loop_tx, _loop_rx) = unbounded_channel();
+        let (_cmd_tx, cmd_rx) = unbounded_channel();
+        let (ev_tx, _ev_rx) = unbounded_channel();
+        let mut d = super::Driver::new(
+            cmd_rx,
+            ev_tx,
+            std::sync::Arc::new(protocol::ws::TungsteniteWsFactory),
+            std::sync::Arc::new(protocol::clock::TokioClock),
+            loop_tx,
+        );
+        let tab = d.open_tab("i1".to_string(), Some("s1".to_string()), "/w".to_string());
+        let t = d.tabs.iter_mut().find(|t| t.id == tab).unwrap();
+        t.core.conn_open = true;
+        t.core.active_session_id = Some("s1".to_string());
+
+        // Send from the composer; hand back what went on the wire.
+        let send = |d: &mut super::Driver, text: &str| -> protocol::session::PromptRequest {
+            d.handle_cmd(
+                super::UiCommand::SendPrompt {
+                    text: text.to_string(),
+                    images: vec![],
+                },
+                0,
+            );
+            let wire = d
+                .tabs
+                .iter_mut()
+                .find(|t| t.id == tab)
+                .unwrap()
+                .core
+                .take_wire()
+                .pop()
+                .expect("the prompt sat on the outbox (nothing pumped it)");
+            let super::WireRequest::Prompt(req) = wire else {
+                panic!("expected the prompt wire request");
+            };
+            req
+        };
+        let queued = |d: &super::Driver| -> Vec<String> {
+            d.tabs
+                .iter()
+                .find(|t| t.id == tab)
+                .unwrap()
+                .core
+                .pending_prompts
+                .get("s1")
+                .map(|q| q.iter().map(|p| p.text.clone()).collect())
+                .unwrap_or_default()
+        };
+
+        // Transport failure: no server reason exists, and the draft is NOT
+        // re-queued (a re-send could duplicate a turn that did run).
+        let req = send(&mut d, "maybe ran");
+        d.handle_loop_event(
+            LoopEvent::PromptResult {
+                tab,
+                req,
+                result: Err("connection closed".to_string()),
+            },
+            0,
+        );
+        assert_eq!(
+            d.toast.current(),
+            None,
+            "a transport failure has nothing to announce"
+        );
+        assert!(queued(&d).is_empty(), "no re-queue on a transport failure");
+
+        // Server rejection: the reason is shown and the draft survives.
+        let req = send(&mut d, "继续");
+        d.handle_loop_event(
+            LoopEvent::PromptResult {
+                tab,
+                req,
+                result: Err("a prompt is already running for this session".to_string()),
+            },
+            0,
+        );
+        assert_eq!(
+            d.toast.current().map(|t| t.text.as_str()),
+            Some(
+                "Message not sent — the server rejected it; the draft is back in the queue: \
+                 a prompt is already running for this session"
+            )
+        );
+        assert_eq!(
+            queued(&d),
+            vec!["继续".to_string()],
+            "the rejected draft is back at the head of the queue"
+        );
     }
 
     /// A dead backend revives instead of retrying forever: once a tab has

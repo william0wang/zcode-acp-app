@@ -10212,6 +10212,49 @@ mod ui_tests {
         .unwrap();
     }
 
+    /// A prompt rejection's reason is long — a provider refusal runs past 150
+    /// characters and puts its way out at the end — so the toast strip wraps
+    /// it: the old single truncated line cut off exactly that tail. The wrap
+    /// is capped, so a pathological message cannot eat the chat column.
+    #[gpui_kit::test]
+    fn toast_strip_wraps_a_long_reason_and_caps_it(cx: &mut TestAppContext) {
+        let _windows = super::window_test_lock();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            cx.set_reduce_motion(true);
+        });
+        let with_toast = |text: String| {
+            let mut snap = connected_snapshot();
+            snap.toast = Some(protocol::toast::Toast { id: 1, text });
+            snap
+        };
+        let (handle, wb, _rt) = cx.update(|cx| open(cx, with_toast("short".to_string()), 600.));
+        cx.update_window(handle.into(), |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.draw(cx).clear(cx);
+            let one_line = window.find("toast-text").bounds();
+
+            // Far more text than the 600px column holds on four lines.
+            let long = "系统检测到输入或生成内容可能包含不安全或敏感内容。".repeat(40);
+            wb.update(cx, |wb, cx| {
+                wb.on_runtime_event(RuntimeEvent::Snapshot(with_toast(long)), cx)
+            });
+            window.draw(cx).clear(cx);
+            let wrapped = window.find("toast-text").bounds();
+
+            let height = |b: Bounds<gpui_kit::Pixels>| f32::from(b.size.height);
+            assert!(
+                height(wrapped) > height(one_line) * 2.5,
+                "a long reason wraps instead of truncating to one line (got {wrapped:?} vs {one_line:?})"
+            );
+            assert!(
+                height(wrapped) < height(one_line) * 4.5,
+                "and stays capped at four lines (got {wrapped:?} vs {one_line:?})"
+            );
+        })
+        .unwrap();
+    }
+
     /// The settings overlay (ADR-0014 §1) replaces the chat surfaces with
     /// its rail + content pane; the all-providers quota drawer still floats
     /// above an intact chat. The gear opens the overlay (seeding its reads

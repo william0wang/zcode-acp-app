@@ -701,8 +701,16 @@ fn slug(text: &str) -> String {
         .collect()
 }
 
+/// The most wrapped lines a toast text may take. A prompt rejection carries
+/// the server's reason — a provider refusal runs past 150 characters and
+/// puts its way out at the end — which one truncated line cut off. The
+/// ellipsis matters: `line_clamp` alone drops the overflow silently, and a
+/// reason cut mid-sentence reads as the whole message.
+const TOAST_MAX_LINES: usize = 4;
+
 /// The ephemeral toast strip (notify-toast semantics live in the driver):
-/// text plus a dismiss control, rendered above the composer.
+/// text (wrapped, up to [`TOAST_MAX_LINES`]) plus a dismiss control,
+/// rendered above the composer.
 pub fn render_toast_strip(
     runtime: &ProtocolRuntime,
     text: &str,
@@ -720,9 +728,12 @@ pub fn render_toast_strip(
         .bg(theme.title_bar)
         .child(
             div()
+                .id("toast-text")
+                .test_support()
                 .min_w_0()
                 .flex_1()
-                .truncate()
+                .line_clamp(TOAST_MAX_LINES)
+                .text_ellipsis()
                 .text_size(ui_text(12.))
                 .text_color(theme.foreground)
                 .child(text.to_string()),

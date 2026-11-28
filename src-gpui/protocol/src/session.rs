@@ -818,12 +818,19 @@ impl SessionCore {
     /// running:false, the next turn end) or a force-send flushes it. The
     /// rejected settle does NOT flush: a still-rejecting bridge would
     /// livelock the queue into a reject-resend loop.
-    pub fn on_prompt_failed(&mut self, now_ms: u64, req: Option<&PromptRequest>, error: &str) {
+    ///
+    /// Returns `true` when the server rejected the prompt (the draft went
+    /// back to the queue): the caller surfaces the reason — the TS store's
+    /// `notice` on that path. A retract with no word reads as "the session
+    /// stopped and nothing recovers it" (observed 2026-11-27 on the desktop
+    /// line, which had dropped the notice). A transport failure, or a late
+    /// answer for an abandoned turn, returns `false`.
+    pub fn on_prompt_failed(&mut self, now_ms: u64, req: Option<&PromptRequest>, error: &str) -> bool {
         // Same late-answer rule as on_prompt_result: a failure for a prompt we
         // already gave up on neither requeues that abandoned draft (the
         // force-send deliberately skipped it) nor settles the newer turn.
         if req.is_some_and(|r| !self.owns_in_flight_prompt(r)) {
-            return;
+            return false;
         }
         self.disarm_force_send_stall();
         if let Some(req) = req.filter(|_| !is_transport_error(error)) {
@@ -836,9 +843,10 @@ impl SessionCore {
             self.in_flight_prompt = None;
             self.is_running = false;
             self.cache_active_snapshot();
-            return;
+            return true;
         }
         self.settle_prompt(now_ms);
+        false
     }
 
     /// The prompt settle: clear the local-turn flag, snapshot, and flush the
@@ -2138,8 +2146,8 @@ mod tests {
         // A's abandoned prompt now fails with a SERVER rejection (the shape
         // that normally pushes the draft back to the queue head). It belongs
         // to a turn the force-send deliberately skipped, so it must neither
-        // requeue A nor settle B.
-        core.on_prompt_failed(2500, Some(&req_a), "already running");
+        // requeue A nor settle B — nor read as a rejection to surface.
+        assert!(!core.on_prompt_failed(2500, Some(&req_a), "already running"));
         assert!(core.is_running && core.local_prompt_active);
         assert!(
             core.pending_prompts.get("sess_1").is_none(),
@@ -2162,7 +2170,9 @@ mod tests {
         let bubble_id = req.bubble_id.clone();
         core.send_prompt(2100, "queued behind", vec![]);
 
-        core.on_prompt_failed(2200, Some(&req), "auto-compact busy");
+        // The rejection is reported to the caller: the draft must not just
+        // silently hop back into the queue.
+        assert!(core.on_prompt_failed(2200, Some(&req), "auto-compact busy"));
 
         // The optimistic bubble is retracted, the draft back at the HEAD
         // (ahead of the queued follow-up), and NOTHING re-sent yet — the
@@ -2185,7 +2195,7 @@ mod tests {
 
         assert_eq!(core.send_prompt(2000, "maybe ran", vec![]), SendOutcome::Ran);
         let req = find_prompt(&mut core);
-        core.on_prompt_failed(2100, Some(&req), "connection closed");
+        assert!(!core.on_prompt_failed(2100, Some(&req), "connection closed"));
 
         // No re-queue: the turn may have run — the reconnect replay rebuilds
         // the truth, a re-send could duplicate it.

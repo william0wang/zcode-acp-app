@@ -692,7 +692,8 @@
     "runSettingsRepointed": "Run settings updated — the amendment superseded this run; the view re-pointed to the new run",
     "queueEmpty": "Nothing queued — the message already went out",
     "sendWhileLoading": "Still loading this session — the queued message sends when it finishes",
-    "sendWhileDisconnected": "Not connected — the queued message sends after the reconnect"
+    "sendWhileDisconnected": "Not connected — the queued message sends after the reconnect",
+    "promptRejected": "Message not sent — the server rejected it; the draft is back in the queue: {{reason}}"
   },
   "projectDialog": {
     "title": "New session",
